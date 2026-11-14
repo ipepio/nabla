@@ -6,8 +6,12 @@
 //   live in settings.json (T5).
 
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
-#[derive(Debug, Clone, PartialEq)]
+// Payloads cross the Tauri bridge as camelCase JSON: the same convention
+// settings.json uses (see L3). The TS contracts mirror these shapes (S4).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Workspace {
     pub id: i64,
     pub path: String,
@@ -15,7 +19,13 @@ pub struct Workspace {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+// Not a command payload (pi writes sessions; nabla only indexes them), but it is
+// serialized anyway so the contract stays symmetric with SessionRow.
+// Used by the upcoming pi-runtime feature: sessions are indexed when a pi
+// session spawns (see .docs/03-referencias.md, per-session topology).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionNew {
     pub workspace_id: i64,
     /// Absolute path of the pi-owned session JSONL file. Unique. Content is never stored here.
@@ -26,7 +36,8 @@ pub struct SessionNew {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionRow {
     pub id: i64,
     pub workspace_id: i64,
@@ -61,7 +72,11 @@ impl From<rusqlite::Error> for StoreError {
 pub type StoreResult<T> = Result<T, StoreError>;
 
 pub struct Store {
-    conn: rusqlite::Connection,
+    /// rusqlite's Connection is `Send` but not `Sync`; the store is shared by
+    /// every Tauri command (which run on worker threads), so access is
+    /// serialized through a mutex exactly like a single-threaded connection
+    /// would be.
+    conn: Mutex<rusqlite::Connection>,
 }
 
 impl Store {
@@ -71,21 +86,33 @@ impl Store {
         // Enforce FK cascade behavior on every connection, not just by default.
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        let store = Store { conn };
+        let store = Store {
+            conn: Mutex::new(conn),
+        };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Locks the connection for the duration of one operation. Any panic while
+    /// holding the guard poisons the mutex, so a corrupted connection surfaces
+    /// as an error instead of being silently reused.
+    fn conn(&self) -> StoreResult<MutexGuard<'_, rusqlite::Connection>> {
+        self.conn
+            .lock()
+            .map_err(|_| StoreError::Sqlite("connection mutex poisoned".to_string()))
     }
 
     /// Versioned migrations tracked by SQLite's PRAGMA user_version.
     /// Each migration is idempotent by definition: it runs only when its
     /// version equals the current user_version.
     fn migrate(&self) -> StoreResult<()> {
-        let current: i64 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let conn = self.conn()?;
+        let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         const LATEST: i64 = 1;
         if current < 1 {
             // S1 schema: application-owned index only. No transcript/content
             // columns exist anywhere: pi owns the session files.
-            self.conn.execute_batch(
+            conn.execute_batch(
                 "BEGIN;
                  CREATE TABLE IF NOT EXISTS workspaces (
                    id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,11 +145,12 @@ impl Store {
             _ => default_name_from_path(path),
         };
         let created_at = now_iso();
-        self.conn.execute(
+        let conn = self.conn()?;
+        conn.execute(
             "INSERT INTO workspaces (path, name, created_at) VALUES (?1, ?2, ?3)",
             rusqlite::params![path, name, created_at],
         )?;
-        let id = self.conn.last_insert_rowid();
+        let id = conn.last_insert_rowid();
         Ok(Workspace {
             id,
             path: path.to_string(),
@@ -132,9 +160,9 @@ impl Store {
     }
 
     pub fn list_workspaces(&self) -> StoreResult<Vec<Workspace>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, path, name, created_at FROM workspaces ORDER BY created_at, id")?;
+        let conn = self.conn()?;
+        let mut stmt =
+            conn.prepare("SELECT id, path, name, created_at FROM workspaces ORDER BY created_at, id")?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(Workspace {
@@ -149,14 +177,16 @@ impl Store {
     }
 
     pub fn remove_workspace(&self, id: i64) -> StoreResult<bool> {
-        let affected = self
-            .conn
-            .execute("DELETE FROM workspaces WHERE id = ?1", [id])?;
+        let conn = self.conn()?;
+        let affected = conn.execute("DELETE FROM workspaces WHERE id = ?1", [id])?;
         Ok(affected > 0)
     }
 
+    // Used by the upcoming pi-runtime feature (see SessionNew note above).
+    #[allow(dead_code)]
     pub fn upsert_session(&self, session: &SessionNew) -> StoreResult<SessionRow> {
-        self.conn.execute(
+        let conn = self.conn()?;
+        conn.execute(
             "INSERT INTO sessions (workspace_id, pi_session_path, title, model, started_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(pi_session_path) DO UPDATE SET
@@ -173,7 +203,7 @@ impl Store {
                 session.updated_at,
             ],
         )?;
-        let row = self.conn.query_row(
+        let row = conn.query_row(
             "SELECT id, workspace_id, pi_session_path, title, model, started_at, updated_at
              FROM sessions WHERE pi_session_path = ?1",
             [&session.pi_session_path],
@@ -193,7 +223,8 @@ impl Store {
     }
 
     pub fn list_sessions(&self, workspace_id: i64) -> StoreResult<Vec<SessionRow>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
             "SELECT id, workspace_id, pi_session_path, title, model, started_at, updated_at
              FROM sessions WHERE workspace_id = ?1
              ORDER BY updated_at DESC, id DESC",
