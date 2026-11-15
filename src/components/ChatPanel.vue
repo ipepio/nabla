@@ -20,7 +20,6 @@ import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Textarea } from "@/components/ui/textarea";
 import type { AgentEvent, RuntimeStatus } from "@/contracts/agent-events";
 import {
@@ -294,10 +293,9 @@ onUnmounted(() => {
 
 <template>
   <div class="flex h-full min-h-0 flex-col">
-    <!-- Main header: the collapse control duplicated here (S1) so the drawer can
-         be toggled from the chat side too. -->
+    <!-- Main header. The collapse control lives only in the drawer (S8), so this
+         header carries the chat title and the session controls and nothing else. -->
     <header class="flex items-center gap-3 border-b px-4 py-2">
-      <SidebarTrigger />
       <div class="min-w-0 flex-1">
         <h1 class="truncate text-sm font-semibold">Chat</h1>
         <p class="truncate text-xs text-muted-foreground">

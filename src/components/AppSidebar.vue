@@ -1,10 +1,19 @@
 <script setup lang="ts">
-// Left drawer (specs S1, S3, S6): the Nabla logo, the collapse control, the
-// workspace list with its add form, and the settings dialog in the footer.
+// Left drawer (specs S1, S3, S6, S7-S9): the Nabla logo, the collapse control —
+// the only one in the shell (S8) — the workspace list with its add form (native
+// folder picker first, manual path second), and the settings dialog in the footer.
 // It owns the workspace/settings data flow; the *selection* is lifted to App.vue
 // through `select`, which feeds ChatPanel.
 import { onMounted, ref, watch } from "vue";
-import { CheckIcon, FolderIcon, PlusIcon, SettingsIcon, Trash2Icon } from "@lucide/vue";
+import {
+  CheckIcon,
+  FolderIcon,
+  FolderOpenIcon,
+  PlusIcon,
+  SettingsIcon,
+  Trash2Icon,
+} from "@lucide/vue";
+import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
 import {
   Alert,
   AlertDescription,
@@ -64,6 +73,12 @@ const newPath = ref("");
 const newName = ref("");
 const adding = ref(false);
 const workspaceError = ref<string | null>(null);
+// The brand mark is optional: `public/brand/nabla-logo.png` is dropped in by the
+// maintainer, so until it exists the header falls back to the ∇ glyph (S7).
+const logoFailed = ref(false);
+// Referenced as a runtime URL (not a static asset import) because Vite fails the
+// build for a missing asset, and the file is expected to be missing at first.
+const logoSource = "/brand/nabla-logo.png";
 
 const settingsOpen = ref(false);
 const settings = ref<AppSettings>({ theme: "dark", piBinary: "pi" });
@@ -120,11 +135,39 @@ async function handleAddWorkspace() {
     workspaceError.value = "Workspace path is required.";
     return;
   }
-  const name = newName.value.trim();
+  await addWorkspaceAndSelect(path, newName.value.trim() === "" ? null : newName.value.trim());
+}
+
+/**
+ * Primary add flow (S9): the native folder picker. Cancelling the dialog is not
+ * an error, so it silently leaves the form untouched. The name is never sent:
+ * the store derives it from the path, exactly like the manual flow's empty name.
+ */
+async function handleBrowseFolder() {
+  if (adding.value) return;
+  workspaceError.value = null;
+  let selected: string | string[] | null;
+  try {
+    selected = await openFolderDialog({
+      directory: true,
+      multiple: false,
+      title: "Choose a workspace folder",
+    });
+  } catch (cause) {
+    workspaceError.value = commandErrorMessage(cause);
+    return;
+  }
+  const path = Array.isArray(selected) ? selected[0] : selected;
+  if (!path) return;
+  await addWorkspaceAndSelect(path, null);
+}
+
+/** Shared by both add flows: create the row, refresh, and select it. */
+async function addWorkspaceAndSelect(path: string, name: string | null) {
   adding.value = true;
   workspaceError.value = null;
   try {
-    const created = await addWorkspace(path, name === "" ? null : name);
+    const created = await addWorkspace(path, name);
     newPath.value = "";
     newName.value = "";
     await refreshWorkspaces();
@@ -193,10 +236,28 @@ onMounted(() => {
   <Sidebar collapsible="icon">
     <SidebarHeader>
       <div class="flex items-center gap-2 px-1 py-1">
+        <!-- The only collapse control in the shell (S8): the central header has
+             none, so the drawer alone owns its own visibility. -->
         <SidebarTrigger class="shrink-0" />
-        <div class="flex min-w-0 items-baseline gap-2 group-data-[collapsible=icon]:hidden">
-          <!-- Nabla glyph: the del operator, the app's namesake. -->
-          <span class="text-lg leading-none font-semibold text-primary select-none">∇</span>
+        <div class="flex min-w-0 items-center gap-2 group-data-[collapsible=icon]:hidden">
+          <!-- Brand mark (S7). `aria-hidden`: the wordmark next to it already
+               names the app. The @error handler is what makes the header
+               correct both before and after the asset lands. -->
+          <img
+            v-if="!logoFailed"
+            :src="logoSource"
+            alt=""
+            aria-hidden="true"
+            class="size-6 shrink-0 rounded-md object-contain"
+            @error="logoFailed = true"
+          />
+          <!-- Nabla glyph fallback: the del operator, the app's namesake. -->
+          <span
+            v-else
+            aria-hidden="true"
+            class="text-lg leading-none font-semibold text-primary select-none"
+            >∇</span
+          >
           <span class="truncate text-sm font-semibold">Nabla</span>
         </div>
       </div>
@@ -237,10 +298,25 @@ onMounted(() => {
         </SidebarGroupContent>
       </SidebarGroup>
 
-      <!-- Add form. Hidden while the drawer is collapsed to icons: a path typed
-           into a 3rem-wide drawer is not a flow worth supporting. -->
+      <!-- Add folder area. Hidden while the drawer is collapsed to icons: a path
+           typed into a 3rem-wide drawer is not a flow worth supporting. -->
       <div class="flex flex-col gap-2 px-2 pb-2 group-data-[collapsible=icon]:hidden">
         <Separator />
+        <!-- Primary flow (S9): the native folder picker. -->
+        <Button
+          variant="outline"
+          size="sm"
+          class="w-full justify-start"
+          aria-label="Browse for folder"
+          :disabled="adding"
+          @click="handleBrowseFolder"
+        >
+          <FolderOpenIcon data-icon="inline-start" />
+          Browse for folder
+        </Button>
+        <!-- Secondary flow: the path typed by hand, for folders the picker cannot
+             reach (remote paths, hidden directories). -->
+        <p class="text-xs text-muted-foreground">Or type a path manually:</p>
         <Input
           v-model="newPath"
           aria-label="Workspace path"

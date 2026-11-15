@@ -17,6 +17,8 @@ use store::Store;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // Native folder picker for the workspace add flow (S9).
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // Directories are resolved once at startup: Tauri maps them to the
             // platform-specific locations, so no path is hardcoded here.
@@ -25,6 +27,11 @@ pub fn run() {
             // SQLite creates the file but not its parent directory.
             std::fs::create_dir_all(&data_dir)?;
             let store = Store::open(&data_dir.join("nabla.db"))?;
+            // S9: the first launch seeds the user's home directory as the default
+            // workspace. `app.path()` is Tauri's resolver; `std::env::home_dir`
+            // is deprecated and platform-dependent.
+            let home = app.path().home_dir()?;
+            commands::seed_default_workspace(&store, &home)?;
             // One supervisor for every pi child (S3). Its sink is the only
             // bridge from a pi process to the webview (S6): each event leaves
             // as `agent-event` with the camelCase `{ sessionId, event }`

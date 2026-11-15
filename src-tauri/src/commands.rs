@@ -10,7 +10,7 @@ use tauri::State;
 use crate::process::{ProcessManager, StartupOutcome};
 use crate::rpc::{AgentEvent, RuntimeStatus};
 use crate::settings::{self, Settings};
-use crate::store::{SessionNew, SessionRow, Store, Workspace};
+use crate::store::{SessionNew, SessionRow, Store, StoreResult, Workspace};
 
 /// State shared with every command: the SQLite store (app-owned state), the
 /// config directory where settings.json lives (human-owned preferences, S2), the
@@ -57,6 +57,22 @@ pub fn add_workspace(
         .store
         .add_workspace(&path, name.as_deref())
         .map_err(display_err)
+}
+
+/// Seeds the user's home directory as the default workspace on the first launch
+/// (S9: "un workspace por default que sea ~").
+///
+/// Runs from the Tauri setup hook, not from a command: it must happen before the
+/// webview asks for the workspace list. Idempotent by the emptiness check (later
+/// launches keep whatever the human configured) and, as a second belt, by the
+/// store's `path UNIQUE` constraint. Returns whether a row was created.
+pub fn seed_default_workspace(store: &Store, home: &Path) -> StoreResult<bool> {
+    if !store.list_workspaces()?.is_empty() {
+        return Ok(false);
+    }
+    // `name` is omitted on purpose: the store derives it from the path.
+    store.add_workspace(&home.to_string_lossy(), None)?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -345,6 +361,84 @@ pub fn session_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scratch directory in the system temp dir (never the worktree): one fresh
+    /// Store plus a `home` folder to seed, removed in teardown.
+    struct TempSeedDir(std::path::PathBuf);
+
+    impl TempSeedDir {
+        fn new(tag: &str) -> Self {
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "nabla_seed_{}_{}_{tag}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(path.join("home")).expect("create temp dirs");
+            TempSeedDir(path)
+        }
+
+        fn home(&self) -> std::path::PathBuf {
+            self.0.join("home")
+        }
+
+        fn store(&self) -> Store {
+            Store::open(&self.0.join("nabla.db")).expect("open store")
+        }
+    }
+
+    impl Drop for TempSeedDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn seed_default_workspace_creates_home_when_the_store_is_empty() {
+        let fixture = TempSeedDir::new("empty");
+        let store = fixture.store();
+        assert!(store.list_workspaces().expect("list").is_empty());
+
+        let seeded = seed_default_workspace(&store, &fixture.home()).expect("seed");
+
+        assert!(seeded, "an empty store must be seeded");
+        let all = store.list_workspaces().expect("list");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].path, fixture.home().to_string_lossy());
+        assert_eq!(all[0].name, "home", "the name derives from the path");
+    }
+
+    #[test]
+    fn seed_default_workspace_leaves_a_populated_store_untouched() {
+        let fixture = TempSeedDir::new("populated");
+        let store = fixture.store();
+        store
+            .add_workspace("/tmp/existing-project", None)
+            .expect("add");
+
+        let seeded = seed_default_workspace(&store, &fixture.home()).expect("seed");
+
+        assert!(!seeded, "a populated store must not be seeded");
+        let all = store.list_workspaces().expect("list");
+        assert_eq!(all.len(), 1, "no extra row may be added");
+        assert_eq!(all[0].path, "/tmp/existing-project");
+    }
+
+    #[test]
+    fn seed_default_workspace_is_idempotent_across_launches() {
+        let fixture = TempSeedDir::new("idempotent");
+        let store = fixture.store();
+
+        assert!(seed_default_workspace(&store, &fixture.home()).expect("first seed"));
+        assert!(!seed_default_workspace(&store, &fixture.home()).expect("second seed"));
+
+        let all = store.list_workspaces().expect("list");
+        assert_eq!(all.len(), 1, "the UNIQUE path constraint still holds");
+        assert_eq!(all[0].path, fixture.home().to_string_lossy());
+    }
 
     #[test]
     fn session_file_stem_is_workspace_scoped_and_unique_per_start() {
