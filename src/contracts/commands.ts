@@ -8,6 +8,9 @@ import type {
   AppSettings,
   ModelInfo,
   ModelOption,
+  PiAuthStatus,
+  PiCliEvent,
+  PiCliResult,
   ProviderDraft,
   ProviderSummary,
   SessionDto,
@@ -150,6 +153,79 @@ export function setProviderKey(
   apiKey: string,
 ): Promise<ProviderSummary> {
   return invoke<ProviderSummary>("set_provider_key", { providerId, apiKey });
+}
+
+// ── pi CLI bridge seam (S1-S4 of `odd/tasks/pi-cli-bridge.md`) ───────────────
+
+/**
+ * S4: the account state of one provider, read by Rust from
+ * `pi auth check --provider <p> --json`. The credential itself stays in pi's
+ * `auth.json`: only presence and state cross the seam.
+ */
+export function piAuthCheck(provider: string): Promise<PiAuthStatus> {
+  return invoke<PiAuthStatus>("pi_auth_check", { provider });
+}
+
+/**
+ * S1/S2: runs one allowlisted `pi` invocation and captures its output. The
+ * allowlist (`auth`, `models`, `config`, `--version`, `--help`), the argv-only
+ * spawn and the bounded output live in Rust; `timeoutMs` is optional and Rust
+ * defaults it to 20 s.
+ *
+ * A non-zero exit is an answer, not a rejection: `exitCode` carries it. Only a
+ * call that could not run at all rejects.
+ */
+export function piCliRun(
+  args: string[],
+  timeoutMs?: number,
+): Promise<PiCliResult> {
+  return invoke<PiCliResult>("pi_cli_run", {
+    args,
+    timeoutMs: timeoutMs ?? null,
+  });
+}
+
+/**
+ * S3: starts an interactive invocation — the OAuth device-code login — and
+ * answers with the session id its `pi-cli` events carry. There is no timeout:
+ * the human decides when the flow ends, and `piCliStop` is how it ends.
+ */
+export function piCliStart(args: string[]): Promise<string> {
+  return invoke<string>("pi_cli_start", { args });
+}
+
+/**
+ * S3: pastes text into the live child's stdin (Rust appends the newline), so the
+ * returned device code reaches `pi auth login`. `false` means the session is
+ * gone or already finished, which is not an error.
+ */
+export function piCliWrite(
+  cliSessionId: string,
+  text: string,
+): Promise<boolean> {
+  return invoke<boolean>("pi_cli_write", { cliSessionId, text });
+}
+
+/**
+ * S3: kills the live child and forgets the session. Idempotent: `false` means
+ * there was nothing left to stop.
+ */
+export function piCliStop(cliSessionId: string): Promise<boolean> {
+  return invoke<boolean>("pi_cli_stop", { cliSessionId });
+}
+
+/**
+ * Subscribes to the `pi-cli` event stream one interactive session produces (S3).
+ * The listener lives here so no component imports the Tauri API directly
+ * (contract-seam rule, AGENTS.md 1). Resolves with an unsubscribe function: call
+ * it on unmount or it keeps receiving events after teardown.
+ */
+export async function subscribePiCli(
+  handler: (event: PiCliEvent) => void,
+): Promise<() => void> {
+  return listen<PiCliEvent>("pi-cli", ({ payload }) => {
+    handler(payload);
+  });
 }
 
 // ── pi runtime seam (R3, R4) ─────────────────────────────────────────────────

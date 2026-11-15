@@ -141,3 +141,59 @@ export interface SessionStatusDto {
   pid: number | null;
   error: string | null;
 }
+
+// ── pi CLI bridge (S1-S4 of `odd/tasks/pi-cli-bridge.md`) ────────────────────
+
+/**
+ * Account state of one provider, exactly the words `pi auth check --json` can
+ * report (S4). `unknown` is what Rust answers when the JSON cannot be
+ * understood, so the UI never invents a login state it did not observe.
+ * Mirrors `AuthState` in `src-tauri/src/cli.rs` (snake_case, as serde writes it).
+ */
+export type PiAuthState = "ready" | "not_ready" | "invalid" | "unknown";
+
+/**
+ * Typed account state of one provider (S4). `credential` says whether a
+ * credential is present, never its value: pi keeps the secret in `auth.json`
+ * and it never crosses this seam. Mirrors `PiAuthStatus` in
+ * `src-tauri/src/cli.rs`.
+ */
+export interface PiAuthStatus {
+  provider: string;
+  state: PiAuthState;
+  credential: boolean;
+}
+
+/**
+ * Answer of one non-interactive `pi` call (S1, S2). A non-zero `exitCode` is an
+ * answer, not an error; `timedOut` says the deadline killed the child and
+ * `truncated` says a stream hit Rust's 64 KiB cap. Mirrors `PiCliResult` in
+ * `src-tauri/src/cli.rs`.
+ */
+export interface PiCliResult {
+  stdout: string;
+  stderr: string;
+  /** `null` when the child was killed by a signal, so no code exists. */
+  exitCode: number | null;
+  timedOut: boolean;
+  truncated: boolean;
+}
+
+/**
+ * The three things one interactive session reports (S3): one line of stdout,
+ * one line of stderr, or the exit of the child.
+ */
+export type PiCliStream = "stdout" | "stderr" | "exit";
+
+/**
+ * Payload of the Tauri event `pi-cli` (S3). `line` carries one complete line
+ * without its newline and is absent on `exit`; `exitCode` is present only on
+ * `exit`, and only when the child left on its own. Mirrors `CliEvent` in
+ * `src-tauri/src/cli.rs`.
+ */
+export interface PiCliEvent {
+  cliSessionId: string;
+  stream: PiCliStream;
+  line?: string;
+  exitCode?: number;
+}

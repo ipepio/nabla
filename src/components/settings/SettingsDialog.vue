@@ -16,9 +16,15 @@
  * S5 of the same task: the custom-provider form is gated by
  * `VITE_ENABLE_CUSTOM_PROVIDERS`, a build-time switch like the rest of Nabla's
  * env configuration — and it is ON BY DEFAULT: only an explicit `0`/`false`/`off`
- * hides the block. No other flag is declared: the pi login flow is out of scope
- * and api keys are handled per provider, so a switch that renders nothing never
- * exists.
+ * hides the block. The subscription accounts block above the list is gated the
+ * same way by `VITE_ENABLE_PROVIDER_LOGIN` (S5 of `pi-cli-bridge.md`), read with
+ * the same helper and with the same default: a build that sets neither shows
+ * both, so a flag nobody exported never hides a working feature.
+ *
+ * S3/S4 of `pi-cli-bridge.md`: those accounts are pi's own subscription login
+ * (device code, live output, pasted code) and logout — see `AccountsSection.vue`.
+ * The pane still owns only which provider the next session uses; the account
+ * state never rewrites the settings.
  *
  * S3/S4: every configured row also offers the api key of that provider (typed
  * inline, never prefilled, written into pi's plain-text `models.json`) and its
@@ -78,6 +84,7 @@ import { Separator } from "@/components/ui/separator";
 import { useAppearance } from "@/lib/appearance";
 import { useI18n, type Locale, type MessageKey } from "@/lib/i18n";
 import type { ThemeMode } from "@/lib/theme";
+import AccountsSection from "./AccountsSection.vue";
 import ProviderForm from "./ProviderForm.vue";
 import {
   commandErrorMessage,
@@ -173,11 +180,18 @@ function readFlag(name: string): boolean {
 
 /**
  * S5 of `providers-pane.md`: build-time switch, read the same way the palette and
- * the hero copy are. The custom-provider block is the only gated section of this
- * pane; the pi login flow was dropped from scope, so no flag is declared for it
- * (a switch that renders nothing is dead configuration).
+ * the hero copy are. The custom-provider block is the only gated block of this
+ * pane.
  */
 const customProvidersEnabled = readFlag("VITE_ENABLE_CUSTOM_PROVIDERS");
+
+/**
+ * S5 of `pi-cli-bridge.md`: the subscription accounts block, gated by the same
+ * `readFlag` rule — on by default, off only for an explicit `0`/`false`/`off`.
+ * The check lives here, next to the other switch, so `AccountsSection.vue` never
+ * declares a second copy of the semantics.
+ */
+const providerLoginEnabled = readFlag("VITE_ENABLE_PROVIDER_LOGIN");
 
 // The applied mode, not the stored one: the ring shows what the app is actually
 // painting, and both agree because opening the dialog applies the stored mode.
@@ -593,10 +607,16 @@ watch(open, (isOpen) => {
             </div>
           </div>
 
-          <!-- S1 of `providers-pane.md`: Providers — every provider pi knows, with
-               the active one marked. Rows carry no rule of their own: the only
-               separator in this pane is the one before the custom block. -->
+          <!-- S3/S4 of `pi-cli-bridge.md`: the subscription accounts, above the
+               provider list because signing in is what makes a provider usable.
+               S5: the whole block is ON unless the build sets
+               `VITE_ENABLE_PROVIDER_LOGIN` to `0`/`false`/`off`. -->
           <div v-else class="space-y-6 py-4">
+            <template v-if="providerLoginEnabled">
+              <AccountsSection :providers="providers" />
+              <Separator />
+            </template>
+
             <section class="space-y-2">
               <div class="min-w-0">
                 <h3 class="text-sm font-medium">
@@ -610,8 +630,8 @@ watch(open, (isOpen) => {
               <!-- S1: the name, url and state are one activate control; the row's
                    other actions are siblings of it (a button inside a button is
                    invalid HTML). The active row is marked by the accent fill, not
-                   by a rule: this pane keeps a single separator, before the
-                   custom block. -->
+                   by a rule: this pane only rules between major blocks (accounts
+                   | providers | custom). -->
               <ul v-if="providers.length" class="space-y-0.5">
                 <li
                   v-for="entry in providers"
