@@ -80,6 +80,58 @@ pub fn remove_workspace(state: State<'_, AppState>, id: i64) -> Result<bool, Str
     state.store.remove_workspace(id).map_err(display_err)
 }
 
+/// Message for an id that is not (or no longer) indexed, shared by every command
+/// that takes a workspace id so the wording never drifts.
+fn unknown_workspace(workspace_id: i64) -> String {
+    format!("unknown workspace: {workspace_id}")
+}
+
+/// Reads one indexed workspace. Commands that mutate a workspace answer with the
+/// row they just wrote, so the UI never has to guess what the update produced.
+fn workspace_by_id(store: &Store, workspace_id: i64) -> Result<Workspace, String> {
+    store
+        .list_workspaces()
+        .map_err(display_err)?
+        .into_iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .ok_or_else(|| unknown_workspace(workspace_id))
+}
+
+/// S8: pins or unpins one space for the "Pinned" filter. Returns the updated row;
+/// an id that changes no row is an error, not a silent success.
+#[tauri::command]
+pub fn set_workspace_pinned(
+    state: State<'_, AppState>,
+    workspace_id: i64,
+    pinned: bool,
+) -> Result<Workspace, String> {
+    let changed = state
+        .store
+        .set_workspace_pinned(workspace_id, pinned)
+        .map_err(display_err)?;
+    if !changed {
+        return Err(unknown_workspace(workspace_id));
+    }
+    workspace_by_id(&state.store, workspace_id)
+}
+
+/// S8: records that the space was just used ("Recientes"). Returns the updated
+/// row; an id that changes no row is an error, not a silent success.
+#[tauri::command]
+pub fn touch_workspace(
+    state: State<'_, AppState>,
+    workspace_id: i64,
+) -> Result<Workspace, String> {
+    let changed = state
+        .store
+        .touch_workspace(workspace_id)
+        .map_err(display_err)?;
+    if !changed {
+        return Err(unknown_workspace(workspace_id));
+    }
+    workspace_by_id(&state.store, workspace_id)
+}
+
 #[tauri::command]
 pub fn list_sessions(
     state: State<'_, AppState>,
@@ -91,6 +143,49 @@ pub fn list_sessions(
 #[tauri::command]
 pub fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
     settings::load(&settings_path(&state)).map_err(display_err)
+}
+
+// ── model selector seam (S7) ────────────────────────────────────────────────
+
+/// One choice of the model selector (S7): the id pi is spawned with and the
+/// human-readable label. camelCase like every other payload.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String,
+}
+
+/// Models of the NaN provider, in the order the selector shows them.
+/// Source: `~/.pi/agent/models.json`, `providers.nan` (id, name). This is a
+/// durable constant on purpose: the selector must work without reading pi's own
+/// configuration. Replace the constant with dynamic provider discovery when pi
+/// exposes it.
+const NAN_MODELS: &[(&str, &str)] = &[
+    ("mimo-v2.6-flash", "MiMo V2.6 Flash (NaN)"),
+    ("glm5.3-flash", "GLM 5.3 Flash (NaN)"),
+    ("gemma4", "Gemma4 (NaN)"),
+    ("qwen3.6", "qwen3.6 (NaN)"),
+    ("qwen3.8-flash", "Qwen 3.8 Flash (NaN)"),
+    ("deepseek-v4-flash", "deepseek (NaN)"),
+    ("hy4", "Hy4 (NaN)"),
+    ("deepseek-v4-pro", "DeepSeek V4 Pro (NaN)"),
+    ("glm5.3", "GLM 5.3 (NaN)"),
+    ("qwen3.8-max", "Qwen 3.8 Max (NaN)"),
+    ("kimi-k3.1-pro", "Kimi K3.1 Pro (NaN)"),
+];
+
+/// S7: the models the selector offers. Synchronous and stateless on purpose:
+/// the list is fixed until provider discovery exists.
+#[tauri::command]
+pub fn list_models() -> Result<Vec<ModelInfo>, String> {
+    Ok(NAN_MODELS
+        .iter()
+        .map(|(id, name)| ModelInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -231,15 +326,10 @@ fn ensure_session_in_workspace(
 pub fn start_session(state: State<'_, AppState>, workspace_id: i64) -> Result<SessionDto, String> {
     // A workspace is a directory on disk: spawning pi somewhere else would
     // produce a session the user never asked for.
-    let workspace = state
-        .store
-        .list_workspaces()
-        .map_err(display_err)?
-        .into_iter()
-        .find(|workspace| workspace.id == workspace_id)
-        .ok_or_else(|| format!("unknown workspace: {workspace_id}"))?;
+    let workspace = workspace_by_id(&state.store, workspace_id)?;
 
-    // The engine path is user-configured, so it is read per start, not cached.
+    // The engine path, provider and model are user-configured, so they are read
+    // per start, not cached (S7).
     let settings = settings::load(&settings_path(&state)).map_err(display_err)?;
 
     let sessions_dir = state.data_dir.join(SESSIONS_DIR);
@@ -272,6 +362,8 @@ pub fn start_session(state: State<'_, AppState>, workspace_id: i64) -> Result<Se
             &session_id,
             &settings.pi_binary,
             &pi_session_path,
+            &settings.provider,
+            &settings.model,
             Path::new(&workspace.path),
         )
         .map_err(display_err)?;
@@ -459,5 +551,77 @@ mod tests {
         assert!(crashed.contains("boom"), "got: {crashed}");
         let silent = startup_failure_message(crate::process::StartupOutcome::Aborted, "");
         assert!(!silent.is_empty());
+    }
+
+    // S7: the selector lists exactly the models of pi's NaN provider, in the
+    // order the provider declares them. The ids are the ones pi is spawned with.
+    #[test]
+    fn list_models_returns_the_eleven_nan_provider_models_in_order() {
+        let models = list_models().expect("list models");
+        let pairs: Vec<(&str, &str)> = models
+            .iter()
+            .map(|model| (model.id.as_str(), model.name.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("mimo-v2.6-flash", "MiMo V2.6 Flash (NaN)"),
+                ("glm5.3-flash", "GLM 5.3 Flash (NaN)"),
+                ("gemma4", "Gemma4 (NaN)"),
+                ("qwen3.6", "qwen3.6 (NaN)"),
+                ("qwen3.8-flash", "Qwen 3.8 Flash (NaN)"),
+                ("deepseek-v4-flash", "deepseek (NaN)"),
+                ("hy4", "Hy4 (NaN)"),
+                ("deepseek-v4-pro", "DeepSeek V4 Pro (NaN)"),
+                ("glm5.3", "GLM 5.3 (NaN)"),
+                ("qwen3.8-max", "Qwen 3.8 Max (NaN)"),
+                ("kimi-k3.1-pro", "Kimi K3.1 Pro (NaN)"),
+            ]
+        );
+    }
+
+    // S7 contract shape: `{ id, name }`, exactly two string fields.
+    #[test]
+    fn model_info_serializes_as_id_and_name() {
+        let json = serde_json::to_value(ModelInfo {
+            id: "glm5.3".to_string(),
+            name: "GLM 5.3 (NaN)".to_string(),
+        })
+        .expect("serialize");
+        assert_eq!(json["id"], serde_json::json!("glm5.3"));
+        assert_eq!(json["name"], serde_json::json!("GLM 5.3 (NaN)"));
+        let round_tripped: ModelInfo = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round_tripped.id, "glm5.3");
+        assert_eq!(round_tripped.name, "GLM 5.3 (NaN)");
+    }
+
+    // S8: the mutating workspace commands answer with the row they changed, so
+    // the UI never has to guess what the update produced.
+    #[test]
+    fn workspace_by_id_returns_the_changed_row_and_names_unknown_ids() {
+        let fixture = TempSeedDir::new("workspace_by_id");
+        let store = fixture.store();
+        let workspace = store
+            .add_workspace("/tmp/proj-a", None)
+            .expect("add workspace");
+
+        store
+            .set_workspace_pinned(workspace.id, true)
+            .expect("pin");
+        let pinned = workspace_by_id(&store, workspace.id).expect("pinned row");
+        assert!(pinned.pinned, "the answer carries the new pin state");
+
+        store
+            .touch_workspace(workspace.id)
+            .expect("touch");
+        let touched = workspace_by_id(&store, workspace.id).expect("touched row");
+        assert!(
+            touched.last_used_at.is_some(),
+            "the answer carries the new last use, got {:?}",
+            touched.last_used_at
+        );
+
+        let unknown = workspace_by_id(&store, 9999);
+        assert_eq!(unknown, Err("unknown workspace: 9999".to_string()));
     }
 }

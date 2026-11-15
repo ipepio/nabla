@@ -56,6 +56,11 @@ pub fn run() {
             commands::list_workspaces,
             commands::add_workspace,
             commands::remove_workspace,
+            // S8: pin and recency support for the spaces sidebar.
+            commands::set_workspace_pinned,
+            commands::touch_workspace,
+            // S7: the model selector's source of truth.
+            commands::list_models,
             commands::list_sessions,
             commands::get_settings,
             commands::save_settings,

@@ -14,6 +14,24 @@ pub struct Settings {
     /// pi binary name or path; resolved at runtime (see .docs/03-referencias.md,
     /// FaqFirebase binary resolution as future reference).
     pub pi_binary: String,
+    /// S7: pi provider for new sessions. "nan" is the provider configured in
+    /// `~/.pi/agent/models.json`; the selector lists its models.
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    /// S7: model id inside `provider` for new sessions.
+    #[serde(default = "default_model")]
+    pub model: String,
+}
+
+/// S7 default provider. Also the value a settings file written before this
+/// preference existed gets, so an upgrade never rejects an older file.
+fn default_provider() -> String {
+    "nan".to_string()
+}
+
+/// S7 default model inside `default_provider`.
+fn default_model() -> String {
+    "deepseek-v4-flash".to_string()
 }
 
 impl Default for Settings {
@@ -21,6 +39,8 @@ impl Default for Settings {
         Settings {
             theme: "dark".to_string(),
             pi_binary: "pi".to_string(),
+            provider: default_provider(),
+            model: default_model(),
         }
     }
 }
@@ -99,17 +119,33 @@ mod tests {
         assert_eq!(s, Settings::default());
         assert_eq!(s.theme, "dark");
         assert_eq!(s.pi_binary, "pi");
+        // S7: the default engine configuration is the NaN provider and its
+        // default model, so a fresh install spawns pi with something usable.
+        assert_eq!(s.provider, "nan");
+        assert_eq!(s.model, "deepseek-v4-flash");
     }
 
+    // S7: provider and model are persisted alongside the rest of the settings.
     #[test]
     fn save_then_load_round_trips() {
         let cfg = TempCfg::new("roundtrip");
         let mut s = Settings::default();
         s.theme = "light".into();
         s.pi_binary = "/opt/pi/bin/pi".into();
+        s.provider = "nan".into();
+        s.model = "glm5.3".into();
         save(&cfg.0, &s).expect("save");
         let loaded = load(&cfg.0).expect("load");
         assert_eq!(loaded, s);
+    }
+
+    // S7: the file is camelCase, so the TS contract mirrors these keys exactly.
+    #[test]
+    fn serialized_keys_are_camel_case_and_include_provider_and_model() {
+        let json = serde_json::to_value(Settings::default()).expect("serialize");
+        assert_eq!(json["piBinary"], serde_json::json!("pi"));
+        assert_eq!(json["provider"], serde_json::json!("nan"));
+        assert_eq!(json["model"], serde_json::json!("deepseek-v4-flash"));
     }
 
     #[test]
@@ -117,12 +153,30 @@ mod tests {
         let cfg = TempCfg::new("unknown_fields");
         std::fs::write(
             &cfg.0,
-            r#"{"theme":"light","piBinary":"pi","futureField":{"x":1}}"#,
+            r#"{"theme":"light","piBinary":"pi","provider":"nan","model":"glm5.3","futureField":{"x":1}}"#,
         )
         .expect("write fixture");
         let s = load(&cfg.0).expect("load with unknown field must succeed");
         assert_eq!(s.theme, "light");
         assert_eq!(s.pi_binary, "pi");
+        // S7: a settings file written by hand sets the engine to use.
+        assert_eq!(s.provider, "nan");
+        assert_eq!(s.model, "glm5.3");
+    }
+
+    // S7 + settings header rule: a file written before provider/model existed
+    // must still load. Missing fields take their defaults; the file is never
+    // rejected because a newer build added a preference.
+    #[test]
+    fn settings_file_without_provider_and_model_uses_defaults() {
+        let cfg = TempCfg::new("pre_provider");
+        std::fs::write(&cfg.0, r#"{"theme":"light","piBinary":"/opt/pi"}"#)
+            .expect("write fixture");
+        let s = load(&cfg.0).expect("an older settings file must load");
+        assert_eq!(s.theme, "light");
+        assert_eq!(s.pi_binary, "/opt/pi");
+        assert_eq!(s.provider, "nan");
+        assert_eq!(s.model, "deepseek-v4-flash");
     }
 
     #[test]

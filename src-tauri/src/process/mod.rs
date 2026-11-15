@@ -310,11 +310,14 @@ impl ProcessManager {
     /// Spawns one headless pi for `key` and waits for readiness, with the single
     /// crash retry. `Err` means the spawn could not even be attempted (already
     /// running); a failed startup is reported inside `SpawnReport`.
+    /// `provider`/`model` come from settings (S7) and are decided per spawn.
     pub fn spawn(
         &self,
         key: &str,
         pi_binary: &str,
         session_file: &Path,
+        provider: &str,
+        model: &str,
         cwd: &Path,
     ) -> Result<SpawnReport, ProcessError> {
         // S3: one process per session. Checked before spawning, not after, so a
@@ -324,7 +327,7 @@ impl ProcessManager {
         }
         let mut attempt = 1;
         loop {
-            let report = self.spawn_once(key, pi_binary, session_file, cwd);
+            let report = self.spawn_once(key, pi_binary, session_file, provider, model, cwd);
             match report.outcome {
                 // A crash before ready is often transient (an AV lock, a
                 // momentary ENOENT): retry exactly once. A timeout is not
@@ -344,6 +347,8 @@ impl ProcessManager {
         key: &str,
         pi_binary: &str,
         session_file: &Path,
+        provider: &str,
+        model: &str,
         cwd: &Path,
     ) -> SpawnReport {
         // Announce the attempt before anything can fail (S4).
@@ -362,7 +367,7 @@ impl ProcessManager {
         let pending: Arc<Mutex<HashMap<String, mpsc::SyncSender<RpcResponse>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        let mut child = match build_command(pi_binary, session_file, cwd).spawn() {
+        let mut child = match build_command(pi_binary, session_file, provider, model, cwd).spawn() {
             Ok(child) => child,
             Err(err) => {
                 let message = format!("failed to spawn pi ({pi_binary}): {err}");
@@ -718,12 +723,18 @@ struct SessionProcess {
 /// Arguments of the pi RPC invocation. Mirror: Stark `process_manager.rs`
 /// (steps 3 wrongly pin provider/model for every project, so only the two flags
 /// Nabla needs are kept) and `pi-rpc-manager.ts` `buildPiArgs`.
-fn spawn_args(session_file: &Path) -> Vec<String> {
+/// S7 adds the explicit provider/model pair: the model selector decides them per
+/// spawn, so pi never falls back to whatever provider it would pick itself.
+fn spawn_args(session_file: &Path, provider: &str, model: &str) -> Vec<String> {
     vec![
         "--mode".to_string(),
         "rpc".to_string(),
         "--session".to_string(),
         session_file.to_string_lossy().to_string(),
+        "--provider".to_string(),
+        provider.to_string(),
+        "--model".to_string(),
+        model.to_string(),
     ]
 }
 
@@ -767,9 +778,15 @@ where
 
 /// Builds the headless child: piped stdio, no terminal, allowlisted env, own
 /// process group on Unix (S1, S5).
-fn build_command(pi_binary: &str, session_file: &Path, cwd: &Path) -> Command {
+fn build_command(
+    pi_binary: &str,
+    session_file: &Path,
+    provider: &str,
+    model: &str,
+    cwd: &Path,
+) -> Command {
     let mut command = Command::new(pi_binary);
-    command.args(spawn_args(session_file));
+    command.args(spawn_args(session_file, provider, model));
     command.current_dir(cwd);
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
@@ -961,6 +978,11 @@ mod tests {
             .collect()
     }
 
+    /// Provider/model used by lifecycle tests that do not care about S7: the
+    /// spawn signature requires them, and any real pair works for a fake engine.
+    const TEST_PROVIDER: &str = "nan";
+    const TEST_MODEL: &str = "deepseek-v4-flash";
+
     fn test_timeouts() -> Timeouts {
         Timeouts {
             ready: Duration::from_millis(400),
@@ -973,8 +995,10 @@ mod tests {
 
     /// The happy-path fake engine: answers the readiness probe, then for every
     /// `prompt` frame emits two text deltas and a correlated response. No real pi,
-    /// no network (S8).
+    /// no network (S8). It first records its own argv, one argument per line, so
+    /// a test can prove which flags reached the child.
     const FAKE_PI: &str = r#"#!/bin/sh
+printf '%s\n' "$@" >> '@ARGS@'
 printf 'attempt\n' >> '@ATTEMPTS@'
 printf '%s\n' '{"type":"response","id":"__startup_probe__","command":"get_state","success":true,"data":{}}'
 while IFS= read -r line; do
@@ -1007,14 +1031,39 @@ sleep 30
     fn write_script(scratch: &Scratch, name: &str, attempts: &Path, marker: &Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = scratch.path(name);
+        // Every fake script can log its argv here: the file sits next to the
+        // script, outside the worktree, and only exists when the script writes it.
+        let args_log = path.with_extension("args");
         let script = body
             .replace("@ATTEMPTS@", &attempts.display().to_string())
-            .replace("@MARKER@", &marker.display().to_string());
+            .replace("@MARKER@", &marker.display().to_string())
+            .replace("@ARGS@", &args_log.display().to_string());
         std::fs::write(&path, script).expect("write fake pi");
         let mut perms = std::fs::metadata(&path).expect("stat fake pi").permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod fake pi");
         path
+    }
+
+    /// Arguments the fake engine recorded for `name`, waiting briefly because the
+    /// writer is the child process, not the test thread.
+    #[cfg(unix)]
+    fn recorded_args(scratch: &Scratch, name: &str) -> Vec<String> {
+        let args_log = scratch.path(name).with_extension("args");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(&args_log)
+                && !raw.trim().is_empty()
+            {
+                return raw.lines().map(|line| line.to_string()).collect();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fake pi never recorded its arguments at {}",
+                args_log.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[cfg(unix)]
@@ -1024,11 +1073,15 @@ sleep 30
             .unwrap_or(0)
     }
 
-    // S2/S3: the invocation shape. Keep only the flags Nabla needs; provider and
-    // model are per-workspace decisions for a later feature.
+    // S2/S3/S7: the invocation shape. Provider and model are passed per spawn
+    // (S7), so pi can never fall back to the provider it would pick on its own.
     #[test]
     fn spawn_args_match_the_pi_rpc_invocation() {
-        let args = spawn_args(Path::new("/tmp/sessions/1-1700000000.jsonl"));
+        let args = spawn_args(
+            Path::new("/tmp/sessions/1-1700000000.jsonl"),
+            "nan",
+            "deepseek-v4-flash",
+        );
         assert_eq!(
             args,
             vec![
@@ -1036,8 +1089,58 @@ sleep 30
                 "rpc".to_string(),
                 "--session".to_string(),
                 "/tmp/sessions/1-1700000000.jsonl".to_string(),
+                "--provider".to_string(),
+                "nan".to_string(),
+                "--model".to_string(),
+                "deepseek-v4-flash".to_string(),
             ]
         );
+    }
+
+    // S7: the configured provider and model reach the child process, in the
+    // exact flag order pi expects. Asserted on the child's own argv, not on the
+    // builder, so a broken pipe of the setting would show up here.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_forwards_the_configured_provider_and_model() {
+        let scratch = Scratch::new("provider_args");
+        let attempts = scratch.path("attempts");
+        let marker = scratch.path("marker");
+        let script = write_script(&scratch, "fake-pi.sh", &attempts, &marker, FAKE_PI);
+        let collected = Arc::new(Collected::default());
+        let manager = ProcessManager::with_timeouts(collected.sink(), test_timeouts());
+
+        let report = manager
+            .spawn(
+                "s1",
+                script.to_str().unwrap(),
+                &scratch.path("s1.jsonl"),
+                "nan",
+                "glm5.3",
+                &scratch.dir,
+            )
+            .expect("spawn");
+        assert_eq!(report.outcome, StartupOutcome::Ready, "stderr: {:?}", report.stderr_tail);
+
+        let args = recorded_args(&scratch, "fake-pi.sh");
+        let provider_at = args.iter().position(|arg| arg == "--provider");
+        let model_at = args.iter().position(|arg| arg == "--model");
+        assert_eq!(
+            provider_at.and_then(|at| args.get(at + 1)).map(String::as_str),
+            Some("nan"),
+            "the child must receive --provider nan, got {args:?}"
+        );
+        assert_eq!(
+            model_at.and_then(|at| args.get(at + 1)).map(String::as_str),
+            Some("glm5.3"),
+            "the child must receive --model glm5.3, got {args:?}"
+        );
+        let session_at = args.iter().position(|arg| arg == "--session").expect("--session");
+        assert!(
+            session_at < provider_at.unwrap_or(0) && provider_at.unwrap() < model_at.unwrap(),
+            "flags follow --session in provider-then-model order: {args:?}"
+        );
+        manager.stop_all();
     }
 
     // S1/S5: the child never inherits the host environment wholesale.
@@ -1105,7 +1208,14 @@ sleep 30
         let manager = ProcessManager::with_timeouts(collected.sink(), test_timeouts());
 
         let report = manager
-            .spawn("s1", script.to_str().unwrap(), &scratch.path("s1.jsonl"), &scratch.dir)
+            .spawn(
+            "s1",
+            script.to_str().unwrap(),
+            &scratch.path("s1.jsonl"),
+            TEST_PROVIDER,
+            TEST_MODEL,
+            &scratch.dir,
+        )
             .expect("spawn");
         assert_eq!(report.outcome, StartupOutcome::Ready, "stderr: {:?}", report.stderr_tail);
         assert_eq!(report.status, RuntimeStatus::Ready);
@@ -1193,7 +1303,14 @@ sleep 30
         let manager = ProcessManager::with_timeouts(collected.sink(), test_timeouts());
 
         let report = manager
-            .spawn("s1", script.to_str().unwrap(), &scratch.path("s1.jsonl"), &scratch.dir)
+            .spawn(
+            "s1",
+            script.to_str().unwrap(),
+            &scratch.path("s1.jsonl"),
+            TEST_PROVIDER,
+            TEST_MODEL,
+            &scratch.dir,
+        )
             .expect("spawn attempt");
         assert_eq!(report.outcome, StartupOutcome::Crashed);
         assert_eq!(report.status, RuntimeStatus::Crashed);
@@ -1233,7 +1350,14 @@ sleep 30
 
         let started = Instant::now();
         let report = manager
-            .spawn("s1", script.to_str().unwrap(), &scratch.path("s1.jsonl"), &scratch.dir)
+            .spawn(
+            "s1",
+            script.to_str().unwrap(),
+            &scratch.path("s1.jsonl"),
+            TEST_PROVIDER,
+            TEST_MODEL,
+            &scratch.dir,
+        )
             .expect("spawn attempt");
         assert_eq!(report.outcome, StartupOutcome::Timeout);
         assert_eq!(report.status, RuntimeStatus::Crashed);
@@ -1261,12 +1385,21 @@ sleep 30
         let manager = ProcessManager::with_timeouts(collected.sink(), test_timeouts());
 
         manager
-            .spawn("s1", script.to_str().unwrap(), &scratch.path("s1.jsonl"), &scratch.dir)
+            .spawn(
+            "s1",
+            script.to_str().unwrap(),
+            &scratch.path("s1.jsonl"),
+            TEST_PROVIDER,
+            TEST_MODEL,
+            &scratch.dir,
+        )
             .expect("first spawn");
         let second = manager.spawn(
             "s1",
             script.to_str().unwrap(),
             &scratch.path("s1.jsonl"),
+            TEST_PROVIDER,
+            TEST_MODEL,
             &scratch.dir,
         );
         assert!(
@@ -1275,7 +1408,14 @@ sleep 30
         );
         // A second session gets its own process.
         manager
-            .spawn("s2", script.to_str().unwrap(), &scratch.path("s2.jsonl"), &scratch.dir)
+            .spawn(
+            "s2",
+            script.to_str().unwrap(),
+            &scratch.path("s2.jsonl"),
+            TEST_PROVIDER,
+            TEST_MODEL,
+            &scratch.dir,
+        )
             .expect("second session spawn");
         assert!(manager.contains("s1") && manager.contains("s2"));
         assert_eq!(attempts_count(&attempts), 2);

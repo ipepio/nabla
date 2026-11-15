@@ -6,6 +6,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { AgentEventEnvelope } from "./agent-events";
 import type {
   AppSettings,
+  ModelInfo,
   SessionDto,
   SessionStatusDto,
   SessionSummary,
@@ -35,6 +36,33 @@ export function addWorkspace(
 
 export function removeWorkspace(id: number): Promise<boolean> {
   return invoke<boolean>("remove_workspace", { id });
+}
+
+/**
+ * S8: answers the same payload as `list_workspaces`, so the drawer can refresh
+ * from one source of truth instead of patching its own copy.
+ */
+export function setWorkspacePinned(
+  workspaceId: number,
+  pinned: boolean,
+): Promise<WorkspaceInfo> {
+  return invoke<WorkspaceInfo>("set_workspace_pinned", { workspaceId, pinned });
+}
+
+/**
+ * S8: records that the space was just used. The recency timestamp is the store's
+ * clock, never the webview's.
+ */
+export function touchWorkspace(workspaceId: number): Promise<WorkspaceInfo> {
+  return invoke<WorkspaceInfo>("touch_workspace", { workspaceId });
+}
+
+/**
+ * S7: the models the configured provider offers. The list lives in Rust (one
+ * constant, sourced from pi's config); the UI never hardcodes model ids.
+ */
+export function listModels(): Promise<ModelInfo[]> {
+  return invoke<ModelInfo[]>("list_models");
 }
 
 export function listSessions(workspaceId: number): Promise<SessionSummary[]> {

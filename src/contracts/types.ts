@@ -10,6 +10,23 @@ export interface WorkspaceInfo {
   path: string;
   name: string;
   createdAt: string;
+  /** S8: pins the space to the top of the list and drives the "Pinned" filter. */
+  pinned: boolean;
+  /**
+   * S8: ISO-8601 timestamp of the last time the space was used, `null` until the
+   * first touch. It is the recency source for the "Recent" filter.
+   */
+  lastUsedAt: string | null;
+}
+
+/**
+ * One model the runtime offers, as the Rust side knows it (S7). The list is a
+ * Rust constant for now; the UI never hardcodes it, it always asks
+ * `listModels()`.
+ */
+export interface ModelInfo {
+  id: string;
+  name: string;
 }
 
 /** Index entry for a pi-owned session file. Content is never copied here. */
@@ -27,6 +44,10 @@ export interface SessionSummary {
 export interface AppSettings {
   theme: string;
   piBinary: string;
+  /** S7: pi provider id the spawn passes as `--provider`. */
+  provider: string;
+  /** S7: model id the spawn passes as `--model`; always one of `listModels()`. */
+  model: string;
 }
 
 /**

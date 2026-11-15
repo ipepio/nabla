@@ -20,17 +20,27 @@ import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import type { AgentEvent, RuntimeStatus } from "@/contracts/agent-events";
 import {
   commandErrorMessage,
+  getSettings,
+  listModels,
+  saveSettings,
   sendPrompt,
   sessionStatus,
   startSession,
   stopSession,
   subscribeAgentEvents,
 } from "@/contracts/commands";
-import type { SessionDto, WorkspaceInfo } from "@/contracts/types";
+import type { AppSettings, ModelInfo, SessionDto, WorkspaceInfo } from "@/contracts/types";
 
 /** The drawer owns the workspace list; the active one arrives already chosen. */
 const props = defineProps<{ workspace: WorkspaceInfo | null }>();
@@ -69,6 +79,15 @@ const error = ref<string | null>(null);
 // Unsubscribe handle for the `agent-event` listener, kept so unmounting does
 // not leave a handler reading into a disposed component.
 let unsubscribe: (() => void) | null = null;
+
+// S5/S7: the model selector's data. `models` is whatever Rust reports (never a
+// hardcoded list here) and `settings` holds the persisted choice.
+const models = ref<ModelInfo[]>([]);
+const settings = ref<AppSettings | null>(null);
+const savingModel = ref(false);
+
+/** Selected model id, or `""` until settings load. */
+const modelId = computed(() => settings.value?.model ?? "");
 
 const canSend = computed(
   () => session.value !== null && prompt.value.trim() !== "" && !sending.value,
@@ -235,6 +254,45 @@ async function handleStart() {
   }
 }
 
+async function loadModelOptions() {
+  try {
+    models.value = await listModels();
+  } catch (cause) {
+    // A missing model list must not break the chat: the session still starts
+    // with whatever the settings file already names.
+    models.value = [];
+    error.value = commandErrorMessage(cause);
+  }
+}
+
+async function loadSettings() {
+  try {
+    settings.value = await getSettings();
+  } catch (cause) {
+    settings.value = null;
+    error.value = commandErrorMessage(cause);
+  }
+}
+
+/**
+ * S5/S7: persists the chosen model. The whole settings file is re-read first so
+ * the write cannot clobber a preference the drawer changed in the meantime
+ * (`save_settings` replaces the file). The choice applies to the next spawn.
+ */
+async function handleModelChange(value: unknown) {
+  if (typeof value !== "string" || value === "") return;
+  savingModel.value = true;
+  error.value = null;
+  try {
+    const current = await getSettings();
+    settings.value = await saveSettings({ ...current, model: value });
+  } catch (cause) {
+    error.value = commandErrorMessage(cause);
+  } finally {
+    savingModel.value = false;
+  }
+}
+
 async function handleSend() {
   const current = session.value;
   const text = prompt.value.trim();
@@ -276,6 +334,10 @@ async function handleStop() {
 }
 
 onMounted(async () => {
+  // Presentation-only additions (S5): the header needs the active space's name
+  // (already a prop) plus the model options and the persisted choice.
+  void loadModelOptions();
+  void loadSettings();
   unsubscribe = await subscribeAgentEvents((envelope) => {
     const current = session.value;
     // One global channel carries every session; only this panel's session is
@@ -293,19 +355,39 @@ onUnmounted(() => {
 
 <template>
   <div class="flex h-full min-h-0 flex-col">
-    <!-- Main header. The collapse control lives only in the drawer (S8), so this
-         header carries the chat title and the session controls and nothing else. -->
+    <!-- Chat header. The collapse control lives only in the drawer (S8), so
+         this header carries the active space's name (S5), the model selector
+         (S5/S7) and the session controls. -->
     <header class="flex items-center gap-3 border-b px-4 py-2">
       <div class="min-w-0 flex-1">
-        <h1 class="truncate text-sm font-semibold">Chat</h1>
+        <h1 class="truncate text-sm font-semibold">
+          {{ workspace?.name ?? "Nabla" }}
+        </h1>
         <p class="truncate text-xs text-muted-foreground">
           {{
             workspace === null
               ? "No workspace selected — add or pick one in the sidebar."
-              : `${workspace.name} · ${workspace.path}`
+              : workspace.path
           }}
         </p>
       </div>
+
+      <!-- Model selector (S5/S7): options come from `list_models`, the value
+           from settings.json. Disabled until both are known. -->
+      <Select
+        :model-value="modelId"
+        :disabled="savingModel || models.length === 0"
+        @update:model-value="handleModelChange"
+      >
+        <SelectTrigger class="h-8 w-[180px] text-xs" aria-label="Model">
+          <SelectValue placeholder="Model" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem v-for="model in models" :key="model.id" :value="model.id">
+            {{ model.name }}
+          </SelectItem>
+        </SelectContent>
+      </Select>
 
       <Badge v-if="session !== null" variant="outline" class="hidden sm:inline-flex">
         session {{ session.sessionId }} · pid {{ session.pid }}
