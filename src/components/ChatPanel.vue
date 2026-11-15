@@ -14,11 +14,11 @@ import {
   CheckIcon,
   CircleAlertIcon,
   LoaderIcon,
-  PanelRightCloseIcon,
   PanelRightOpenIcon,
   XIcon,
 } from "@lucide/vue";
 import ChatEmptyState from "@/components/chat/ChatEmptyState.vue";
+import ThemeToggle from "@/components/chat/ThemeToggle.vue";
 import ChatHeader from "@/components/chat/ChatHeader.vue";
 import Composer from "@/components/chat/Composer.vue";
 import MessageBubble from "@/components/chat/MessageBubble.vue";
@@ -447,21 +447,23 @@ onUnmounted(() => {
 
 <template>
   <div class="relative flex h-full min-h-0 flex-col">
-    <!-- Tools drawer toggle for the no-conversation state: the header (which
-         carries the other toggle) does not exist yet. Hidden while the drawer
-         is open — the drawer itself owns the collapse control. -->
-    <Button
-      v-if="isEmptyState && !toolsOpen"
-      variant="ghost"
-      size="icon-sm"
-      class="absolute top-2 right-2 z-10"
-      :aria-label="toolsOpen ? 'Collapse tools panel' : 'Expand tools panel'"
-      :aria-pressed="toolsOpen"
-      @click="emit('toggleTools')"
-    >
-      <PanelRightCloseIcon v-if="toolsOpen" />
-      <PanelRightOpenIcon v-else />
-    </Button>
+    <!-- Corner cluster for the no-conversation state: the header (which carries
+         the same controls) does not exist yet, so both switches live here until
+         the first turn. Tools toggle hides while the drawer is open.
+         -->
+    <div v-if="isEmptyState" class="absolute top-2 right-2 z-10 flex items-center gap-1">
+      <ThemeToggle :is-dark="isDark" @toggle="handleToggleTheme" />
+      <Button
+        v-if="!toolsOpen"
+        variant="ghost"
+        size="icon-sm"
+        aria-label="Expand tools panel"
+        :aria-pressed="toolsOpen"
+        @click="emit('toggleTools')"
+      >
+        <PanelRightOpenIcon />
+      </Button>
+    </div>
 
     <!-- S1: no conversation yet — brand mark, chips and composer, no header. -->
     <ChatEmptyState

@@ -50,7 +50,7 @@ const emit = defineEmits<{
   <!-- The composer owns its own max width (single source of truth): the empty
        state and the transcript composer must stay the same size, and parents no
        longer pass a conflicting cap. -->
-  <div class="mx-auto w-full max-w-[640px] rounded-2xl border border-border bg-card/60 shadow-sm">
+  <div class="mx-auto w-full min-w-0 max-w-[640px] rounded-2xl border border-border bg-card/60 shadow-sm">
     <Textarea
       :model-value="modelValue"
       aria-label="Prompt"
@@ -61,7 +61,7 @@ const emit = defineEmits<{
       @keydown.enter.exact.prevent="emit('send')"
     />
 
-    <div class="flex items-center gap-1 px-2 pb-2">
+    <div class="flex min-w-0 items-center gap-1 px-2 pb-2">
       <!-- Seam: attaching files/context is not wired yet. -->
       <Button
         variant="ghost"
@@ -73,13 +73,13 @@ const emit = defineEmits<{
       </Button>
 
       <span
-        class="inline-flex min-w-0 items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground"
+        class="hidden min-w-0 items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground sm:inline-flex"
       >
         <span class="truncate">Writing in {{ workspaceName }}</span>
         <ChevronDownIcon class="size-3 shrink-0" />
       </span>
 
-      <div class="ms-auto flex shrink-0 items-center gap-1.5">
+      <div class="ms-auto flex min-w-0 shrink items-center gap-1.5">
         <!-- Model selector (S5/S7): options from `list_models`, value from
              settings.json. -->
         <Select
@@ -88,7 +88,7 @@ const emit = defineEmits<{
           @update:model-value="emit('update:modelId', String($event))"
         >
           <SelectTrigger
-            class="h-8 w-[150px] border-0 bg-transparent text-xs shadow-none hover:bg-muted dark:bg-transparent dark:hover:bg-muted"
+            class="h-8 w-[118px] min-w-0 border-0 bg-transparent text-xs shadow-none hover:bg-muted sm:w-[150px] dark:bg-transparent dark:hover:bg-muted"
             aria-label="Model"
           >
             <SelectValue placeholder="Select model" />

@@ -10,14 +10,21 @@
 // width across launches would need a `settings.json` key (task T4 follow-up),
 // which is out of scope for this unit.
 import type { HTMLAttributes } from "vue";
-import { onBeforeUnmount, ref } from "vue";
+import { onBeforeUnmount, onMounted, ref } from "vue";
 
 const DEFAULT_WIDTH = 280;
 const MIN_WIDTH = 240;
-const MAX_WIDTH = 560;
-// Never let the panel eat the chat: at most 60% of the window at drag time.
-const MAX_VIEWPORT_RATIO = 0.6;
 const KEYBOARD_STEP = 16;
+
+/**
+ * Hard floor for the chat column. The panel may grow as far as the user drags,
+ * but never past the point where the chat is narrower than this.
+ *
+ * The floor is the composer's minimum plus its wrapper padding: the prompt box
+ * is capped at 640px, so half of it (320px) is the narrowest it should ever get,
+ * and the transcript composer sits inside a `px-4` container (2 × 16px).
+ */
+const MIN_CHAT_WIDTH = 320 + 32;
 
 const props = withDefaults(
   defineProps<{
@@ -34,13 +41,28 @@ const width = ref(DEFAULT_WIDTH);
 const isDragging = ref(false);
 
 /**
- * Clamp a candidate width. `maxByViewport` covers the "at most 60% of the
- * window" rule while still never falling below the hard minimum on tiny windows.
+ * The widest this panel may get right now: whatever the chat leaves. There is no
+ * fixed cap — dragging is limited only by the chat's minimum, measured on the
+ * flex row that owns both siblings.
  */
+function maxWidth(): number {
+  const available =
+    asideEl.value?.parentElement?.clientWidth ?? window.innerWidth;
+  return Math.max(MIN_WIDTH, available - MIN_CHAT_WIDTH);
+}
+
+/** Clamp a candidate width to [MIN_WIDTH, maxWidth()]. */
 function clampWidth(candidate: number): number {
-  const maxByViewport = Math.floor(window.innerWidth * MAX_VIEWPORT_RATIO);
-  const max = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, maxByViewport));
-  return Math.round(Math.min(Math.max(candidate, MIN_WIDTH), max));
+  return Math.round(Math.min(Math.max(candidate, MIN_WIDTH), maxWidth()));
+}
+
+/** Width ceiling for the ARIA values, read at render time. */
+const maxWidthNow = ref(DEFAULT_WIDTH);
+
+/** Keep the ceiling current and never let a shrink hide the chat. */
+function handleViewportResize(): void {
+  maxWidthNow.value = maxWidth();
+  if (width.value > maxWidthNow.value) width.value = maxWidthNow.value;
 }
 
 /** The aside is right-aligned: its own rect right edge is the reference axis. */
@@ -56,6 +78,7 @@ function onPointerDown(event: PointerEvent): void {
   if (event.button !== 0) return;
   const handle = event.currentTarget as HTMLElement;
   isDragging.value = true;
+  maxWidthNow.value = maxWidth();
   handle.setPointerCapture(event.pointerId);
   // Guard against the drag turning into a text selection across the app.
   document.body.style.userSelect = "none";
@@ -93,7 +116,13 @@ function onKeyDown(event: KeyboardEvent): void {
   width.value = clampWidth(candidate);
 }
 
+onMounted(() => {
+  handleViewportResize();
+  window.addEventListener("resize", handleViewportResize);
+});
+
 onBeforeUnmount(() => {
+  window.removeEventListener("resize", handleViewportResize);
   // The drag can end without a pointerup (unmount mid-gesture, lost capture).
   document.body.style.userSelect = "";
 });
@@ -117,7 +146,7 @@ onBeforeUnmount(() => {
       aria-label="Resize tools panel"
       :aria-valuenow="width"
       :aria-valuemin="MIN_WIDTH"
-      :aria-valuemax="MAX_WIDTH"
+      :aria-valuemax="maxWidthNow"
       tabindex="0"
       class="absolute inset-y-0 left-0 z-10 w-1.5 -translate-x-1/2 cursor-col-resize touch-none outline-none transition-colors focus-visible:bg-border"
       :class="isDragging ? 'bg-border' : 'hover:bg-border'"

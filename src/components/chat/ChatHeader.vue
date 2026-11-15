@@ -7,12 +7,8 @@
 // The header carries no theme state of its own: `isDark` is the resolved mode
 // the panel owns, and `toggleTheme` asks the panel for the next one (S4: the
 // theme is applied by `src/lib/theme.ts` only).
-import {
-  MoonIcon,
-  MoreHorizontalIcon,
-  PanelRightOpenIcon,
-  SunIcon,
-} from "@lucide/vue";
+import { MoreHorizontalIcon, PanelRightOpenIcon } from "@lucide/vue";
+import ThemeToggle from "@/components/chat/ThemeToggle.vue";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 
@@ -58,17 +54,9 @@ const emit = defineEmits<{
     </Button>
 
     <!-- Theme switch: the icon names the *target* palette (sun = light), and
-         the panel persists the new mode in settings.json. -->
-    <Button
-      variant="ghost"
-      size="icon-sm"
-      :aria-label="isDark ? 'Switch to light theme' : 'Switch to dark theme'"
-      :aria-pressed="isDark"
-      @click="emit('toggleTheme')"
-    >
-      <SunIcon v-if="isDark" />
-      <MoonIcon v-else />
-    </Button>
+         the panel persists the new mode in settings.json. Shared with the
+         empty-state cluster so the control never depends on having a turn. -->
+    <ThemeToggle :is-dark="isDark" @toggle="emit('toggleTheme')" />
 
     <!-- Seam: no session menu yet. -->
     <Button variant="ghost" size="icon-sm" aria-label="More actions (not wired yet)">
