@@ -10,6 +10,7 @@ import {
   CheckIcon,
   FolderIcon,
   FolderOpenIcon,
+  PanelLeftIcon,
   PinIcon,
   PlusIcon,
   SearchIcon,
@@ -372,17 +373,20 @@ onMounted(() => {
             >∇</span
           >
 
-          <!-- Wordmark only, so the row never repeats the mark twice. -->
-          <img
-            v-if="!wordmarkFailed"
-            :src="wordmarkSource"
-            alt="Nabla"
-            class="h-4 w-auto shrink-0 object-contain"
-            @error="wordmarkFailed = true"
-          />
-          <span v-else class="truncate text-sm font-semibold">Nabla</span>
+          <!-- Wordmark only, centered in the gap between mark and trigger, so the
+               row never repeats the mark twice. -->
+          <span class="flex min-w-0 flex-1 items-center justify-center">
+            <img
+              v-if="!wordmarkFailed"
+              :src="wordmarkSource"
+              alt="Nabla"
+              class="h-3 w-auto shrink-0 object-contain"
+              @error="wordmarkFailed = true"
+            />
+            <span v-else class="truncate text-xs font-semibold">Nabla</span>
+          </span>
 
-          <SidebarTrigger class="ms-auto shrink-0" />
+          <SidebarTrigger class="shrink-0" />
         </div>
 
         <!-- Collapsed: the app mark *is* the expand control, so the rail gains
@@ -390,20 +394,29 @@ onMounted(() => {
         <Button
           variant="ghost"
           size="icon-sm"
-          class="mx-auto hidden group-data-[collapsible=icon]:flex"
+          class="group/expand mx-auto hidden group-data-[collapsible=icon]:flex"
           aria-label="Expand sidebar"
           @click="toggleSidebar"
         >
+          <!-- Brand-first at rest; the expand affordance appears on hover and on
+               keyboard focus, so the control stays discoverable without the rail
+               losing its logo. -->
           <img
             v-if="!logoFailed"
             :src="logoSource"
             alt="Nabla"
-            class="size-6 rounded-md object-contain"
+            class="size-6 rounded-md object-contain group-hover/expand:hidden group-focus-visible/expand:hidden"
             @error="logoFailed = true"
           />
-          <span v-else aria-hidden="true" class="text-lg leading-none font-semibold"
+          <span
+            v-else
+            aria-hidden="true"
+            class="text-lg leading-none font-semibold group-hover/expand:hidden group-focus-visible/expand:hidden"
             >∇</span
           >
+          <PanelLeftIcon
+            class="hidden group-hover/expand:block group-focus-visible/expand:block"
+          />
         </Button>
       </div>
     </SidebarHeader>
