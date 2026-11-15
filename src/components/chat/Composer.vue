@@ -47,7 +47,10 @@ const emit = defineEmits<{
 </script>
 
 <template>
-  <div class="rounded-2xl border border-border bg-card/60 shadow-sm">
+  <!-- The composer owns its own max width (single source of truth): the empty
+       state and the transcript composer must stay the same size, and parents no
+       longer pass a conflicting cap. -->
+  <div class="mx-auto w-full max-w-[640px] rounded-2xl border border-border bg-card/60 shadow-sm">
     <Textarea
       :model-value="modelValue"
       aria-label="Prompt"

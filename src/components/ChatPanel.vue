@@ -531,7 +531,6 @@ onUnmounted(() => {
           <div class="border-t border-border px-4 py-3">
             <Composer
               v-model="prompt"
-              class="mx-auto w-full max-w-[760px]"
               :model-id="modelId"
               :models="models"
               :workspace-name="workspace?.name ?? 'no workspace'"
