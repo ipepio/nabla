@@ -5,12 +5,17 @@
 // The drawer owns the workspace and settings data; this component owns only the
 // active selection, so ChatPanel receives one workspace instead of the list.
 import { ref } from "vue";
+import { PanelRightCloseIcon } from "@lucide/vue";
 import AppSidebar from "./components/AppSidebar.vue";
 import ChatPanel from "./components/ChatPanel.vue";
+import { Button } from "./components/ui/button";
 import { SidebarInset, SidebarProvider } from "./components/ui/sidebar";
 import type { WorkspaceInfo } from "./contracts/types";
 
 const activeWorkspace = ref<WorkspaceInfo | null>(null);
+// Right tools drawer (S6): collapsed by default; the chat header and the empty
+// state both expose the toggle, so it is reachable in every state.
+const toolsOpen = ref(false);
 </script>
 
 <template>
@@ -27,7 +32,11 @@ const activeWorkspace = ref<WorkspaceInfo | null>(null);
       -->
       <div class="flex min-h-0 flex-1 flex-row">
         <div class="flex min-h-0 min-w-0 flex-1 flex-col">
-          <ChatPanel :workspace="activeWorkspace" />
+          <ChatPanel
+            :workspace="activeWorkspace"
+            :tools-open="toolsOpen"
+            @toggle-tools="toolsOpen = !toolsOpen"
+          />
         </div>
 
         <!--
@@ -43,11 +52,21 @@ const activeWorkspace = ref<WorkspaceInfo | null>(null);
           below — that needs no restructuring either.
         -->
         <aside
+          v-if="toolsOpen"
           aria-label="Tools"
           class="hidden w-[280px] shrink-0 flex-col border-l bg-sidebar md:flex"
         >
-          <div class="flex items-center border-b px-3 py-2">
+          <div class="flex items-center gap-2 border-b px-3 py-2">
             <h2 class="text-sm font-semibold">Tools</h2>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              class="ms-auto"
+              aria-label="Collapse tools panel"
+              @click="toolsOpen = false"
+            >
+              <PanelRightCloseIcon />
+            </Button>
           </div>
           <div class="flex flex-1 items-center justify-center p-4">
             <p class="text-center text-xs text-muted-foreground">

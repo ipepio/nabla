@@ -2,7 +2,13 @@
 // Conversation header (spec S2): title + mode chip on the left, actions on the
 // right. Both actions are seams — theme switching and the overflow menu are not
 // wired yet, so they intentionally call nothing.
-import { MoonIcon, MoreHorizontalIcon, SunIcon } from "@lucide/vue";
+import {
+  MoonIcon,
+  MoreHorizontalIcon,
+  PanelRightCloseIcon,
+  PanelRightOpenIcon,
+  SunIcon,
+} from "@lucide/vue";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 
@@ -11,7 +17,11 @@ defineProps<{
   title: string;
   /** Interaction mode label; only "Standard mode" exists today. */
   mode: string;
+  /** Right tools drawer visibility, so the control reflects the real state. */
+  toolsOpen: boolean;
 }>();
+
+const emit = defineEmits<{ (e: "toggleTools"): void }>();
 </script>
 
 <template>
@@ -22,6 +32,19 @@ defineProps<{
         {{ mode }}
       </Badge>
     </div>
+
+    <!-- Tools drawer toggle: collapsed by default, reachable from here and
+         from the empty state so it never becomes unreachable. -->
+    <Button
+      variant="ghost"
+      size="icon-sm"
+      :aria-label="toolsOpen ? 'Collapse tools panel' : 'Expand tools panel'"
+      :aria-pressed="toolsOpen"
+      @click="emit('toggleTools')"
+    >
+      <PanelRightCloseIcon v-if="toolsOpen" />
+      <PanelRightOpenIcon v-else />
+    </Button>
 
     <!-- Seam: no theme state is persisted from the UI yet (settings.theme is
          written by the settings file, not by this button). -->

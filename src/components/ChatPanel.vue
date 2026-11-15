@@ -14,6 +14,8 @@ import {
   CheckIcon,
   CircleAlertIcon,
   LoaderIcon,
+  PanelRightCloseIcon,
+  PanelRightOpenIcon,
   XIcon,
 } from "@lucide/vue";
 import ChatEmptyState from "@/components/chat/ChatEmptyState.vue";
@@ -40,7 +42,13 @@ import {
 import type { AppSettings, ModelInfo, SessionDto, WorkspaceInfo } from "@/contracts/types";
 
 /** The drawer owns the workspace list; the active one arrives already chosen. */
-const props = defineProps<{ workspace: WorkspaceInfo | null }>();
+const props = defineProps<{
+  workspace: WorkspaceInfo | null;
+  /** Right tools drawer visibility (App.vue owns the state). */
+  toolsOpen: boolean;
+}>();
+
+const emit = defineEmits<{ (e: "toggleTools"): void }>();
 
 /** One rendered turn. Assistant text grows as deltas arrive. */
 interface ChatMessage {
@@ -394,7 +402,23 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="flex h-full min-h-0 flex-col">
+  <div class="relative flex h-full min-h-0 flex-col">
+    <!-- Tools drawer toggle for the no-conversation state: the header (which
+         carries the other toggle) does not exist yet, so without this the
+         drawer would be unreachable until the first message. -->
+    <Button
+      v-if="isEmptyState"
+      variant="ghost"
+      size="icon-sm"
+      class="absolute top-2 right-2 z-10"
+      :aria-label="toolsOpen ? 'Collapse tools panel' : 'Expand tools panel'"
+      :aria-pressed="toolsOpen"
+      @click="emit('toggleTools')"
+    >
+      <PanelRightCloseIcon v-if="toolsOpen" />
+      <PanelRightOpenIcon v-else />
+    </Button>
+
     <!-- S1: no conversation yet — brand mark, chips and composer, no header. -->
     <ChatEmptyState
       v-if="isEmptyState"
@@ -425,7 +449,12 @@ onUnmounted(() => {
 
     <!-- S2: conversation state — header, Chat/Linaje tabs, transcript, composer. -->
     <template v-else>
-      <ChatHeader :title="workspaceName" mode="Standard mode" />
+      <ChatHeader
+        :title="workspaceName"
+        mode="Standard mode"
+        :tools-open="toolsOpen"
+        @toggle-tools="emit('toggleTools')"
+      />
 
       <Tabs default-value="chat" class="min-h-0 flex-1 gap-0">
         <div class="border-b border-border px-4">

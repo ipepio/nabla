@@ -22,7 +22,7 @@ defineProps<{
   <div
     class="flex h-full min-h-0 flex-col items-center justify-center overflow-y-auto px-6 py-10"
   >
-    <div class="flex w-full max-w-[720px] flex-col items-center gap-6">
+    <div class="flex w-full max-w-[820px] flex-col items-center gap-6">
       <div class="flex flex-col items-center gap-2">
         <img
           :src="mark"
