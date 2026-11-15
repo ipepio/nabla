@@ -31,6 +31,8 @@ import {
   saveSettings,
 } from "./contracts/commands";
 import type { AppSettings, WorkspaceInfo } from "./contracts/types";
+// The chat tracer (R4) is a view of its own; App.vue only supplies workspaces.
+import ChatPanel from "./components/ChatPanel.vue";
 
 const THEMES: string[] = ["dark", "light", "system"];
 
@@ -216,7 +218,7 @@ onMounted(() => {
         </v-card>
 
         <!-- Settings: user-editable preferences from settings.json (spec S2). -->
-        <v-card elevation="2" rounded="lg">
+        <v-card class="mb-6" elevation="2" rounded="lg">
           <v-card-title class="text-subtitle-1">Settings</v-card-title>
           <v-card-text>
             <v-row density="comfortable">
@@ -251,6 +253,9 @@ onMounted(() => {
             </v-btn>
           </v-card-text>
         </v-card>
+
+        <!-- Chat: the pi runtime tracer (R4) — streams one session's output. -->
+        <ChatPanel class="mt-6" :workspaces="workspaces" />
       </v-container>
     </v-main>
 
