@@ -11,20 +11,17 @@
 // which is out of scope for this unit.
 import type { HTMLAttributes } from "vue";
 import { onBeforeUnmount, onMounted, ref } from "vue";
+import { CHAT_MIN_WIDTH } from "@/lib/layout";
 
 const DEFAULT_WIDTH = 280;
 const MIN_WIDTH = 240;
 const KEYBOARD_STEP = 16;
 
 /**
- * Hard floor for the chat column. The panel may grow as far as the user drags,
- * but never past the point where the chat is narrower than this.
- *
- * The floor is the composer's minimum plus its wrapper padding: the prompt box
- * is capped at 640px, so half of it (320px) is the narrowest it should ever get,
- * and the transcript composer sits inside a `px-4` container (2 × 16px).
+ * Hard floor for the chat column, imported from `src/lib/layout.ts`: the
+ * composer's minimum (half of its normal width) plus its wrapper padding. The
+ * panel grows freely until the chat is exactly that wide and no further.
  */
-const MIN_CHAT_WIDTH = 320 + 32;
 
 const props = withDefaults(
   defineProps<{
@@ -48,7 +45,7 @@ const isDragging = ref(false);
 function maxWidth(): number {
   const available =
     asideEl.value?.parentElement?.clientWidth ?? window.innerWidth;
-  return Math.max(MIN_WIDTH, available - MIN_CHAT_WIDTH);
+  return Math.max(MIN_WIDTH, available - CHAT_MIN_WIDTH);
 }
 
 /** Clamp a candidate width to [MIN_WIDTH, maxWidth()]. */

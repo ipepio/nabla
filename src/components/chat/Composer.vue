@@ -15,6 +15,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { COMPOSER_MAX_WIDTH, COMPOSER_MIN_WIDTH } from "@/lib/layout";
 import type { ModelInfo } from "@/contracts/types";
 
 defineProps<{
@@ -50,7 +51,12 @@ const emit = defineEmits<{
   <!-- The composer owns its own max width (single source of truth): the empty
        state and the transcript composer must stay the same size, and parents no
        longer pass a conflicting cap. -->
-  <div class="mx-auto w-full min-w-0 max-w-[640px] rounded-2xl border border-border bg-card/60 shadow-sm">
+  <!-- Bounds come from `src/lib/layout.ts`: the box shrinks with its column and
+       stops at half of its normal width, which is also the chat's floor. -->
+  <div
+    class="mx-auto w-full min-w-0 rounded-2xl border border-border bg-card/60 shadow-sm"
+    :style="{ maxWidth: `${COMPOSER_MAX_WIDTH}px`, minWidth: `${COMPOSER_MIN_WIDTH}px` }"
+  >
     <Textarea
       :model-value="modelValue"
       aria-label="Prompt"
