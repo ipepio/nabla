@@ -357,27 +357,9 @@ watch(open, (isOpen) => {
               </div>
             </section>
 
-            <!-- S1 first separator: Appearance | Configuration file. -->
-            <Separator />
-
-            <section class="flex flex-col gap-2">
-              <div class="min-w-0">
-                <h3 class="text-sm font-medium">
-                  {{ t("settings.general.configurationFile") }}
-                </h3>
-                <p class="mt-0.5 text-xs text-muted-foreground">
-                  {{ t("settings.general.configurationFile.description") }}
-                </p>
-              </div>
-              <!-- S3 of `settings-dialog.md`: the absolute path, resolved by
-                   Rust, read-only. -->
-              <code
-                class="block rounded-md bg-muted px-2.5 py-2 font-mono text-xs break-all text-muted-foreground select-all"
-                >{{ configPath ?? "—" }}</code
-              >
-            </section>
-
-            <!-- S1 second separator: Configuration file | Language. -->
+            <!-- One separator only: Appearance | Language. The configuration
+                 block that used to sit here was redundant with the single
+                 "open configuration file" action at the end of the pane. -->
             <Separator />
 
             <section class="flex flex-wrap items-center justify-between gap-4">
