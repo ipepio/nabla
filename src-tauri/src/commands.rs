@@ -9,6 +9,7 @@ use tauri::State;
 use tauri_plugin_opener::OpenerExt;
 
 use crate::process::{ProcessManager, StartupOutcome};
+use crate::providers::{ModelOption, ProviderDraft, ProviderSummary};
 use crate::rpc::{AgentEvent, RuntimeStatus};
 use crate::settings::{self, Settings};
 use crate::store::{SessionNew, SessionRow, Store, StoreResult, Workspace};
@@ -21,6 +22,9 @@ pub struct AppState {
     pub store: Store,
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
+    /// S3 of `providers-pane.md`: pi's own provider configuration lives under the
+    /// user's home directory, resolved once at startup by Tauri's path resolver.
+    pub home_dir: PathBuf,
     pub runtime: ProcessManager,
 }
 
@@ -192,6 +196,47 @@ pub fn list_models() -> Result<Vec<ModelInfo>, String> {
             name: name.to_string(),
         })
         .collect())
+}
+
+// ── providers seam (S1-S4 of `providers-pane.md`) ───────────────────────────
+
+/// Path of pi's provider configuration inside the user's home directory. One
+/// resolver for reading and writing, so both target the `models.json` pi itself
+/// reads (S3).
+fn models_file(home_dir: &Path) -> PathBuf {
+    crate::providers::models_path(home_dir)
+}
+
+fn models_path(state: &AppState) -> PathBuf {
+    models_file(&state.home_dir)
+}
+
+/// S1: the providers pi knows. The api key is reduced to `has_api_key` (S4).
+#[tauri::command]
+pub fn list_providers(state: State<'_, AppState>) -> Result<Vec<ProviderSummary>, String> {
+    crate::providers::read_providers(&models_path(&state)).map_err(display_err)
+}
+
+/// S3: backup, merge into `providers.<id>` and atomic write; answers with the
+/// summary of what the file now holds.
+#[tauri::command]
+pub fn save_provider(
+    state: State<'_, AppState>,
+    draft: ProviderDraft,
+) -> Result<ProviderSummary, String> {
+    crate::providers::save_provider(&models_path(&state), &draft).map_err(display_err)
+}
+
+/// S2: `GET {baseUrl}/models` from Rust, so the api key never reaches the
+/// webview and CORS/CSP stay out of the way.
+#[tauri::command]
+pub async fn discover_models(
+    base_url: String,
+    api_key: String,
+) -> Result<Vec<ModelOption>, String> {
+    crate::providers::discover_models(&base_url, &api_key)
+        .await
+        .map_err(display_err)
 }
 
 #[tauri::command]
@@ -1217,6 +1262,19 @@ mod tests {
         settings::save(&path, &custom).expect("save custom settings");
         ensure_config_file(&path).expect("keep the existing file");
         assert_eq!(settings::load(&path).expect("load"), custom);
+    }
+
+    // ── providers (S1-S4 of `providers-pane.md`) ────────────────────────────
+
+    // S3: the commands resolve pi's own file from the home directory Tauri hands
+    // the state, so reading and writing never diverge.
+    #[test]
+    fn models_file_is_pis_own_models_json_under_the_home_dir() {
+        let home = Path::new("/home/tester");
+        assert_eq!(
+            models_file(home),
+            PathBuf::from("/home/tester/.pi/agent/models.json")
+        );
     }
 
     // ── session lifecycle (S1, S3, S5) ──────────────────────────────────────

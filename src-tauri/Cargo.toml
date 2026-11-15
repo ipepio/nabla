@@ -26,6 +26,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Bundled: compiles SQLite into the binary, no system dependency, cross-platform.
 rusqlite = { version = "0.37", features = ["bundled"] }
+# S2: model discovery is a native HTTP call. It runs in Rust so the webview never
+# sees the api key and CORS/CSP stay out of the way. rustls keeps the build free
+# of an OpenSSL system dependency.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 
 # S5 (cross-platform kill): std exposes `Command::process_group` but no way to
 # signal a process group, so reaping pi's descendants on Unix needs killpg/kill.

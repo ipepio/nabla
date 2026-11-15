@@ -1,5 +1,6 @@
 mod commands;
 mod process;
+mod providers;
 mod rpc;
 mod settings;
 mod store;
@@ -48,6 +49,10 @@ pub fn run() {
                 store,
                 config_dir,
                 data_dir,
+                // S3 of `providers-pane.md`: providers live in pi's own
+                // `~/.pi/agent/models.json`, so the module needs the home dir
+                // Tauri just resolved — not a second, invented location.
+                home_dir: home,
                 runtime,
             });
             Ok(())
@@ -61,6 +66,11 @@ pub fn run() {
             commands::touch_workspace,
             // S7: the model selector's source of truth.
             commands::list_models,
+            // S1-S4 of `providers-pane.md`: pi's providers, the custom provider
+            // form and its native model discovery.
+            commands::list_providers,
+            commands::save_provider,
+            commands::discover_models,
             commands::list_sessions,
             commands::get_settings,
             commands::save_settings,
