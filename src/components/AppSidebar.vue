@@ -377,7 +377,7 @@ onMounted(() => {
             v-if="!wordmarkFailed"
             :src="wordmarkSource"
             alt="Nabla"
-            class="h-6 w-auto shrink-0 object-contain"
+            class="h-4 w-auto shrink-0 object-contain"
             @error="wordmarkFailed = true"
           />
           <span v-else class="truncate text-sm font-semibold">Nabla</span>
