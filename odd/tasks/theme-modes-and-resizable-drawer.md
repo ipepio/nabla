@@ -14,10 +14,10 @@ Alcance: tema claro real (tokens + interruptor + persistencia) y panel derecho r
 
 | ID | Tarea | Specs | Estado | Commit |
 | --- | --- | --- | --- | --- |
-| T1 | Worker A: `theme.ts` pasa a inyectar dos paletas (`:root` claro / `.dark` oscuro) desde env; `setThemeMode()`; toggle cableado en ChatHeader/ChatPanel; aplicar al cargar settings y tras guardar en el dialog | S1, S2, S4 | pending | |
-| T2 | Worker B: nuevo componente de panel redimensionable + `App.vue` (handle, min/max, teclado) | S3, S4 | pending | |
-| T3 | Verificación: build, ambos temas, resize, seams | — | pending | |
-| T4 | Commit + cierre ODD | — | pending | |
+| T1 | Worker A: `theme.ts` inyecta dos paletas (`:root` claro / `.dark` oscuro) desde env; `setThemeMode()`; toggle cableado en ChatHeader/ChatPanel; aplicado al cargar settings y tras guardar en el dialog | S1, S2, S4 | done | 81afe90 |
+| T2 | Worker B: `ResizableAside.vue` (handle, drag con pointer capture, clamp 240-560px y 60% viewport, teclado, doble clic reset) + `App.vue` | S3, S4 | done | d593adb |
+| T3 | Verificación orchestrator: build OK, API de tema, cero escrituras inline de paleta, wiring completo, clamp/teclado presentes, un solo aside | — | done | — |
+| T4 | Commit + cierre ODD | — | done | 81afe90, d593adb |
 
 ## Contrato
 
@@ -30,3 +30,6 @@ Alcance: tema claro real (tokens + interruptor + persistencia) y panel derecho r
 - **L1** Usuario: «echo en falta que se pueda redimensionar la parte del workspace de la derecha, y aplica el tema light también please. Después de esto, ya pasamos a trabajar el drawer izquierdo».
 - **L2** Problema detectado en el código actual: `theme.ts` aplica las variables como estilos inline en `<html>`, por lo que ganan también en modo claro. T1 debe pasar a inyectar reglas `:root` y `.dark`.
 - **L3** Superficies disjuntas para el paralelismo: T1 (theme.ts, ChatHeader, ChatPanel, AppSidebar, docs) vs T2 (App.vue + componente nuevo). Ninguno toca `.env` (bloqueado por el guard): solo documentan claves.
+
+- **L4** Verificación orchestrator: `npm run build` OK; `theme.ts` exporta asThemeMode/isDarkMode/applyTheme/setThemeMode y no escribe variables inline; claves light derivadas por prefijo (`VITE_COLOR_X` → `VITE_COLOR_LIGHT_X`); toggle cableado en header, boot y dialog; `ResizableAside` con pointer capture, clamp y teclado; App.vue sin `<aside>` propio.
+- **L5** Pendiente para el usuario: crear el fichero de entorno con la paleta clara (`VITE_COLOR_LIGHT_*`) si quiere un claro a medida; sin ellas el claro usa los defaults neutros de `index.css`.
