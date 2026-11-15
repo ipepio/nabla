@@ -5,14 +5,20 @@
  *
  * `mark`/`logo`/`wordmark` are the light-on-dark variants used by the default
  * dark theme; the `*Light` siblings are the dark-on-light variants.
+ *
+ * The wordmark entries point at the TRIMMED exports (`*_trimmed.png`): the
+ * originals are square 1254x1254 canvases with a wide transparent margin, so
+ * sizing them by height only scaled the padding and the logotype stayed tiny.
+ * `scripts/trim_png.py <input> <output>` regenerates a trimmed copy when a new
+ * export lands; the originals stay in `public/` untouched.
  */
 export const BRAND = {
   mark: "/logo_white.png", // squared mark, dark theme
   markLight: "/logo.png", // squared mark, light theme
   logo: "/logo_texto_white.png", // mark + wordmark, dark theme
   logoLight: "/logo_texto.png", // mark + wordmark, light theme
-  wordmark: "/text_white.png", // wordmark only, dark theme
-  wordmarkLight: "/texto.png", // wordmark only, light theme
+  wordmark: "/text_white_trimmed.png", // wordmark only, dark theme (cropped)
+  wordmarkLight: "/texto_trimmed.png", // wordmark only, light theme (cropped)
 } as const;
 
 /** A brand asset kind: `mark`, `logo`, `wordmark` and their light siblings. */
