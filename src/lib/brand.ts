@@ -18,7 +18,21 @@ export const BRAND = {
 /** A brand asset kind: `mark`, `logo`, `wordmark` and their light siblings. */
 export type BrandAsset = keyof typeof BRAND;
 
+/** The base kinds whose light sibling is picked by theme. */
+export type BrandBase = "mark" | "logo" | "wordmark";
+
 /** Absolute URL (Vite base) of one brand asset. */
 export function brandAsset(kind: BrandAsset): string {
   return BRAND[kind];
+}
+
+/**
+ * Theme-aware asset: the white-on-dark variant for the dark palette and the
+ * black-on-light sibling otherwise, so switching the theme switches the logo
+ * too instead of leaving a white mark on a light background.
+ */
+export function themedBrand(kind: BrandBase, isDark: boolean): string {
+  const dark = BRAND[kind];
+  if (isDark) return dark;
+  return BRAND[`${kind}Light` as BrandAsset];
 }

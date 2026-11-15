@@ -55,7 +55,8 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { asThemeMode, setThemeMode } from "@/lib/theme";
+import { useAppearance } from "@/lib/appearance";
+import { themedBrand } from "@/lib/brand";
 import {
   addWorkspace,
   commandErrorMessage,
@@ -93,12 +94,14 @@ const newPath = ref("");
 const newName = ref("");
 const adding = ref(false);
 const workspaceError = ref<string | null>(null);
-// The brand mark is optional: `/logo.png` is dropped in by the maintainer, so
-// until it exists the header falls back to the ∇ glyph (S7).
+// The brand mark is theme-aware: the white-on-dark variant on the dark palette
+// and its black-on-light sibling otherwise, so a theme switch switches the logo
+// too. `logoFailed` keeps the ∇ fallback while an asset is missing (S7).
 const logoFailed = ref(false);
+const { isDark, setMode } = useAppearance();
 // Referenced as a runtime URL (not a static asset import) because Vite fails the
 // build for a missing asset, and the file is expected to be missing at first.
-const logoSource = "/logo.png";
+const logoSource = computed(() => themedBrand("mark", isDark.value));
 
 const settingsOpen = ref(false);
 // Mirrors `Settings::default()` in `src-tauri/src/settings.rs` for the moment
@@ -292,9 +295,9 @@ async function loadModels() {
 async function loadSettings() {
   try {
     settings.value = await getSettings();
-    // S2: the stored mode is applied through `src/lib/theme.ts`, the only module
-    // that touches the palette or the `dark` class (S4).
-    setThemeMode(asThemeMode(settings.value.theme));
+    // S2: the stored mode is applied through the shared appearance module, the
+    // only path that applies the palette or toggles the `dark` class (S4).
+    setMode(settings.value.theme);
     settingsError.value = null;
   } catch (cause) {
     settingsError.value = commandErrorMessage(cause);
@@ -307,8 +310,9 @@ async function handleSaveSettings() {
   try {
     settings.value = await saveSettings({ ...settings.value });
     // S2: the dialog saves the mode; applying it here makes the change visible
-    // as soon as the write lands, without waiting for a reload.
-    setThemeMode(asThemeMode(settings.value.theme));
+    // as soon as the write lands, without waiting for a reload. Logos follow
+    // because they read the same shared state.
+    setMode(settings.value.theme);
     settingsOpen.value = false;
   } catch (cause) {
     settingsError.value = commandErrorMessage(cause);

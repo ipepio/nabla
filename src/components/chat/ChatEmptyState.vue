@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed } from "vue";
 // Empty chat (spec S1): one brand image, an optional configurable hero line,
 // two inert mode/provider chips and the composer, centred in the panel.
 //
@@ -6,10 +7,14 @@
 // `public/` re-brands the app without touching this component. The image is the
 // combined mark + wordmark asset, so the panel never renders two logos.
 import { ChevronDownIcon } from "@lucide/vue";
-import { brandAsset } from "@/lib/brand";
+import { useAppearance } from "@/lib/appearance";
+import { themedBrand } from "@/lib/brand";
 import { HERO } from "@/lib/hero";
 
-const logo = brandAsset("logo");
+// Theme-aware: the combined mark + wordmark asset follows the palette, so the
+// empty state never shows a white logo on a light background.
+const { isDark } = useAppearance();
+const logo = computed(() => themedBrand("logo", isDark.value));
 
 defineProps<{
   /** Provider id from settings.json, shown in the first chip. */

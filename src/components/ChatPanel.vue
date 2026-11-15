@@ -40,12 +40,8 @@ import {
   subscribeAgentEvents,
 } from "@/contracts/commands";
 import type { AppSettings, ModelInfo, SessionDto, WorkspaceInfo } from "@/contracts/types";
-import {
-  asThemeMode,
-  isDarkMode,
-  setThemeMode,
-  type ThemeMode,
-} from "@/lib/theme";
+import { useAppearance } from "@/lib/appearance";
+import { isDarkMode, type ThemeMode } from "@/lib/theme";
 
 /** The drawer owns the workspace list; the active one arrives already chosen. */
 const props = defineProps<{
@@ -99,11 +95,11 @@ const models = ref<ModelInfo[]>([]);
 const settings = ref<AppSettings | null>(null);
 const savingModel = ref(false);
 
-// S2 of `theme-modes-and-resizable-drawer.md`: the panel owns the live theme
-// mode; `src/lib/theme.ts` is the only module that applies it (S4). The initial
-// value mirrors the `.dark` class shipped by `index.html` until settings load.
-const theme = ref<ThemeMode>("dark");
-const isDark = computed(() => isDarkMode(theme.value));
+// S2/S4 of `theme-modes-and-resizable-drawer.md`: the appearance state lives in
+// one module so the sidebar, the empty state and this panel all agree on the
+// mode (the logo variant follows it); `src/lib/theme.ts` stays the only module
+// that applies the palette.
+const { mode: theme, isDark, setMode } = useAppearance();
 
 /** Selected model id, or `""` until settings load. */
 const modelId = computed(() => settings.value?.model ?? "");
@@ -329,8 +325,7 @@ async function loadSettings() {
     settings.value = await getSettings();
     // Apply the persisted mode as soon as the file is read, so the first paint
     // after startup shows the theme the human chose.
-    theme.value = asThemeMode(settings.value.theme);
-    setThemeMode(theme.value);
+    setMode(settings.value.theme);
   } catch (cause) {
     settings.value = null;
     error.value = commandErrorMessage(cause);
@@ -358,8 +353,7 @@ async function handleToggleTheme() {
   try {
     const stored = await getSettings();
     settings.value = await saveSettings({ ...stored, theme: next });
-    theme.value = next;
-    setThemeMode(next);
+    setMode(next);
   } catch (cause) {
     error.value = commandErrorMessage(cause);
   }
