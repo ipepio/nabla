@@ -29,6 +29,46 @@ export interface ModelInfo {
   name: string;
 }
 
+/**
+ * One provider pi knows, as `list_providers` summarizes it (S1 of
+ * `odd/tasks/providers-pane.md`). The api key never crosses the seam: the DTO
+ * carries only `hasApiKey` (S4), so the webview cannot read or leak it.
+ * Mirrors `ProviderSummary` in `src-tauri/src/providers.rs`.
+ */
+export interface ProviderSummary {
+  id: string;
+  name: string;
+  baseUrl: string;
+  api: string;
+  modelCount: number;
+  hasApiKey: boolean;
+}
+
+/**
+ * One model a provider offers, as `discover_models` reads it from
+ * `GET {baseUrl}/models` (S2). Mirrors `ModelOption` in
+ * `src-tauri/src/providers.rs`.
+ */
+export interface ModelOption {
+  id: string;
+  name: string;
+}
+
+/**
+ * What `save_provider` writes into pi's `providers.<id>` (S3 of
+ * `providers-pane.md`). An empty `api` keeps the one the file already has (and
+ * defaults to `openai-completions` when it has none); an empty `name` falls back
+ * to the id, both on the Rust side. Mirrors `ProviderDraft` there.
+ */
+export interface ProviderDraft {
+  id: string;
+  name: string;
+  baseUrl: string;
+  api: string;
+  apiKey: string;
+  models: ModelOption[];
+}
+
 /** Index entry for a pi-owned session file. Content is never copied here. */
 export interface SessionSummary {
   id: number;

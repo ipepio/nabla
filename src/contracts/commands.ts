@@ -7,6 +7,9 @@ import type { AgentEventEnvelope } from "./agent-events";
 import type {
   AppSettings,
   ModelInfo,
+  ModelOption,
+  ProviderDraft,
+  ProviderSummary,
   SessionDto,
   SessionStatusDto,
   SessionSummary,
@@ -93,6 +96,36 @@ export function configFilePath(): Promise<string> {
  */
 export function openConfigFile(): Promise<void> {
   return invoke<void>("open_config_file");
+}
+
+// ── providers seam (S1-S3 of `providers-pane.md`) ───────────────────────────
+
+/**
+ * S1: the providers pi knows, read from `~/.pi/agent/models.json`. The api key is
+ * reduced to `hasApiKey` on the Rust side (S4), so it never reaches the webview.
+ */
+export function listProviders(): Promise<ProviderSummary[]> {
+  return invoke<ProviderSummary[]>("list_providers");
+}
+
+/**
+ * S3: writes one provider into `providers.<id>` — backup, merge into the existing
+ * file, atomic write — and answers with the summary the file now holds.
+ */
+export function saveProvider(draft: ProviderDraft): Promise<ProviderSummary> {
+  return invoke<ProviderSummary>("save_provider", { draft });
+}
+
+/**
+ * S2: `GET {baseUrl}/models` from Rust, so the api key never reaches the webview
+ * and CORS/CSP stay out of the way. An unreachable endpoint or a non-2xx answer
+ * rejects with the message the form shows inline.
+ */
+export function discoverModels(
+  baseUrl: string,
+  apiKey: string,
+): Promise<ModelOption[]> {
+  return invoke<ModelOption[]>("discover_models", { baseUrl, apiKey });
 }
 
 // ── pi runtime seam (R3, R4) ─────────────────────────────────────────────────

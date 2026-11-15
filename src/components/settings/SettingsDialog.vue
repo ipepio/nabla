@@ -5,8 +5,18 @@
  *
  * Two panes, like a preferences window: a header with the title and the close
  * control; a left nav with the two sections that have a real backend today
- * (General, Models); and a scrolling right pane of rows — label and one-line
+ * (General, Providers); and a scrolling right pane of rows — label and one-line
  * description on the left, control on the right.
+ *
+ * S1 of `odd/tasks/providers-pane.md`: the second pane is Providers, not Models.
+ * It lists the providers pi knows and marks the active one (`settings.provider`);
+ * clicking a row persists that choice. The model selector moved out of this
+ * dialog: the chat composer owns it and already writes `settings.model`.
+ *
+ * S5 of the same task: the custom-provider form exists only when
+ * `VITE_ENABLE_CUSTOM_PROVIDERS` is truthy, a build-time switch like the rest of
+ * Nabla's env configuration. Without the flag the section is not rendered, so a
+ * build never shows a control whose backend it cannot reach.
  *
  * S1 of `i18n-and-settings-polish.md`: the pane has no rule between single rows.
  * Blocks are separated by spacing plus at most two rules, one between each pair
@@ -27,10 +37,12 @@
  */
 import { computed, ref, watch } from "vue";
 import {
-  CpuIcon,
+  CheckIcon,
   ExternalLinkIcon,
   MonitorIcon,
   MoonIcon,
+  PlugIcon,
+  PlusIcon,
   SettingsIcon,
   SunIcon,
   XIcon,
@@ -56,21 +68,22 @@ import { Separator } from "@/components/ui/separator";
 import { useAppearance } from "@/lib/appearance";
 import { useI18n, type Locale, type MessageKey } from "@/lib/i18n";
 import type { ThemeMode } from "@/lib/theme";
+import ProviderForm from "./ProviderForm.vue";
 import {
   commandErrorMessage,
   configFilePath,
   getSettings,
-  listModels,
+  listProviders,
   openConfigFile,
   saveSettings,
 } from "@/contracts/commands";
-import type { AppSettings, ModelInfo } from "@/contracts/types";
+import type { AppSettings, ProviderSummary } from "@/contracts/types";
 
 /** The dialog is open when the drawer's gear button says so. */
 const open = defineModel<boolean>("open", { default: false });
 
 /** S1 of `settings-dialog.md`: the two sections the app can drive right now. */
-type Section = "general" | "models";
+type Section = "general" | "providers";
 const section = ref<Section>("general");
 
 /** S2: every row renders through the catalogue, so a locale switch re-renders. */
@@ -106,9 +119,8 @@ const LANGUAGE_OPTIONS: { value: Locale; labelKey: MessageKey }[] = [
 
 /** Persisted preferences, `null` until the file is read on open. */
 const settings = ref<AppSettings | null>(null);
-/** S4 of `settings-dialog.md`: model options come from `list_models`, never
- * from a list kept here. */
-const models = ref<ModelInfo[]>([]);
+/** S1 of `providers-pane.md`: the providers pi knows, as Rust summarizes them. */
+const providers = ref<ProviderSummary[]>([]);
 /** S3: the absolute preferences path, resolved by Rust. */
 const configPath = ref<string | null>(null);
 const loading = ref(false);
@@ -116,16 +128,29 @@ const error = ref<string | null>(null);
 /** A write is in flight, so the controls cannot fire twice. */
 const saving = ref(false);
 const opening = ref(false);
+/** S2: the inline custom-provider form is open. */
+const showProviderForm = ref(false);
+
+/**
+ * S5: the custom-provider block is a build-time switch, read the same way the
+ * palette and the hero copy are. Only "1"/"true" (any case) turns it on; an
+ * absent or unrecognised value leaves the section unrendered, never disabled.
+ */
+function readFlag(value: string | undefined): boolean {
+  const normalized = (value ?? "").trim().toLowerCase();
+  return normalized === "1" || normalized === "true";
+}
+const customProvidersEnabled = readFlag(
+  (import.meta.env as Record<string, string | undefined>)
+    .VITE_ENABLE_CUSTOM_PROVIDERS,
+);
 
 // The applied mode, not the stored one: the ring shows what the app is actually
 // painting, and both agree because opening the dialog applies the stored mode.
 const { mode, setMode } = useAppearance();
 
-/** S4 of `settings-dialog.md`: the persisted model id, `""` until read. */
-const modelId = computed(() => settings.value?.model ?? "");
-
-/** S4 of `settings-dialog.md`: the provider is shown read-only. */
-const provider = computed(() => settings.value?.provider ?? "—");
+/** S1 of `providers-pane.md`: the provider the next session starts with. */
+const activeProvider = computed(() => settings.value?.provider ?? "");
 
 async function loadPreferences() {
   loading.value = true;
@@ -146,13 +171,15 @@ async function loadPreferences() {
   }
 }
 
-async function loadModels() {
+/**
+ * S1 of `providers-pane.md`: the list is read from pi's own configuration on
+ * every open, so a provider added elsewhere shows up instead of going stale.
+ */
+async function loadProviders() {
   try {
-    models.value = await listModels();
+    providers.value = await listProviders();
   } catch (cause) {
-    // A missing model list must not break the dialog: the row still reports what
-    // the file names and the message says why the options are absent.
-    models.value = [];
+    providers.value = [];
     error.value = commandErrorMessage(cause);
   }
 }
@@ -188,21 +215,34 @@ async function handleThemeChange(next: ThemeMode) {
 }
 
 /**
- * S4 of `settings-dialog.md`: persists the chosen model. Same re-read-then-write
- * rule as the theme; the choice applies to the next session spawn.
+ * S1 of `providers-pane.md`: clicking a provider makes it the active one by
+ * persisting `settings.provider`.
+ *
+ * `settings.model` is left exactly as it is: this pane has no catalogue to check
+ * it against, and the chat composer owns that choice (L4 of the task doc).
  */
-async function handleModelChange(value: string) {
-  if (value === "" || saving.value) return;
+async function handleProviderActivate(providerId: string) {
+  if (saving.value || providerId === activeProvider.value) return;
   saving.value = true;
   error.value = null;
   try {
     const current = await getSettings();
-    settings.value = await saveSettings({ ...current, model: value });
+    settings.value = await saveSettings({ ...current, provider: providerId });
   } catch (cause) {
     error.value = commandErrorMessage(cause);
   } finally {
     saving.value = false;
   }
+}
+
+/**
+ * S2 of `providers-pane.md`: a saved provider lands in pi's file, so the list is
+ * re-read instead of patched locally — Rust is the one that knows the stored
+ * name and model count (an empty name falls back to the id there).
+ */
+function handleProviderSaved(_summary: ProviderSummary) {
+  showProviderForm.value = false;
+  void loadProviders();
 }
 
 /**
@@ -244,14 +284,16 @@ async function handleOpenConfigFile() {
   }
 }
 
-// Every open re-reads the file, the model options and the path, so a human edit
-// outside the app is picked up instead of showing a stale dialog.
+// Every open re-reads the file, the provider list and the path, so a human edit
+// outside the app is picked up instead of showing a stale dialog. The inline form
+// starts closed, the way a preferences window does.
 watch(open, (isOpen) => {
   if (!isOpen) return;
   section.value = "general";
+  showProviderForm.value = false;
   error.value = null;
   void loadPreferences();
-  void loadModels();
+  void loadProviders();
   void loadConfigPath();
 });
 </script>
@@ -301,17 +343,17 @@ watch(open, (isOpen) => {
           </button>
           <button
             type="button"
-            :aria-current="section === 'models' ? 'page' : undefined"
+            :aria-current="section === 'providers' ? 'page' : undefined"
             :class="[
               'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
-              section === 'models'
+              section === 'providers'
                 ? 'bg-sidebar-accent font-medium text-sidebar-accent-foreground'
                 : 'text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground',
             ]"
-            @click="section = 'models'"
+            @click="section = 'providers'"
           >
-            <CpuIcon class="size-4 shrink-0" aria-hidden="true" />
-            {{ t("settings.section.models") }}
+            <PlugIcon class="size-4 shrink-0" aria-hidden="true" />
+            {{ t("settings.section.providers") }}
           </button>
         </nav>
 
@@ -410,56 +452,105 @@ watch(open, (isOpen) => {
             </div>
           </div>
 
-          <!-- S4 of `settings-dialog.md`: Models — the model selector and the
-               provider it comes from. -->
+          <!-- S1 of `providers-pane.md`: Providers — every provider pi knows, with
+               the active one marked. Rows carry no rule of their own: the only
+               separator in this pane is the one before the custom block. -->
           <div v-else class="space-y-6 py-4">
-            <section class="flex flex-wrap items-center justify-between gap-4">
-              <div class="min-w-0">
-                <h3 class="text-sm font-medium">{{ t("settings.models.model") }}</h3>
-                <p class="mt-0.5 text-xs text-muted-foreground">
-                  {{ t("settings.models.model.description") }}
-                </p>
-              </div>
-              <Select
-                :model-value="modelId"
-                :disabled="saving || models.length === 0"
-                @update:model-value="handleModelChange(String($event))"
-              >
-                <SelectTrigger
-                  class="w-48"
-                  :aria-label="t('settings.models.model')"
-                >
-                  <SelectValue
-                    :placeholder="t('settings.models.model.selectPlaceholder')"
-                  />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem
-                    v-for="model in models"
-                    :key="model.id"
-                    :value="model.id"
-                  >
-                    {{ model.name }}
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-            </section>
-
-            <section class="flex flex-wrap items-center justify-between gap-4">
+            <section class="space-y-2">
               <div class="min-w-0">
                 <h3 class="text-sm font-medium">
-                  {{ t("settings.models.provider") }}
+                  {{ t("settings.providers.title") }}
                 </h3>
                 <p class="mt-0.5 text-xs text-muted-foreground">
-                  {{ t("settings.models.provider.description") }}
+                  {{ t("settings.providers.description") }}
                 </p>
               </div>
-              <span class="text-sm text-muted-foreground">{{ provider }}</span>
+
+              <!-- S1: a row is the control: clicking it activates that provider by
+                   persisting `settings.provider`. aria-pressed carries the state. -->
+              <ul v-if="providers.length" class="space-y-0.5">
+                <li v-for="entry in providers" :key="entry.id">
+                  <button
+                    type="button"
+                    :aria-pressed="entry.id === activeProvider"
+                    :disabled="saving"
+                    :class="[
+                      'w-full rounded-md px-2 py-1.5 text-left outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50',
+                      entry.id === activeProvider
+                        ? 'bg-sidebar-accent text-sidebar-accent-foreground'
+                        : 'hover:bg-muted',
+                    ]"
+                    @click="handleProviderActivate(entry.id)"
+                  >
+                    <span class="flex items-center justify-between gap-2">
+                      <span class="flex min-w-0 items-baseline gap-2">
+                        <span class="min-w-0 truncate text-sm font-medium">
+                          {{ entry.name }}
+                        </span>
+                        <span
+                          class="min-w-0 truncate font-mono text-xs text-muted-foreground"
+                        >
+                          {{ entry.id }}
+                        </span>
+                      </span>
+                      <CheckIcon
+                        v-if="entry.id === activeProvider"
+                        class="size-4 shrink-0"
+                        aria-hidden="true"
+                      />
+                    </span>
+                    <span
+                      class="mt-0.5 flex items-center justify-between gap-2 text-xs text-muted-foreground"
+                    >
+                      <span class="min-w-0 truncate" :title="entry.baseUrl">
+                        {{ entry.baseUrl }}
+                      </span>
+                      <span class="shrink-0">
+                        {{
+                          t("settings.providers.models", {
+                            count: entry.modelCount,
+                          })
+                        }}
+                        ·
+                        {{
+                          entry.hasApiKey
+                            ? t("settings.providers.keySet")
+                            : t("settings.providers.noKey")
+                        }}
+                      </span>
+                    </span>
+                  </button>
+                </li>
+              </ul>
+              <p v-else class="text-xs text-muted-foreground">
+                {{ t("settings.providers.empty") }}
+              </p>
             </section>
 
-            <p class="text-xs text-muted-foreground">
-              {{ t("settings.models.note") }}
-            </p>
+            <!-- S5: this whole block exists only when the build set
+                 VITE_ENABLE_CUSTOM_PROVIDERS; with the flag off there is nothing
+                 to click and nothing to explain. -->
+            <template v-if="customProvidersEnabled">
+              <Separator />
+
+              <section class="space-y-3">
+                <Button
+                  v-if="!showProviderForm"
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  @click="showProviderForm = true"
+                >
+                  <PlusIcon data-icon="inline-start" />
+                  {{ t("settings.providers.custom.title") }}
+                </Button>
+                <ProviderForm
+                  v-else
+                  @saved="handleProviderSaved"
+                  @cancel="showProviderForm = false"
+                />
+              </section>
+            </template>
           </div>
 
           <Alert v-if="error" variant="destructive" class="mb-4">

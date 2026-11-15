@@ -36,10 +36,10 @@ save_provider(draft: ProviderDraft) -> ProviderSummary        // backup + merge 
 
 | ID | Tarea | Specs | Estado | Commit |
 | --- | --- | --- | --- | --- |
-| P1 | Rust: lectura/escritura de `~/.pi/agent/models.json` (backup, merge, atómico) + `ProviderSummary`/`ModelOption`/`ProviderDraft` + tests | S3, S4 | pending | |
-| P2 | Rust: `discover_models` con require HTTP + tests (sin red real, mock de parsing) | S2 | pending | |
-| P3 | TS: pestaña Providers (lista real + activo), formulario de alta gateado por `VITE_ENABLE_CUSTOM_PROVIDERS`, descubrimiento con selección de modelos | S1, S2, S5 | pending | |
-| P4 | Verificación + commit | — | pending | |
+| P1 | Rust: `providers.rs` (lectura sin pérdida, merge de `providers.<id>`, backup, atómico) + DTOs + 22 tests | S3, S4 | done | 83a268d |
+| P2 | Rust: `discover_models` (reqwest+rustls, 15s, Bearer) + parser puro testeado | S2 | done | 83a268d |
+| P3 | TS: pestaña Providers (lista real + activo), alta gateada por flag, descubrimiento con casillas | S1, S2, S5 | done | (unidad providers) |
+| P4 | Verificación: 95/95 cargo, clippy 0, build OK, i18n 120/120 claves, contratos alineados | — | done | (unidad providers) |
 
 ## Notas
 
@@ -53,3 +53,6 @@ save_provider(draft: ProviderDraft) -> ProviderSummary        // backup + merge 
 - **L2** Research de `pi-nan-provider`: es una *extensión* de pi que registra providers vía `pi.registerProvider(...)` con `piAi.createProvider({ id, name, baseUrl, auth, models, api })`; el usuario puede sobreescribir modelos en `models.json` bajo `providers.<id>.modelOverrides.<modelId>`. Conclusión: Nabla no necesita una extensión propia para un provider estático — basta escribir `providers.<id>` en el `models.json` que pi ya lee, que es exactamente lo aprobado por el usuario.
 - **L3** Respuestas del usuario: `default_provider` = cadena con la URL; providers en el `models.json` de pi; keys en texto plano.
 - **L4** Secuencia: esta unidad implementa S1-S5 (parte custom). `default_provider`, login y api-keys quedan para la siguiente, sin controles muertos.
+
+- **L5** Verificación orchestrator: `cargo test` 95/95 (22 nuevos), clippy 0; `npm run build` OK; `en`/`es` con 120 claves idénticas (30 de providers); contratos `list_providers`/`save_provider`/`discover_models` con los nombres de argumento que espera Rust; el bloque de alta sólo existe con `VITE_ENABLE_CUSTOM_PROVIDERS`.
+- **L6** Pestaña renombrada a Providers (PlugIcon); las claves antiguas `settings.models.*` se retiraron de ambos catálogos.
