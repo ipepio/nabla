@@ -4,10 +4,13 @@
 // are camelCase so the TS contracts (T6) can mirror them field by field.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use tauri::State;
 use tauri_plugin_opener::OpenerExt;
 
+use crate::cli::{self, AuthState, CliSessions, CliSink, PiAuthStatus, PiCliResult};
 use crate::process::{ProcessManager, StartupOutcome};
 use crate::providers::{ModelOption, ProviderDraft, ProviderSummary};
 use crate::rpc::{AgentEvent, RuntimeStatus};
@@ -26,6 +29,12 @@ pub struct AppState {
     /// user's home directory, resolved once at startup by Tauri's path resolver.
     pub home_dir: PathBuf,
     pub runtime: ProcessManager,
+    /// S1/S3 of `pi-cli-bridge.md`: the allowlisted bridge to the `pi` command
+    /// line and the registry of interactive sessions it started.
+    pub cli: CliSessions,
+    /// Emitter of the `pi-cli` event. The registry receives the sink per call,
+    /// so nothing below this layer decides how an event reaches the webview.
+    pub cli_sink: CliSink,
 }
 
 // Errors cross the bridge as plain strings for now: StoreError and SettingsError
@@ -1072,6 +1081,91 @@ pub fn live_session_ids(state: State<'_, AppState>) -> Result<Vec<String>, Strin
     Ok(state.runtime.live_ids())
 }
 
+// ── pi CLI bridge (S1-S4 of `pi-cli-bridge.md`) ─────────────────────────────
+
+/// S1/S2: runs one allowlisted `pi` invocation with a mandatory deadline and
+/// bounded output. The allowlist, the argv-only spawn and the kill on timeout
+/// live in `cli`, so no command can bypass them.
+#[tauri::command]
+pub fn pi_cli_run(
+    state: State<'_, AppState>,
+    args: Vec<String>,
+    timeout_ms: Option<u64>,
+) -> Result<PiCliResult, String> {
+    let settings = settings::load(&settings_path(&state)).map_err(display_err)?;
+    // The binary resolution is the one the runtime already uses (S1):
+    // `settings.pi_binary`, never a path invented here.
+    let timeout = timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(cli::DEFAULT_TIMEOUT_MS));
+    cli::run(&args, timeout, &settings.pi_binary).map_err(display_err)
+}
+
+/// S3: starts an interactive `pi` invocation — the OAuth device-code login — and
+/// answers with the session id its `pi-cli` events carry. No timeout: the human
+/// decides when the flow ends.
+#[tauri::command]
+pub fn pi_cli_start(state: State<'_, AppState>, args: Vec<String>) -> Result<String, String> {
+    let settings = settings::load(&settings_path(&state)).map_err(display_err)?;
+    state
+        .cli
+        .start(&args, &settings.pi_binary, Arc::clone(&state.cli_sink))
+        .map_err(display_err)
+}
+
+/// S3: pastes the returned device code into the live child's stdin. `false`
+/// means the session is unknown or already finished, which is not an error.
+#[tauri::command]
+pub fn pi_cli_write(
+    state: State<'_, AppState>,
+    cli_session_id: String,
+    text: String,
+) -> Result<bool, String> {
+    state.cli.write(&cli_session_id, &text).map_err(display_err)
+}
+
+/// S3: kills the live child and forgets the session. Idempotent, like `stop`.
+#[tauri::command]
+pub fn pi_cli_stop(state: State<'_, AppState>, cli_session_id: String) -> Result<bool, String> {
+    state.cli.stop(&cli_session_id).map_err(display_err)
+}
+
+/// S4: the typed account state of one provider, read from pi's own answer.
+/// Credentials stay in pi's `auth.json`: this command never sees a secret.
+#[tauri::command]
+pub fn pi_auth_check(state: State<'_, AppState>, provider: String) -> Result<PiAuthStatus, String> {
+    let settings = settings::load(&settings_path(&state)).map_err(display_err)?;
+    let result = cli::run(
+        &auth_check_args(&provider),
+        Duration::from_millis(cli::DEFAULT_TIMEOUT_MS),
+        &settings.pi_binary,
+    )
+    .map_err(display_err)?;
+    // A probe that ran out of time says nothing about the account: report it as
+    // unknown instead of inventing a login state.
+    if result.timed_out {
+        return Ok(PiAuthStatus {
+            provider,
+            state: AuthState::Unknown,
+            credential: false,
+        });
+    }
+    Ok(cli::auth_status(&provider, &result.stdout, result.exit_code))
+}
+
+/// Exact argv of the account probe (S4): `pi auth check --provider <p> --json`.
+/// Typed arguments, so the provider name can never be read as a flag or a shell
+/// fragment.
+fn auth_check_args(provider: &str) -> Vec<String> {
+    vec![
+        "auth".to_string(),
+        "check".to_string(),
+        "--provider".to_string(),
+        provider.to_string(),
+        "--json".to_string(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1175,6 +1269,26 @@ mod tests {
         assert!(crashed.contains("boom"), "got: {crashed}");
         let silent = startup_failure_message(crate::process::StartupOutcome::Aborted, "");
         assert!(!silent.is_empty());
+    }
+
+    // S4 of `pi-cli-bridge.md`: the account probe is exactly the documented
+    // invoke, and its subcommand is one the bridge's allowlist admits.
+    #[test]
+    fn auth_check_args_match_the_documented_invocation() {
+        assert_eq!(
+            auth_check_args("nan"),
+            vec![
+                "auth".to_string(),
+                "check".to_string(),
+                "--provider".to_string(),
+                "nan".to_string(),
+                "--json".to_string(),
+            ]
+        );
+        assert!(
+            crate::cli::ALLOWED_SUBCOMMANDS.contains(&"auth"),
+            "the probe can only reach pi through the allowlist"
+        );
     }
 
     // S7: the selector lists exactly the models of pi's NaN provider, in the

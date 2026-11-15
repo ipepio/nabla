@@ -769,7 +769,9 @@ const FORWARDED_ENV_PREFIXES: &[&str] = &["ANTHROPIC_", "GOOGLE_"];
 /// Environment allowlist forwarded to pi. The child never inherits the whole
 /// parent environment: only what the engine needs to reach its providers.
 /// Mirror: Stark `process_manager.rs` `forwarded_env_vars`.
-fn forwarded_env<I>(vars: I) -> Vec<(String, String)>
+/// Shared with `cli.rs` (S1, S2 of `pi-cli-bridge.md`): the CLI bridge forwards
+/// the very same allowlist instead of duplicating it.
+pub(crate) fn forwarded_env<I>(vars: I) -> Vec<(String, String)>
 where
     I: IntoIterator<Item = (String, String)>,
 {
@@ -825,8 +827,9 @@ fn build_command(
 }
 
 /// Windows creation flag: run without a console window (S1).
+/// Shared with `cli.rs` so a CLI call never flashes a console either.
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Windows force-kill invocation for a whole process tree (S5). Built here,
 /// unconditionally, so the shape is unit-tested on every platform; only executed
@@ -851,23 +854,25 @@ fn signal_group(pid: u32, signal: i32) {
     }
 }
 
+// The terminate/kill pair is shared with `cli.rs`: one process-group kill path
+// for every child Nabla owns, never a second, weaker one.
 #[cfg(unix)]
-fn signal_terminate(pid: u32) {
+pub(crate) fn signal_terminate(pid: u32) {
     signal_group(pid, libc::SIGTERM);
 }
 
 #[cfg(unix)]
-fn signal_kill(pid: u32) {
+pub(crate) fn signal_kill(pid: u32) {
     signal_group(pid, libc::SIGKILL);
 }
 
 #[cfg(windows)]
-fn signal_terminate(pid: u32) {
+pub(crate) fn signal_terminate(pid: u32) {
     run_taskkill(pid, false);
 }
 
 #[cfg(windows)]
-fn signal_kill(pid: u32) {
+pub(crate) fn signal_kill(pid: u32) {
     run_taskkill(pid, true);
 }
 

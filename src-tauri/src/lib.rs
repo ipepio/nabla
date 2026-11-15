@@ -1,3 +1,4 @@
+mod cli;
 mod commands;
 mod process;
 mod providers;
@@ -45,6 +46,13 @@ pub fn run() {
                 };
                 let _ = handle.emit("agent-event", envelope);
             }));
+            // S1/S3 of `pi-cli-bridge.md`: the interactive CLI sessions emit
+            // their `{ cliSessionId, stream, line?, exitCode? }` payload on
+            // `pi-cli`, the same one-way bridge the runtime uses.
+            let cli_handle = app.handle().clone();
+            let cli_sink: cli::CliSink = Arc::new(move |event: &cli::CliEvent| {
+                let _ = cli_handle.emit("pi-cli", event.clone());
+            });
             app.manage(AppState {
                 store,
                 config_dir,
@@ -54,6 +62,8 @@ pub fn run() {
                 // Tauri just resolved — not a second, invented location.
                 home_dir: home,
                 runtime,
+                cli: cli::CliSessions::new(),
+                cli_sink,
             });
             Ok(())
         })
@@ -93,7 +103,15 @@ pub fn run() {
             // Per-session actions: pause is the existing stop, delete archives
             // the transcript and removes the row.
             commands::delete_session,
-            commands::session_status
+            commands::session_status,
+            // S1-S4 of `pi-cli-bridge.md`: the allowlisted bridge to the `pi`
+            // command line, its interactive sessions and the typed account
+            // state. Every call runs argv-only, never through a shell.
+            commands::pi_cli_run,
+            commands::pi_cli_start,
+            commands::pi_cli_write,
+            commands::pi_cli_stop,
+            commands::pi_auth_check
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

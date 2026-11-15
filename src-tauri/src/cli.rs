@@ -1,0 +1,1099 @@
+// CLI bridge module: a generic, allowlisted bridge to the `pi` command line
+// (spec S1 of `pi-cli-bridge.md`) plus the interactive session bridge the OAuth
+// device-code login needs (S3).
+//
+// Design notes:
+// - argv only: `std::process::Command` with a typed argument vector, never a
+//   shell, so there is no interpolation surface at all (S1, S2).
+// - the allowlist is enforced in Rust before anything is spawned: the FIRST
+//   argument must be one of `ALLOWED_SUBCOMMANDS` (S2). `install`/`update` are
+//   outside it because they run third-party code, and `auth print-api-key` /
+//   `auth print-bearer-token` are never called from here because they would hand
+//   secrets to the webview.
+// - the child inherits the same environment allowlist the pi runtime forwards
+//   (`process::forwarded_env`): this bridge can never leak the host environment.
+// - output is bounded: each non-interactive stream is capped at `STREAM_CAP`
+//   bytes and reported as `truncated` instead of growing without limit (S2).
+// - no busy loop: `run` waits on a channel fed by a waiter thread, and a timeout
+//   terminates the child's whole process group (the same kill path the runtime
+//   uses), escalating from the polite signal to the force kill.
+//
+// Frozen contract (see `odd/tasks/pi-cli-bridge.md`): `PiCliResult` is the
+// non-interactive answer, `CliEvent` is the `pi-cli` event payload, and
+// `PiAuthStatus` is the typed account state. All of them serialize camelCase so
+// the TS contracts (C3) mirror them field by field.
+
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// Cap of each captured stream in `run`, in bytes (S2: "salida acotada", 64 KiB
+/// per stream). Interactive sessions stream line by line instead, so they are not
+/// capped.
+pub const STREAM_CAP: usize = 64 * 1024;
+
+/// Default deadline of a non-interactive call (S2: "timeout por defecto 20s").
+pub const DEFAULT_TIMEOUT_MS: u64 = 20_000;
+
+/// Grace given to a child to leave after the polite terminate signal before the
+/// force kill. Bounds the extra wait a timed-out `run` can cost.
+pub const KILL_GRACE: Duration = Duration::from_millis(500);
+
+/// Grace given to a child to leave after `stop` terminates it.
+pub const STOP_GRACE: Duration = Duration::from_millis(500);
+
+/// The subcommands this bridge is allowed to run (S2). The first argument of
+/// every call must be exactly one of these: nothing is matched by prefix, so
+/// `auth print-api-key` can only ever run if `auth` is allowed — and Nabla never
+/// asks for it.
+pub const ALLOWED_SUBCOMMANDS: &[&str] = &["auth", "models", "config", "--version", "--help"];
+
+/// Answer of one non-interactive call. Mirrors the frozen contract:
+/// `{ stdout, stderr, exitCode, timedOut, truncated }` (S1, S2).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiCliResult {
+    pub stdout: String,
+    pub stderr: String,
+    /// `None` when the child was terminated by a signal (no exit code exists).
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub truncated: bool,
+}
+
+/// Account state reported by `pi auth check --json` (S4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthState {
+    Ready,
+    NotReady,
+    Invalid,
+    Unknown,
+}
+
+impl AuthState {
+    /// Words pi (or a future pi) may use for each state. Compared lowercased, so
+    /// `Not-Ready` and `not_ready` are the same answer.
+    fn parse(raw: &str) -> Option<AuthState> {
+        let normalized = raw.trim().to_ascii_lowercase().replace('-', "_");
+        match normalized.as_str() {
+            "ready" | "ok" | "logged_in" | "authenticated" | "valid" => Some(AuthState::Ready),
+            "not_ready" | "notready" | "logged_out" | "unauthenticated" | "missing" => {
+                Some(AuthState::NotReady)
+            }
+            "invalid" | "invalid_credential" | "expired" | "error" => Some(AuthState::Invalid),
+            "unknown" => Some(AuthState::Unknown),
+            _ => None,
+        }
+    }
+
+    /// Documented exit codes of `pi auth check`: 0 ready, 1 not ready, 2 invalid.
+    /// Used ONLY as a fallback when the JSON carries no status field.
+    fn from_exit_code(code: i32) -> AuthState {
+        match code {
+            0 => AuthState::Ready,
+            1 => AuthState::NotReady,
+            2 => AuthState::Invalid,
+            _ => AuthState::Unknown,
+        }
+    }
+}
+
+/// Typed account state (S4). `credential` says whether a credential is present,
+/// never its value: the bridge must not move secrets into the webview.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiAuthStatus {
+    pub provider: String,
+    pub state: AuthState,
+    pub credential: bool,
+}
+
+/// The three streams one interactive session reports (S3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CliStream {
+    Stdout,
+    Stderr,
+    Exit,
+}
+
+/// Payload of the Tauri `pi-cli` event: `{ cliSessionId, stream, line?, exitCode? }`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliEvent {
+    pub cli_session_id: String,
+    pub stream: CliStream,
+    /// One complete line, without its trailing newline. Absent on `exit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<String>,
+    /// Exit code of the child. Present only on `exit`, and only when the child
+    /// left on its own rather than being killed by a signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+/// Handle of one interactive session, as handed to the webview (S3).
+pub type CliSessionId = String;
+
+/// Where every session event goes. The command layer turns this into the Tauri
+/// `pi-cli` event; tests collect it in a vector.
+pub type CliSink = Arc<dyn Fn(&CliEvent) + Send + Sync>;
+
+/// Failures of the bridge. Plain strings cross the Tauri bridge (see
+/// commands.rs); this enum keeps them typed and testable inside Rust.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CliError {
+    /// No arguments at all: there is no subcommand to allow.
+    EmptyArgs,
+    /// The first argument is not in `ALLOWED_SUBCOMMANDS` (S2).
+    NotAllowed(String),
+    /// The child could not be started at all.
+    Spawn(String),
+    /// Writing to a live child's stdin failed.
+    Write(String),
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CliError::EmptyArgs => write!(
+                f,
+                "pi cli: empty argument list; the first argument must be one of {}",
+                ALLOWED_SUBCOMMANDS.join(", ")
+            ),
+            CliError::NotAllowed(arg) => write!(
+                f,
+                "pi cli: subcommand not allowed: {arg} (allowed: {})",
+                ALLOWED_SUBCOMMANDS.join(", ")
+            ),
+            CliError::Spawn(message) => write!(f, "pi cli: {message}"),
+            CliError::Write(message) => write!(f, "pi cli: stdin write failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for CliError {}
+
+/// Runs one allowlisted `pi` invocation and captures its output (S1, S2).
+///
+/// A non-zero exit is an answer, not an error: the caller decides what a code
+/// means. `Err` is reserved for a call that could not run at all.
+pub fn run(args: &[String], timeout: Duration, binary: &str) -> Result<PiCliResult, CliError> {
+    check_allowlist(args)?;
+    // A zero deadline would kill the child before it could even read its argv.
+    let timeout = timeout.max(Duration::from_millis(1));
+    let mut child = build_command(binary, args)
+        .spawn()
+        .map_err(|err| CliError::Spawn(format!("failed to spawn {binary}: {err}")))?;
+    let pid = child.id();
+    let stdout_reader = child
+        .stdout
+        .take()
+        .map(|pipe| thread::spawn(move || read_capped(pipe)));
+    let stderr_reader = child
+        .stderr
+        .take()
+        .map(|pipe| thread::spawn(move || read_capped(pipe)));
+
+    // The waiter owns the handle, so the deadline is enforced by a channel and
+    // never by polling: no busy loop can spin here (S2).
+    let (exit_tx, exit_rx) = mpsc::channel::<Option<i32>>();
+    let waiter = thread::spawn(move || {
+        let code = child.wait().ok().and_then(|status| status.code());
+        let _ = exit_tx.send(code);
+    });
+
+    let (exit_code, timed_out) = match exit_rx.recv_timeout(timeout) {
+        Ok(code) => (code, false),
+        // A child that outlives its deadline is killed, never left behind (S2).
+        Err(_) => (terminate(pid, &exit_rx), true),
+    };
+    let _ = waiter.join();
+
+    let (stdout, stdout_cut) = join_stream(stdout_reader);
+    let (stderr, stderr_cut) = join_stream(stderr_reader);
+    Ok(PiCliResult {
+        stdout,
+        stderr,
+        exit_code,
+        timed_out,
+        truncated: stdout_cut || stderr_cut,
+    })
+}
+
+/// Parses the JSON of `pi auth check --json` (S4). Never panics: anything it
+/// cannot understand is reported as `unknown` with no credential.
+pub fn parse_auth_check(json: &str) -> PiAuthStatus {
+    interpret_auth_json("", json, None)
+}
+
+/// Parses the JSON of `pi auth check --json`, falling back to the documented
+/// exit codes when the JSON carries no status field (S4).
+pub fn auth_status(provider: &str, json: &str, exit_code: Option<i32>) -> PiAuthStatus {
+    // A child killed by a signal reports no code, so the JSON is the only
+    // evidence left: that is exactly what the contract's parser reads.
+    if exit_code.is_none() {
+        let mut status = parse_auth_check(json);
+        if status.provider.trim().is_empty() {
+            status.provider = provider.to_string();
+        }
+        return status;
+    }
+    interpret_auth_json(provider, json, exit_code)
+}
+
+/// One reading of `pi auth check --json`.
+///
+/// A document that is not a JSON object says nothing about the account, so it
+/// answers `unknown` (S4) — the exit-code fallback applies only to an object
+/// without a usable status field, never to garbage that happened to exit 0.
+fn interpret_auth_json(provider: &str, json: &str, exit_code: Option<i32>) -> PiAuthStatus {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str(json) else {
+        return PiAuthStatus {
+            provider: provider.to_string(),
+            state: AuthState::Unknown,
+            credential: false,
+        };
+    };
+    let reported_provider = ["provider", "providerId"]
+        .iter()
+        .find_map(|key| map.get(*key).and_then(|value| value.as_str()))
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| provider.to_string());
+    let state = ["status", "state"]
+        .iter()
+        .find_map(|key| {
+            map.get(*key)
+                .and_then(|value| value.as_str())
+                .and_then(AuthState::parse)
+        })
+        .or_else(|| {
+            ["loggedIn", "logged_in", "authenticated"]
+                .iter()
+                .find_map(|key| map.get(*key).and_then(|value| value.as_bool()))
+                .map(|logged_in| match logged_in {
+                    true => AuthState::Ready,
+                    false => AuthState::NotReady,
+                })
+        })
+        .or_else(|| exit_code.map(AuthState::from_exit_code))
+        .unwrap_or(AuthState::Unknown);
+    let credential = ["credential", "hasCredential", "has_credential"]
+        .iter()
+        .find_map(|key| map.get(*key).and_then(|value| value.as_bool()))
+        .unwrap_or(state == AuthState::Ready);
+    PiAuthStatus {
+        provider: reported_provider,
+        state,
+        credential,
+    }
+}
+
+/// Reads one pipe up to `STREAM_CAP`, draining the rest so a chatty child is
+/// never blocked on a full pipe, and reports whether anything was cut (S2).
+fn read_capped<R: Read>(mut pipe: R) -> (String, bool) {
+    let mut captured: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(filled) => {
+                let room = STREAM_CAP.saturating_sub(captured.len());
+                let keep = filled.min(room);
+                captured.extend_from_slice(&chunk[..keep]);
+                if keep < filled {
+                    truncated = true;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            // A read error on a pipe that was already drained is not worth
+            // failing the whole call: what was captured is what the caller gets.
+            Err(_) => break,
+        }
+    }
+    // Decoded lossily: a cut can land inside a multi-byte character.
+    (String::from_utf8_lossy(&captured).into_owned(), truncated)
+}
+
+/// Joins one stream reader, treating a thread that never produced bytes as an
+/// empty stream instead of panicking the command layer.
+fn join_stream(handle: Option<thread::JoinHandle<(String, bool)>>) -> (String, bool) {
+    match handle.map(thread::JoinHandle::join) {
+        Some(Ok(captured)) => captured,
+        _ => (String::new(), false),
+    }
+}
+
+/// Escalating kill of a timed-out child's whole process group: the polite
+/// signal first, the force kill only when the child ignores it (S2).
+fn terminate(pid: u32, exit: &mpsc::Receiver<Option<i32>>) -> Option<i32> {
+    crate::process::signal_terminate(pid);
+    match exit.recv_timeout(KILL_GRACE) {
+        Ok(code) => code,
+        Err(_) => {
+            crate::process::signal_kill(pid);
+            exit.recv_timeout(KILL_GRACE).unwrap_or(None)
+        }
+    }
+}
+
+/// Registry of live interactive sessions (S3). Owned by `AppState`.
+#[derive(Default)]
+pub struct CliSessions {
+    sessions: Mutex<HashMap<CliSessionId, Arc<CliSession>>>,
+    next_id: AtomicUsize,
+}
+
+impl CliSessions {
+    pub fn new() -> CliSessions {
+        CliSessions::default()
+    }
+
+    /// Spawns one allowlisted child and starts streaming its output (S3).
+    ///
+    /// The session is registered before its reader threads start, so the first
+    /// event can never arrive for an id nobody knows yet.
+    pub fn start(
+        &self,
+        args: &[String],
+        binary: &str,
+        sink: CliSink,
+    ) -> Result<CliSessionId, CliError> {
+        check_allowlist(args)?;
+        let mut child = build_command(binary, args)
+            .spawn()
+            .map_err(|err| CliError::Spawn(format!("failed to spawn {binary}: {err}")))?;
+        let pid = child.id();
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let id = self.next_session_id();
+        let exited = Arc::new(AtomicBool::new(false));
+        lock(&self.sessions).insert(
+            id.clone(),
+            Arc::new(CliSession {
+                pid,
+                stdin: Mutex::new(stdin),
+                exited: Arc::clone(&exited),
+            }),
+        );
+
+        if let Some(pipe) = stdout {
+            stream_lines(pipe, id.clone(), CliStream::Stdout, Arc::clone(&sink));
+        }
+        if let Some(pipe) = stderr {
+            stream_lines(pipe, id.clone(), CliStream::Stderr, Arc::clone(&sink));
+        }
+
+        // Exit watcher: it owns the `Child`, so it can reap the process without
+        // holding any lock the writer needs.
+        let exit_id = id.clone();
+        thread::spawn(move || {
+            let code = child.wait().ok().and_then(|status| status.code());
+            exited.store(true, Ordering::SeqCst);
+            sink(&CliEvent {
+                cli_session_id: exit_id,
+                stream: CliStream::Exit,
+                line: None,
+                exit_code: code,
+            });
+        });
+        Ok(id)
+    }
+
+    /// Writes `text` plus a newline to the session's stdin. `Ok(false)` for an
+    /// unknown session id, so a late write is not an error.
+    pub fn write(&self, session_id: &str, text: &str) -> Result<bool, CliError> {
+        let Some(session) = lock(&self.sessions).get(session_id).cloned() else {
+            return Ok(false);
+        };
+        // A child that already exited has nothing left to read.
+        if session.exited.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let mut guard = lock(&session.stdin);
+        let Some(pipe) = guard.as_mut() else {
+            return Ok(false);
+        };
+        let mut line = String::with_capacity(text.len() + 1);
+        line.push_str(text);
+        line.push('\n');
+        pipe.write_all(line.as_bytes())
+            .and_then(|()| pipe.flush())
+            .map_err(|err| CliError::Write(err.to_string()))?;
+        Ok(true)
+    }
+
+    /// Kills the session's child if it is still alive and removes the session.
+    /// `Ok(false)` for an unknown session id, so stop is idempotent.
+    pub fn stop(&self, session_id: &str) -> Result<bool, CliError> {
+        let Some(session) = lock(&self.sessions).remove(session_id) else {
+            return Ok(false);
+        };
+        // Close stdin first: a child that reads it sees EOF and may leave on its
+        // own before any signal is needed.
+        lock(&session.stdin).take();
+        if session.exited.load(Ordering::SeqCst) {
+            return Ok(true);
+        }
+        crate::process::signal_terminate(session.pid);
+        if !wait_exit(&session.exited, STOP_GRACE) {
+            // A child that ignores the polite signal must not outlive the host.
+            crate::process::signal_kill(session.pid);
+            let _ = wait_exit(&session.exited, STOP_GRACE);
+        }
+        Ok(true)
+    }
+
+    /// Stops every live session (S1: no pi child outlives the host).
+    pub fn stop_all(&self) {
+        let ids: Vec<CliSessionId> = lock(&self.sessions).keys().cloned().collect();
+        for id in ids {
+            let _ = self.stop(&id);
+        }
+    }
+
+    /// Ids of the live sessions, sorted so the answer is stable across calls.
+    #[cfg(test)]
+    fn live_ids(&self) -> Vec<CliSessionId> {
+        let mut ids: Vec<CliSessionId> = lock(&self.sessions).keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    fn next_session_id(&self) -> CliSessionId {
+        let sequence = self.next_id.fetch_add(1, Ordering::SeqCst);
+        format!("cli-{}-{sequence}", std::process::id())
+    }
+}
+
+impl Drop for CliSessions {
+    fn drop(&mut self) {
+        // S1: a login flow must not outlive the window that started it.
+        self.stop_all();
+    }
+}
+
+/// Forwards one pipe as `line` events until the pipe closes (S3). A last line
+/// without its newline is still a line, and the trailing newline is dropped so
+/// the webview never renders an empty row per line.
+fn stream_lines<R: Read + Send + 'static>(
+    pipe: R,
+    id: CliSessionId,
+    stream: CliStream,
+    sink: CliSink,
+) {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(pipe);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let text = line.trim_end_matches(['\r', '\n']).to_string();
+                    sink(&CliEvent {
+                        cli_session_id: id.clone(),
+                        stream,
+                        line: Some(text),
+                        exit_code: None,
+                    });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+/// Waits for the exit latch within `budget`. Polled, never spun: the interval is
+/// a sleep, and the budget bounds the whole wait.
+fn wait_exit(exited: &AtomicBool, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if exited.load(Ordering::SeqCst) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    exited.load(Ordering::SeqCst)
+}
+
+/// Rejects a call the allowlist does not cover, before anything is spawned (S2).
+fn check_allowlist(args: &[String]) -> Result<(), CliError> {
+    let Some(first) = args.first() else {
+        return Err(CliError::EmptyArgs);
+    };
+    if ALLOWED_SUBCOMMANDS.contains(&first.as_str()) {
+        Ok(())
+    } else {
+        Err(CliError::NotAllowed(first.clone()))
+    }
+}
+
+/// Builds the child invocation: piped stdio, allowlisted env, own process group
+/// on Unix (so a kill reaches the whole tree). Every mainstream OS is covered by
+/// the shared branches; only the platform extras are conditional.
+fn build_command(binary: &str, args: &[String]) -> Command {
+    let mut command = Command::new(binary);
+    command.args(args);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.env_clear();
+    for (name, value) in crate::process::forwarded_env(std::env::vars()) {
+        command.env(name, value);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Its own process group (pgid == child pid) makes the kill path reach the
+        // child AND every descendant it spawned (S2, S3).
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // S1: no console window, ever.
+        // SAFETY: a documented creation flag, no memory or pointer effects.
+        unsafe {
+            command.creation_flags(crate::process::CREATE_NO_WINDOW);
+        }
+    }
+    command
+}
+
+/// One managed interactive child and the handles its threads need.
+struct CliSession {
+    pid: u32,
+    /// Taken by `stop` to close the child's stdin; a live session always has it.
+    stdin: Mutex<Option<ChildStdin>>,
+    /// Set by the waiter thread once the child is reaped.
+    exited: Arc<AtomicBool>,
+}
+
+/// Locks without panicking: a poisoned lock in a background thread must not turn
+/// into a session the host can no longer address.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+
+    /// Scratch directory in the system temp dir (never the worktree), removed on
+    /// drop.
+    struct Scratch {
+        dir: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            let mut dir = std::env::temp_dir();
+            dir.push(format!(
+                "nabla_cli_{}_{}_{tag}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            Scratch { dir }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir.join(name)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    // ── fake `pi` scripts: no real pi, no network ───────────────────────────
+
+    /// Happy path: one stdout line, one stderr line, exit 0.
+    const FAKE_OK: &str = r#"#!/bin/sh
+printf 'hello from pi\n'
+printf 'a warning\n' >&2
+exit 0
+"#;
+
+    /// Failing child: partial output, a diagnostic, exit 7.
+    const FAKE_FAIL: &str = r#"#!/bin/sh
+printf 'partial\n'
+printf 'boom\n' >&2
+exit 7
+"#;
+
+    /// A child that never answers: only the timeout can end it.
+    const FAKE_SLOW: &str = r#"#!/bin/sh
+printf 'started\n'
+sleep 30
+"#;
+
+    /// More than `STREAM_CAP` bytes on stdout, with no newline at 64 KiB.
+    const FAKE_BIG: &str = r#"#!/bin/sh
+head -c 200000 /dev/zero | tr '\0' 'a'
+"#;
+
+    /// Interactive: greets, then echoes every stdin line back on stdout.
+    const FAKE_ECHO: &str = r#"#!/bin/sh
+printf 'ready line\n'
+while IFS= read -r line; do
+  printf 'echo:%s\n' "$line"
+done
+exit 0
+"#;
+
+    /// Interactive: streams two lines on two streams and exits on its own.
+    const FAKE_STREAM: &str = r#"#!/bin/sh
+printf 'line one\n'
+printf 'warn one\n' >&2
+printf 'line two\n'
+exit 0
+"#;
+
+    /// Interactive: announces itself, ignores stdin and hangs, so only a kill
+    /// can end it.
+    const FAKE_HANG: &str = r#"#!/bin/sh
+printf 'started\n'
+printf 'started\n' >> '@MARKER@'
+sleep 30
+"#;
+
+    /// Writes a fake CLI script and makes it executable. `@MARKER@` becomes a
+    /// path the script can touch so a test can prove it ran (or never did).
+    #[cfg(unix)]
+    fn write_script(scratch: &Scratch, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = scratch.path(name);
+        let marker = scratch.path("marker");
+        std::fs::write(&path, body.replace("@MARKER@", &marker.display().to_string()))
+            .expect("write fake pi");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat fake pi")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod fake pi");
+        path
+    }
+
+    #[cfg(unix)]
+    fn binary(path: &Path) -> &str {
+        path.to_str().expect("utf-8 path")
+    }
+
+    /// Events collected from a session sink.
+    #[derive(Default)]
+    struct Collected {
+        events: Mutex<Vec<CliEvent>>,
+    }
+
+    impl Collected {
+        fn sink(self: &Arc<Self>) -> CliSink {
+            let collected = Arc::clone(self);
+            Arc::new(move |event: &CliEvent| {
+                collected.events.lock().unwrap().push(event.clone());
+            })
+        }
+
+        fn snapshot(&self) -> Vec<CliEvent> {
+            self.events.lock().unwrap().clone()
+        }
+
+        /// Waits until `check` accepts the collected events, so no test races a
+        /// reader thread. Panics with what it saw on timeout.
+        fn wait_for(&self, what: &str, check: impl Fn(&[CliEvent]) -> bool) -> Vec<CliEvent> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let events = self.snapshot();
+                if check(&events) {
+                    return events;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {what}: {events:#?}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    fn lines_of(events: &[CliEvent], stream: CliStream) -> Vec<String> {
+        events
+            .iter()
+            .filter(|event| event.stream == stream)
+            .filter_map(|event| event.line.clone())
+            .collect()
+    }
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    // ── non-interactive bridge (S1, S2) ─────────────────────────────────────
+
+    // S2: the allowlist is the frozen contract's set, exactly.
+    #[test]
+    fn allowlist_matches_the_frozen_contract() {
+        assert_eq!(
+            ALLOWED_SUBCOMMANDS,
+            &["auth", "models", "config", "--version", "--help"]
+        );
+    }
+
+    // S1: a normal call is captured whole, with its code.
+    #[cfg(unix)]
+    #[test]
+    fn run_captures_stdout_and_a_zero_exit() {
+        let scratch = Scratch::new("run_ok");
+        let script = write_script(&scratch, "pi-ok.sh", FAKE_OK);
+
+        let result = run(&args(&["--version"]), Duration::from_secs(10), binary(&script))
+            .expect("run an allowlisted command");
+
+        assert_eq!(result.stdout, "hello from pi\n");
+        assert_eq!(result.stderr, "a warning\n");
+        assert_eq!(result.exit_code, Some(0));
+        assert!(!result.timed_out, "the child left on its own: {result:?}");
+        assert!(!result.truncated, "nothing was cut: {result:?}");
+    }
+
+    // S1: a failing child is an answer, not an error: the code and both streams
+    // reach the caller.
+    #[cfg(unix)]
+    #[test]
+    fn run_reports_a_non_zero_exit_code() {
+        let scratch = Scratch::new("run_fail");
+        let script = write_script(&scratch, "pi-fail.sh", FAKE_FAIL);
+
+        let result = run(&args(&["auth", "check"]), Duration::from_secs(10), binary(&script))
+            .expect("a non-zero exit is still a result");
+
+        assert_eq!(result.exit_code, Some(7));
+        assert_eq!(result.stdout, "partial\n");
+        assert_eq!(result.stderr, "boom\n");
+        assert!(!result.timed_out);
+    }
+
+    // S2: the timeout is mandatory and it really kills the child.
+    #[cfg(unix)]
+    #[test]
+    fn run_kills_the_child_when_the_timeout_expires() {
+        let scratch = Scratch::new("run_timeout");
+        let script = write_script(&scratch, "pi-slow.sh", FAKE_SLOW);
+
+        let started = Instant::now();
+        let result = run(&args(&["models"]), Duration::from_millis(300), binary(&script))
+            .expect("a timeout is a result, not an error");
+        let elapsed = started.elapsed();
+
+        assert!(result.timed_out, "the deadline must be reported: {result:?}");
+        assert_eq!(result.stdout, "started\n", "output before the kill is kept");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the injected deadline must bound the wait, took {elapsed:?}"
+        );
+        // The kill left nothing behind: the script's sleep cannot outlive it.
+        assert!(
+            !is_running(&script).0,
+            "a timed-out child must be killed, not orphaned"
+        );
+    }
+
+    // S2: output is bounded per stream and the cut is reported.
+    #[cfg(unix)]
+    #[test]
+    fn run_caps_each_stream_at_64_kib_and_flags_truncation() {
+        let scratch = Scratch::new("run_big");
+        let script = write_script(&scratch, "pi-big.sh", FAKE_BIG);
+
+        let result = run(&args(&["models"]), Duration::from_secs(30), binary(&script))
+            .expect("run with output over the cap");
+
+        assert_eq!(
+            result.stdout.len(),
+            STREAM_CAP,
+            "stdout must stop at the cap, got {} bytes",
+            result.stdout.len()
+        );
+        assert!(result.stdout.bytes().all(|byte| byte == b'a'));
+        assert!(result.truncated, "overflow must be reported: {result:?}");
+    }
+
+    // S2: a subcommand outside the allowlist never reaches the spawn path.
+    #[cfg(unix)]
+    #[test]
+    fn run_rejects_a_disallowed_subcommand_without_spawning() {
+        let scratch = Scratch::new("run_denied");
+        let script = write_script(&scratch, "pi-ok.sh", FAKE_OK);
+        let marker = scratch.path("marker");
+
+        let err = run(
+            &args(&["install", "some-package"]),
+            Duration::from_secs(10),
+            binary(&script),
+        )
+        .expect_err("install is not in the allowlist");
+
+        assert_eq!(err, CliError::NotAllowed("install".to_string()));
+        assert!(
+            !marker.exists(),
+            "a rejected subcommand must never spawn the child"
+        );
+    }
+
+    // S2: no arguments means no subcommand to check, so the call is refused
+    // before any process exists.
+    #[test]
+    fn run_rejects_empty_arguments() {
+        let err = run(&[], Duration::from_secs(1), "/nonexistent/pi")
+            .expect_err("an empty argv has no allowlisted subcommand");
+        assert_eq!(err, CliError::EmptyArgs);
+        assert!(err.to_string().contains("auth"), "the message names the allowlist: {err}");
+    }
+
+    // ── account state (S4) ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_auth_check_reads_the_json_status() {
+        let status = parse_auth_check(r#"{"provider":"nan","status":"ready","credential":true}"#);
+        assert_eq!(status.provider, "nan");
+        assert_eq!(status.state, AuthState::Ready);
+        assert!(status.credential);
+
+        let not_ready = parse_auth_check(r#"{"provider":"nan","status":"not_ready"}"#);
+        assert_eq!(not_ready.state, AuthState::NotReady);
+        assert!(
+            !not_ready.credential,
+            "no credential field and not ready means no credential"
+        );
+    }
+
+    // S4 contract shape: `{ provider, state, credential }`, snake_case state.
+    #[test]
+    fn pi_auth_status_serializes_with_the_contract_field_names() {
+        let status = PiAuthStatus {
+            provider: "nan".to_string(),
+            state: AuthState::NotReady,
+            credential: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&status).expect("serialize"),
+            json!({ "provider": "nan", "state": "not_ready", "credential": false })
+        );
+    }
+
+    // S4: unparsable input never panics and never invents a state.
+    #[test]
+    fn parse_auth_check_answers_unknown_for_unparsable_json() {
+        for raw in ["", "not json", "[]", "null", r#"{"status":42}"#, r#"{"status":"nope"}"#] {
+            let status = parse_auth_check(raw);
+            assert_eq!(status.state, AuthState::Unknown, "raw: {raw:?}");
+            assert!(!status.credential, "raw: {raw:?}");
+        }
+    }
+
+    // S4: the documented exit codes are the fallback when the JSON has no status.
+    #[test]
+    fn auth_status_falls_back_to_the_documented_exit_codes() {
+        for (code, expected) in [
+            (0, AuthState::Ready),
+            (1, AuthState::NotReady),
+            (2, AuthState::Invalid),
+            (9, AuthState::Unknown),
+        ] {
+            let status = auth_status("nan", r#"{"provider":"nan"}"#, Some(code));
+            assert_eq!(status.state, expected, "exit code {code}");
+        }
+        // An explicit status always wins over the exit code.
+        assert_eq!(
+            auth_status("nan", r#"{"status":"not_ready"}"#, Some(0)).state,
+            AuthState::NotReady
+        );
+        // Garbage stays unknown even next to a clean exit code, and the answer
+        // still names the provider the caller asked about.
+        let garbage = auth_status("nan", "boom", Some(0));
+        assert_eq!(garbage.state, AuthState::Unknown);
+        assert_eq!(garbage.provider, "nan");
+    }
+
+    // ── interactive bridge (S1, S3) ─────────────────────────────────────────
+
+    // S3: stdout and stderr arrive line by line, and the exit is reported.
+    #[cfg(unix)]
+    #[test]
+    fn start_streams_stdout_stderr_and_the_exit_event() {
+        let scratch = Scratch::new("start_stream");
+        let script = write_script(&scratch, "pi-stream.sh", FAKE_STREAM);
+        let sessions = CliSessions::new();
+        let collected = Arc::new(Collected::default());
+
+        let id = sessions
+            .start(&args(&["auth"]), binary(&script), collected.sink())
+            .expect("start an allowlisted command");
+        assert!(id.starts_with("cli-"), "the id is a session handle, got {id}");
+
+        let events = collected.wait_for("the exit event", |events| {
+            events.iter().any(|event| event.stream == CliStream::Exit)
+        });
+
+        assert_eq!(
+            lines_of(&events, CliStream::Stdout),
+            vec!["line one".to_string(), "line two".to_string()],
+            "stdout lines arrive whole and in order: {events:#?}"
+        );
+        assert_eq!(lines_of(&events, CliStream::Stderr), vec!["warn one".to_string()]);
+        let exit = events
+            .iter()
+            .find(|event| event.stream == CliStream::Exit)
+            .expect("exit event");
+        assert_eq!(exit.exit_code, Some(0));
+        assert_eq!(exit.line, None, "an exit carries a code, not a line");
+        assert!(
+            events.iter().all(|event| event.cli_session_id == id),
+            "every event names its session: {events:#?}"
+        );
+        // The registry tracks the id until the host stops it, so a late `stop`
+        // is what reaps the finished child.
+        assert_eq!(sessions.live_ids(), vec![id.clone()]);
+        assert!(sessions.stop(&id).expect("stop after a natural exit"));
+        assert!(
+            sessions.live_ids().is_empty(),
+            "a stopped session is no longer live"
+        );
+    }
+
+    // S3: a pasted device code reaches the child's stdin, newline included.
+    #[cfg(unix)]
+    #[test]
+    fn write_reaches_the_child_stdin() {
+        let scratch = Scratch::new("write");
+        let script = write_script(&scratch, "pi-echo.sh", FAKE_ECHO);
+        let sessions = CliSessions::new();
+        let collected = Arc::new(Collected::default());
+        let id = sessions
+            .start(&args(&["auth", "login", "nan", "--no-browser"]), binary(&script), collected.sink())
+            .expect("start the login flow");
+
+        // The greeting proves the child is up and reading before we write.
+        collected.wait_for("the greeting", |events| {
+            lines_of(events, CliStream::Stdout).iter().any(|line| line == "ready line")
+        });
+
+        assert!(
+            sessions.write(&id, "device-code-123").expect("write"),
+            "a live session accepts input"
+        );
+
+        // The child only echoes complete lines, so the newline was appended.
+        collected.wait_for("the echoed code", |events| {
+            lines_of(events, CliStream::Stdout)
+                .iter()
+                .any(|line| line == "echo:device-code-123")
+        });
+
+        sessions.stop(&id).expect("stop the login flow");
+    }
+
+    // S3: stop kills a hanging child and removes the session, idempotently.
+    #[cfg(unix)]
+    #[test]
+    fn stop_kills_the_child_and_removes_the_session() {
+        let scratch = Scratch::new("stop");
+        let script = write_script(&scratch, "pi-hang.sh", FAKE_HANG);
+        let marker = scratch.path("marker");
+        let sessions = CliSessions::new();
+        let collected = Arc::new(Collected::default());
+        let id = sessions
+            .start(&args(&["auth", "login"]), binary(&script), collected.sink())
+            .expect("start a hanging child");
+
+        collected.wait_for("the child's first line", |events| {
+            lines_of(events, CliStream::Stdout)
+                .iter()
+                .any(|line| line == "started")
+        });
+        assert!(marker.exists(), "the fake child must have run at all");
+
+        let started = Instant::now();
+        assert!(
+            sessions.stop(&id).expect("stop"),
+            "a live session is stopped"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stop must not wait out the child, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !sessions.stop(&id).expect("second stop"),
+            "the session is removed, so stop is idempotent"
+        );
+        assert!(
+            !sessions.write(&id, "late").expect("write after stop"),
+            "an unknown session id answers false"
+        );
+        // The exit event proves the kill actually landed.
+        collected.wait_for("the exit event", |events| {
+            events.iter().any(|event| event.stream == CliStream::Exit)
+        });
+    }
+
+    #[test]
+    fn write_and_stop_answer_false_for_an_unknown_session() {
+        let sessions = CliSessions::new();
+        assert!(!sessions.write("cli-unknown", "text").expect("write"));
+        assert!(!sessions.stop("cli-unknown").expect("stop"));
+    }
+
+    // S2: the interactive path enforces the same allowlist, without spawning.
+    #[cfg(unix)]
+    #[test]
+    fn start_rejects_a_disallowed_subcommand_without_spawning() {
+        let scratch = Scratch::new("start_denied");
+        let script = write_script(&scratch, "pi-stream.sh", FAKE_STREAM);
+        let marker = scratch.path("marker");
+        let sessions = CliSessions::new();
+        let collected = Arc::new(Collected::default());
+
+        let err = sessions
+            .start(&args(&["update"]), binary(&script), collected.sink())
+            .expect_err("update is not in the allowlist");
+
+        assert_eq!(err, CliError::NotAllowed("update".to_string()));
+        assert!(!marker.exists(), "nothing may be spawned for a denied call");
+        assert!(
+            collected.snapshot().is_empty(),
+            "a denied call emits no session event"
+        );
+    }
+
+    /// True when a process still runs the given script path. Used to prove a
+    /// killed child left nothing behind.
+    #[cfg(unix)]
+    fn is_running(script: &Path) -> (bool, String) {
+        let name = script.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        let output = Command::new("ps")
+            .args(["-A", "-o", "command="])
+            .output()
+            .expect("ps");
+        let listing = String::from_utf8_lossy(&output.stdout).to_string();
+        (listing.lines().any(|line| line.contains(name)), listing)
+    }
+}
