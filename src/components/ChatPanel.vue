@@ -9,7 +9,7 @@
 // are the same code the earlier panel had; the shell around them is new:
 // an empty state before the first turn and a header + Chat/Linaje tabs after.
 import type { Component } from "vue";
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   CheckIcon,
   CircleAlertIcon,
@@ -35,12 +35,16 @@ import {
   saveSettings,
   sendPrompt,
   sessionStatus,
-  startSession,
   stopSession,
   subscribeAgentEvents,
 } from "@/contracts/commands";
 import type { AppSettings, ModelInfo, SessionDto, WorkspaceInfo } from "@/contracts/types";
 import { useAppearance } from "@/lib/appearance";
+import {
+  activeSession,
+  newSession,
+  sessionGeneration,
+} from "@/lib/session-store";
 import { isDarkMode, type ThemeMode } from "@/lib/theme";
 
 /** The drawer owns the workspace list; the active one arrives already chosen. */
@@ -72,7 +76,6 @@ interface StatusAlert {
   text: string;
 }
 
-const session = ref<SessionDto | null>(null);
 const prompt = ref("");
 const messages = ref<ChatMessage[]>([]);
 const tools = ref<ToolEntry[]>([]);
@@ -84,6 +87,42 @@ const starting = ref(false);
 const sending = ref(false);
 const stopping = ref(false);
 const error = ref<string | null>(null);
+
+/**
+ * N1 of `sidebar-rework.md`: the active session now lives in the shared store
+ * (`src/lib/session-store.ts`) because the drawer creates and opens sessions
+ * too. This panel still owns everything about *rendering* it.
+ */
+const currentSession = computed<SessionDto | null>(() => {
+  const active = activeSession.value;
+  if (active === null || props.workspace === null) return null;
+  // A session belongs to one workspace: switching workspaces must never route a
+  // prompt to the previous workspace's process, so the old session stops being
+  // "current" here and the next send starts a fresh one.
+  return active.workspaceId === props.workspace.id ? active : null;
+});
+
+/**
+ * Creating, opening or clearing the active session replaces what the transcript
+ * shows, so the per-session view state resets while the store keeps the
+ * identity. `flush: "sync"` keeps the reset ahead of the turn the composer is
+ * about to echo into `messages`.
+ *
+ * A past session's content lives in pi's JSONL file and no command reads it
+ * yet, so opening an older session starts the view empty (documented
+ * follow-up).
+ */
+function resetTranscript() {
+  messages.value = [];
+  tools.value = [];
+  status.value = null;
+  statusError.value = null;
+  exitCode.value = null;
+  error.value = null;
+  prompt.value = "";
+}
+
+watch(sessionGeneration, resetTranscript, { flush: "sync" });
 
 // Unsubscribe handle for the `agent-event` listener, kept so unmounting does
 // not leave a handler reading into a disposed component.
@@ -281,12 +320,14 @@ function toolStateLabel(state: ToolEntry["state"]): string {
 
 /**
  * S1: the empty state has no "start session" control, so the first send starts
- * the session itself. Returns the live session, or `null` when it could not be
- * started (the error is already rendered then).
+ * the session itself. N1: it starts through the shared store, so this and the
+ * drawer's "New session" button are one creation path and the drawer sees the
+ * session the chat is talking to. Returns the live session, or `null` when it
+ * could not be started (the error is already rendered then).
  */
 async function ensureSession(): Promise<SessionDto | null> {
-  const current = session.value;
-  if (current !== null) return current;
+  const existing = currentSession.value;
+  if (existing !== null) return existing;
   const workspace = props.workspace;
   if (workspace === null) {
     error.value = "Select a workspace before sending a prompt.";
@@ -294,12 +335,10 @@ async function ensureSession(): Promise<SessionDto | null> {
   }
   starting.value = true;
   try {
-    const started = await startSession(workspace.id);
-    session.value = started;
-    tools.value = [];
+    const started = await newSession(workspace.id);
+    // The store bumped the generation, which reset the view; the start status is
+    // the one fact that reset cannot know.
     status.value = started.status;
-    statusError.value = null;
-    exitCode.value = null;
     return started;
   } catch (cause) {
     error.value = commandErrorMessage(cause);
@@ -399,7 +438,7 @@ async function handleSend() {
 }
 
 async function handleStop() {
-  const current = session.value;
+  const current = currentSession.value;
   if (current === null) return;
   stopping.value = true;
   error.value = null;
@@ -425,10 +464,9 @@ onMounted(async () => {
   void loadModelOptions();
   void loadSettings();
   unsubscribe = await subscribeAgentEvents((envelope) => {
-    const current = session.value;
-    // One global channel carries every session; only this panel's session is
-    // its business.
-    if (current === null || envelope.sessionId !== current.sessionId) return;
+    // One global channel carries every session; only the active session of the
+    // workspace on screen is this panel's business.
+    if (envelope.sessionId !== currentSession.value?.sessionId) return;
     handleEvent(envelope.event);
   });
 });
@@ -479,7 +517,7 @@ onUnmounted(() => {
           :disabled="workspace === null"
           :can-send="canSend"
           :model-disabled="savingModel || models.length === 0"
-          :can-stop="session !== null && !stopping"
+          :can-stop="currentSession !== null && !stopping"
           @update:model-id="handleModelChange"
           @send="handleSend"
           @stop="handleStop"
@@ -580,7 +618,7 @@ onUnmounted(() => {
               :disabled="workspace === null"
               :can-send="canSend"
               :model-disabled="savingModel || models.length === 0"
-              :can-stop="session !== null && !stopping"
+              :can-stop="currentSession !== null && !stopping"
               @update:model-id="handleModelChange"
               @send="handleSend"
               @stop="handleStop"

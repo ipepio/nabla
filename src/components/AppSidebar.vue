@@ -1,27 +1,25 @@
 <script setup lang="ts">
-// Left drawer (specs S1-S4, S6-S9): the Nabla logo, the collapse control — the
-// only one in the shell (S8) — the "spaces" list (the current workspaces, S1)
-// with its filter chips (S2), its search box (S3) and the add flow (S4: native
-// folder picker first, manual path second), and the settings dialog in the
-// footer. It owns the workspace/settings data flow; the *selection* is lifted to
-// App.vue through `select`, which feeds ChatPanel.
+// Left drawer (specs S1-S6 of `odd/tasks/sidebar-rework.md`): the Nabla logo and
+// the collapse control (the only one in the shell), the "New session" button
+// (S2), the Workspaces header with its three actions (S3), the collapsible
+// workspace list with each workspace's sessions (S4-S6) and the settings dialog
+// in the footer.
+//
+// It owns the workspace/settings data flow and the session *index* it shows; the
+// selection is lifted to App.vue through `select`, which feeds ChatPanel, and the
+// active session lives in the shared `src/lib/session-store.ts` (task N1).
 import { computed, onMounted, ref, watch } from "vue";
 import {
   CheckIcon,
-  FolderIcon,
-  FolderOpenIcon,
+  CirclePlusIcon,
+  FolderPlusIcon,
   PanelLeftIcon,
-  PinIcon,
-  PlusIcon,
   SearchIcon,
   SettingsIcon,
-  Trash2Icon,
+  SlidersHorizontalIcon,
 } from "@lucide/vue";
 import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
-import {
-  Alert,
-  AlertDescription,
-} from "@/components/ui/alert";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -45,57 +43,72 @@ import {
   Sidebar,
   SidebarContent,
   SidebarFooter,
-  SidebarGroup,
-  SidebarGroupContent,
-  SidebarGroupLabel,
   SidebarHeader,
   SidebarMenu,
-  SidebarMenuButton,
   SidebarMenuItem,
-  SidebarSeparator,
   SidebarTrigger,
   useSidebar,
 } from "@/components/ui/sidebar";
-import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import SessionsList from "@/components/sidebar/SessionsList.vue";
+import WorkspaceRow from "@/components/sidebar/WorkspaceRow.vue";
 import { useAppearance } from "@/lib/appearance";
 import { themedBrand } from "@/lib/brand";
+import {
+  activeSession,
+  newSession,
+  openSession,
+  sessionGeneration,
+} from "@/lib/session-store";
 import {
   addWorkspace,
   commandErrorMessage,
   getSettings,
   listModels,
+  listSessions,
   listWorkspaces,
   removeWorkspace,
   saveSettings,
   setWorkspacePinned,
   touchWorkspace,
 } from "../contracts/commands";
-import type { AppSettings, ModelInfo, WorkspaceInfo } from "../contracts/types";
+import type {
+  AppSettings,
+  ModelInfo,
+  SessionSummary,
+  WorkspaceInfo,
+} from "../contracts/types";
 
 const props = defineProps<{ activeWorkspaceId: number | null }>();
 const emit = defineEmits<{ select: [workspace: WorkspaceInfo | null] }>();
 
 const THEMES = ["dark", "light", "system"] as const;
 
-/** S2: the three filters the user asked for. */
-type FilterValue = "all" | "recent" | "pinned";
-
-const FILTERS: { value: FilterValue; label: string }[] = [
-  { value: "all", label: "All" },
-  { value: "recent", label: "Recent" },
-  { value: "pinned", label: "Pinned" },
-];
-
 const workspaces = ref<WorkspaceInfo[]>([]);
 const workspacesLoading = ref(false);
-const filter = ref<FilterValue>("all");
 const search = ref("");
+/** S3: the magnifier toggles the search field instead of it always taking room. */
+const searchOpen = ref(false);
+/**
+ * S3: the sliders button toggles edit mode. This unit only stores the flag and
+ * reflects it on the rows (their actions stay visible); the rename/delete
+ * dialogs land in the next unit.
+ */
+const editMode = ref(false);
 // The space whose pin request is in flight, so its button cannot double-fire.
 const pinPendingId = ref<number | null>(null);
-const newPath = ref("");
-const newName = ref("");
 const adding = ref(false);
+/** A `start_session` call is in flight, so the button cannot spawn two pis. */
+const creating = ref(false);
 const workspaceError = ref<string | null>(null);
+
+/** S5: ids of the workspaces whose session list is open. */
+const expandedIds = ref<number[]>([]);
+/** S5: the sessions of each workspace, keyed by workspace id. */
+const sessionsByWorkspace = ref<Record<number, SessionSummary[]>>({});
+/** S5: workspaces whose session fetch is in flight. */
+const sessionsLoading = ref<number[]>([]);
+const sessionsErrors = ref<Record<number, string>>({});
+
 // The brand mark is theme-aware: the white-on-dark variant on the dark palette
 // and its black-on-light sibling otherwise, so a theme switch switches the logo
 // too. `logoFailed` keeps the ∇ fallback while an asset is missing (S7).
@@ -113,6 +126,9 @@ const wordmarkSource = computed(() => themedBrand("wordmark", isDark.value));
 const { toggleSidebar } = useSidebar();
 
 const settingsOpen = ref(false);
+// S6 (next unit): the ⋯ menu's edit item opens this read-only placeholder.
+const editOpen = ref(false);
+const editingWorkspace = ref<WorkspaceInfo | null>(null);
 // Mirrors `Settings::default()` in `src-tauri/src/settings.rs` for the moment
 // before `get_settings` resolves; it is one fallback model id, never the model
 // list (that always comes from `list_models`, S7).
@@ -142,45 +158,18 @@ function addErrorMessage(cause: unknown): string {
 }
 
 /**
- * Recency key for the "Recent" filter (S2/S8). A space that was never touched
- * falls back to its creation time, so it is ordered instead of pushed to the
- * edge; ties keep the server order.
- */
-function recencyKey(workspace: WorkspaceInfo): string {
-  return workspace.lastUsedAt ?? workspace.createdAt;
-}
-
-/**
- * S2/S3: chips and search are one client-side pass over the loaded list. "All"
- * keeps the server order (pinned first, then most recently used), "Recent"
- * re-sorts by the recency key and "Pinned" keeps the pinned rows only; the
- * search text then narrows whatever survived, by name or by path.
+ * S3/S4: the search text narrows the loaded list by name or by path. The order
+ * stays the server's (pinned first, then most recently used).
  */
 const visibleWorkspaces = computed<WorkspaceInfo[]>(() => {
   const query = search.value.trim().toLowerCase();
-  let list = workspaces.value;
-  if (filter.value === "pinned") {
-    list = list.filter((workspace) => workspace.pinned);
-  }
-  if (query !== "") {
-    list = list.filter(
-      (workspace) =>
-        workspace.name.toLowerCase().includes(query) ||
-        workspace.path.toLowerCase().includes(query),
-    );
-  }
-  if (filter.value === "recent") {
-    list = [...list].sort((a, b) => recencyKey(b).localeCompare(recencyKey(a)));
-  }
-  return list;
+  if (query === "") return workspaces.value;
+  return workspaces.value.filter(
+    (workspace) =>
+      workspace.name.toLowerCase().includes(query) ||
+      workspace.path.toLowerCase().includes(query),
+  );
 });
-
-/** S2: the chips are controlled, so an empty selection is never rendered. */
-function setFilter(value: unknown) {
-  if (value === "all" || value === "recent" || value === "pinned") {
-    filter.value = value;
-  }
-}
 
 async function refreshWorkspaces() {
   workspacesLoading.value = true;
@@ -201,8 +190,7 @@ async function refreshWorkspaces() {
 
 /**
  * S8: selecting is also a usage signal. The selection lands immediately, then
- * `touch_workspace` records it and the refresh re-sorts the list under
- * "Recent".
+ * `touch_workspace` records it and the refresh re-sorts the list by recency.
  */
 async function handleSelectWorkspace(workspace: WorkspaceInfo) {
   emit("select", workspace);
@@ -214,7 +202,120 @@ async function handleSelectWorkspace(workspace: WorkspaceInfo) {
   }
 }
 
-/** S2: pin/unpin one row; the refreshed server list is the source of truth. */
+/**
+ * S5: a row click selects the workspace (the existing path) and toggles its
+ * session list. Clicking the already-selected row only toggles: re-touching it
+ * would rewrite recency for an action that changed nothing.
+ */
+async function handleActivateWorkspace(workspace: WorkspaceInfo) {
+  toggleExpanded(workspace.id);
+  if (workspace.id !== props.activeWorkspaceId) {
+    await handleSelectWorkspace(workspace);
+  }
+}
+
+function isExpanded(workspaceId: number): boolean {
+  return expandedIds.value.includes(workspaceId);
+}
+
+function toggleExpanded(workspaceId: number) {
+  expandedIds.value = isExpanded(workspaceId)
+    ? expandedIds.value.filter((id) => id !== workspaceId)
+    : [...expandedIds.value, workspaceId];
+}
+
+/** S5: the cached sessions of a workspace, empty until its first fetch lands. */
+function sessionsFor(workspaceId: number): SessionSummary[] {
+  return sessionsByWorkspace.value[workspaceId] ?? [];
+}
+
+function sessionsLoadingFor(workspaceId: number): boolean {
+  return sessionsLoading.value.includes(workspaceId);
+}
+
+/**
+ * S5: reads one workspace's session index. `list_sessions` is the only source;
+ * the cache exists so the list keeps rendering while a refresh is in flight.
+ */
+async function loadSessions(workspaceId: number) {
+  if (sessionsLoading.value.includes(workspaceId)) return;
+  sessionsLoading.value = [...sessionsLoading.value, workspaceId];
+  try {
+    const list = await listSessions(workspaceId);
+    sessionsByWorkspace.value = { ...sessionsByWorkspace.value, [workspaceId]: list };
+    delete sessionsErrors.value[workspaceId];
+  } catch (cause) {
+    sessionsErrors.value = {
+      ...sessionsErrors.value,
+      [workspaceId]: commandErrorMessage(cause),
+    };
+  } finally {
+    sessionsLoading.value = sessionsLoading.value.filter((id) => id !== workspaceId);
+  }
+}
+
+/**
+ * S5: fetches every expanded workspace. Expanding and re-expanding both come
+ * through here, which is why a re-expand refreshes instead of trusting the
+ * cache: a session may have started while the row was closed.
+ */
+function syncSessions(ids: number[]) {
+  for (const id of ids) void loadSessions(id);
+  // Collapsed rows drop their cache so a later expand cannot show a stale list.
+  const keep = new Set(ids);
+  sessionsByWorkspace.value = Object.fromEntries(
+    Object.entries(sessionsByWorkspace.value).filter(([key]) => keep.has(Number(key))),
+  );
+}
+
+watch(expandedIds, syncSessions);
+
+// N1: a new session (from the button or from the composer's first send) changes
+// what each open list must show.
+watch(sessionGeneration, () => {
+  sessionsByWorkspace.value = {};
+  syncSessions(expandedIds.value);
+});
+
+/** S2: creates a session for the selected workspace — the one creation path. */
+async function handleNewSession() {
+  const workspace = workspaces.value.find((w) => w.id === props.activeWorkspaceId);
+  if (workspace === undefined || creating.value) return;
+  creating.value = true;
+  workspaceError.value = null;
+  try {
+    // Same usage signal the selection path records; the list itself is not
+    // re-sorted under the pointer here, only on the next select or add.
+    await touchWorkspace(workspace.id);
+    await newSession(workspace.id);
+    // S5: open the row so the session it just created is visible.
+    if (!isExpanded(workspace.id)) {
+      expandedIds.value = [...expandedIds.value, workspace.id];
+    }
+  } catch (cause) {
+    workspaceError.value = commandErrorMessage(cause);
+  } finally {
+    creating.value = false;
+  }
+}
+
+/**
+ * S5: clicking a session in the list makes it the active session and focuses its
+ * workspace, so the chat is never showing one workspace while its session
+ * belongs to another. The transcript itself lives in pi's file; no command reads
+ * it yet.
+ */
+async function handleOpenSession(
+  workspace: WorkspaceInfo,
+  session: SessionSummary,
+) {
+  if (workspace.id !== props.activeWorkspaceId) {
+    await handleSelectWorkspace(workspace);
+  }
+  openSession(session);
+}
+
+/** S3: pin/unpin one row; the refreshed server list is the source of truth. */
 async function handleTogglePin(workspace: WorkspaceInfo) {
   if (pinPendingId.value !== null) return;
   pinPendingId.value = workspace.id;
@@ -229,19 +330,10 @@ async function handleTogglePin(workspace: WorkspaceInfo) {
   }
 }
 
-async function handleAddWorkspace() {
-  const path = newPath.value.trim();
-  if (path === "") {
-    workspaceError.value = "Workspace path is required.";
-    return;
-  }
-  await addWorkspaceAndSelect(path, newName.value.trim() === "" ? null : newName.value.trim());
-}
-
 /**
- * Primary add flow (S4): the native folder picker. Cancelling the dialog is not
- * an error, so it silently leaves the form untouched. The name is never sent:
- * the store derives it from the path, exactly like the manual flow's empty name.
+ * S3: the header's folder button. The native folder picker is the whole add
+ * flow; cancelling the dialog is not an error, so it silently does nothing. The
+ * name is never sent: the store derives it from the path (S6's default).
  */
 async function handleBrowseFolder() {
   if (adding.value) return;
@@ -262,16 +354,13 @@ async function handleBrowseFolder() {
   await addWorkspaceAndSelect(path, null);
 }
 
-/** Shared by both add flows: create the row, refresh, and select it. */
+/** Create the row, refresh, and select it — adding a workspace is an intent. */
 async function addWorkspaceAndSelect(path: string, name: string | null) {
   adding.value = true;
   workspaceError.value = null;
   try {
     const created = await addWorkspace(path, name);
-    newPath.value = "";
-    newName.value = "";
     await refreshWorkspaces();
-    // Adding a workspace is a selection intent: open it.
     const added = workspaces.value.find((w) => w.id === created.id) ?? created;
     emit("select", added);
   } catch (cause) {
@@ -285,11 +374,25 @@ async function handleRemoveWorkspace(workspace: WorkspaceInfo) {
   workspaceError.value = null;
   try {
     await removeWorkspace(workspace.id);
+    // The row is gone: drop its cached sessions and its expansion as well.
+    expandedIds.value = expandedIds.value.filter((id) => id !== workspace.id);
+    delete sessionsByWorkspace.value[workspace.id];
+    delete sessionsErrors.value[workspace.id];
     // `refreshWorkspaces` replaces the selection when the active row is gone.
     await refreshWorkspaces();
   } catch (cause) {
     workspaceError.value = commandErrorMessage(cause);
   }
+}
+
+/**
+ * S6: the ⋯ menu's edit item. Rename/alias and the delete confirmation are the
+ * next unit's work; until then this opens a read-only dialog that shows exactly
+ * what the store holds, so nothing is silently pretended.
+ */
+function openEditDialog(workspace: WorkspaceInfo) {
+  editingWorkspace.value = workspace;
+  editOpen.value = true;
 }
 
 async function loadModels() {
@@ -419,160 +522,134 @@ onMounted(() => {
           />
         </Button>
       </div>
+
+      <!-- S2: New session, full width, just under the header. It creates the
+           session for the selected workspace through the shared store, so the
+           chat follows it; collapsed, the label gives way to the icon. -->
+      <Button
+        variant="secondary"
+        class="h-9 w-full gap-2 rounded-xl bg-secondary/60 px-3 text-sm font-medium text-secondary-foreground hover:bg-secondary group-data-[collapsible=icon]:size-8 group-data-[collapsible=icon]:self-center group-data-[collapsible=icon]:p-0"
+        :disabled="activeWorkspaceId === null || creating"
+        aria-label="New session"
+        @click="handleNewSession"
+      >
+        <CirclePlusIcon class="size-4 shrink-0" aria-hidden="true" />
+        <span class="group-data-[collapsible=icon]:hidden">New session</span>
+      </Button>
     </SidebarHeader>
 
-    <SidebarSeparator />
-
+    <!-- S1: no separator between the header and the content. -->
     <SidebarContent>
-      <SidebarGroup>
-        <SidebarGroupLabel>Workspaces</SidebarGroupLabel>
-        <SidebarGroupContent>
-          <!-- S3: the search box. Filters the loaded list by name or by path. -->
-          <div class="px-2 pb-2 group-data-[collapsible=icon]:hidden">
-            <div class="relative">
-              <SearchIcon
-                aria-hidden="true"
-                class="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground"
-              />
-              <Input
-                v-model="search"
-                aria-label="Search spaces"
-                placeholder="Search spaces…"
-                class="h-8 pl-7 text-xs"
-              />
-            </div>
-          </div>
-
-          <!-- S2: Todos / Recientes / Pinned. A single-select segmented control;
-               the selection is controlled from `filter` and clicking a chip can
-               never leave the group without a visible value. -->
-          <ToggleGroup
-            type="single"
-            size="sm"
-            variant="outline"
-            :model-value="filter"
-            class="mx-2 mb-2 w-auto group-data-[collapsible=icon]:hidden"
-            @update:model-value="setFilter"
+      <!-- S3: section title on the left, the three actions on the right. -->
+      <div
+        class="flex items-center justify-between gap-1 px-3 pt-1 pb-1 group-data-[collapsible=icon]:hidden"
+      >
+        <span class="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+          Workspaces
+        </span>
+        <div class="flex items-center gap-0.5">
+          <!-- Search: toggles the field below instead of it always taking room. -->
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            class="text-muted-foreground"
+            aria-label="Search workspaces"
+            :aria-pressed="searchOpen"
+            :aria-expanded="searchOpen"
+            @click="searchOpen = !searchOpen"
           >
-            <ToggleGroupItem
-              v-for="option in FILTERS"
-              :key="option.value"
-              :value="option.value"
-              class="flex-1 px-2 text-xs"
-            >
-              {{ option.label }}
-            </ToggleGroupItem>
-          </ToggleGroup>
-
-          <p
-            v-if="workspaces.length === 0 && !workspacesLoading"
-            class="px-2 pb-2 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden"
+            <SearchIcon />
+          </Button>
+          <!-- Edit mode: the flag this unit stores; rows keep their actions
+               visible while it is on (the dialogs come next). -->
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            :class="editMode ? 'text-foreground' : 'text-muted-foreground'"
+            aria-label="Toggle edit mode"
+            :aria-pressed="editMode"
+            @click="editMode = !editMode"
           >
-            No workspaces yet — add a folder path below.
-          </p>
-          <!-- Search/filter came back empty: distinct from "no workspaces". -->
-          <p
-            v-else-if="!workspacesLoading && visibleWorkspaces.length === 0"
-            class="px-2 pb-2 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden"
+            <SlidersHorizontalIcon />
+          </Button>
+          <!-- Add folder: the native picker, the whole add flow (S3). -->
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            class="text-muted-foreground"
+            aria-label="Add workspace folder"
+            :disabled="adding"
+            @click="handleBrowseFolder"
           >
-            No spaces match this filter.
-          </p>
+            <FolderPlusIcon />
+          </Button>
+        </div>
+      </div>
 
-          <SidebarMenu>
-            <SidebarMenuItem v-for="workspace in visibleWorkspaces" :key="workspace.id">
-              <SidebarMenuButton
-                :is-active="workspace.id === activeWorkspaceId"
-                :tooltip="workspace.name"
-                class="h-auto items-start py-1.5 pr-16 group-data-[collapsible=icon]:pr-2"
-                @click="handleSelectWorkspace(workspace)"
-              >
-                <FolderIcon class="mt-0.5" />
-                <span class="flex min-w-0 flex-col">
-                  <span class="truncate text-sm leading-5">{{ workspace.name }}</span>
-                  <span class="truncate text-xs leading-4 text-muted-foreground">
-                    {{ workspace.path }}
-                  </span>
-                </span>
-              </SidebarMenuButton>
+      <div v-if="searchOpen" class="px-2 pb-1 group-data-[collapsible=icon]:hidden">
+        <div class="relative">
+          <SearchIcon
+            aria-hidden="true"
+            class="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground"
+          />
+          <Input
+            v-model="search"
+            aria-label="Search workspaces"
+            placeholder="Search workspaces…"
+            class="h-8 pl-7 text-xs"
+          />
+        </div>
+      </div>
 
-              <!-- Row actions sit over the row, never inside the select button. -->
-              <div
-                class="absolute top-1 right-1 flex items-center gap-0.5 group-data-[collapsible=icon]:hidden"
-              >
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  :aria-label="workspace.pinned ? `Unpin ${workspace.name}` : `Pin ${workspace.name}`"
-                  :aria-pressed="workspace.pinned"
-                  :disabled="pinPendingId === workspace.id"
-                  :class="[
-                    'text-muted-foreground',
-                    workspace.pinned
-                      ? 'text-primary'
-                      : 'opacity-0 group-focus-within/menu-item:opacity-100 group-hover/menu-item:opacity-100 focus-visible:opacity-100',
-                  ]"
-                  @click.stop="handleTogglePin(workspace)"
-                >
-                  <PinIcon :class="workspace.pinned ? 'fill-current' : ''" />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  class="text-muted-foreground opacity-0 group-focus-within/menu-item:opacity-100 group-hover/menu-item:opacity-100 focus-visible:opacity-100"
-                  :aria-label="`Remove ${workspace.name}`"
-                  @click.stop="handleRemoveWorkspace(workspace)"
-                >
-                  <Trash2Icon />
-                </Button>
-              </div>
-            </SidebarMenuItem>
-          </SidebarMenu>
-        </SidebarGroupContent>
-      </SidebarGroup>
-
-      <!-- Add folder area. Hidden while the drawer is collapsed to icons: a path
-           typed into a 3rem-wide drawer is not a flow worth supporting. -->
-      <div class="flex flex-col gap-2 px-2 pb-2 group-data-[collapsible=icon]:hidden">
+      <!-- S5: the divider, then the collapsible list. -->
+      <div class="px-2 pb-1 group-data-[collapsible=icon]:hidden">
         <Separator />
-        <!-- Primary flow (S4): the native folder picker. -->
-        <Button
-          variant="outline"
-          size="sm"
-          class="w-full justify-start"
-          aria-label="Browse for folder"
-          :disabled="adding"
-          @click="handleBrowseFolder"
+      </div>
+
+      <div class="flex min-h-0 flex-col gap-1 px-1 pb-1">
+        <p
+          v-if="workspaces.length === 0 && !workspacesLoading"
+          class="px-2 py-1 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden"
         >
-          <FolderOpenIcon data-icon="inline-start" />
-          Browse for folder
-        </Button>
-        <!-- Secondary flow: the path typed by hand, for folders the picker cannot
-             reach (remote paths, hidden directories). -->
-        <p class="text-xs text-muted-foreground">Or type a path manually:</p>
-        <Input
-          v-model="newPath"
-          aria-label="Workspace path"
-          placeholder="/Users/me/projects/app"
-          @keyup.enter="handleAddWorkspace"
-        />
-        <Input
-          v-model="newName"
-          aria-label="Workspace name (optional)"
-          placeholder="Name (optional)"
-          @keyup.enter="handleAddWorkspace"
-        />
-        <Button size="sm" :disabled="adding" @click="handleAddWorkspace">
-          <PlusIcon data-icon="inline-start" />
-          {{ adding ? "Adding…" : "Add workspace" }}
-        </Button>
-        <p class="text-xs text-muted-foreground">
-          The path must be a folder that already exists on this machine.
+          No workspaces yet — add a folder with the folder button.
+        </p>
+        <!-- Search came back empty: distinct from "no workspaces". -->
+        <p
+          v-else-if="!workspacesLoading && visibleWorkspaces.length === 0"
+          class="px-2 py-1 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden"
+        >
+          No workspaces match this search.
         </p>
 
-        <Alert v-if="workspaceError" variant="destructive">
-          <AlertDescription>{{ workspaceError }}</AlertDescription>
-        </Alert>
+        <SidebarMenu>
+          <SidebarMenuItem v-for="workspace in visibleWorkspaces" :key="workspace.id">
+            <WorkspaceRow
+              :workspace="workspace"
+              :active="workspace.id === activeWorkspaceId"
+              :expanded="isExpanded(workspace.id)"
+              :edit-mode="editMode"
+              :pin-pending="pinPendingId === workspace.id"
+              @activate="handleActivateWorkspace(workspace)"
+              @toggle-pin="handleTogglePin(workspace)"
+              @edit="openEditDialog(workspace)"
+              @remove="handleRemoveWorkspace(workspace)"
+            />
+            <!-- S5: its sessions, lazily fetched and cached per workspace. -->
+            <SessionsList
+              v-if="isExpanded(workspace.id)"
+              :sessions="sessionsFor(workspace.id)"
+              :loading="sessionsLoadingFor(workspace.id)"
+              :error="sessionsErrors[workspace.id] ?? null"
+              :active-session-id="activeSession?.sessionId ?? null"
+              @select="handleOpenSession(workspace, $event)"
+            />
+          </SidebarMenuItem>
+        </SidebarMenu>
       </div>
+
+      <Alert v-if="workspaceError" variant="destructive" class="mx-2 mb-2">
+        <AlertDescription>{{ workspaceError }}</AlertDescription>
+      </Alert>
     </SidebarContent>
 
     <SidebarFooter>
@@ -646,6 +723,41 @@ onMounted(() => {
               <CheckIcon data-icon="inline-start" />
               {{ savingSettings ? "Saving…" : "Save" }}
             </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <!-- S6: read-only placeholder behind the row menu's "Edit workspace".
+           Alias editing and the delete confirmation are the next unit. -->
+      <Dialog v-model:open="editOpen">
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Edit workspace</DialogTitle>
+            <DialogDescription>
+              Renaming and deleting a workspace land in the next unit. This is
+              what the store holds today.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div class="grid gap-3">
+            <div class="grid gap-1">
+              <span class="text-sm font-medium">Name</span>
+              <p class="text-sm break-words text-muted-foreground">
+                {{ editingWorkspace?.name }}
+              </p>
+            </div>
+            <div class="grid gap-1">
+              <span class="text-sm font-medium">Path</span>
+              <p class="text-sm break-all text-muted-foreground">
+                {{ editingWorkspace?.path }}
+              </p>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <DialogClose as-child>
+              <Button variant="outline">Close</Button>
+            </DialogClose>
           </DialogFooter>
         </DialogContent>
       </Dialog>
