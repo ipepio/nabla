@@ -8,6 +8,7 @@ import { ref } from "vue";
 import { PanelRightCloseIcon } from "@lucide/vue";
 import AppSidebar from "./components/AppSidebar.vue";
 import ChatPanel from "./components/ChatPanel.vue";
+import ResizableAside from "./components/ResizableAside.vue";
 import { Button } from "./components/ui/button";
 import { SidebarInset, SidebarProvider } from "./components/ui/sidebar";
 import type { WorkspaceInfo } from "./contracts/types";
@@ -28,7 +29,7 @@ const toolsOpen = ref(false);
     <SidebarInset class="h-svh min-h-0 flex-1 overflow-hidden">
       <!--
         Central area is a row: the chat takes the remaining width, the right
-        viewport keeps a fixed 280px rail.
+        viewport is a resizable rail (default 280px, 240–560px).
       -->
       <div class="flex min-h-0 flex-1 flex-row">
         <div class="flex min-h-0 min-w-0 flex-1 flex-col">
@@ -40,21 +41,25 @@ const toolsOpen = ref(false);
         </div>
 
         <!--
-          RIGHT VIEWPORT SEAM (S6) — a placeholder, deliberately inert.
+          RIGHT VIEWPORT (S6, resizable since S3) — still a placeholder, but no
+          longer inert: `ResizableAside` owns the drag handle, the pointer and
+          keyboard resizing, and the panel width itself (S4: one owner). This
+          component keeps only `toolsOpen`, and the panel therefore resets to
+          its default width when reopened.
 
           The user asked for an empty right viewport to be left for future tools;
-          nothing in it is interactive yet. It is a plain flex sibling, so a real
-          tool panel replaces its content without moving the chat: the chat owns
-          its own scroll and only loses the width this rail takes.
+          nothing inside it is interactive yet. It stays a plain flex sibling, so
+          a real tool panel replaces its content without moving the chat: the
+          chat owns its own scroll and only loses the width this rail takes.
 
           When it grows controls, promote it to
           `<Sidebar side="right" collapsible="offcanvas">` inside the provider
           below — that needs no restructuring either.
         -->
-        <aside
+        <ResizableAside
           v-if="toolsOpen"
           aria-label="Tools"
-          class="hidden w-[280px] shrink-0 flex-col border-l bg-sidebar md:flex"
+          class="hidden md:flex"
         >
           <div class="flex items-center gap-2 border-b px-3 py-2">
             <h2 class="text-sm font-semibold">Tools</h2>
@@ -73,7 +78,7 @@ const toolsOpen = ref(false);
               No tools yet. This viewport is reserved.
             </p>
           </div>
-        </aside>
+        </ResizableAside>
       </div>
     </SidebarInset>
   </SidebarProvider>
