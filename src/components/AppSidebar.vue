@@ -5,12 +5,13 @@
 // workspace list with each workspace's sessions (S4-S6) and the settings dialog
 // in the footer.
 //
-// It owns the workspace/settings data flow and the session *index* it shows; the
+// It owns the workspace data flow and the session *index* it shows; the
 // selection is lifted to App.vue through `select`, which feeds ChatPanel, and the
 // active session lives in the shared `src/lib/session-store.ts` (task N1).
+// Preferences live in `components/settings/SettingsDialog.vue`, which the footer's
+// gear button opens; the drawer only keeps the open flag.
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import {
-  CheckIcon,
   CirclePlusIcon,
   FolderPlusIcon,
   PanelLeftIcon,
@@ -32,13 +33,6 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
   Sidebar,
   SidebarContent,
   SidebarFooter,
@@ -48,6 +42,7 @@ import {
   SidebarTrigger,
   useSidebar,
 } from "@/components/ui/sidebar";
+import SettingsDialog from "@/components/settings/SettingsDialog.vue";
 import SessionsList from "@/components/sidebar/SessionsList.vue";
 import WorkspaceRow from "@/components/sidebar/WorkspaceRow.vue";
 import { useAppearance } from "@/lib/appearance";
@@ -67,27 +62,17 @@ import {
   addWorkspace,
   commandErrorMessage,
   deleteSession,
-  getSettings,
-  listModels,
   listSessions,
   listWorkspaces,
   removeWorkspace,
-  saveSettings,
   setWorkspacePinned,
   stopSession,
   touchWorkspace,
 } from "../contracts/commands";
-import type {
-  AppSettings,
-  ModelInfo,
-  SessionSummary,
-  WorkspaceInfo,
-} from "../contracts/types";
+import type { SessionSummary, WorkspaceInfo } from "../contracts/types";
 
 const props = defineProps<{ activeWorkspaceId: number | null }>();
 const emit = defineEmits<{ select: [workspace: WorkspaceInfo | null] }>();
-
-const THEMES = ["dark", "light", "system"] as const;
 
 const workspaces = ref<WorkspaceInfo[]>([]);
 const workspacesLoading = ref(false);
@@ -132,7 +117,7 @@ const sessionActionErrors = ref<Record<number, string>>({});
 // and its black-on-light sibling otherwise, so a theme switch switches the logo
 // too. `logoFailed` keeps the ∇ fallback while an asset is missing (S7).
 const logoFailed = ref(false);
-const { isDark, setMode } = useAppearance();
+const { isDark } = useAppearance();
 // Referenced as a runtime URL (not a static asset import) because Vite fails the
 // build for a missing asset, and the file is expected to be missing at first.
 const logoSource = computed(() => themedBrand("mark", isDark.value));
@@ -144,23 +129,12 @@ const wordmarkSource = computed(() => themedBrand("wordmark", isDark.value));
 // toggle: there the app mark *is* the expand control.
 const { toggleSidebar } = useSidebar();
 
+// S1 of `settings-dialog.md`: the drawer's gear button opens the two-pane
+// settings dialog, which owns the preference reads and writes.
 const settingsOpen = ref(false);
 // S6 (next unit): the ⋯ menu's edit item opens this read-only placeholder.
 const editOpen = ref(false);
 const editingWorkspace = ref<WorkspaceInfo | null>(null);
-// Mirrors `Settings::default()` in `src-tauri/src/settings.rs` for the moment
-// before `get_settings` resolves; it is one fallback model id, never the model
-// list (that always comes from `list_models`, S7).
-const settings = ref<AppSettings>({
-  theme: "dark",
-  piBinary: "pi",
-  provider: "nan",
-  model: "deepseek-v4-flash",
-});
-// S7: the model options come from `list_models`, never from a list kept here.
-const models = ref<ModelInfo[]>([]);
-const savingSettings = ref(false);
-const settingsError = ref<string | null>(null);
 
 /**
  * `add_workspace` rejects with a plain Display string. The one rejection worth
@@ -470,58 +444,10 @@ function openEditDialog(workspace: WorkspaceInfo) {
   editOpen.value = true;
 }
 
-async function loadModels() {
-  try {
-    models.value = await listModels();
-  } catch (cause) {
-    models.value = [];
-    settingsError.value = commandErrorMessage(cause);
-  }
-}
-
-async function loadSettings() {
-  try {
-    settings.value = await getSettings();
-    // S2: the stored mode is applied through the shared appearance module, the
-    // only path that applies the palette or toggles the `dark` class (S4).
-    setMode(settings.value.theme);
-    settingsError.value = null;
-  } catch (cause) {
-    settingsError.value = commandErrorMessage(cause);
-  }
-}
-
-async function handleSaveSettings() {
-  savingSettings.value = true;
-  settingsError.value = null;
-  try {
-    settings.value = await saveSettings({ ...settings.value });
-    // S2: the dialog saves the mode; applying it here makes the change visible
-    // as soon as the write lands, without waiting for a reload. Logos follow
-    // because they read the same shared state.
-    setMode(settings.value.theme);
-    settingsOpen.value = false;
-  } catch (cause) {
-    settingsError.value = commandErrorMessage(cause);
-  } finally {
-    savingSettings.value = false;
-  }
-}
-
-// Preferences live in settings.json; read them (and the model options) every
-// time the dialog opens so a human edit outside the app is picked up.
-watch(settingsOpen, (open) => {
-  if (open) {
-    void loadSettings();
-    void loadModels();
-  }
-});
-
 onMounted(() => {
   void refreshWorkspaces();
-  // Apply the persisted theme once at startup; the dialog re-reads the file on
-  // every open so a human edit outside the app is picked up.
-  void loadSettings();
+  // The persisted theme is applied by the chat panel at startup (its settings
+  // load calls `setMode`); this drawer only opens the settings dialog.
   // L4: which sessions have a live process. Events keep this current (the store
   // updates it on every lifecycle frame); the interval only covers the case the
   // drawer needs after a process started or died while it was not listening.
@@ -743,79 +669,18 @@ onUnmounted(() => {
     </SidebarContent>
 
     <SidebarFooter>
-      <Dialog v-model:open="settingsOpen">
-        <Button
-          variant="ghost"
-          class="w-full justify-start gap-2"
-          aria-label="Settings"
-          @click="settingsOpen = true"
-        >
-          <SettingsIcon />
-          <span class="group-data-[collapsible=icon]:hidden">Settings</span>
-        </Button>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Settings</DialogTitle>
-            <DialogDescription>
-              Preferences are stored in settings.json.
-            </DialogDescription>
-          </DialogHeader>
-
-          <div class="grid gap-4">
-            <div class="grid gap-2">
-              <label for="settings-theme" class="text-sm font-medium">Theme</label>
-              <Select v-model="settings.theme">
-                <SelectTrigger id="settings-theme" class="w-full">
-                  <SelectValue placeholder="Theme" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem v-for="theme in THEMES" :key="theme" :value="theme">
-                    {{ theme }}
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-
-            <div class="grid gap-2">
-              <label for="settings-pi-binary" class="text-sm font-medium">pi binary</label>
-              <Input id="settings-pi-binary" v-model="settings.piBinary" placeholder="pi" />
-            </div>
-
-            <!-- S7: the same model the chat header selects, settable from here
-                 too. It is part of this form, so Save persists it with the rest. -->
-            <div class="grid gap-2">
-              <label for="settings-model" class="text-sm font-medium">Model</label>
-              <Select v-model="settings.model">
-                <SelectTrigger id="settings-model" class="w-full">
-                  <SelectValue placeholder="Model" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem v-for="model in models" :key="model.id" :value="model.id">
-                    {{ model.name }}
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-              <p class="text-xs text-muted-foreground">
-                Provider: {{ settings.provider }} · used by the next session spawn.
-              </p>
-            </div>
-
-            <Alert v-if="settingsError" variant="destructive">
-              <AlertDescription>{{ settingsError }}</AlertDescription>
-            </Alert>
-          </div>
-
-          <DialogFooter>
-            <DialogClose as-child>
-              <Button variant="outline">Cancel</Button>
-            </DialogClose>
-            <Button :disabled="savingSettings" @click="handleSaveSettings">
-              <CheckIcon data-icon="inline-start" />
-              {{ savingSettings ? "Saving…" : "Save" }}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <!-- S1 of `settings-dialog.md`: the gear opens the two-pane settings
+           dialog; the dialog owns every preference read and write. -->
+      <Button
+        variant="ghost"
+        class="w-full justify-start gap-2"
+        aria-label="Settings"
+        @click="settingsOpen = true"
+      >
+        <SettingsIcon />
+        <span class="group-data-[collapsible=icon]:hidden">Settings</span>
+      </Button>
+      <SettingsDialog v-model:open="settingsOpen" />
 
       <!-- S6: read-only placeholder behind the row menu's "Edit workspace".
            Alias editing and the delete confirmation are the next unit. -->

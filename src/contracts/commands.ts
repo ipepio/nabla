@@ -78,6 +78,23 @@ export function saveSettings(settings: AppSettings): Promise<AppSettings> {
   return invoke<AppSettings>("save_settings", { settings });
 }
 
+/**
+ * S2 of `settings-dialog.md`: the absolute path of the preferences file the app
+ * reads and writes. Rust resolves it, so the dialog never guesses a directory.
+ */
+export function configFilePath(): Promise<string> {
+  return invoke<string>("config_file_path");
+}
+
+/**
+ * S2: opens the preferences file with the system's default editor. Rust creates
+ * it with the defaults first when it does not exist yet, so the action always
+ * opens a real file.
+ */
+export function openConfigFile(): Promise<void> {
+  return invoke<void>("open_config_file");
+}
+
 // ── pi runtime seam (R3, R4) ─────────────────────────────────────────────────
 
 export function startSession(workspaceId: number): Promise<SessionDto> {

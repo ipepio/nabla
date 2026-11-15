@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use tauri::State;
+use tauri_plugin_opener::OpenerExt;
 
 use crate::process::{ProcessManager, StartupOutcome};
 use crate::rpc::{AgentEvent, RuntimeStatus};
@@ -204,6 +205,54 @@ pub fn save_settings(
     // Return what the file actually holds, not what was sent: the caller sees
     // the persisted shape (round-tripped through defaults/normalization).
     crate::settings::load(&path).map_err(display_err)
+}
+
+// ── configuration file seam (S2 of `settings-dialog.md`) ────────────────────
+
+/// S2: the absolute path of the preferences file the settings dialog shows.
+/// `settings_file` stays the single resolver, so the path the UI displays is the
+/// same file `get_settings`/`save_settings` read and write.
+fn config_file_path_for(config_dir: &Path) -> Result<String, String> {
+    let path = settings_file(config_dir);
+    // Tauri resolves the config dir absolutely; a relative one would display a
+    // path that does not name the file the app opens.
+    if !path.is_absolute() {
+        return Err(format!("settings path is not absolute: {}", path.display()));
+    }
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// S2: the preferences file the "Open configuration file" action targets.
+#[tauri::command]
+pub fn config_file_path(state: State<'_, AppState>) -> Result<String, String> {
+    config_file_path_for(&state.config_dir)
+}
+
+/// S2: makes sure the preferences file exists before it is opened. A fresh
+/// install has never written one, since defaults are served from memory until
+/// the first save, so they are persisted through the settings module (which also
+/// creates the config directory) instead of handing the system opener a missing
+/// path. An existing file is never rewritten.
+fn ensure_config_file(path: &Path) -> Result<(), String> {
+    if path.is_file() {
+        return Ok(());
+    }
+    settings::save(path, &Settings::default()).map_err(display_err)
+}
+
+/// S2: opens the preferences file in the system's default editor through the
+/// opener plugin the app already installs. The path is resolved here, so the
+/// webview never needs it to trigger the action.
+#[tauri::command]
+pub fn open_config_file(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let path = settings_path(&state);
+    ensure_config_file(&path)?;
+    app.opener()
+        .open_path(path.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|err| format!("cannot open {}: {err}", path.display()))
 }
 
 // ── pi runtime seam (R3) ─────────────────────────────────────────────────────
@@ -1126,6 +1175,48 @@ mod tests {
 
         let unknown = workspace_by_id(&store, 9999);
         assert_eq!(unknown, Err("unknown workspace: 9999".to_string()));
+    }
+
+    // S2 of `settings-dialog.md`: the dialog shows the preferences path, so it
+    // must be absolute and name the same file the settings commands use.
+    #[test]
+    fn config_file_path_is_absolute_and_names_the_settings_file() {
+        let fixture = TempSeedDir::new("config_path");
+        let config_dir = fixture.0.join("config");
+
+        let resolved = config_file_path_for(&config_dir).expect("absolute config dir");
+
+        assert!(Path::new(&resolved).is_absolute(), "got: {resolved}");
+        assert!(
+            resolved.ends_with("settings.json"),
+            "the path must name the settings file, got: {resolved}"
+        );
+        // One resolver: the path shown is the path the commands read and write.
+        assert_eq!(resolved, settings_file(&config_dir).to_string_lossy());
+        // A relative config dir would display a path the app cannot open.
+        assert!(config_file_path_for(Path::new("relative/config")).is_err());
+    }
+
+    // S2: opening the file must never hand the opener a missing path, and it
+    // must never rewrite preferences the human already has.
+    #[test]
+    fn ensure_config_file_writes_defaults_once_and_keeps_an_existing_file() {
+        let fixture = TempSeedDir::new("ensure_config");
+        let path = fixture.0.join("config").join("settings.json");
+        assert!(!path.exists(), "the fixture starts without a settings file");
+
+        ensure_config_file(&path).expect("create the settings file");
+        assert!(path.is_file(), "the file must exist for the opener");
+        assert_eq!(settings::load(&path).expect("load"), Settings::default());
+
+        // An existing file wins: the defaults are written once, never over it.
+        let custom = Settings {
+            theme: "light".to_string(),
+            ..Settings::default()
+        };
+        settings::save(&path, &custom).expect("save custom settings");
+        ensure_config_file(&path).expect("keep the existing file");
+        assert_eq!(settings::load(&path).expect("load"), custom);
     }
 
     // ── session lifecycle (S1, S3, S5) ──────────────────────────────────────

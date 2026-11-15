@@ -64,6 +64,10 @@ pub fn run() {
             commands::list_sessions,
             commands::get_settings,
             commands::save_settings,
+            // S2 of `settings-dialog.md`: the dialog shows the preferences path
+            // and opens that file with the system editor.
+            commands::config_file_path,
+            commands::open_config_file,
             commands::start_session,
             // S1/S3/S5: existing sessions are opened lazily, reused when live,
             // and read back from the pi-owned file.
