@@ -8,7 +8,7 @@
 // It owns the workspace/settings data flow and the session *index* it shows; the
 // selection is lifted to App.vue through `select`, which feeds ChatPanel, and the
 // active session lives in the shared `src/lib/session-store.ts` (task N1).
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   CheckIcon,
   CirclePlusIcon,
@@ -55,8 +55,10 @@ import { useAppearance } from "@/lib/appearance";
 import { themedBrand } from "@/lib/brand";
 import {
   activeSession,
+  liveIds,
   newSession,
-  openSession,
+  refreshLiveSessions,
+  selectSession,
   sessionGeneration,
 } from "@/lib/session-store";
 import {
@@ -100,6 +102,14 @@ const adding = ref(false);
 /** A `start_session` call is in flight, so the button cannot spawn two pis. */
 const creating = ref(false);
 const workspaceError = ref<string | null>(null);
+
+/**
+ * L4: how often the drawer re-asks which sessions have a live process. The
+ * stream already updates the list on every lifecycle event, so this is only a
+ * slow safety net for a runtime that never reported one.
+ */
+const LIVE_POLL_MS = 5000;
+let livePollHandle: number | null = null;
 
 /** S5: ids of the workspaces whose session list is open. */
 const expandedIds = ref<number[]>([]);
@@ -300,10 +310,12 @@ async function handleNewSession() {
 }
 
 /**
- * S5: clicking a session in the list makes it the active session and focuses its
- * workspace, so the chat is never showing one workspace while its session
- * belongs to another. The transcript itself lives in pi's file; no command reads
- * it yet.
+ * L4: selecting a session in the list makes it the active session and focuses
+ * its workspace, so the chat is never showing one workspace while its session
+ * belongs to another. The store does the rest — opening the process on demand
+ * when it is not live (S3), reusing it when it is (S5) and seeding the
+ * transcript from pi's file. Any session that was running before keeps running
+ * (S4): this path never stops anything.
  */
 async function handleOpenSession(
   workspace: WorkspaceInfo,
@@ -312,7 +324,7 @@ async function handleOpenSession(
   if (workspace.id !== props.activeWorkspaceId) {
     await handleSelectWorkspace(workspace);
   }
-  openSession(session);
+  await selectSession(session);
 }
 
 /** S3: pin/unpin one row; the refreshed server list is the source of truth. */
@@ -447,6 +459,19 @@ onMounted(() => {
   // Apply the persisted theme once at startup; the dialog re-reads the file on
   // every open so a human edit outside the app is picked up.
   void loadSettings();
+  // L4: which sessions have a live process. Events keep this current (the store
+  // updates it on every lifecycle frame); the interval only covers the case the
+  // drawer needs after a process started or died while it was not listening.
+  void refreshLiveSessions();
+  livePollHandle = window.setInterval(() => {
+    void refreshLiveSessions();
+  }, LIVE_POLL_MS);
+});
+
+onUnmounted(() => {
+  if (livePollHandle === null) return;
+  window.clearInterval(livePollHandle);
+  livePollHandle = null;
 });
 </script>
 
@@ -641,6 +666,7 @@ onMounted(() => {
               :loading="sessionsLoadingFor(workspace.id)"
               :error="sessionsErrors[workspace.id] ?? null"
               :active-session-id="activeSession?.sessionId ?? null"
+              :live-session-ids="liveIds"
               @select="handleOpenSession(workspace, $event)"
             />
           </SidebarMenuItem>

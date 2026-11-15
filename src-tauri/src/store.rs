@@ -264,6 +264,33 @@ impl Store {
         Ok(row)
     }
 
+    /// Looks one indexed session up by its row id, the runtime key of the pi
+    /// process (S1). `None` means the id is not (or no longer) indexed: the
+    /// command layer reports that instead of spawning anything for it.
+    pub fn session_by_id(&self, id: i64) -> StoreResult<Option<SessionRow>> {
+        use rusqlite::OptionalExtension;
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                "SELECT id, workspace_id, pi_session_path, title, model, started_at, updated_at
+                 FROM sessions WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok(SessionRow {
+                        id: row.get(0)?,
+                        workspace_id: row.get(1)?,
+                        pi_session_path: row.get(2)?,
+                        title: row.get(3)?,
+                        model: row.get(4)?,
+                        started_at: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     pub fn list_sessions(&self, workspace_id: i64) -> StoreResult<Vec<SessionRow>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
@@ -653,6 +680,29 @@ mod tests {
         assert!(store.list_workspaces().expect("list").is_empty());
         assert!(store.list_sessions(ws.id).expect("list").is_empty());
         assert!(!store.remove_workspace(ws.id).expect("remove again"));
+    }
+
+    // S1/S3: the runtime key is the session row id, so opening a session needs
+    // a lookup by that id alone — no workspace in scope, and no row means no
+    // process. The answer is metadata only, like every session read.
+    #[test]
+    fn session_by_id_returns_the_indexed_row_and_none_for_an_unknown_id() {
+        let db = TempDb::new("session_by_id");
+        let store = Store::open(&db.0).expect("open");
+        let ws = ws_new(&store, "/tmp/proj-a");
+        let row = store
+            .upsert_session(&session_new(ws.id, "/sessions/a.jsonl"))
+            .expect("insert");
+
+        let found = store
+            .session_by_id(row.id)
+            .expect("lookup")
+            .expect("the indexed row is found by its id");
+        assert_eq!(found, row, "the lookup answers the whole index row");
+        assert_eq!(found.pi_session_path, "/sessions/a.jsonl");
+
+        assert_eq!(store.session_by_id(row.id + 1).expect("lookup"), None);
+        assert_eq!(store.session_by_id(0).expect("lookup"), None);
     }
 
     #[test]

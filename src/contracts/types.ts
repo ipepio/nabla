@@ -65,6 +65,23 @@ export interface SessionDto {
 }
 
 /**
+ * One turn of a pi-owned transcript, as `session_transcript` reads it back from
+ * the JSONL file (S3 of `odd/tasks/session-lifecycle.md`). Mirrors
+ * `TranscriptMessage` in `src-tauri/src/commands.rs`.
+ *
+ * `at` is pi's own timestamp string, `null` when the line carries none: the
+ * store passes it through untouched and the view formats it for display.
+ */
+export interface TranscriptMessage {
+  role: TranscriptRole;
+  text: string;
+  at: string | null;
+}
+
+/** The roles a pi transcript line can have; anything else is ignored by Rust. */
+export type TranscriptRole = "user" | "assistant" | "tool";
+
+/**
  * What `session_status` returns. A session that is not running reports
  * `stopped` with no pid. Mirrors `SessionStatusDto` in
  * `src-tauri/src/commands.rs`.

@@ -695,6 +695,15 @@ impl ProcessManager {
         }
     }
 
+    /// Ids of the sessions that currently have a registered child, sorted so
+    /// the answer is stable across calls. Reads the registry only: this never
+    /// spawns or touches a process (S5, `live_session_ids`).
+    pub fn live_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = lock(&self.sessions).keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
     #[cfg(test)]
     fn contains(&self, key: &str) -> bool {
         lock(&self.sessions).contains_key(key)
@@ -1422,5 +1431,53 @@ sleep 30
 
         manager.stop_all();
         assert!(!manager.contains("s1") && !manager.contains("s2"));
+    }
+
+    // S5: the live-id list is read from the registry, so it reflects a spawned
+    // session without spawning anything and drops the id once the child is
+    // stopped. The ids must never be empty for a live child (the list paints
+    // the per-session state in the UI).
+    #[cfg(unix)]
+    #[test]
+    fn live_ids_lists_a_spawned_session_and_drops_it_after_stop() {
+        let scratch = Scratch::new("live_ids");
+        let attempts = scratch.path("attempts");
+        let marker = scratch.path("marker");
+        let script = write_script(&scratch, "fake-pi.sh", &attempts, &marker, FAKE_PI);
+        let collected = Arc::new(Collected::default());
+        let manager = ProcessManager::with_timeouts(collected.sink(), test_timeouts());
+        assert_eq!(manager.live_ids(), Vec::<String>::new(), "nothing spawned yet");
+
+        manager
+            .spawn(
+                "s1",
+                script.to_str().unwrap(),
+                &scratch.path("s1.jsonl"),
+                TEST_PROVIDER,
+                TEST_MODEL,
+                &scratch.dir,
+            )
+            .expect("first spawn");
+        manager
+            .spawn(
+                "s2",
+                script.to_str().unwrap(),
+                &scratch.path("s2.jsonl"),
+                TEST_PROVIDER,
+                TEST_MODEL,
+                &scratch.dir,
+            )
+            .expect("second spawn");
+        assert_eq!(
+            manager.live_ids(),
+            vec!["s1".to_string(), "s2".to_string()],
+            "live ids come from the registry and are stable"
+        );
+        assert_eq!(attempts_count(&attempts), 2, "reading live ids never spawns");
+
+        manager.stop_and_wait("s1").expect("stop s1");
+        assert_eq!(manager.live_ids(), vec!["s2".to_string()]);
+        manager.stop_all();
+        assert!(manager.live_ids().is_empty(), "a stopped session is not live");
     }
 }

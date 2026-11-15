@@ -65,6 +65,11 @@ pub fn run() {
             commands::get_settings,
             commands::save_settings,
             commands::start_session,
+            // S1/S3/S5: existing sessions are opened lazily, reused when live,
+            // and read back from the pi-owned file.
+            commands::open_session,
+            commands::session_transcript,
+            commands::live_session_ids,
             commands::send_prompt,
             commands::stop_session,
             commands::session_status

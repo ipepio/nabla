@@ -1,20 +1,23 @@
 <script setup lang="ts">
 // Tracer-bullet chat (spec S6, task R4): one pi session per selected workspace,
 // streaming assistant text and tool activity into a minimal transcript.
-// Everything pi sends arrives through the contracts seam (`subscribeAgentEvents`
-// → `agent-event` envelope), never from a view-level Tauri import.
+// Everything pi sends arrives through the contracts seam, never from a
+// view-level Tauri import.
 //
-// S1/S2: this rewrite changes presentation only. The subscription, the delta
-// folding, the tool-state machine, the status mapping and the send/stop paths
-// are the same code the earlier panel had; the shell around them is new:
-// an empty state before the first turn and a header + Chat/Linaje tabs after.
+// Tasks L3/L4 of `session-lifecycle.md`: this panel no longer owns the stream.
+// `src/lib/session-store.ts` keeps one buffer per session and one subscription
+// that routes by session id, so the panel is a *renderer* of the active
+// session's buffer. Switching sessions (S4) is therefore a pure view change:
+// nothing here starts, stops or resets a process, and the previous session keeps
+// running and keeps accumulating events off screen.
 import type { Component } from "vue";
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, onMounted, ref } from "vue";
 import {
   CheckIcon,
   CircleAlertIcon,
   LoaderIcon,
   PanelRightOpenIcon,
+  WrenchIcon,
   XIcon,
 } from "@lucide/vue";
 import ChatEmptyState from "@/components/chat/ChatEmptyState.vue";
@@ -27,7 +30,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import type { AgentEvent, RuntimeStatus } from "@/contracts/agent-events";
 import {
   commandErrorMessage,
   getSettings,
@@ -36,14 +38,25 @@ import {
   sendPrompt,
   sessionStatus,
   stopSession,
-  subscribeAgentEvents,
 } from "@/contracts/commands";
-import type { AppSettings, ModelInfo, SessionDto, WorkspaceInfo } from "@/contracts/types";
+import type {
+  AppSettings,
+  ModelInfo,
+  SessionDto,
+  TranscriptRole,
+  WorkspaceInfo,
+} from "@/contracts/types";
 import { useAppearance } from "@/lib/appearance";
 import {
   activeSession,
+  appendUserTurn,
+  ensureSessionEvents,
+  isTranscriptLoading,
   newSession,
-  sessionGeneration,
+  recordSessionStatus,
+  sessionBuffer,
+  type SessionBuffer,
+  type ToolEntry,
 } from "@/lib/session-store";
 import { isDarkMode, type ThemeMode } from "@/lib/theme";
 
@@ -56,77 +69,51 @@ const props = defineProps<{
 
 const emit = defineEmits<{ (e: "toggleTools"): void }>();
 
-/** One rendered turn. Assistant text grows as deltas arrive. */
-interface ChatMessage {
-  role: "user" | "assistant";
-  text: string;
-  /** `HH:MM` the turn was added, shown under user bubbles (S2). */
-  at: string;
-}
-
-/** One tool call shown as a compact timeline chip, keyed by its wire id. */
-interface ToolEntry {
-  toolCallId: string;
-  toolName: string;
-  state: "running" | "done" | "error";
-}
-
 interface StatusAlert {
   type: "info" | "success" | "warning" | "error";
   text: string;
 }
 
 const prompt = ref("");
-const messages = ref<ChatMessage[]>([]);
-const tools = ref<ToolEntry[]>([]);
-const status = ref<RuntimeStatus | null>(null);
-const statusError = ref<string | null>(null);
-const exitCode = ref<number | null>(null);
 
 const starting = ref(false);
 const sending = ref(false);
 const stopping = ref(false);
-const error = ref<string | null>(null);
+/** Last command failure of this panel; the session's own diagnosis lives in
+ * its buffer, so switching sessions cannot carry one over the other. */
+const panelError = ref<string | null>(null);
 
 /**
- * N1 of `sidebar-rework.md`: the active session now lives in the shared store
- * (`src/lib/session-store.ts`) because the drawer creates and opens sessions
- * too. This panel still owns everything about *rendering* it.
+ * N1 of `sidebar-rework.md`: the active session lives in the shared store
+ * (`src/lib/session-store.ts`) because the drawer creates and selects sessions
+ * too. L3 adds the other half: the store also owns what the session has said, so
+ * this panel renders a buffer it does not own.
  */
 const currentSession = computed<SessionDto | null>(() => {
   const active = activeSession.value;
   if (active === null || props.workspace === null) return null;
   // A session belongs to one workspace: switching workspaces must never route a
   // prompt to the previous workspace's process, so the old session stops being
-  // "current" here and the next send starts a fresh one.
+  // "current" here and the next send starts a fresh one. Its process is not
+  // touched — it keeps running off screen (S4).
   return active.workspaceId === props.workspace.id ? active : null;
 });
 
 /**
- * Creating, opening or clearing the active session replaces what the transcript
- * shows, so the per-session view state resets while the store keeps the
- * identity. `flush: "sync"` keeps the reset ahead of the turn the composer is
- * about to echo into `messages`.
- *
- * A past session's content lives in pi's JSONL file and no command reads it
- * yet, so opening an older session starts the view empty (documented
- * follow-up).
+ * The buffer of the session on screen. Everything below — transcript, streaming
+ * tail, tools, status — is read from here, which is why selecting another
+ * session is instant and why a session that was off screen still shows its
+ * history when it comes back (S4).
  */
-function resetTranscript() {
-  messages.value = [];
-  tools.value = [];
-  status.value = null;
-  statusError.value = null;
-  exitCode.value = null;
-  error.value = null;
-  prompt.value = "";
-}
-
-watch(sessionGeneration, resetTranscript, { flush: "sync" });
-
-// Unsubscribe handle for the `agent-event` listener, kept so unmounting does
-// not leave a handler reading into a disposed component.
-let unsubscribe: (() => void) | null = null;
+const buffer = computed<SessionBuffer | null>(() =>
+  sessionBuffer(currentSession.value?.sessionId ?? null),
+);
+const transcript = computed(() => buffer.value?.transcript ?? []);
+const tools = computed<ToolEntry[]>(() => buffer.value?.tools ?? []);
+const streamingText = computed(() => buffer.value?.streamingText ?? "");
+const transcriptLoading = computed(() =>
+  isTranscriptLoading(currentSession.value?.sessionId ?? null),
+);
 
 // S5/S7: the model selector's data. `models` is whatever Rust reports (never a
 // hardcoded list here) and `settings` holds the persisted choice.
@@ -144,9 +131,19 @@ const { mode: theme, isDark, setMode } = useAppearance();
 const modelId = computed(() => settings.value?.model ?? "");
 
 /** S1: no turn has been rendered yet, so the empty state owns the panel. */
-const isEmptyState = computed(
-  () => messages.value.length === 0 && tools.value.length === 0 && error.value === null,
-);
+const isEmptyState = computed(() => {
+  // S3: a session whose history is being read shows the conversation shell, so
+  // the panel does not flash the brand empty state on the way in.
+  if (transcriptLoading.value) return false;
+  const current = buffer.value;
+  if (current === null) return true;
+  return (
+    current.transcript.length === 0 &&
+    current.streamingText === "" &&
+    current.tools.length === 0 &&
+    errorText.value === null
+  );
+});
 
 const canSend = computed(
   () => props.workspace !== null && prompt.value.trim() !== "" && !sending.value && !starting.value,
@@ -160,14 +157,37 @@ const workspaceName = computed(() => props.workspace?.name ?? "Nabla");
 
 /** Footer meta under the composer (S2): user turns and tool steps so far. */
 const turns = computed(
-  () => messages.value.filter((message) => message.role === "user").length,
+  () => transcript.value.filter((message) => message.role === "user").length,
 );
 const steps = computed(() => tools.value.length);
 
+/**
+ * The dismissible failure card. Command failures come from this panel; a
+ * session-level error comes from its buffer, except while the process crashed —
+ * the status alert below already names the stderr tail there.
+ */
+const errorText = computed<string | null>(() => {
+  if (panelError.value !== null) return panelError.value;
+  const current = buffer.value;
+  if (current === null || current.status === "crashed") return null;
+  return current.error;
+});
+
+/** Dismisses whichever failure is on screen, panel-owned or session-owned. */
+function dismissError() {
+  if (panelError.value !== null) {
+    panelError.value = null;
+    return;
+  }
+  if (buffer.value !== null) buffer.value.error = null;
+}
+
 /** Human-readable lifecycle state, the same five states the runtime models. */
 const statusAlert = computed<StatusAlert | null>(() => {
-  const current = status.value;
+  const current = buffer.value?.status ?? null;
   if (current === null) return null;
+  const exit = buffer.value?.exitCode ?? null;
+  const runtimeError = buffer.value?.error ?? null;
   switch (current) {
     case "spawning":
       return { type: "info", text: "pi is starting…" };
@@ -179,16 +199,12 @@ const statusAlert = computed<StatusAlert | null>(() => {
       return {
         type: "info",
         text:
-          exitCode.value === null
-            ? "pi is stopped."
-            : `pi is stopped (exit code ${exitCode.value}).`,
+          exit === null ? "pi is stopped." : `pi is stopped (exit code ${exit}).`,
       };
     case "crashed":
       return {
         type: "error",
-        text: statusError.value
-          ? `pi crashed: ${statusError.value}`
-          : "pi crashed.",
+        text: runtimeError ? `pi crashed: ${runtimeError}` : "pi crashed.",
       };
   }
 });
@@ -205,84 +221,26 @@ function statusAlertClass(type: StatusAlert["type"]): string {
   }
 }
 
-/** Local clock as `HH:MM`; the bubble only shows the hour a turn was added. */
-function timeLabel(): string {
-  const now = new Date();
-  const hours = String(now.getHours()).padStart(2, "0");
-  const minutes = String(now.getMinutes()).padStart(2, "0");
+/**
+ * Local clock as `HH:MM`. Buffer timestamps are pi's own string (or the ISO
+ * stamp the store writes for a local turn); an unparseable one renders nothing
+ * rather than "Invalid Date".
+ */
+function timeLabel(at: string | null): string {
+  if (at === null || at === "") return "";
+  const then = new Date(at);
+  if (Number.isNaN(then.getTime())) return "";
+  const hours = String(then.getHours()).padStart(2, "0");
+  const minutes = String(then.getMinutes()).padStart(2, "0");
   return `${hours}:${minutes}`;
 }
 
-function appendAssistantDelta(delta: string) {
-  const last = messages.value[messages.value.length - 1];
-  if (last !== undefined && last.role === "assistant") {
-    last.text += delta;
-  } else {
-    messages.value.push({ role: "assistant", text: delta, at: timeLabel() });
-  }
-}
-
-function findTool(toolCallId: string): ToolEntry | undefined {
-  return tools.value.find((entry) => entry.toolCallId === toolCallId);
-}
-
-/** Applies one forwarded pi event to the transcript. */
-function handleEvent(event: AgentEvent) {
-  switch (event.type) {
-    case "message_update": {
-      const slice = event.assistantMessageEvent;
-      // Only grown text is rendered; thinking slices and empty markers carry
-      // nothing this view shows yet.
-      if (slice.type === "text_delta" && slice.delta !== undefined && slice.delta !== "") {
-        appendAssistantDelta(slice.delta);
-      }
-      return;
-    }
-    case "tool_execution_start":
-      tools.value.push({
-        toolCallId: event.toolCallId,
-        toolName: event.toolName,
-        state: "running",
-      });
-      return;
-    case "tool_execution_update": {
-      const entry = findTool(event.toolCallId);
-      if (entry === undefined) {
-        tools.value.push({
-          toolCallId: event.toolCallId,
-          toolName: event.toolName,
-          state: "running",
-        });
-      } else {
-        entry.state = "running";
-      }
-      return;
-    }
-    case "tool_execution_end": {
-      const entry = findTool(event.toolCallId);
-      if (entry === undefined) {
-        tools.value.push({
-          toolCallId: event.toolCallId,
-          toolName: event.toolName,
-          state: event.isError ? "error" : "done",
-        });
-      } else {
-        entry.state = event.isError ? "error" : "done";
-      }
-      return;
-    }
-    case "process_status":
-      status.value = event.status;
-      statusError.value = event.error ?? null;
-      return;
-    case "process_exit":
-      exitCode.value = event.code ?? null;
-      return;
-    default:
-      // agent_start/agent_end/turn_start/turn_end and unmodelled pi events add
-      // nothing to this view yet; the stream keeps flowing past them.
-      return;
-  }
+/**
+ * `MessageBubble` knows the two speaking roles; a `tool` line of a recovered
+ * transcript renders as the muted note below instead of a bubble.
+ */
+function bubbleRole(role: TranscriptRole): "user" | "assistant" {
+  return role === "user" ? "user" : "assistant";
 }
 
 function toolIcon(state: ToolEntry["state"]): Component {
@@ -330,18 +288,16 @@ async function ensureSession(): Promise<SessionDto | null> {
   if (existing !== null) return existing;
   const workspace = props.workspace;
   if (workspace === null) {
-    error.value = "Select a workspace before sending a prompt.";
+    panelError.value = "Select a workspace before sending a prompt.";
     return null;
   }
   starting.value = true;
   try {
-    const started = await newSession(workspace.id);
-    // The store bumped the generation, which reset the view; the start status is
-    // the one fact that reset cannot know.
-    status.value = started.status;
-    return started;
+    // The store creates the buffer, marks it live and makes it active; the panel
+    // then simply renders it.
+    return await newSession(workspace.id);
   } catch (cause) {
-    error.value = commandErrorMessage(cause);
+    panelError.value = commandErrorMessage(cause);
     return null;
   } finally {
     starting.value = false;
@@ -355,7 +311,7 @@ async function loadModelOptions() {
     // A missing model list must not break the chat: the session still starts
     // with whatever the settings file already names.
     models.value = [];
-    error.value = commandErrorMessage(cause);
+    panelError.value = commandErrorMessage(cause);
   }
 }
 
@@ -367,7 +323,7 @@ async function loadSettings() {
     setMode(settings.value.theme);
   } catch (cause) {
     settings.value = null;
-    error.value = commandErrorMessage(cause);
+    panelError.value = commandErrorMessage(cause);
   }
 }
 
@@ -388,13 +344,13 @@ async function handleToggleTheme() {
       : current === "dark"
         ? "light"
         : "dark";
-  error.value = null;
+  panelError.value = null;
   try {
     const stored = await getSettings();
     settings.value = await saveSettings({ ...stored, theme: next });
     setMode(next);
   } catch (cause) {
-    error.value = commandErrorMessage(cause);
+    panelError.value = commandErrorMessage(cause);
   }
 }
 
@@ -406,12 +362,12 @@ async function handleToggleTheme() {
 async function handleModelChange(value: string) {
   if (value === "") return;
   savingModel.value = true;
-  error.value = null;
+  panelError.value = null;
   try {
     const current = await getSettings();
     settings.value = await saveSettings({ ...current, model: value });
   } catch (cause) {
-    error.value = commandErrorMessage(cause);
+    panelError.value = commandErrorMessage(cause);
   } finally {
     savingModel.value = false;
   }
@@ -421,27 +377,33 @@ async function handleSend() {
   const text = prompt.value.trim();
   if (text === "" || sending.value || starting.value) return;
   sending.value = true;
-  error.value = null;
+  panelError.value = null;
   try {
     const current = await ensureSession();
     if (current === null) return;
     await sendPrompt(current.workspaceId, Number(current.sessionId), text);
     // Echo the turn so the transcript reads as a conversation: pi answers with
-    // deltas on `agent-event`, it does not echo the prompt back.
-    messages.value.push({ role: "user", text, at: timeLabel() });
+    // deltas on `agent-event`, it does not echo the prompt back. The turn lands
+    // in that session's buffer, not in whatever is on screen.
+    appendUserTurn(current.sessionId, text);
     prompt.value = "";
   } catch (cause) {
-    error.value = commandErrorMessage(cause);
+    panelError.value = commandErrorMessage(cause);
   } finally {
     sending.value = false;
   }
 }
 
+/**
+ * Stops the active session. This is the only path that stops a process —
+ * changing sessions never does (S4), and the button only touches the session on
+ * screen.
+ */
 async function handleStop() {
   const current = currentSession.value;
   if (current === null) return;
   stopping.value = true;
-  error.value = null;
+  panelError.value = null;
   try {
     await stopSession(current.workspaceId, Number(current.sessionId));
     // Confirm with the runtime instead of assuming the transition landed.
@@ -449,31 +411,23 @@ async function handleStop() {
       current.workspaceId,
       Number(current.sessionId),
     );
-    status.value = snapshot.status;
-    statusError.value = snapshot.error;
+    recordSessionStatus(current.sessionId, snapshot.status, snapshot.error);
   } catch (cause) {
-    error.value = commandErrorMessage(cause);
+    panelError.value = commandErrorMessage(cause);
   } finally {
     stopping.value = false;
   }
 }
 
-onMounted(async () => {
+onMounted(() => {
   // Presentation-only additions (S5): the header needs the active space's name
   // (already a prop) plus the model options and the persisted choice.
   void loadModelOptions();
   void loadSettings();
-  unsubscribe = await subscribeAgentEvents((envelope) => {
-    // One global channel carries every session; only the active session of the
-    // workspace on screen is this panel's business.
-    if (envelope.sessionId !== currentSession.value?.sessionId) return;
-    handleEvent(envelope.event);
-  });
-});
-
-onUnmounted(() => {
-  unsubscribe?.();
-  unsubscribe = null;
+  // L3/S4: the store owns the single `agent-event` subscription and buffers
+  // every session, so this panel only asks for it to be installed. It is never
+  // torn down with the panel: a background session must keep receiving events.
+  void ensureSessionEvents();
 });
 </script>
 
@@ -559,7 +513,7 @@ onUnmounted(() => {
 
               <!-- S2: failures render inside the transcript flow, not as a
                    floating toast. -->
-              <div v-if="error" class="relative rounded-md border border-border p-3">
+              <div v-if="errorText" class="relative rounded-md border border-border p-3">
                 <div class="flex items-center gap-1.5 pr-6">
                   <span
                     class="size-1.5 shrink-0 rounded-full bg-destructive"
@@ -567,7 +521,7 @@ onUnmounted(() => {
                   />
                   <span class="text-xs font-semibold">Error</span>
                 </div>
-                <p class="mt-1 text-sm text-muted-foreground">{{ error }}</p>
+                <p class="mt-1 text-sm text-muted-foreground">{{ errorText }}</p>
                 <div class="mt-2 flex items-center justify-end">
                   <span
                     class="text-[10px] font-medium tracking-wider text-muted-foreground uppercase"
@@ -580,18 +534,44 @@ onUnmounted(() => {
                   size="icon-xs"
                   class="absolute top-1.5 right-1.5"
                   aria-label="Dismiss"
-                  @click="error = null"
+                  @click="dismissError"
                 >
                   <XIcon />
                 </Button>
               </div>
 
+              <!-- S3: the session's own history is being read from pi's file. -->
+              <p
+                v-if="transcriptLoading && transcript.length === 0"
+                class="text-sm text-muted-foreground"
+              >
+                Loading conversation…
+              </p>
+
+              <!-- L3/S4: the active session's buffer, which kept filling while
+                   this session was off screen. -->
+              <template v-for="(message, index) in transcript" :key="index">
+                <div
+                  v-if="message.role === 'tool'"
+                  class="flex items-start gap-2 text-xs text-muted-foreground"
+                >
+                  <WrenchIcon class="mt-0.5 size-3 shrink-0" aria-hidden="true" />
+                  <span class="min-w-0 whitespace-pre-wrap">{{ message.text }}</span>
+                </div>
+                <MessageBubble
+                  v-else
+                  :role="bubbleRole(message.role)"
+                  :text="message.text"
+                  :at="timeLabel(message.at)"
+                />
+              </template>
+
+              <!-- The turn still streaming: it becomes a transcript entry when
+                   pi closes the message. -->
               <MessageBubble
-                v-for="(message, index) in messages"
-                :key="index"
-                :role="message.role"
-                :text="message.text"
-                :at="message.at"
+                v-if="streamingText !== ''"
+                role="assistant"
+                :text="streamingText"
               />
 
               <div v-if="tools.length > 0" class="flex flex-wrap gap-2">

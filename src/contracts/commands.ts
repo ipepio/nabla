@@ -10,6 +10,7 @@ import type {
   SessionDto,
   SessionStatusDto,
   SessionSummary,
+  TranscriptMessage,
   WorkspaceInfo,
 } from "./types";
 
@@ -103,6 +104,37 @@ export function sessionStatus(
   sessionId: number,
 ): Promise<SessionStatusDto> {
   return invoke<SessionStatusDto>("session_status", { workspaceId, sessionId });
+}
+
+/**
+ * S3/S5 of `session-lifecycle.md`: makes sure the session has a process.
+ *
+ * Idempotent by contract: if pi is already live for this id the runtime returns
+ * that session untouched, otherwise it spawns pi resuming the session's own
+ * JSONL file. Selecting a session calls this; it is never a way to restart one.
+ */
+export function openSession(sessionId: string): Promise<SessionDto> {
+  return invoke<SessionDto>("open_session", { sessionId });
+}
+
+/**
+ * S3: the conversation a session already had, read by Rust from pi's JSONL file
+ * (content never enters the app database). Oldest first, already capped by
+ * Rust, and defensive about lines it does not model.
+ */
+export function sessionTranscript(
+  sessionId: string,
+): Promise<TranscriptMessage[]> {
+  return invoke<TranscriptMessage[]>("session_transcript", { sessionId });
+}
+
+/**
+ * L4: ids that currently have a live pi process, so the drawer can mark them
+ * without claiming anything it cannot verify. An empty list means nothing is
+ * running (S2: startup spawns nothing).
+ */
+export function liveSessionIds(): Promise<string[]> {
+  return invoke<string[]>("live_session_ids");
 }
 
 /**
