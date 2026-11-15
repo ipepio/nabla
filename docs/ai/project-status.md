@@ -11,6 +11,7 @@ Product definition lives in the local `.docs/`; this file tracks the versioned c
 | Rust tests | Passing (12) | `cargo test` in `src-tauri`: 12 passed, 0 failed |
 | Rust lint | Passing | `cargo clippy` in `src-tauri`: no warnings |
 | Frontend gate | Passing | `npm run build`: `vue-tsc --noEmit` + `vite build` succeed |
+| Theming baseline | Modules in place, not yet wired | `src/lib/theme.ts` (env → CSS variables, self-applies on import) and `src/lib/brand.ts` (single brand module); tokens `--tertiary`, `--success`, `--warning` in `src/assets/index.css`. No `main.ts` import yet — a follow-up task wires it. Decision: ADR 0009 |
 | pi runtime (headless spawn) | Not implemented | `odd/tasks/pi-runtime.md`: R1–R5 all `pending` |
 | Frontend tests | Absent | No runner in `package.json`, no test script, no `vitest` |
 | GUI acceptance | Not automated | Opening the window is manual (`npm run tauri dev`) |
@@ -41,6 +42,10 @@ Do not treat an open finding as permission to fix it.
 
 ## Current task / continuation
 
+- Delivered: configurable theming baseline (T1 of `odd/tasks/chat-shell-and-theme-tokens.md`):
+  `.env`/`.env.example` token contract, `src/lib/theme.ts`, `src/lib/brand.ts`, extra CSS tokens and
+  [ADR 0009](../adr/0009-configurable-theme-tokens.md). The chat redesign (T2) and its independent
+  verification (T3) are still pending.
 - Delivered: agent documentation architecture A1–A2 (`AGENTS.md`, `CONTENTS.md`, `docs/ai/*`) per
   `odd/tasks/agents-architecture.md`.
 - Pending there: A3 (`docs/adr/` + `docs/templates/`) and A4 (consistency review). Neither folder

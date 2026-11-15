@@ -14,6 +14,11 @@ dist
 dist-ssr
 *.local
 
+# Local theme tokens (the hex palette). `.env.example` is the versioned reference
+# and stays tracked; see docs/adr/0009-configurable-theme-tokens.md.
+/.env
+/.env.local
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

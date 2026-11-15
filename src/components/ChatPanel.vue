@@ -4,30 +4,27 @@
 // Everything pi sends arrives through the contracts seam (`subscribeAgentEvents`
 // → `agent-event` envelope), never from a view-level Tauri import.
 //
-// S5/S1: this rewrite changes presentation only. The subscription, the delta
-// folding, the tool-state machine and the status mapping are the same code the
-// Vuetify panel had.
+// S1/S2: this rewrite changes presentation only. The subscription, the delta
+// folding, the tool-state machine, the status mapping and the send/stop paths
+// are the same code the earlier panel had; the shell around them is new:
+// an empty state before the first turn and a header + Chat/Linaje tabs after.
 import type { Component } from "vue";
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import {
   CheckIcon,
   CircleAlertIcon,
   LoaderIcon,
-  SquareIcon,
   XIcon,
 } from "@lucide/vue";
-import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
+import ChatEmptyState from "@/components/chat/ChatEmptyState.vue";
+import ChatHeader from "@/components/chat/ChatHeader.vue";
+import Composer from "@/components/chat/Composer.vue";
+import MessageBubble from "@/components/chat/MessageBubble.vue";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Textarea } from "@/components/ui/textarea";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { AgentEvent, RuntimeStatus } from "@/contracts/agent-events";
 import {
   commandErrorMessage,
@@ -49,6 +46,8 @@ const props = defineProps<{ workspace: WorkspaceInfo | null }>();
 interface ChatMessage {
   role: "user" | "assistant";
   text: string;
+  /** `HH:MM` the turn was added, shown under user bubbles (S2). */
+  at: string;
 }
 
 /** One tool call shown as a compact timeline chip, keyed by its wire id. */
@@ -89,13 +88,26 @@ const savingModel = ref(false);
 /** Selected model id, or `""` until settings load. */
 const modelId = computed(() => settings.value?.model ?? "");
 
-const canSend = computed(
-  () => session.value !== null && prompt.value.trim() !== "" && !sending.value,
+/** S1: no turn has been rendered yet, so the empty state owns the panel. */
+const isEmptyState = computed(
+  () => messages.value.length === 0 && tools.value.length === 0 && error.value === null,
 );
 
-const canStart = computed(
-  () => props.workspace !== null && session.value === null && !starting.value,
+const canSend = computed(
+  () => props.workspace !== null && prompt.value.trim() !== "" && !sending.value && !starting.value,
 );
+
+/** Provider reported by settings, used by the empty-state chip (S1). */
+const providerName = computed(() => settings.value?.provider ?? "pi");
+
+/** Header title: the active space's name (S2). */
+const workspaceName = computed(() => props.workspace?.name ?? "Nabla");
+
+/** Footer meta under the composer (S2): user turns and tool steps so far. */
+const turns = computed(
+  () => messages.value.filter((message) => message.role === "user").length,
+);
+const steps = computed(() => tools.value.length);
 
 /** Human-readable lifecycle state, the same five states the runtime models. */
 const statusAlert = computed<StatusAlert | null>(() => {
@@ -126,12 +138,32 @@ const statusAlert = computed<StatusAlert | null>(() => {
   }
 });
 
+/** Semantic tone for the status alert; success/warning are the new tokens (S4). */
+function statusAlertClass(type: StatusAlert["type"]): string {
+  switch (type) {
+    case "success":
+      return "text-success";
+    case "warning":
+      return "text-warning";
+    default:
+      return "";
+  }
+}
+
+/** Local clock as `HH:MM`; the bubble only shows the hour a turn was added. */
+function timeLabel(): string {
+  const now = new Date();
+  const hours = String(now.getHours()).padStart(2, "0");
+  const minutes = String(now.getMinutes()).padStart(2, "0");
+  return `${hours}:${minutes}`;
+}
+
 function appendAssistantDelta(delta: string) {
   const last = messages.value[messages.value.length - 1];
   if (last !== undefined && last.role === "assistant") {
     last.text += delta;
   } else {
-    messages.value.push({ role: "assistant", text: delta });
+    messages.value.push({ role: "assistant", text: delta, at: timeLabel() });
   }
 }
 
@@ -231,24 +263,31 @@ function toolStateLabel(state: ToolEntry["state"]): string {
   }
 }
 
-async function handleStart() {
+/**
+ * S1: the empty state has no "start session" control, so the first send starts
+ * the session itself. Returns the live session, or `null` when it could not be
+ * started (the error is already rendered then).
+ */
+async function ensureSession(): Promise<SessionDto | null> {
+  const current = session.value;
+  if (current !== null) return current;
   const workspace = props.workspace;
   if (workspace === null) {
-    error.value = "Select a workspace before starting a session.";
-    return;
+    error.value = "Select a workspace before sending a prompt.";
+    return null;
   }
   starting.value = true;
-  error.value = null;
   try {
     const started = await startSession(workspace.id);
     session.value = started;
-    messages.value = [];
     tools.value = [];
     status.value = started.status;
     statusError.value = null;
     exitCode.value = null;
+    return started;
   } catch (cause) {
     error.value = commandErrorMessage(cause);
+    return null;
   } finally {
     starting.value = false;
   }
@@ -279,8 +318,8 @@ async function loadSettings() {
  * the write cannot clobber a preference the drawer changed in the meantime
  * (`save_settings` replaces the file). The choice applies to the next spawn.
  */
-async function handleModelChange(value: unknown) {
-  if (typeof value !== "string" || value === "") return;
+async function handleModelChange(value: string) {
+  if (value === "") return;
   savingModel.value = true;
   error.value = null;
   try {
@@ -294,16 +333,17 @@ async function handleModelChange(value: unknown) {
 }
 
 async function handleSend() {
-  const current = session.value;
   const text = prompt.value.trim();
-  if (current === null || text === "" || sending.value) return;
+  if (text === "" || sending.value || starting.value) return;
   sending.value = true;
   error.value = null;
   try {
+    const current = await ensureSession();
+    if (current === null) return;
     await sendPrompt(current.workspaceId, Number(current.sessionId), text);
     // Echo the turn so the transcript reads as a conversation: pi answers with
     // deltas on `agent-event`, it does not echo the prompt back.
-    messages.value.push({ role: "user", text });
+    messages.value.push({ role: "user", text, at: timeLabel() });
     prompt.value = "";
   } catch (cause) {
     error.value = commandErrorMessage(cause);
@@ -355,136 +395,140 @@ onUnmounted(() => {
 
 <template>
   <div class="flex h-full min-h-0 flex-col">
-    <!-- Chat header. The collapse control lives only in the drawer (S8), so
-         this header carries the active space's name (S5), the model selector
-         (S5/S7) and the session controls. -->
-    <header class="flex items-center gap-3 border-b px-4 py-2">
-      <div class="min-w-0 flex-1">
-        <h1 class="truncate text-sm font-semibold">
-          {{ workspace?.name ?? "Nabla" }}
-        </h1>
-        <p class="truncate text-xs text-muted-foreground">
-          {{
-            workspace === null
-              ? "No workspace selected — add or pick one in the sidebar."
-              : workspace.path
-          }}
-        </p>
-      </div>
+    <!-- S1: no conversation yet — brand mark, chips and composer, no header. -->
+    <ChatEmptyState
+      v-if="isEmptyState"
+      :provider="providerName"
+      :hint="
+        workspace === null
+          ? 'No workspace selected — add or pick one in the sidebar.'
+          : null
+      "
+    >
+      <template #composer>
+        <Composer
+          v-model="prompt"
+          :model-id="modelId"
+          :models="models"
+          :workspace-name="workspace?.name ?? 'no workspace'"
+          :streaming="sending"
+          :disabled="workspace === null"
+          :can-send="canSend"
+          :model-disabled="savingModel || models.length === 0"
+          :can-stop="session !== null && !stopping"
+          @update:model-id="handleModelChange"
+          @send="handleSend"
+          @stop="handleStop"
+        />
+      </template>
+    </ChatEmptyState>
 
-      <!-- Model selector (S5/S7): options come from `list_models`, the value
-           from settings.json. Disabled until both are known. -->
-      <Select
-        :model-value="modelId"
-        :disabled="savingModel || models.length === 0"
-        @update:model-value="handleModelChange"
-      >
-        <SelectTrigger class="h-8 w-[180px] text-xs" aria-label="Model">
-          <SelectValue placeholder="Model" />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem v-for="model in models" :key="model.id" :value="model.id">
-            {{ model.name }}
-          </SelectItem>
-        </SelectContent>
-      </Select>
+    <!-- S2: conversation state — header, Chat/Linaje tabs, transcript, composer. -->
+    <template v-else>
+      <ChatHeader :title="workspaceName" mode="Standard mode" />
 
-      <Badge v-if="session !== null" variant="outline" class="hidden sm:inline-flex">
-        session {{ session.sessionId }} · pid {{ session.pid }}
-      </Badge>
-      <Button v-if="session === null" :disabled="!canStart" @click="handleStart">
-        {{ starting ? "Starting…" : "Start session" }}
-      </Button>
-      <Button
-        v-else
-        variant="outline"
-        :disabled="stopping"
-        aria-label="Stop session"
-        @click="handleStop"
-      >
-        <SquareIcon data-icon="inline-start" />
-        {{ stopping ? "Stopping…" : "Stop" }}
-      </Button>
-    </header>
+      <Tabs default-value="chat" class="min-h-0 flex-1 gap-0">
+        <div class="border-b border-border px-4">
+          <TabsList variant="line" class="h-9">
+            <TabsTrigger value="chat">Chat</TabsTrigger>
+            <TabsTrigger value="linaje">Linaje</TabsTrigger>
+          </TabsList>
+        </div>
 
-    <div v-if="error" class="px-4 pt-3">
-      <Alert variant="destructive">
-        <AlertDescription>{{ error }}</AlertDescription>
-        <AlertAction>
-          <Button variant="ghost" size="icon-xs" aria-label="Dismiss" @click="error = null">
-            <XIcon />
-          </Button>
-        </AlertAction>
-      </Alert>
-    </div>
+        <TabsContent value="chat" class="flex min-h-0 flex-1 flex-col">
+          <!-- Transcript: the only scrolling region of the panel. -->
+          <ScrollArea class="min-h-0 flex-1">
+            <div class="flex flex-col gap-4 p-4">
+              <Alert
+                v-if="statusAlert"
+                :variant="statusAlert.type === 'error' ? 'destructive' : 'default'"
+              >
+                <AlertDescription :class="statusAlertClass(statusAlert.type)">
+                  {{ statusAlert.text }}
+                </AlertDescription>
+              </Alert>
 
-    <div v-if="statusAlert" class="px-4 pt-3">
-      <Alert :variant="statusAlert.type === 'error' ? 'destructive' : 'default'">
-        <AlertDescription>{{ statusAlert.text }}</AlertDescription>
-      </Alert>
-    </div>
+              <!-- S2: failures render inside the transcript flow, not as a
+                   floating toast. -->
+              <div v-if="error" class="relative rounded-md border border-border p-3">
+                <div class="flex items-center gap-1.5 pr-6">
+                  <span
+                    class="size-1.5 shrink-0 rounded-full bg-destructive"
+                    aria-hidden="true"
+                  />
+                  <span class="text-xs font-semibold">Error</span>
+                </div>
+                <p class="mt-1 text-sm text-muted-foreground">{{ error }}</p>
+                <div class="mt-2 flex items-center justify-end">
+                  <span
+                    class="text-[10px] font-medium tracking-wider text-muted-foreground uppercase"
+                  >
+                    TURN_FAILED
+                  </span>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  class="absolute top-1.5 right-1.5"
+                  aria-label="Dismiss"
+                  @click="error = null"
+                >
+                  <XIcon />
+                </Button>
+              </div>
 
-    <!-- Transcript: the only scrolling region of the app (S1). -->
-    <ScrollArea class="min-h-0 flex-1">
-      <div class="flex flex-col gap-5 p-4">
-        <p v-if="session === null" class="text-sm text-muted-foreground">
-          Start a session to talk to pi.
-        </p>
-        <p v-else-if="messages.length === 0" class="text-sm text-muted-foreground">
-          No messages yet — send a prompt below.
-        </p>
+              <MessageBubble
+                v-for="(message, index) in messages"
+                :key="index"
+                :role="message.role"
+                :text="message.text"
+                :at="message.at"
+              />
 
-        <div
-          v-for="(message, index) in messages"
-          :key="index"
-          class="flex flex-col gap-1"
+              <div v-if="tools.length > 0" class="flex flex-wrap gap-2">
+                <Badge
+                  v-for="tool in tools"
+                  :key="tool.toolCallId"
+                  :variant="toolBadgeVariant(tool.state)"
+                >
+                  <component :is="toolIcon(tool.state)" />
+                  {{ tool.toolName }} · {{ toolStateLabel(tool.state) }}
+                </Badge>
+              </div>
+            </div>
+          </ScrollArea>
+
+          <!-- Composer, pinned under the transcript, plus the turns/steps meta. -->
+          <div class="border-t border-border px-4 py-3">
+            <Composer
+              v-model="prompt"
+              :model-id="modelId"
+              :models="models"
+              :workspace-name="workspace?.name ?? 'no workspace'"
+              :streaming="sending"
+              :disabled="workspace === null"
+              :can-send="canSend"
+              :model-disabled="savingModel || models.length === 0"
+              :can-stop="session !== null && !stopping"
+              @update:model-id="handleModelChange"
+              @send="handleSend"
+              @stop="handleStop"
+            />
+            <p class="mt-2 text-center text-xs text-muted-foreground">
+              {{ turns }} turns · {{ steps }} steps
+            </p>
+          </div>
+        </TabsContent>
+
+        <TabsContent
+          value="linaje"
+          class="flex min-h-0 flex-1 items-center justify-center"
         >
-          <span class="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-            {{ message.role === "user" ? "You" : "pi" }}
-          </span>
-          <p
-            class="text-sm whitespace-pre-wrap"
-            :class="message.role === 'user' ? 'text-foreground/80' : 'text-foreground'"
-          >
-            {{ message.text }}
+          <p class="text-center text-sm text-muted-foreground">
+            Activity trace will appear here.
           </p>
-        </div>
-
-        <div v-if="tools.length > 0" class="flex flex-wrap gap-2">
-          <Badge
-            v-for="tool in tools"
-            :key="tool.toolCallId"
-            :variant="toolBadgeVariant(tool.state)"
-          >
-            <component :is="toolIcon(tool.state)" />
-            {{ tool.toolName }} · {{ toolStateLabel(tool.state) }}
-          </Badge>
-        </div>
-      </div>
-    </ScrollArea>
-
-    <!-- Composer, pinned under the transcript. -->
-    <footer class="flex items-end gap-2 border-t p-3">
-      <Textarea
-        v-model="prompt"
-        aria-label="Prompt"
-        placeholder="Ask pi…"
-        class="max-h-40 min-h-16 flex-1 resize-none"
-        :disabled="session === null"
-        @keydown.enter.exact.prevent="handleSend"
-      />
-      <Button :disabled="!canSend" @click="handleSend">
-        {{ sending ? "Sending…" : "Send" }}
-      </Button>
-      <Button
-        variant="outline"
-        size="icon"
-        aria-label="Stop session"
-        :disabled="session === null || stopping"
-        @click="handleStop"
-      >
-        <SquareIcon />
-      </Button>
-    </footer>
+        </TabsContent>
+      </Tabs>
+    </template>
   </div>
 </template>

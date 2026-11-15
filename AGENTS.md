@@ -24,6 +24,8 @@ and kills with the app. This file is the entry point for any agent working here.
 | `src-tauri/src/commands.rs` | Command layer — the only seam between webview and Rust |
 | `src-tauri/src/store.rs` | SQLite store (`nabla.db`): workspaces + session index, metadata only |
 | `src-tauri/src/settings.rs` | `settings.json`: human-editable preferences, atomic write |
+| `src/lib/theme.ts` | Semantic color tokens: reads `VITE_COLOR_*`/`VITE_RADIUS` from `.env` and applies the CSS variables at boot |
+| `src/lib/brand.ts` | The single brand module: every logo and wordmark path the UI shows |
 | `odd/tasks/` | ODD feature documents (specs, task tables, logs) — orchestrator-owned |
 | `docs/` | Versioned agent documentation (this architecture) |
 | `.docs/` | Local product definition, Spanish, gitignored (D-004). Never commit it |
@@ -49,6 +51,8 @@ and kills with the app. This file is the entry point for any agent working here.
    (P-001). Do not build a later stage early because a reference project has it.
 8. **Scope respect.** `.docs/` is local-only and `odd/` is orchestrator-owned; do not edit either
    unless the task explicitly allows it.
+9. **No hardcoded colors or brand asset paths in components.** Colors come from `.env`
+   (`VITE_COLOR_*`), brand images from `src/lib/brand.ts`. See ADR 0009.
 
 ## Verify
 

@@ -36,6 +36,13 @@ one contracts module. Do not add layers that the current screens do not need.
   a documented seam, not yet built.
 - Icons come from lucide (one icon family only); accessibility belongs to the component: every
   icon-only button carries an `aria-label`.
+- Colors are semantic tokens, never literals: use the Tailwind utilities that map to them
+  (`bg-background`, `text-muted-foreground`, `bg-primary`, `text-success`, `bg-tertiary`, `border-border`…).
+  The values live in `.env` (`VITE_COLOR_*`) and reach the CSS variables through `src/lib/theme.ts`;
+  a hex or `rgb()` in a component is a defect (ADR 0009, [conventions](conventions.md#theming-and-branding)).
+- Brand images resolve through `brandAsset()` from `src/lib/brand.ts` (`mark`, `logo`, `wordmark` and
+  their `*Light` siblings). A component never writes an asset path such as `/logo.png`; changing the
+  image in `public/` re-brands the UI without touching code.
 - CSP stays enabled; `style-src 'unsafe-inline'` is currently required by the Tailwind dev
   pipeline, remote assets are not (see ADR 0007).
 

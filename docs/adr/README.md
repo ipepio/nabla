@@ -21,6 +21,7 @@ authoritative for behavior, an ADR is authoritative for direction.
 | [0006 — Pi runtime integration](0006-pi-runtime-integration.md) | Provisional | RPC-first: host-owned, supervised, one headless pi process per session, dies with the app |
 | [0007 — Webview security baseline](0007-webview-security-baseline.md) | Accepted | CSP enabled from day one; `style-src 'unsafe-inline'` only for Vuetify's dynamic styles |
 | [0008 — Application identifier](0008-application-identifier.md) | Accepted (value provisional) | `com.ipepio.nabla`, product name `Nabla`; determines the app-data directory |
+| [0009 — Configurable theme tokens and a single brand module](0009-configurable-theme-tokens.md) | Accepted | Colors from `.env` (`VITE_COLOR_*`) through `src/lib/theme.ts`; brand images only through `src/lib/brand.ts` |
 
 ## Conventions
 
