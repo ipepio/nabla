@@ -264,6 +264,18 @@ impl Store {
         Ok(row)
     }
 
+    /// Sets the human-readable alias of an indexed session (what the drawer
+    /// shows). Returns whether a row changed. Only metadata: the transcript
+    /// stays in pi's file.
+    pub fn set_session_title(&self, id: i64, title: &str) -> StoreResult<bool> {
+        let conn = self.conn()?;
+        let affected = conn.execute(
+            "UPDATE sessions SET title = ?1 WHERE id = ?2",
+            rusqlite::params![title, id],
+        )?;
+        Ok(affected > 0)
+    }
+
     /// Looks one indexed session up by its row id, the runtime key of the pi
     /// process (S1). `None` means the id is not (or no longer) indexed: the
     /// command layer reports that instead of spawning anything for it.
@@ -685,6 +697,26 @@ mod tests {
     // S1/S3: the runtime key is the session row id, so opening a session needs
     // a lookup by that id alone — no workspace in scope, and no row means no
     // process. The answer is metadata only, like every session read.
+    #[test]
+    fn set_session_title_persists_the_alias() {
+        let db = TempDb::new("session_title");
+        let store = Store::open(&db.0).expect("open");
+        let ws = ws_new(&store, "/tmp/proj-title");
+        let row = store
+            .upsert_session(&session_new(ws.id, "/sessions/titled.jsonl"))
+            .expect("insert");
+        assert!(store
+            .set_session_title(row.id, "Fix the drawer spacing")
+            .expect("set"));
+        let fetched = store
+            .session_by_id(row.id)
+            .expect("lookup")
+            .expect("indexed row");
+        assert_eq!(fetched.title.as_deref(), Some("Fix the drawer spacing"));
+        // Unknown id: no row changed, and the caller learns it.
+        assert!(!store.set_session_title(9_999, "ghost").expect("no-op"));
+    }
+
     #[test]
     fn session_by_id_returns_the_indexed_row_and_none_for_an_unknown_id() {
         let db = TempDb::new("session_by_id");

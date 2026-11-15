@@ -52,3 +52,7 @@ live_session_ids() -> Vec<String>   // ids con proceso vivo (para pintar el esta
 
 - **L4** Implementado el contrato completo (open_session / session_transcript / live_session_ids) con 9 tests nuevos en Rust; el frontend quedó con un buffer por sesión y una única suscripción, de modo que cambiar de sesión es sólo cambiar `activeSessionId`.
 - **L5** Verificación orchestrator: `npm run build` OK; 58/58 tests; comandos registrados; `stopSession` aparece únicamente en `handleStop` (acción explícita del usuario), nunca en el cambio de sesión.
+
+- **L6** Unidad posterior (misma rama): alias automático de sesión — el primer prompt nombra la sesión. `derive_session_title` en Rust (primera línea, espacios colapsados, corte por palabra a 60 caracteres con puntos suspensivos) y `Store::set_session_title`; `send_prompt` lo aplica sólo si `title` es NULL y sin bloquear el envío si falla. El drawer refresca al detectar el primer turno (`sessionGeneration`). Un alias escrito a mano o un resumen por modelo quedan como evolución.
+- **L7** Limpieza visual pedida: fuera el separador bajo la cabecera *Workspaces* y fuera la línea vertical de `SidebarMenuSub` en la lista de sesiones.
+- **L8** Tests: 64/64 cargo (5 de `derive_session_title`, 1 de `set_session_title`).

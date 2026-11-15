@@ -400,6 +400,17 @@ pub fn send_prompt(
     }
     ensure_session_in_workspace(&state.store, workspace_id, session_id)?;
 
+    // The first prompt names the session: the drawer shows this alias instead of
+    // a generic label, and the row keeps `title = None` until then. A failure
+    // here must never block the prompt, so it is deliberately ignored.
+    if let Ok(Some(row)) = state.store.session_by_id(session_id)
+        && row.title.is_none()
+    {
+        let _ = state
+            .store
+            .set_session_title(session_id, &derive_session_title(&text));
+    }
+
     let mut fields = serde_json::Map::new();
     fields.insert("message".to_string(), serde_json::Value::String(text));
     let response = state
@@ -412,6 +423,76 @@ pub fn send_prompt(
         Err(response
             .error
             .unwrap_or_else(|| "pi refused the prompt".to_string()))
+    }
+}
+
+/// Alias for a session, derived from its first prompt: the first line with
+/// whitespace collapsed, truncated on a word boundary. Deterministic and free,
+/// unlike a model-written summary; a session can later be renamed by hand.
+fn derive_session_title(text: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let first_line = text.lines().next().unwrap_or("").trim();
+    let collapsed = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= MAX_CHARS {
+        return collapsed;
+    }
+    let mut kept = String::new();
+    for word in collapsed.split(' ') {
+        let candidate = if kept.is_empty() {
+            word.to_string()
+        } else {
+            format!("{kept} {word}")
+        };
+        if candidate.chars().count() > MAX_CHARS - 1 {
+            break;
+        }
+        kept = candidate;
+    }
+    if kept.is_empty() {
+        return collapsed.chars().take(MAX_CHARS - 1).collect::<String>() + "…";
+    }
+    format!("{kept}…")
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::derive_session_title;
+
+    #[test]
+    fn short_prompts_become_the_title_verbatim() {
+        assert_eq!(derive_session_title("Fix the drawer"), "Fix the drawer");
+    }
+
+    #[test]
+    fn only_the_first_line_counts_and_whitespace_collapses() {
+        assert_eq!(
+            derive_session_title("  Add   session\n\nsecond line ignored  "),
+            "Add session"
+        );
+    }
+
+    #[test]
+    fn long_prompts_are_cut_on_a_word_boundary_with_an_ellipsis() {
+        let long = "Please refactor the session lifecycle so switching does not stop any process";
+        let title = derive_session_title(long);
+        assert!(title.ends_with('…'), "title was {title}");
+        assert!(title.chars().count() <= 60, "title was {title}");
+        // The cut lands between words, never mid-word.
+        let body = title.trim_end_matches('…');
+        assert!(long.starts_with(body), "title was {title}");
+        assert!(!body.ends_with(' '));
+    }
+
+    #[test]
+    fn a_single_giant_word_is_hard_cut() {
+        let title = derive_session_title(&"x".repeat(120));
+        assert_eq!(title.chars().count(), 60);
+        assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn empty_prompt_yields_an_empty_title() {
+        assert_eq!(derive_session_title("   \n  "), "");
     }
 }
 

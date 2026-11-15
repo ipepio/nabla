@@ -38,7 +38,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Separator } from "@/components/ui/separator";
 import {
   Sidebar,
   SidebarContent,
@@ -626,11 +625,8 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <!-- S5: the divider, then the collapsible list. -->
-      <div class="px-2 pb-1 group-data-[collapsible=icon]:hidden">
-        <Separator />
-      </div>
-
+      <!-- S5: the collapsible list. The divider that used to sit here was
+           removed: the section header already separates the groups. -->
       <div class="flex min-h-0 flex-col gap-1 px-1 pb-1">
         <p
           v-if="workspaces.length === 0 && !workspacesLoading"

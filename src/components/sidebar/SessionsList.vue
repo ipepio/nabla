@@ -59,7 +59,7 @@ function timeLabel(updatedAt: string): string {
 </script>
 
 <template>
-  <SidebarMenuSub>
+  <SidebarMenuSub class="border-l-0">
     <SidebarMenuSubItem v-for="session in sessions" :key="session.id">
       <SidebarMenuSubButton
         as="button"
