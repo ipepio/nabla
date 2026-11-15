@@ -47,6 +47,7 @@ import type {
   WorkspaceInfo,
 } from "@/contracts/types";
 import { useAppearance } from "@/lib/appearance";
+import { t } from "@/lib/i18n";
 import {
   activeSession,
   appendUserTurn,
@@ -191,21 +192,26 @@ const statusAlert = computed<StatusAlert | null>(() => {
   const runtimeError = buffer.value?.error ?? null;
   switch (current) {
     case "spawning":
-      return { type: "info", text: "pi is starting…" };
+      return { type: "info", text: t("chat.status.spawning") };
     case "ready":
-      return { type: "success", text: "pi is ready." };
+      return { type: "success", text: t("chat.status.ready") };
     case "running":
-      return { type: "info", text: "pi is working…" };
+      return { type: "info", text: t("chat.status.working") };
     case "stopped":
       return {
         type: "info",
         text:
-          exit === null ? "pi is stopped." : `pi is stopped (exit code ${exit}).`,
+          exit === null
+            ? t("chat.status.stopped")
+            : t("chat.status.stoppedExit", { code: exit }),
       };
     case "crashed":
       return {
         type: "error",
-        text: runtimeError ? `pi crashed: ${runtimeError}` : "pi crashed.",
+        text:
+          runtimeError === null || runtimeError === ""
+            ? t("chat.status.crashed")
+            : t("chat.status.crashedError", { error: runtimeError }),
       };
   }
 });
@@ -269,11 +275,11 @@ function toolBadgeVariant(state: ToolEntry["state"]): "secondary" | "outline" | 
 function toolStateLabel(state: ToolEntry["state"]): string {
   switch (state) {
     case "running":
-      return "running";
+      return t("chat.tool.running");
     case "done":
-      return "done";
+      return t("chat.tool.done");
     case "error":
-      return "failed";
+      return t("chat.tool.failed");
   }
 }
 
@@ -289,7 +295,7 @@ async function ensureSession(): Promise<SessionDto | null> {
   if (existing !== null) return existing;
   const workspace = props.workspace;
   if (workspace === null) {
-    panelError.value = "Select a workspace before sending a prompt.";
+    panelError.value = t("chat.errors.noWorkspace");
     return null;
   }
   starting.value = true;
@@ -451,7 +457,7 @@ onMounted(() => {
         v-if="!toolsOpen"
         variant="ghost"
         size="icon-sm"
-        aria-label="Expand tools panel"
+        :aria-label="t('chat.expandTools')"
         :aria-pressed="toolsOpen"
         @click="emit('toggleTools')"
       >
@@ -463,18 +469,14 @@ onMounted(() => {
     <ChatEmptyState
       v-if="isEmptyState"
       :provider="providerName"
-      :hint="
-        workspace === null
-          ? 'No workspace selected — add or pick one in the sidebar.'
-          : null
-      "
+      :hint="workspace === null ? t('chat.noWorkspaceHint') : null"
     >
       <template #composer>
         <Composer
           v-model="prompt"
           :model-id="modelId"
           :models="models"
-          :workspace-name="workspace?.name ?? 'no workspace'"
+          :workspace-name="workspace?.name ?? t('chat.noWorkspace')"
           :streaming="sending"
           :disabled="workspace === null"
           :can-send="canSend"
@@ -491,7 +493,7 @@ onMounted(() => {
     <template v-else>
       <ChatHeader
         :title="workspaceName"
-        mode="Standard mode"
+        :mode="t('chat.standardMode')"
         :tools-open="toolsOpen"
         :is-dark="isDark"
         @toggle-tools="emit('toggleTools')"
@@ -501,8 +503,8 @@ onMounted(() => {
       <Tabs default-value="chat" class="min-h-0 flex-1 gap-0">
         <div class="border-b border-border px-4">
           <TabsList variant="line" class="h-9">
-            <TabsTrigger value="chat">Chat</TabsTrigger>
-            <TabsTrigger value="linaje">Linaje</TabsTrigger>
+            <TabsTrigger value="chat">{{ t("chat.tab.chat") }}</TabsTrigger>
+            <TabsTrigger value="linaje">{{ t("chat.tab.lineage") }}</TabsTrigger>
           </TabsList>
         </div>
 
@@ -527,21 +529,21 @@ onMounted(() => {
                     class="size-1.5 shrink-0 rounded-full bg-destructive"
                     aria-hidden="true"
                   />
-                  <span class="text-xs font-semibold">Error</span>
+                  <span class="text-xs font-semibold">{{ t("chat.error.label") }}</span>
                 </div>
                 <p class="mt-1 text-sm text-muted-foreground">{{ errorText }}</p>
                 <div class="mt-2 flex items-center justify-end">
                   <span
                     class="text-[10px] font-medium tracking-wider text-muted-foreground uppercase"
                   >
-                    TURN_FAILED
+                    {{ t("chat.error.tag") }}
                   </span>
                 </div>
                 <Button
                   variant="ghost"
                   size="icon-xs"
                   class="absolute top-1.5 right-1.5"
-                  aria-label="Dismiss"
+                  :aria-label="t('common.dismiss')"
                   @click="dismissError"
                 >
                   <XIcon />
@@ -553,7 +555,7 @@ onMounted(() => {
                 v-if="transcriptLoading && transcript.length === 0"
                 class="text-sm text-muted-foreground"
               >
-                Loading conversation…
+                {{ t("chat.loadingConversation") }}
               </p>
 
               <!-- L3/S4: the active session's buffer, which kept filling while
@@ -601,7 +603,7 @@ onMounted(() => {
               v-model="prompt"
               :model-id="modelId"
               :models="models"
-              :workspace-name="workspace?.name ?? 'no workspace'"
+              :workspace-name="workspace?.name ?? t('chat.noWorkspace')"
               :streaming="sending"
               :disabled="workspace === null"
               :can-send="canSend"
@@ -612,7 +614,7 @@ onMounted(() => {
               @stop="handleStop"
             />
             <p class="mt-2 text-center text-xs text-muted-foreground">
-              {{ turns }} turns · {{ steps }} steps
+              {{ t("chat.turnsAndSteps", { turns, steps }) }}
             </p>
           </div>
         </TabsContent>
@@ -622,7 +624,7 @@ onMounted(() => {
           class="flex min-h-0 flex-1 items-center justify-center"
         >
           <p class="text-center text-sm text-muted-foreground">
-            Activity trace will appear here.
+            {{ t("chat.lineagePlaceholder") }}
           </p>
         </TabsContent>
       </Tabs>

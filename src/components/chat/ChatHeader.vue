@@ -11,6 +11,7 @@ import { MoreHorizontalIcon, PanelRightOpenIcon } from "@lucide/vue";
 import ThemeToggle from "@/components/chat/ThemeToggle.vue";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { t } from "@/lib/i18n";
 
 defineProps<{
   /** Workspace/session name. */
@@ -46,7 +47,7 @@ const emit = defineEmits<{
       v-if="!toolsOpen"
       variant="ghost"
       size="icon-sm"
-      aria-label="Expand tools panel"
+      :aria-label="t('chat.expandTools')"
       :aria-pressed="toolsOpen"
       @click="emit('toggleTools')"
     >
@@ -59,7 +60,11 @@ const emit = defineEmits<{
     <ThemeToggle :is-dark="isDark" @toggle="emit('toggleTheme')" />
 
     <!-- Seam: no session menu yet. -->
-    <Button variant="ghost" size="icon-sm" aria-label="More actions (not wired yet)">
+    <Button
+      variant="ghost"
+      size="icon-sm"
+      :aria-label="t('chat.moreActions')"
+    >
       <MoreHorizontalIcon />
     </Button>
   </header>

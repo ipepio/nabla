@@ -48,6 +48,13 @@ export interface AppSettings {
   provider: string;
   /** S7: model id the spawn passes as `--model`; always one of `listModels()`. */
   model: string;
+  /**
+   * S2 of `odd/tasks/i18n-and-settings-polish.md`: interface language, mirrored
+   * from Rust (`Settings.language`). The value the UI writes is always one of
+   * `SUPPORTED_LOCALES` in `src/lib/i18n.ts`; Rust defaults a missing field to
+   * `"en"`, and the UI normalizes anything else to English as well.
+   */
+  language: string;
 }
 
 /**

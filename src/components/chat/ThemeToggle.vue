@@ -6,6 +6,7 @@
 // so this button never touches the contracts seam.
 import { MoonIcon, SunIcon } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
+import { t } from "@/lib/i18n";
 
 const props = defineProps<{
   /** Current resolved appearance. */
@@ -19,7 +20,9 @@ const emit = defineEmits<{ (e: "toggle"): void }>();
   <Button
     variant="ghost"
     size="icon-sm"
-    :aria-label="props.isDark ? 'Switch to light theme' : 'Switch to dark theme'"
+    :aria-label="
+      props.isDark ? t('theme.switchToLight') : t('theme.switchToDark')
+    "
     :aria-pressed="props.isDark"
     @click="emit('toggle')"
   >

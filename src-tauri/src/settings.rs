@@ -21,6 +21,11 @@ pub struct Settings {
     /// S7: model id inside `provider` for new sessions.
     #[serde(default = "default_model")]
     pub model: String,
+    /// S2 of `i18n-and-settings-polish.md`: interface language, `"en"` | `"es"`.
+    /// The UI normalizes anything else to English; the file keeps what was
+    /// written, so a locale added later is not silently rewritten here.
+    #[serde(default = "default_language")]
+    pub language: String,
 }
 
 /// S7 default provider. Also the value a settings file written before this
@@ -34,6 +39,13 @@ fn default_model() -> String {
     "deepseek-v4-flash".to_string()
 }
 
+/// S2 of `i18n-and-settings-polish.md`: English is the default interface
+/// language, so a settings file written before the preference existed (or a
+/// fresh install) opens in `en`.
+fn default_language() -> String {
+    "en".to_string()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -41,6 +53,7 @@ impl Default for Settings {
             pi_binary: "pi".to_string(),
             provider: default_provider(),
             model: default_model(),
+            language: default_language(),
         }
     }
 }
@@ -123,6 +136,8 @@ mod tests {
         // default model, so a fresh install spawns pi with something usable.
         assert_eq!(s.provider, "nan");
         assert_eq!(s.model, "deepseek-v4-flash");
+        // S2 of `i18n-and-settings-polish.md`: the interface starts in English.
+        assert_eq!(s.language, "en");
     }
 
     // S7: provider and model are persisted alongside the rest of the settings.
@@ -177,6 +192,43 @@ mod tests {
         assert_eq!(s.pi_binary, "/opt/pi");
         assert_eq!(s.provider, "nan");
         assert_eq!(s.model, "deepseek-v4-flash");
+    }
+
+    // S2 of `i18n-and-settings-polish.md`: the language is a preference like the
+    // others — saved with the file and read back unchanged.
+    #[test]
+    fn language_is_saved_and_read_back() {
+        let cfg = TempCfg::new("language_roundtrip");
+        let s = Settings {
+            language: "es".into(),
+            ..Settings::default()
+        };
+        save(&cfg.0, &s).expect("save");
+        let loaded = load(&cfg.0).expect("load");
+        assert_eq!(loaded.language, "es");
+    }
+
+    // S2: the key is `language`, so the TS contract mirrors it field by field.
+    #[test]
+    fn serialized_language_key_is_camel_case() {
+        let json = serde_json::to_value(Settings::default()).expect("serialize");
+        assert_eq!(json["language"], serde_json::json!("en"));
+    }
+
+    // S2 + settings header rule: a file written before `language` existed must
+    // still load, and it keeps working in the default locale instead of failing.
+    #[test]
+    fn settings_file_without_language_uses_the_english_default() {
+        let cfg = TempCfg::new("pre_language");
+        std::fs::write(
+            &cfg.0,
+            r#"{"theme":"light","piBinary":"pi","provider":"nan","model":"glm5.3"}"#,
+        )
+        .expect("write fixture");
+        let s = load(&cfg.0).expect("an older settings file must load");
+        assert_eq!(s.theme, "light");
+        assert_eq!(s.model, "glm5.3");
+        assert_eq!(s.language, "en");
     }
 
     #[test]

@@ -5,6 +5,7 @@
 import { ref } from "vue";
 import { CheckIcon, CopyIcon } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
+import { t } from "@/lib/i18n";
 
 const props = defineProps<{
   role: "user" | "assistant";
@@ -42,7 +43,12 @@ async function copyText() {
     </div>
     <div class="flex items-center gap-1 text-xs text-muted-foreground">
       <span v-if="at">{{ at }}</span>
-      <Button variant="ghost" size="icon-xs" aria-label="Copy message" @click="copyText">
+      <Button
+        variant="ghost"
+        size="icon-xs"
+        :aria-label="t('message.copy')"
+        @click="copyText"
+      >
         <CheckIcon v-if="copied" />
         <CopyIcon v-else />
       </Button>

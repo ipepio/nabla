@@ -35,6 +35,7 @@ import {
   SidebarMenuSubButton,
   SidebarMenuSubItem,
 } from "@/components/ui/sidebar";
+import { t } from "@/lib/i18n";
 import type { SessionSummary } from "@/contracts/types";
 
 defineProps<{
@@ -72,7 +73,7 @@ function isRunning(session: SessionSummary, liveSessionIds: string[]): boolean {
 
 /** The contract has no title yet, so the fallback is the neutral "Session". */
 function label(session: SessionSummary): string {
-  return session.title ?? "Session";
+  return session.title ?? t("session.untitled");
 }
 
 /**
@@ -84,12 +85,12 @@ function timeLabel(updatedAt: string): string {
   const then = new Date(updatedAt).getTime();
   if (Number.isNaN(then)) return "";
   const minutes = Math.floor((Date.now() - then) / 60_000);
-  if (minutes < 1) return "now";
-  if (minutes < 60) return `${minutes}m`;
+  if (minutes < 1) return t("session.age.now");
+  if (minutes < 60) return t("session.age.minutes", { count: minutes });
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h`;
+  if (hours < 24) return t("session.age.hours", { count: hours });
   const days = Math.floor(hours / 24);
-  if (days < 7) return `${days}d`;
+  if (days < 7) return t("session.age.days", { count: days });
   return new Date(then).toLocaleDateString();
 }
 
@@ -133,16 +134,16 @@ function confirmDelete() {
           v-if="busySessionIds.includes(String(session.id))"
           class="size-3 shrink-0 animate-spin rounded-full border-2 border-warning/30 border-t-warning"
           role="status"
-          aria-label="Agent is working"
-          title="Agent is working"
+          :aria-label="t('session.working')"
+          :title="t('session.working')"
         />
         <span
           v-else-if="isRunning(session, liveSessionIds)"
           class="flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground"
-          title="pi is running"
+          :title="t('session.runningTooltip')"
         >
           <span class="size-1.5 rounded-full bg-success" aria-hidden="true" />
-          <span>running</span>
+          <span>{{ t("session.running") }}</span>
         </span>
         <time
           v-else
@@ -165,7 +166,7 @@ function confirmDelete() {
               variant="ghost"
               size="icon-xs"
               class="text-muted-foreground"
-              :aria-label="`More actions for ${label(session)}`"
+              :aria-label="t('common.moreActions', { name: label(session) })"
             >
               <MoreHorizontalIcon />
             </Button>
@@ -178,23 +179,25 @@ function confirmDelete() {
               @select="emit('pause', session)"
             >
               <PauseIcon />
-              Pause
+              {{ t("session.pause") }}
             </DropdownMenuItem>
             <DropdownMenuItem variant="destructive" @select="requestDelete(session)">
               <Trash2Icon />
-              Delete
+              {{ t("common.delete") }}
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
     </SidebarMenuSubItem>
 
-    <li v-if="loading" class="px-2 py-1 text-xs text-muted-foreground">Loading…</li>
+    <li v-if="loading" class="px-2 py-1 text-xs text-muted-foreground">
+      {{ t("common.loading") }}
+    </li>
     <li v-if="actionError" class="px-2 py-1 text-xs text-destructive">{{ actionError }}</li>
     <template v-if="!loading">
       <li v-if="error" class="px-2 py-1 text-xs text-destructive">{{ error }}</li>
       <li v-else-if="sessions.length === 0" class="px-2 py-1 text-xs text-muted-foreground">
-        No sessions yet.
+        {{ t("session.empty") }}
       </li>
     </template>
 
@@ -203,17 +206,18 @@ function confirmDelete() {
     <Dialog v-model:open="deleteOpen">
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Delete this session?</DialogTitle>
+          <DialogTitle>{{ t("session.delete.title") }}</DialogTitle>
           <DialogDescription>
-            Its transcript moves to the archive folder and it disappears from the
-            list.
+            {{ t("session.delete.description") }}
           </DialogDescription>
         </DialogHeader>
         <DialogFooter>
           <DialogClose as-child>
-            <Button variant="outline">Cancel</Button>
+            <Button variant="outline">{{ t("common.cancel") }}</Button>
           </DialogClose>
-          <Button variant="destructive" @click="confirmDelete">Delete</Button>
+          <Button variant="destructive" @click="confirmDelete">
+            {{ t("common.delete") }}
+          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

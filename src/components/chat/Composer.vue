@@ -15,6 +15,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { t } from "@/lib/i18n";
 import { COMPOSER_MAX_WIDTH, COMPOSER_MIN_WIDTH } from "@/lib/layout";
 import type { ModelInfo } from "@/contracts/types";
 
@@ -59,8 +60,8 @@ const emit = defineEmits<{
   >
     <Textarea
       :model-value="modelValue"
-      aria-label="Prompt"
-      placeholder="Describe what you want to build, / commands, @ files or sessions"
+      :aria-label="t('chat.composer.prompt')"
+      :placeholder="t('chat.composer.placeholder')"
       class="max-h-64 min-h-[96px] resize-none border-0 bg-transparent px-3.5 pt-3 pb-1 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
       :disabled="disabled"
       @update:model-value="emit('update:modelValue', String($event))"
@@ -72,7 +73,7 @@ const emit = defineEmits<{
       <Button
         variant="ghost"
         size="icon-sm"
-        aria-label="Add context (not wired yet)"
+        :aria-label="t('chat.composer.addContext')"
         :disabled="disabled"
       >
         <PlusIcon />
@@ -81,7 +82,9 @@ const emit = defineEmits<{
       <span
         class="hidden min-w-0 items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground sm:inline-flex"
       >
-        <span class="truncate">Writing in {{ workspaceName }}</span>
+        <span class="truncate">
+          {{ t("chat.composer.writingIn", { workspace: workspaceName }) }}
+        </span>
         <ChevronDownIcon class="size-3 shrink-0" />
       </span>
 
@@ -95,9 +98,9 @@ const emit = defineEmits<{
         >
           <SelectTrigger
             class="h-8 w-[118px] min-w-0 border-0 bg-transparent text-xs shadow-none hover:bg-muted sm:w-[150px] dark:bg-transparent dark:hover:bg-muted"
-            aria-label="Model"
+            :aria-label="t('chat.composer.model')"
           >
-            <SelectValue placeholder="Select model" />
+            <SelectValue :placeholder="t('chat.composer.selectModel')" />
           </SelectTrigger>
           <SelectContent>
             <SelectItem v-for="model in models" :key="model.id" :value="model.id">
@@ -111,7 +114,7 @@ const emit = defineEmits<{
           variant="outline"
           size="icon-sm"
           class="rounded-full"
-          aria-label="Stop session"
+          :aria-label="t('chat.composer.stop')"
           @click="emit('stop')"
         >
           <SquareIcon />
@@ -120,7 +123,7 @@ const emit = defineEmits<{
           v-else
           size="icon-sm"
           class="rounded-full"
-          aria-label="Send prompt"
+          :aria-label="t('chat.composer.send')"
           :disabled="!canSend"
           @click="emit('send')"
         >

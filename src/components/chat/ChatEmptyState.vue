@@ -10,6 +10,7 @@ import { ChevronDownIcon } from "@lucide/vue";
 import { useAppearance } from "@/lib/appearance";
 import { themedBrand } from "@/lib/brand";
 import { HERO } from "@/lib/hero";
+import { t } from "@/lib/i18n";
 
 // Theme-aware: the combined mark + wordmark asset follows the palette, so the
 // empty state never shows a white logo on a light background.
@@ -61,7 +62,7 @@ defineProps<{
         <span
           class="inline-flex items-center gap-1 rounded-full border border-border bg-card/60 px-2.5 py-1 text-xs text-muted-foreground"
         >
-          Standard mode
+          {{ t("chat.standardMode") }}
           <ChevronDownIcon class="size-3" />
         </span>
       </div>

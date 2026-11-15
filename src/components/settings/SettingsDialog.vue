@@ -1,20 +1,29 @@
 <script setup lang="ts">
 /**
- * Settings dialog (specs S1-S5 of `odd/tasks/settings-dialog.md`).
+ * Settings dialog (specs S1-S5 of `odd/tasks/settings-dialog.md`, S1/S2/S4 of
+ * `odd/tasks/i18n-and-settings-polish.md`).
  *
- * Two panes, like a preferences window: a header with the title, the "open
- * configuration file" action and the close control; a left nav with the two
- * sections that have a real backend today (General, Models); and a scrolling
- * right pane of rows — label and one-line description on the left, control on
- * the right, sections separated by a subtle border.
+ * Two panes, like a preferences window: a header with the title and the close
+ * control; a left nav with the two sections that have a real backend today
+ * (General, Models); and a scrolling right pane of rows — label and one-line
+ * description on the left, control on the right.
  *
- * S5 is the reason the nav has exactly two entries: permissions, language, font
- * size, work details, code view and shortcuts have no backend yet, so they are
- * not painted as if they worked. They are listed as next units in the task doc.
+ * S1 of `i18n-and-settings-polish.md`: the pane has no rule between single rows.
+ * Blocks are separated by spacing plus at most two rules, one between each pair
+ * of major blocks (Appearance / Configuration file / Language), so the pane reads
+ * as three groups instead of a wall of lines.
+ *
+ * S4: the configuration-file action exists exactly once, at the end of the
+ * General pane; the header no longer repeats it.
+ *
+ * S5 of `settings-dialog.md`: the nav has exactly two entries — permissions,
+ * font size, work details, code view and shortcuts have no backend yet, so they
+ * are not painted as if they worked.
  *
  * Preferences live in `settings.json`; this component owns the get/save flow
  * (`getSettings`/`saveSettings`) and applies the theme through the shared
- * `useAppearance().setMode`, the only path that touches the palette.
+ * `useAppearance().setMode`, the only path that touches the palette. Every
+ * user-visible string comes from the catalogue in `src/lib/i18n.ts` (S2).
  */
 import { computed, ref, watch } from "vue";
 import {
@@ -43,7 +52,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Separator } from "@/components/ui/separator";
 import { useAppearance } from "@/lib/appearance";
+import { useI18n, type Locale, type MessageKey } from "@/lib/i18n";
 import type { ThemeMode } from "@/lib/theme";
 import {
   commandErrorMessage,
@@ -58,20 +69,45 @@ import type { AppSettings, ModelInfo } from "@/contracts/types";
 /** The dialog is open when the drawer's gear button says so. */
 const open = defineModel<boolean>("open", { default: false });
 
-/** S1: the two sections the app can actually drive right now. */
+/** S1 of `settings-dialog.md`: the two sections the app can drive right now. */
 type Section = "general" | "models";
 const section = ref<Section>("general");
 
+/** S2: every row renders through the catalogue, so a locale switch re-renders. */
+const { locale, setLocale, t } = useI18n();
+
 /** S3: the three modes, each with the icon its card shows. */
-const THEME_OPTIONS: { mode: ThemeMode; label: string; icon: typeof SunIcon }[] = [
-  { mode: "light", label: "Light", icon: SunIcon },
-  { mode: "dark", label: "Dark", icon: MoonIcon },
-  { mode: "system", label: "System", icon: MonitorIcon },
+const THEME_OPTIONS: {
+  mode: ThemeMode;
+  labelKey: MessageKey;
+  icon: typeof SunIcon;
+}[] = [
+  {
+    mode: "light",
+    labelKey: "settings.general.appearance.light",
+    icon: SunIcon,
+  },
+  { mode: "dark", labelKey: "settings.general.appearance.dark", icon: MoonIcon },
+  {
+    mode: "system",
+    labelKey: "settings.general.appearance.system",
+    icon: MonitorIcon,
+  },
+];
+
+/**
+ * S2: the locales the selector offers. The label is each language's own name, so
+ * someone who cannot read the current interface language still finds their own.
+ */
+const LANGUAGE_OPTIONS: { value: Locale; labelKey: MessageKey }[] = [
+  { value: "en", labelKey: "settings.general.language.english" },
+  { value: "es", labelKey: "settings.general.language.spanish" },
 ];
 
 /** Persisted preferences, `null` until the file is read on open. */
 const settings = ref<AppSettings | null>(null);
-/** S4: model options come from `list_models`, never from a list kept here. */
+/** S4 of `settings-dialog.md`: model options come from `list_models`, never
+ * from a list kept here. */
 const models = ref<ModelInfo[]>([]);
 /** S3: the absolute preferences path, resolved by Rust. */
 const configPath = ref<string | null>(null);
@@ -85,10 +121,10 @@ const opening = ref(false);
 // painting, and both agree because opening the dialog applies the stored mode.
 const { mode, setMode } = useAppearance();
 
-/** S4: the persisted model id, `""` until the file is read. */
+/** S4 of `settings-dialog.md`: the persisted model id, `""` until read. */
 const modelId = computed(() => settings.value?.model ?? "");
 
-/** S4: the provider is shown read-only; it is not editable here. */
+/** S4 of `settings-dialog.md`: the provider is shown read-only. */
 const provider = computed(() => settings.value?.provider ?? "—");
 
 async function loadPreferences() {
@@ -97,9 +133,11 @@ async function loadPreferences() {
   try {
     const loaded = await getSettings();
     settings.value = loaded;
-    // S3: the file may have been edited outside the app, so the stored mode is
-    // applied again on every open.
+    // S3 of `settings-dialog.md`: the file may have been edited outside the app,
+    // so the stored mode is applied again on every open. S2 of
+    // `i18n-and-settings-polish.md`: same rule for the language.
     setMode(loaded.theme);
+    setLocale(loaded.language);
   } catch (cause) {
     settings.value = null;
     error.value = commandErrorMessage(cause);
@@ -129,9 +167,10 @@ async function loadConfigPath() {
 }
 
 /**
- * S3: persists the appearance and applies it immediately. The whole file is
- * re-read first so this write cannot clobber a preference another surface
- * changed in the meantime (`save_settings` replaces the file).
+ * S3 of `settings-dialog.md`: persists the appearance and applies it
+ * immediately. The whole file is re-read first so this write cannot clobber a
+ * preference another surface changed in the meantime (`save_settings` replaces
+ * the file).
  */
 async function handleThemeChange(next: ThemeMode) {
   if (saving.value || mode.value === next) return;
@@ -149,8 +188,8 @@ async function handleThemeChange(next: ThemeMode) {
 }
 
 /**
- * S4: persists the chosen model. Same re-read-then-write rule as the theme; the
- * choice applies to the next session spawn.
+ * S4 of `settings-dialog.md`: persists the chosen model. Same re-read-then-write
+ * rule as the theme; the choice applies to the next session spawn.
  */
 async function handleModelChange(value: string) {
   if (value === "" || saving.value) return;
@@ -167,9 +206,30 @@ async function handleModelChange(value: string) {
 }
 
 /**
- * S2: opens the real preferences file — `settings.json` — with the system's
- * default editor. Rust creates it with the defaults when it does not exist yet,
- * so the action never targets a missing path.
+ * S2 of `i18n-and-settings-polish.md`: persists the language and applies it at
+ * once, so the dialog itself switches without a reload. The write lands first:
+ * a failed save must not leave the UI in a language the file does not record.
+ */
+async function handleLanguageChange(next: string) {
+  if (saving.value) return;
+  saving.value = true;
+  error.value = null;
+  try {
+    const current = await getSettings();
+    settings.value = await saveSettings({ ...current, language: next });
+    setLocale(next);
+  } catch (cause) {
+    error.value = commandErrorMessage(cause);
+  } finally {
+    saving.value = false;
+  }
+}
+
+/**
+ * S2 of `settings-dialog.md`: opens the real preferences file — `settings.json` —
+ * with the system's default editor. Rust creates it with the defaults when it
+ * does not exist yet, so the action never targets a missing path. S4 of
+ * `i18n-and-settings-polish.md` keeps this as the only such action.
  */
 async function handleOpenConfigFile() {
   if (opening.value) return;
@@ -198,39 +258,31 @@ watch(open, (isOpen) => {
 
 <template>
   <Dialog v-model:open="open">
-    <!-- The close control belongs to the header row (next to the open action),
-         so the default floating X is off. -->
+    <!-- The close control is the only header action (S4: the configuration-file
+         action lives at the end of the General pane), so the default floating X
+         is off. -->
     <DialogContent
       :show-close-button="false"
       class="flex max-h-[min(85vh,44rem)] w-full max-w-2xl flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl"
     >
-      <DialogHeader
-        class="flex-row items-center justify-between gap-3 border-b border-border px-4 py-3"
-      >
-        <DialogTitle>Settings</DialogTitle>
-        <div class="flex items-center gap-1.5">
+      <DialogHeader class="flex-row items-center justify-between gap-3 px-4 py-3">
+        <DialogTitle>{{ t("settings.title") }}</DialogTitle>
+        <DialogClose as-child>
           <Button
-            variant="outline"
-            size="sm"
-            :disabled="opening"
-            @click="handleOpenConfigFile"
+            variant="ghost"
+            size="icon-sm"
+            :aria-label="t('settings.close')"
           >
-            <ExternalLinkIcon data-icon="inline-start" />
-            Open configuration file
+            <XIcon />
           </Button>
-          <DialogClose as-child>
-            <Button variant="ghost" size="icon-sm" aria-label="Close settings">
-              <XIcon />
-            </Button>
-          </DialogClose>
-        </div>
+        </DialogClose>
       </DialogHeader>
 
       <div class="flex min-h-0 flex-1">
         <!-- S1: left navigation. Active item uses the drawer's accent tokens so
              it reads as the same kind of selected row as a workspace. -->
         <nav
-          aria-label="Settings sections"
+          :aria-label="t('settings.sections')"
           class="flex w-44 shrink-0 flex-col gap-0.5 border-r border-border p-2"
         >
           <button
@@ -245,7 +297,7 @@ watch(open, (isOpen) => {
             @click="section = 'general'"
           >
             <SettingsIcon class="size-4 shrink-0" aria-hidden="true" />
-            General
+            {{ t("settings.section.general") }}
           </button>
           <button
             type="button"
@@ -259,26 +311,29 @@ watch(open, (isOpen) => {
             @click="section = 'models'"
           >
             <CpuIcon class="size-4 shrink-0" aria-hidden="true" />
-            Models
+            {{ t("settings.section.models") }}
           </button>
         </nav>
 
         <!-- S1: the scrolling pane. One row per setting: label and description
-             on the left, control on the right. -->
+             on the left, control on the right. Blocks are spaced, not ruled: the
+             only separators are the two between Appearance / Configuration file /
+             Language. -->
         <div class="min-h-0 flex-1 overflow-y-auto px-4 py-2">
           <div v-if="loading" class="py-6 text-sm text-muted-foreground">
-            Reading settings…
+            {{ t("settings.loading") }}
           </div>
 
-          <!-- S3: General — appearance, then the configuration file. -->
-          <template v-else-if="section === 'general'">
-            <section
-              class="flex flex-wrap items-start justify-between gap-4 border-b border-border py-4"
-            >
+          <!-- S3 of `settings-dialog.md`: General — appearance, the configuration
+               file and the language (S2 of `i18n-and-settings-polish.md`). -->
+          <div v-else-if="section === 'general'" class="space-y-6 py-4">
+            <section class="flex flex-wrap items-start justify-between gap-4">
               <div class="min-w-0">
-                <h3 class="text-sm font-medium">Appearance</h3>
+                <h3 class="text-sm font-medium">
+                  {{ t("settings.general.appearance") }}
+                </h3>
                 <p class="mt-0.5 text-xs text-muted-foreground">
-                  Theme used across the whole app.
+                  {{ t("settings.general.appearance.description") }}
                 </p>
               </div>
               <div class="flex gap-2">
@@ -297,46 +352,90 @@ watch(open, (isOpen) => {
                   @click="handleThemeChange(option.mode)"
                 >
                   <component :is="option.icon" class="size-4" aria-hidden="true" />
-                  {{ option.label }}
+                  {{ t(option.labelKey) }}
                 </button>
               </div>
             </section>
 
-            <section class="flex flex-col gap-2 py-4">
-              <div class="flex items-start justify-between gap-4">
-                <div class="min-w-0">
-                  <h3 class="text-sm font-medium">Configuration file</h3>
-                  <p class="mt-0.5 text-xs text-muted-foreground">
-                    Preferences are stored here; the system editor opens it.
-                  </p>
-                </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  :disabled="opening"
-                  @click="handleOpenConfigFile"
-                >
-                  <ExternalLinkIcon data-icon="inline-start" />
-                  Open
-                </Button>
+            <!-- S1 first separator: Appearance | Configuration file. -->
+            <Separator />
+
+            <section class="flex flex-col gap-2">
+              <div class="min-w-0">
+                <h3 class="text-sm font-medium">
+                  {{ t("settings.general.configurationFile") }}
+                </h3>
+                <p class="mt-0.5 text-xs text-muted-foreground">
+                  {{ t("settings.general.configurationFile.description") }}
+                </p>
               </div>
-              <!-- S3: the absolute path, resolved by Rust, read-only. -->
+              <!-- S3 of `settings-dialog.md`: the absolute path, resolved by
+                   Rust, read-only. -->
               <code
                 class="block rounded-md bg-muted px-2.5 py-2 font-mono text-xs break-all text-muted-foreground select-all"
                 >{{ configPath ?? "—" }}</code
               >
             </section>
-          </template>
 
-          <!-- S4: Models — the model selector and the provider it comes from. -->
-          <template v-else>
-            <section
-              class="flex items-center justify-between gap-4 border-b border-border py-4"
-            >
+            <!-- S1 second separator: Configuration file | Language. -->
+            <Separator />
+
+            <section class="flex flex-wrap items-center justify-between gap-4">
               <div class="min-w-0">
-                <h3 class="text-sm font-medium">Model</h3>
+                <h3 class="text-sm font-medium">
+                  {{ t("settings.general.language") }}
+                </h3>
                 <p class="mt-0.5 text-xs text-muted-foreground">
-                  Used by the next session the app spawns.
+                  {{ t("settings.general.language.description") }}
+                </p>
+              </div>
+              <Select
+                :model-value="locale"
+                :disabled="saving"
+                @update:model-value="handleLanguageChange(String($event))"
+              >
+                <SelectTrigger
+                  class="w-40"
+                  :aria-label="t('settings.general.language')"
+                >
+                  <SelectValue
+                    :placeholder="t('settings.general.language.selectPlaceholder')"
+                  />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem
+                    v-for="option in LANGUAGE_OPTIONS"
+                    :key="option.value"
+                    :value="option.value"
+                  >
+                    {{ t(option.labelKey) }}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            </section>
+
+            <!-- S4: the only configuration-file action, at the end of the pane. -->
+            <div class="flex justify-end">
+              <Button
+                variant="outline"
+                size="sm"
+                :disabled="opening"
+                @click="handleOpenConfigFile"
+              >
+                <ExternalLinkIcon data-icon="inline-start" />
+                {{ t("settings.general.configurationFile.open") }}
+              </Button>
+            </div>
+          </div>
+
+          <!-- S4 of `settings-dialog.md`: Models — the model selector and the
+               provider it comes from. -->
+          <div v-else class="space-y-6 py-4">
+            <section class="flex flex-wrap items-center justify-between gap-4">
+              <div class="min-w-0">
+                <h3 class="text-sm font-medium">{{ t("settings.models.model") }}</h3>
+                <p class="mt-0.5 text-xs text-muted-foreground">
+                  {{ t("settings.models.model.description") }}
                 </p>
               </div>
               <Select
@@ -344,8 +443,13 @@ watch(open, (isOpen) => {
                 :disabled="saving || models.length === 0"
                 @update:model-value="handleModelChange(String($event))"
               >
-                <SelectTrigger class="w-48" aria-label="Model">
-                  <SelectValue placeholder="Select model" />
+                <SelectTrigger
+                  class="w-48"
+                  :aria-label="t('settings.models.model')"
+                >
+                  <SelectValue
+                    :placeholder="t('settings.models.model.selectPlaceholder')"
+                  />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem
@@ -359,21 +463,22 @@ watch(open, (isOpen) => {
               </Select>
             </section>
 
-            <section class="flex items-center justify-between gap-4 py-4">
+            <section class="flex flex-wrap items-center justify-between gap-4">
               <div class="min-w-0">
-                <h3 class="text-sm font-medium">Provider</h3>
+                <h3 class="text-sm font-medium">
+                  {{ t("settings.models.provider") }}
+                </h3>
                 <p class="mt-0.5 text-xs text-muted-foreground">
-                  Read-only: the provider the app config names.
+                  {{ t("settings.models.provider.description") }}
                 </p>
               </div>
               <span class="text-sm text-muted-foreground">{{ provider }}</span>
             </section>
 
-            <p class="pb-4 text-xs text-muted-foreground">
-              The list comes from the provider configured in the app config
-              today.
+            <p class="text-xs text-muted-foreground">
+              {{ t("settings.models.note") }}
             </p>
-          </template>
+          </div>
 
           <Alert v-if="error" variant="destructive" class="mb-4">
             <AlertDescription>{{ error }}</AlertDescription>
@@ -382,8 +487,7 @@ watch(open, (isOpen) => {
       </div>
 
       <DialogDescription class="sr-only">
-        Preferences stored in the configuration file. General covers appearance
-        and the configuration file itself; Models covers the model and provider.
+        {{ t("settings.description") }}
       </DialogDescription>
     </DialogContent>
   </Dialog>

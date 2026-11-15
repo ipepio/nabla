@@ -22,6 +22,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import type { WorkspaceInfo } from "@/contracts/types";
+import { t } from "@/lib/i18n";
 
 defineProps<{
   workspace: WorkspaceInfo;
@@ -95,7 +96,11 @@ const emit = defineEmits<{
         variant="ghost"
         size="icon-xs"
         class="text-muted-foreground"
-        :aria-label="workspace.pinned ? `Unpin ${workspace.name}` : `Pin ${workspace.name}`"
+        :aria-label="
+          workspace.pinned
+            ? t('workspace.unpin', { name: workspace.name })
+            : t('workspace.pin', { name: workspace.name })
+        "
         :aria-pressed="workspace.pinned"
         :disabled="pinPending"
         @click="emit('togglePin')"
@@ -111,7 +116,7 @@ const emit = defineEmits<{
             variant="ghost"
             size="icon-xs"
             class="text-muted-foreground"
-            :aria-label="`More actions for ${workspace.name}`"
+            :aria-label="t('common.moreActions', { name: workspace.name })"
           >
             <MoreHorizontalIcon />
           </Button>
@@ -119,11 +124,11 @@ const emit = defineEmits<{
         <DropdownMenuContent align="end" class="w-44">
           <DropdownMenuItem @select="emit('edit')">
             <PencilIcon />
-            Edit workspace
+            {{ t("workspace.edit") }}
           </DropdownMenuItem>
           <DropdownMenuItem variant="destructive" @select="emit('remove')">
             <Trash2Icon />
-            Remove workspace
+            {{ t("workspace.remove") }}
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>

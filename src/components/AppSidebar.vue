@@ -47,6 +47,7 @@ import SessionsList from "@/components/sidebar/SessionsList.vue";
 import WorkspaceRow from "@/components/sidebar/WorkspaceRow.vue";
 import { useAppearance } from "@/lib/appearance";
 import { themedBrand } from "@/lib/brand";
+import { t } from "@/lib/i18n";
 import {
   activeSession,
   busyIds,
@@ -144,8 +145,10 @@ const editingWorkspace = ref<WorkspaceInfo | null>(null);
  */
 function addErrorMessage(cause: unknown): string {
   const message = commandErrorMessage(cause);
+  // The SQLite rejection is the only one this path translates; the rest are
+  // backend messages rendered as they arrive.
   if (message.includes("UNIQUE constraint failed")) {
-    return "That workspace path is already in the list.";
+    return t("sidebar.duplicatePath");
   }
   return message;
 }
@@ -392,7 +395,7 @@ async function handleBrowseFolder() {
     selected = await openFolderDialog({
       directory: true,
       multiple: false,
-      title: "Choose a workspace folder",
+      title: t("sidebar.chooseFolder"),
     });
   } catch (cause) {
     workspaceError.value = commandErrorMessage(cause);
@@ -512,7 +515,7 @@ onUnmounted(() => {
           variant="ghost"
           size="icon-sm"
           class="group/expand mx-auto hidden group-data-[collapsible=icon]:flex"
-          aria-label="Expand sidebar"
+          :aria-label="t('sidebar.expand')"
           @click="toggleSidebar"
         >
           <!-- Brand-first at rest; the expand affordance appears on hover and on
@@ -544,11 +547,13 @@ onUnmounted(() => {
         variant="secondary"
         class="h-9 w-full gap-2 rounded-xl bg-secondary/60 px-3 text-sm font-medium text-secondary-foreground hover:bg-secondary group-data-[collapsible=icon]:size-8 group-data-[collapsible=icon]:self-center group-data-[collapsible=icon]:p-0"
         :disabled="activeWorkspaceId === null || creating"
-        aria-label="New session"
+        :aria-label="t('sidebar.newSession')"
         @click="handleNewSession"
       >
         <CirclePlusIcon class="size-4 shrink-0" aria-hidden="true" />
-        <span class="group-data-[collapsible=icon]:hidden">New session</span>
+        <span class="group-data-[collapsible=icon]:hidden">
+          {{ t("sidebar.newSession") }}
+        </span>
       </Button>
     </SidebarHeader>
 
@@ -559,7 +564,7 @@ onUnmounted(() => {
         class="flex items-center justify-between gap-1 px-3 pt-1 pb-1 group-data-[collapsible=icon]:hidden"
       >
         <span class="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          Workspaces
+          {{ t("sidebar.workspaces") }}
         </span>
         <div class="flex items-center gap-0.5">
           <!-- Search: toggles the field below instead of it always taking room. -->
@@ -567,7 +572,7 @@ onUnmounted(() => {
             variant="ghost"
             size="icon-xs"
             class="text-muted-foreground"
-            aria-label="Search workspaces"
+            :aria-label="t('sidebar.search')"
             :aria-pressed="searchOpen"
             :aria-expanded="searchOpen"
             @click="searchOpen = !searchOpen"
@@ -580,7 +585,7 @@ onUnmounted(() => {
             variant="ghost"
             size="icon-xs"
             :class="editMode ? 'text-foreground' : 'text-muted-foreground'"
-            aria-label="Toggle edit mode"
+            :aria-label="t('sidebar.editMode')"
             :aria-pressed="editMode"
             @click="editMode = !editMode"
           >
@@ -591,7 +596,7 @@ onUnmounted(() => {
             variant="ghost"
             size="icon-xs"
             class="text-muted-foreground"
-            aria-label="Add workspace folder"
+            :aria-label="t('sidebar.addWorkspace')"
             :disabled="adding"
             @click="handleBrowseFolder"
           >
@@ -608,8 +613,8 @@ onUnmounted(() => {
           />
           <Input
             v-model="search"
-            aria-label="Search workspaces"
-            placeholder="Search workspaces…"
+            :aria-label="t('sidebar.search')"
+            :placeholder="t('sidebar.searchPlaceholder')"
             class="h-8 pl-7 text-xs"
           />
         </div>
@@ -622,14 +627,14 @@ onUnmounted(() => {
           v-if="workspaces.length === 0 && !workspacesLoading"
           class="px-2 py-1 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden"
         >
-          No workspaces yet — add a folder with the folder button.
+          {{ t("sidebar.empty") }}
         </p>
         <!-- Search came back empty: distinct from "no workspaces". -->
         <p
           v-else-if="!workspacesLoading && visibleWorkspaces.length === 0"
           class="px-2 py-1 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden"
         >
-          No workspaces match this search.
+          {{ t("sidebar.emptySearch") }}
         </p>
 
         <SidebarMenu>
@@ -674,11 +679,13 @@ onUnmounted(() => {
       <Button
         variant="ghost"
         class="w-full justify-start gap-2"
-        aria-label="Settings"
+        :aria-label="t('sidebar.settings')"
         @click="settingsOpen = true"
       >
         <SettingsIcon />
-        <span class="group-data-[collapsible=icon]:hidden">Settings</span>
+        <span class="group-data-[collapsible=icon]:hidden">
+          {{ t("sidebar.settings") }}
+        </span>
       </Button>
       <SettingsDialog v-model:open="settingsOpen" />
 
@@ -687,22 +694,21 @@ onUnmounted(() => {
       <Dialog v-model:open="editOpen">
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Edit workspace</DialogTitle>
+            <DialogTitle>{{ t("workspace.edit") }}</DialogTitle>
             <DialogDescription>
-              Renaming and deleting a workspace land in the next unit. This is
-              what the store holds today.
+              {{ t("workspace.editDescription") }}
             </DialogDescription>
           </DialogHeader>
 
           <div class="grid gap-3">
             <div class="grid gap-1">
-              <span class="text-sm font-medium">Name</span>
+              <span class="text-sm font-medium">{{ t("common.name") }}</span>
               <p class="text-sm break-words text-muted-foreground">
                 {{ editingWorkspace?.name }}
               </p>
             </div>
             <div class="grid gap-1">
-              <span class="text-sm font-medium">Path</span>
+              <span class="text-sm font-medium">{{ t("common.path") }}</span>
               <p class="text-sm break-all text-muted-foreground">
                 {{ editingWorkspace?.path }}
               </p>
@@ -711,7 +717,7 @@ onUnmounted(() => {
 
           <DialogFooter>
             <DialogClose as-child>
-              <Button variant="outline">Close</Button>
+              <Button variant="outline">{{ t("common.close") }}</Button>
             </DialogClose>
           </DialogFooter>
         </DialogContent>
