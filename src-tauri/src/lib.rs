@@ -71,6 +71,10 @@ pub fn run() {
             commands::list_providers,
             commands::save_provider,
             commands::discover_models,
+            // S3/S4: removing a provider and setting its api key in pi's file,
+            // with the same backup and atomic write as `save_provider`.
+            commands::delete_provider,
+            commands::set_provider_key,
             commands::list_sessions,
             commands::get_settings,
             commands::save_settings,

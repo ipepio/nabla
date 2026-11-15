@@ -239,6 +239,33 @@ pub async fn discover_models(
         .map_err(display_err)
 }
 
+/// S3: removes one provider from pi's configuration, backup and atomic write
+/// included. `true` means an entry was removed; an id the file does not have is
+/// `false` and not an error, which keeps the delete idempotent (the same stance
+/// `list_providers` takes: it never invents an entry). A malformed id is still
+/// rejected before the file is touched.
+#[tauri::command]
+pub fn delete_provider(
+    state: State<'_, AppState>,
+    provider_id: String,
+) -> Result<bool, String> {
+    crate::providers::delete_provider(&models_path(&state), &provider_id).map_err(display_err)
+}
+
+/// S4: sets the api key of an existing provider in place, in pi's plain-text
+/// file (the user's own decision). The entry is never created here and the
+/// answer is the summary `list_providers` would report, so the pane refreshes
+/// from what the file holds without ever receiving the key back.
+#[tauri::command]
+pub fn set_provider_key(
+    state: State<'_, AppState>,
+    provider_id: String,
+    api_key: String,
+) -> Result<ProviderSummary, String> {
+    crate::providers::set_provider_key(&models_path(&state), &provider_id, &api_key)
+        .map_err(display_err)
+}
+
 #[tauri::command]
 pub fn save_settings(
     state: State<'_, AppState>,

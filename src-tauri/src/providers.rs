@@ -51,6 +51,9 @@ pub enum ProvidersError {
     InvalidId(String),
     InvalidBaseUrl(String),
     EmptyApiKey,
+    /// A provider entry the file does not have. Only `set_provider_key` can hit
+    /// this: a key belongs to an entry that exists, and nothing invents providers.
+    UnknownProvider(String),
     Http(String),
 }
 
@@ -67,6 +70,7 @@ impl std::fmt::Display for ProvidersError {
                 write!(f, "provider base url must be http(s): {url:?}")
             }
             ProvidersError::EmptyApiKey => write!(f, "provider api key must not be empty"),
+            ProvidersError::UnknownProvider(id) => write!(f, "unknown provider: {id}"),
             ProvidersError::Http(m) => write!(f, "providers http error: {m}"),
         }
     }
@@ -170,16 +174,9 @@ pub fn save_provider(path: &Path, draft: &ProviderDraft) -> ProvidersResult<Prov
     providers.insert(id.to_string(), serde_json::Value::Object(entry));
 
     // The backup is taken before the rewrite, and only when there was a file.
-    if existed {
-        let backup = backup_path(path)?;
-        std::fs::copy(path, &backup).map_err(|e| {
-            ProvidersError::Io(format!("backup {}: {e}", backup.display()))
-        })?;
-    }
+    backup_before_rewrite(path, existed)?;
 
-    let serialized = serde_json::to_string_pretty(&root)
-        .map_err(|e| ProvidersError::Parse(e.to_string()))?;
-    write_atomic(path, &serialized)?;
+    write_root(path, &root)?;
 
     Ok(ProviderSummary {
         id: id.to_string(),
@@ -190,6 +187,94 @@ pub fn save_provider(path: &Path, draft: &ProviderDraft) -> ProvidersResult<Prov
         // Validated non-empty above, so this is always true on this path.
         has_api_key: true,
     })
+}
+
+/// S3: removes `providers.<provider_id>` and nothing else — same backup and
+/// atomic write as every other writer of this file.
+///
+/// An id the file does not have is a no-op (`false`), never an error: deleting is
+/// idempotent, exactly like listing never invents an entry. Nothing is rewritten
+/// and no backup is taken for a change that did not happen, so the file stays
+/// byte-identical. The id shape is validated first, so a malformed id can never
+/// reach the file.
+pub fn delete_provider(path: &Path, provider_id: &str) -> ProvidersResult<bool> {
+    let id = provider_id.trim();
+    validate_id(id)?;
+
+    let (mut root, existed) = read_root(path)?;
+    let removed = match root.get_mut("providers").and_then(|v| v.as_object_mut()) {
+        Some(providers) => providers.remove(id).is_some(),
+        // No `providers` object (or one that is not an object) holds nothing
+        // to remove.
+        None => false,
+    };
+    if !removed {
+        return Ok(false);
+    }
+
+    backup_before_rewrite(path, existed)?;
+    write_root(path, &root)?;
+    Ok(true)
+}
+
+/// S4: rewrites `providers.<provider_id>.apiKey` in place, in plain text (the
+/// user's own decision, with the keychain noted as debt).
+///
+/// Nothing else is created or touched: the entry must already exist (an unknown
+/// id is an error, not an invented provider), and every other key of the entry,
+/// of the other providers and of the file survives. The answer is the same
+/// `ProviderSummary` `list_providers` would report, so the pane refreshes from it
+/// without ever seeing the key.
+pub fn set_provider_key(
+    path: &Path,
+    provider_id: &str,
+    api_key: &str,
+) -> ProvidersResult<ProviderSummary> {
+    let id = provider_id.trim();
+    validate_id(id)?;
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err(ProvidersError::EmptyApiKey);
+    }
+
+    let (mut root, existed) = read_root(path)?;
+    let entry = root
+        .get_mut("providers")
+        .and_then(|v| v.as_object_mut())
+        .and_then(|providers| providers.get_mut(id))
+        .and_then(|v| v.as_object_mut())
+        .ok_or_else(|| ProvidersError::UnknownProvider(id.to_string()))?;
+    entry.insert(
+        "apiKey".to_string(),
+        serde_json::Value::String(api_key.to_string()),
+    );
+    // The summary is built from the entry as it now stands, copy taken so the
+    // borrow of `root` ends before the file is rewritten.
+    let summary = summary_of(id, &serde_json::Value::Object(entry.clone()));
+
+    backup_before_rewrite(path, existed)?;
+    write_root(path, &root)?;
+    Ok(summary)
+}
+
+/// S3: copies the file next to itself before a rewrite. One helper for every
+/// writer, so no path can forget it; a file that did not exist needs no backup.
+fn backup_before_rewrite(path: &Path, existed: bool) -> ProvidersResult<()> {
+    if !existed {
+        return Ok(());
+    }
+    let backup = backup_path(path)?;
+    std::fs::copy(path, &backup)
+        .map_err(|e| ProvidersError::Io(format!("backup {}: {e}", backup.display())))?;
+    Ok(())
+}
+
+/// Serializes and atomically writes the whole root. One helper, so every writer
+/// keeps the same formatting and the same crash safety.
+fn write_root(path: &Path, root: &serde_json::Value) -> ProvidersResult<()> {
+    let serialized = serde_json::to_string_pretty(root)
+        .map_err(|e| ProvidersError::Parse(e.to_string()))?;
+    write_atomic(path, &serialized)
 }
 
 /// Reads `path` as a JSON object, tolerating a missing file. Returns the value
@@ -766,6 +851,269 @@ mod tests {
                 ProvidersError::EmptyApiKey => {}
                 other => panic!("expected EmptyApiKey for {key:?}, got {other}"),
             }
+        }
+    }
+
+    // ── removing and re-keying a provider (S3, S4) ──────────────────────────
+
+    /// Two providers plus a top-level key Nabla does not model, and, inside one
+    /// of them, keys pi owns (`timeoutSeconds`, `modelOverrides`).
+    const TWO_PROVIDERS: &str = r#"{
+      "theme": "dark",
+      "providers": {
+        "keep": {
+          "name": "Keep",
+          "baseUrl": "https://keep.test/v1",
+          "api": "openai-completions",
+          "apiKey": "sk-keep",
+          "timeoutSeconds": 300,
+          "modelOverrides": { "m": { "contextWindow": 4096 } },
+          "models": [{ "id": "m", "name": "M" }]
+        },
+        "drop": {
+          "name": "Drop",
+          "baseUrl": "https://drop.test/v1",
+          "api": "openai-completions",
+          "apiKey": "sk-drop",
+          "models": [{ "id": "d", "name": "D" }]
+        }
+      }
+    }"#;
+
+    /// The backups written next to the file, in name order.
+    fn backups(dir: &TempModelsDir) -> Vec<String> {
+        dir.entries()
+            .into_iter()
+            .filter(|name| name.starts_with("models.json.bak-"))
+            .collect()
+    }
+
+    // S3: deleting one provider touches `providers.<id>` only — the other
+    // provider (with the keys pi owns inside it), every top-level key and the
+    // pre-delete backup are all exactly what the contract promises.
+    #[test]
+    fn delete_removes_only_that_provider_and_writes_a_backup() {
+        let dir = TempModelsDir::new("delete_one");
+        dir.write(TWO_PROVIDERS);
+
+        assert!(delete_provider(&dir.path(), "drop").expect("delete provider"));
+
+        let written: serde_json::Value = serde_json::from_str(&dir.read()).expect("parse");
+        let providers = written["providers"].as_object().expect("providers object");
+        assert_eq!(providers.len(), 1, "only the named provider is gone");
+        assert!(providers.contains_key("keep"));
+        let original: serde_json::Value =
+            serde_json::from_str(TWO_PROVIDERS).expect("parse fixture");
+        assert_eq!(
+            written["providers"]["keep"], original["providers"]["keep"],
+            "the other provider is untouched, unknown keys included"
+        );
+        assert_eq!(
+            written["theme"],
+            serde_json::json!("dark"),
+            "top-level keys stay"
+        );
+
+        let written_backups = backups(&dir);
+        assert_eq!(
+            written_backups.len(),
+            1,
+            "exactly one backup: {:?}",
+            dir.entries()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join(&written_backups[0])).expect("read backup"),
+            TWO_PROVIDERS,
+            "the backup holds the pre-delete contents"
+        );
+        // S3: the atomic write leaves no temporary file behind.
+        assert!(
+            !dir.entries().iter().any(|name| name.contains(".tmp")),
+            "left behind: {:?}",
+            dir.entries()
+        );
+        // And pi would read exactly one provider next time.
+        assert_eq!(read_providers(&dir.path()).expect("read").len(), 1);
+    }
+
+    // S3: an id the file does not have is a no-op — no rewrite, no backup, the
+    // file byte-identical.
+    #[test]
+    fn delete_of_an_unknown_id_leaves_the_file_byte_identical() {
+        let dir = TempModelsDir::new("delete_unknown");
+        dir.write(TWO_PROVIDERS);
+        let before = dir.read();
+
+        assert!(!delete_provider(&dir.path(), "absent").expect("a no-op delete"));
+
+        assert_eq!(dir.read(), before, "nothing is rewritten");
+        assert_eq!(
+            dir.entries(),
+            vec!["models.json".to_string()],
+            "no backup for a rewrite that did not happen"
+        );
+    }
+
+    // A file that does not exist has nothing to delete, and deleting must not
+    // create one.
+    #[test]
+    fn delete_of_a_missing_file_creates_nothing() {
+        let dir = TempModelsDir::new("delete_missing");
+        assert!(!delete_provider(&dir.path(), "absent").expect("no-op"));
+        assert_eq!(dir.entries(), Vec::<String>::new(), "nothing is written");
+    }
+
+    // S3: the id shape is validated before the file is touched, so a malformed
+    // id can never reach a write.
+    #[test]
+    fn delete_rejects_an_invalid_id_without_touching_the_file() {
+        let dir = TempModelsDir::new("delete_bad_id");
+        dir.write(TWO_PROVIDERS);
+        let before = dir.read();
+        for id in ["", "Drop", "drop me", "../drop", &"d".repeat(33)] {
+            let err = delete_provider(&dir.path(), id).expect_err("a malformed id is rejected");
+            match err {
+                ProvidersError::InvalidId(value) => assert_eq!(value, id),
+                other => panic!("expected InvalidId for {id:?}, got {other:?}"),
+            }
+            assert_eq!(dir.read(), before, "a rejected id changes nothing: {id:?}");
+            assert_eq!(dir.entries(), vec!["models.json".to_string()]);
+        }
+    }
+
+    // S4: the key of one provider is rewritten in place; every other value of the
+    // file stays exactly as it was, and the summary reports the new state without
+    // ever carrying the key.
+    #[test]
+    fn set_provider_key_updates_only_that_provider() {
+        let dir = TempModelsDir::new("set_key");
+        dir.write(TWO_PROVIDERS);
+
+        let summary = set_provider_key(&dir.path(), "keep", "sk-new").expect("set key");
+
+        assert_eq!(summary.id, "keep");
+        assert_eq!(summary.name, "Keep");
+        assert_eq!(summary.base_url, "https://keep.test/v1");
+        assert_eq!(summary.model_count, 1);
+        assert!(
+            summary.has_api_key,
+            "the answer reports the key it just wrote"
+        );
+
+        let written: serde_json::Value = serde_json::from_str(&dir.read()).expect("parse");
+        assert_eq!(
+            written["providers"]["keep"]["apiKey"],
+            serde_json::json!("sk-new")
+        );
+        // Everything else survived: the keys pi owns inside the entry, the other
+        // provider and the top-level settings.
+        assert_eq!(
+            written["providers"]["keep"]["timeoutSeconds"],
+            serde_json::json!(300)
+        );
+        assert_eq!(
+            written["providers"]["keep"]["modelOverrides"]["m"]["contextWindow"],
+            serde_json::json!(4096)
+        );
+        assert_eq!(
+            written["providers"]["keep"]["baseUrl"],
+            serde_json::json!("https://keep.test/v1")
+        );
+        let original: serde_json::Value =
+            serde_json::from_str(TWO_PROVIDERS).expect("parse fixture");
+        assert_eq!(written["providers"]["drop"], original["providers"]["drop"]);
+        assert_eq!(written["theme"], serde_json::json!("dark"));
+
+        let written_backups = backups(&dir);
+        assert_eq!(
+            written_backups.len(),
+            1,
+            "the rewrite is backed up: {:?}",
+            dir.entries()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join(&written_backups[0])).expect("read backup"),
+            TWO_PROVIDERS
+        );
+
+        // The pane reads the result without ever seeing the key.
+        let providers = read_providers(&dir.path()).expect("read providers");
+        assert!(providers.iter().all(|provider| provider.has_api_key));
+        let json = serde_json::to_string(&providers).expect("serialize");
+        assert!(
+            !json.contains("sk-new"),
+            "the key never reaches the payload: {json}"
+        );
+    }
+
+    // S4: an empty key is not a key, and a rejected write changes nothing.
+    #[test]
+    fn set_provider_key_rejects_an_empty_key() {
+        let dir = TempModelsDir::new("set_key_empty");
+        dir.write(TWO_PROVIDERS);
+        let before = dir.read();
+        for key in ["", "   "] {
+            let err = set_provider_key(&dir.path(), "keep", key)
+                .expect_err("an empty key is rejected");
+            match err {
+                ProvidersError::EmptyApiKey => {}
+                other => panic!("expected EmptyApiKey for {key:?}, got {other:?}"),
+            }
+            assert_eq!(dir.read(), before, "a rejected key changes nothing");
+            assert_eq!(
+                dir.entries(),
+                vec!["models.json".to_string()],
+                "no backup for a rejected write"
+            );
+        }
+    }
+
+    // S3/S4: a key belongs to an entry that exists; an id the file does not have
+    // is an error, and no provider is invented.
+    #[test]
+    fn set_provider_key_rejects_an_unknown_provider() {
+        let dir = TempModelsDir::new("set_key_unknown");
+        dir.write(TWO_PROVIDERS);
+        let before = dir.read();
+
+        let err = set_provider_key(&dir.path(), "absent", "sk-new")
+            .expect_err("an unknown provider cannot be keyed");
+        match err {
+            ProvidersError::UnknownProvider(id) => assert_eq!(id, "absent"),
+            other => panic!("expected UnknownProvider, got {other:?}"),
+        }
+        assert_eq!(dir.read(), before, "the file is not rewritten");
+        assert_eq!(
+            dir.entries(),
+            vec!["models.json".to_string()],
+            "no provider is created"
+        );
+
+        // An entry that is not an object is not a provider to key either.
+        dir.write(r#"{"providers":{"weird":"nope"}}"#);
+        let err = set_provider_key(&dir.path(), "weird", "sk-new")
+            .expect_err("a non-object entry is not a provider");
+        match err {
+            ProvidersError::UnknownProvider(id) => assert_eq!(id, "weird"),
+            other => panic!("expected UnknownProvider, got {other:?}"),
+        }
+    }
+
+    // S3: the id shape is validated before a key is written.
+    #[test]
+    fn set_provider_key_rejects_an_invalid_id() {
+        let dir = TempModelsDir::new("set_key_bad_id");
+        dir.write(TWO_PROVIDERS);
+        let before = dir.read();
+        for id in ["", "Keep", "keep me", &"k".repeat(33)] {
+            let err = set_provider_key(&dir.path(), id, "sk-new")
+                .expect_err("a malformed id is rejected");
+            match err {
+                ProvidersError::InvalidId(value) => assert_eq!(value, id),
+                other => panic!("expected InvalidId for {id:?}, got {other:?}"),
+            }
+            assert_eq!(dir.read(), before, "a rejected id changes nothing");
+            assert_eq!(dir.entries(), vec!["models.json".to_string()]);
         }
     }
 

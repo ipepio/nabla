@@ -33,6 +33,8 @@ export interface ModelInfo {
  * One provider pi knows, as `list_providers` summarizes it (S1 of
  * `odd/tasks/providers-pane.md`). The api key never crosses the seam: the DTO
  * carries only `hasApiKey` (S4), so the webview cannot read or leak it.
+ * `set_provider_key` answers with this same shape after writing a key, so the
+ * pane refreshes one row from what the file holds instead of guessing.
  * Mirrors `ProviderSummary` in `src-tauri/src/providers.rs`.
  */
 export interface ProviderSummary {

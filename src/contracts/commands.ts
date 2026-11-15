@@ -128,6 +128,30 @@ export function discoverModels(
   return invoke<ModelOption[]>("discover_models", { baseUrl, apiKey });
 }
 
+/**
+ * S3: removes `providers.<id>` from pi's configuration file — backup and atomic
+ * write included — and answers with the summary the entry now has.
+ *
+ * `true` means the entry was removed. `false` means the file no longer had it:
+ * the delete is idempotent, so a stale row cannot turn into an error. A
+ * malformed id still rejects before anything is written.
+ */
+export function deleteProvider(providerId: string): Promise<boolean> {
+  return invoke<boolean>("delete_provider", { providerId });
+}
+
+/**
+ * S4: stores the api key of an existing provider in pi's plain-text file and
+ * answers with the summary `list_providers` would report, so the pane refreshes
+ * from it instead of guessing. The key itself never comes back across the bridge.
+ */
+export function setProviderKey(
+  providerId: string,
+  apiKey: string,
+): Promise<ProviderSummary> {
+  return invoke<ProviderSummary>("set_provider_key", { providerId, apiKey });
+}
+
 // ── pi runtime seam (R3, R4) ─────────────────────────────────────────────────
 
 export function startSession(workspaceId: number): Promise<SessionDto> {

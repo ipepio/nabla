@@ -13,10 +13,18 @@
  * clicking a row persists that choice. The model selector moved out of this
  * dialog: the chat composer owns it and already writes `settings.model`.
  *
- * S5 of the same task: the custom-provider form exists only when
- * `VITE_ENABLE_CUSTOM_PROVIDERS` is truthy, a build-time switch like the rest of
- * Nabla's env configuration. Without the flag the section is not rendered, so a
- * build never shows a control whose backend it cannot reach.
+ * S5 of the same task: the custom-provider form is gated by
+ * `VITE_ENABLE_CUSTOM_PROVIDERS`, a build-time switch like the rest of Nabla's
+ * env configuration — and it is ON BY DEFAULT: only an explicit `0`/`false`/`off`
+ * hides the block. The same helper declares `VITE_ENABLE_PROVIDER_LOGIN` and
+ * `VITE_ENABLE_API_KEYS`, which render nothing yet: those two sections belong to
+ * the next unit, so this build has no dead control.
+ *
+ * S3/S4: every configured row also offers the api key of that provider (typed
+ * inline, never prefilled, written into pi's plain-text `models.json`) and its
+ * removal behind a confirmation. Removing the active provider falls back to the
+ * first remaining one; with none left the settings stay untouched and the pane
+ * says so.
  *
  * S1 of `i18n-and-settings-polish.md`: the pane has no rule between single rows.
  * Blocks are separated by spacing plus at most two rules, one between each pair
@@ -54,9 +62,11 @@ import {
   DialogClose,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import {
   Select,
   SelectContent,
@@ -72,10 +82,12 @@ import ProviderForm from "./ProviderForm.vue";
 import {
   commandErrorMessage,
   configFilePath,
+  deleteProvider,
   getSettings,
   listProviders,
   openConfigFile,
   saveSettings,
+  setProviderKey,
 } from "@/contracts/commands";
 import type { AppSettings, ProviderSummary } from "@/contracts/types";
 
@@ -130,20 +142,51 @@ const saving = ref(false);
 const opening = ref(false);
 /** S2: the inline custom-provider form is open. */
 const showProviderForm = ref(false);
+/** S4: the provider whose inline api-key editor is open, `null` when closed. */
+const keyTarget = ref<string | null>(null);
+/** The key being typed. Always empty when the editor opens: never prefilled. */
+const keyDraft = ref("");
+/** A key write is in flight. */
+const savingKey = ref(false);
+/** The provider the removal confirmation is about, `null` when it is closed. */
+const pendingRemoval = ref<ProviderSummary | null>(null);
+const removalOpen = ref(false);
+/** A removal finished, so a write is in flight. */
+const removing = ref(false);
+/**
+ * A line the pane shows after a removal that left the settings untouched (S1
+ * fallback could not happen). Informational, not an error: nothing failed.
+ */
+const warning = ref<string | null>(null);
 
 /**
- * S5: the custom-provider block is a build-time switch, read the same way the
- * palette and the hero copy are. Only "1"/"true" (any case) turns it on; an
- * absent or unrecognised value leaves the section unrendered, never disabled.
+ * S5 of `providers-pane.md`: build-time switches, read the same way the palette
+ * and the hero copy are. ON BY DEFAULT — only an explicit `0`/`false`/`off`
+ * (any case, surrounding spaces ignored) turns a section off, so a build without
+ * these variables configured shows the features instead of hiding them.
  */
-function readFlag(value: string | undefined): boolean {
+function readFlag(name: string): boolean {
+  const value = (import.meta.env as Record<string, string | undefined>)[name];
   const normalized = (value ?? "").trim().toLowerCase();
-  return normalized === "1" || normalized === "true";
+  return normalized !== "0" && normalized !== "false" && normalized !== "off";
 }
-const customProvidersEnabled = readFlag(
-  (import.meta.env as Record<string, string | undefined>)
-    .VITE_ENABLE_CUSTOM_PROVIDERS,
-);
+
+/**
+ * S5: the three independent switches of this task.
+ *
+ * `customProviders` is rendered below. `providerLogin` and `apiKeys` are DECLARED
+ * here for the next unit — the login section and the known-provider api-key section
+ * — and deliberately render nothing yet: this build shows no dead control. They
+ * live in one object so a build can flip them without touching the pane.
+ */
+const PROVIDER_FLAGS = {
+  customProviders: readFlag("VITE_ENABLE_CUSTOM_PROVIDERS"),
+  // Next unit (S5/S6): login with pi's own options. No UI yet.
+  providerLogin: readFlag("VITE_ENABLE_PROVIDER_LOGIN"),
+  // Next unit (S5): api keys for providers pi already knows. No UI yet.
+  apiKeys: readFlag("VITE_ENABLE_API_KEYS"),
+} as const;
+const customProvidersEnabled = PROVIDER_FLAGS.customProviders;
 
 // The applied mode, not the stored one: the ring shows what the app is actually
 // painting, and both agree because opening the dialog applies the stored mode.
@@ -236,6 +279,107 @@ async function handleProviderActivate(providerId: string) {
 }
 
 /**
+ * S4: opens the inline api-key editor for one provider. The field always starts
+ * empty — Rust never sends the key, so there is nothing to prefill.
+ */
+function toggleKeyEditor(entry: ProviderSummary) {
+  if (keyTarget.value === entry.id) {
+    closeKeyEditor();
+    return;
+  }
+  keyTarget.value = entry.id;
+  keyDraft.value = "";
+  error.value = null;
+}
+
+function closeKeyEditor() {
+  keyTarget.value = null;
+  keyDraft.value = "";
+}
+
+/**
+ * S4: stores the typed key through `set_provider_key`, which rewrites
+ * `providers.<id>.apiKey` in pi's plain-text file (backup + atomic write). Rust
+ * answers with the summary the file now holds, so the row is refreshed from it
+ * instead of guessing, and "key set" appears because the file says so.
+ *
+ * An empty field cannot be submitted (the button is disabled), and the typed key
+ * is dropped once the write lands.
+ */
+async function handleSaveKey() {
+  const target = keyTarget.value;
+  const key = keyDraft.value.trim();
+  if (!target || key === "" || savingKey.value) return;
+  savingKey.value = true;
+  error.value = null;
+  try {
+    const summary = await setProviderKey(target, key);
+    providers.value = providers.value.map((entry) =>
+      entry.id === summary.id ? summary : entry,
+    );
+    closeKeyEditor();
+  } catch (cause) {
+    // A rejected key keeps the editor open with what was typed.
+    error.value = commandErrorMessage(cause);
+  } finally {
+    savingKey.value = false;
+  }
+}
+
+/** Opens the removal confirmation for one provider (S1/S3). */
+function requestRemove(entry: ProviderSummary) {
+  pendingRemoval.value = entry;
+  removalOpen.value = true;
+  error.value = null;
+  warning.value = null;
+}
+
+/**
+ * S3: removes one provider from pi's configuration after confirmation, then
+ * re-reads the list (Rust may have had nothing to remove).
+ *
+ * S1 fallback: if the removed provider was the active one, the first remaining
+ * provider becomes active; with none left, the settings are left untouched and
+ * the pane says so instead of writing a provider the file no longer has.
+ */
+async function confirmRemove() {
+  const target = pendingRemoval.value;
+  if (!target || removing.value) return;
+  removalOpen.value = false;
+  pendingRemoval.value = null;
+  removing.value = true;
+  error.value = null;
+  warning.value = null;
+  try {
+    // An editor left open on the removed row would have no provider to write.
+    if (keyTarget.value === target.id) closeKeyEditor();
+    const removed = await deleteProvider(target.id);
+    await loadProviders();
+    if (!removed) {
+      // The entry was already gone from the file: report it instead of
+      // pretending the removal happened.
+      warning.value = t("settings.providers.remove.missing");
+      return;
+    }
+    if (target.id !== activeProvider.value) return;
+    const remaining = providers.value[0];
+    if (!remaining) {
+      warning.value = t("settings.providers.remove.activeWarning");
+      return;
+    }
+    const current = await getSettings();
+    settings.value = await saveSettings({
+      ...current,
+      provider: remaining.id,
+    });
+  } catch (cause) {
+    error.value = commandErrorMessage(cause);
+  } finally {
+    removing.value = false;
+  }
+}
+
+/**
  * S2 of `providers-pane.md`: a saved provider lands in pi's file, so the list is
  * re-read instead of patched locally — Rust is the one that knows the stored
  * name and model count (an empty name falls back to the id there).
@@ -291,6 +435,12 @@ watch(open, (isOpen) => {
   if (!isOpen) return;
   section.value = "general";
   showProviderForm.value = false;
+  closeKeyEditor();
+  pendingRemoval.value = null;
+  removalOpen.value = false;
+  savingKey.value = false;
+  removing.value = false;
+  warning.value = null;
   error.value = null;
   void loadPreferences();
   void loadProviders();
@@ -466,70 +616,150 @@ watch(open, (isOpen) => {
                 </p>
               </div>
 
-              <!-- S1: a row is the control: clicking it activates that provider by
-                   persisting `settings.provider`. aria-pressed carries the state. -->
+              <!-- S1: the name, url and state are one activate control; the row's
+                   other actions are siblings of it (a button inside a button is
+                   invalid HTML). The active row is marked by the accent fill, not
+                   by a rule: this pane keeps a single separator, before the
+                   custom block. -->
               <ul v-if="providers.length" class="space-y-0.5">
-                <li v-for="entry in providers" :key="entry.id">
-                  <button
-                    type="button"
-                    :aria-pressed="entry.id === activeProvider"
-                    :disabled="saving"
-                    :class="[
-                      'w-full rounded-md px-2 py-1.5 text-left outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50',
-                      entry.id === activeProvider
-                        ? 'bg-sidebar-accent text-sidebar-accent-foreground'
-                        : 'hover:bg-muted',
-                    ]"
-                    @click="handleProviderActivate(entry.id)"
-                  >
-                    <span class="flex items-center justify-between gap-2">
-                      <span class="flex min-w-0 items-baseline gap-2">
-                        <span class="min-w-0 truncate text-sm font-medium">
-                          {{ entry.name }}
-                        </span>
-                        <span
-                          class="min-w-0 truncate font-mono text-xs text-muted-foreground"
-                        >
-                          {{ entry.id }}
-                        </span>
-                      </span>
-                      <CheckIcon
-                        v-if="entry.id === activeProvider"
-                        class="size-4 shrink-0"
-                        aria-hidden="true"
-                      />
-                    </span>
-                    <span
-                      class="mt-0.5 flex items-center justify-between gap-2 text-xs text-muted-foreground"
+                <li
+                  v-for="entry in providers"
+                  :key="entry.id"
+                  :class="[
+                    'rounded-md transition-colors',
+                    entry.id === activeProvider
+                      ? 'bg-sidebar-accent text-sidebar-accent-foreground'
+                      : 'hover:bg-muted',
+                  ]"
+                >
+                  <div class="flex items-center gap-1 px-2 py-1.5">
+                    <button
+                      type="button"
+                      :aria-pressed="entry.id === activeProvider"
+                      :disabled="saving || removing"
+                      class="min-w-0 flex-1 rounded-sm text-left outline-hidden focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+                      @click="handleProviderActivate(entry.id)"
                     >
-                      <span class="min-w-0 truncate" :title="entry.baseUrl">
-                        {{ entry.baseUrl }}
+                      <span class="flex items-center justify-between gap-2">
+                        <span class="flex min-w-0 items-baseline gap-2">
+                          <span class="min-w-0 truncate text-sm font-medium">
+                            {{ entry.name }}
+                          </span>
+                          <span
+                            class="min-w-0 truncate font-mono text-xs text-muted-foreground"
+                          >
+                            {{ entry.id }}
+                          </span>
+                        </span>
+                        <CheckIcon
+                          v-if="entry.id === activeProvider"
+                          class="size-4 shrink-0"
+                          aria-hidden="true"
+                        />
                       </span>
-                      <span class="shrink-0">
-                        {{
-                          t("settings.providers.models", {
-                            count: entry.modelCount,
-                          })
-                        }}
-                        ·
-                        {{
-                          entry.hasApiKey
-                            ? t("settings.providers.keySet")
-                            : t("settings.providers.noKey")
-                        }}
+                      <span
+                        class="mt-0.5 flex items-center justify-between gap-2 text-xs text-muted-foreground"
+                      >
+                        <span class="min-w-0 truncate" :title="entry.baseUrl">
+                          {{ entry.baseUrl }}
+                        </span>
+                        <span class="shrink-0">
+                          {{
+                            t("settings.providers.models", {
+                              count: entry.modelCount,
+                            })
+                          }}
+                          ·
+                          {{
+                            entry.hasApiKey
+                              ? t("settings.providers.keySet")
+                              : t("settings.providers.noKey")
+                          }}
+                        </span>
                       </span>
-                    </span>
-                  </button>
+                    </button>
+
+                    <!-- S4: the api-key action of this row. -->
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      :aria-expanded="keyTarget === entry.id"
+                      :disabled="removing"
+                      @click="toggleKeyEditor(entry)"
+                    >
+                      {{ t("settings.providers.apiKey") }}
+                    </Button>
+                    <!-- S1/S3: removal, behind the pane's confirmation dialog. -->
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      :disabled="removing"
+                      @click="requestRemove(entry)"
+                    >
+                      {{ t("settings.providers.remove") }}
+                    </Button>
+                  </div>
+
+                  <!-- S4: the key is typed here and never prefilled — Rust has
+                       no copy to send back, so the field always starts empty. -->
+                  <form
+                    v-if="keyTarget === entry.id"
+                    class="flex flex-wrap items-center gap-2 px-2 pb-2"
+                    @submit.prevent="handleSaveKey"
+                  >
+                    <Input
+                      v-model="keyDraft"
+                      type="password"
+                      autocomplete="new-password"
+                      spellcheck="false"
+                      class="h-8 min-w-0 flex-1 text-sm"
+                      :aria-label="
+                        t('settings.providers.apiKey.label', { id: entry.id })
+                      "
+                      :placeholder="t('settings.providers.apiKey.placeholder')"
+                    />
+                    <Button
+                      type="submit"
+                      size="sm"
+                      :disabled="!keyDraft.trim() || savingKey"
+                    >
+                      {{
+                        savingKey
+                          ? t("settings.providers.apiKey.saving")
+                          : t("settings.providers.apiKey.save")
+                      }}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      :disabled="savingKey"
+                      @click="closeKeyEditor"
+                    >
+                      {{ t("common.cancel") }}
+                    </Button>
+                    <p class="w-full text-xs text-muted-foreground">
+                      {{ t("settings.providers.apiKey.description") }}
+                    </p>
+                  </form>
                 </li>
               </ul>
               <p v-else class="text-xs text-muted-foreground">
                 {{ t("settings.providers.empty") }}
               </p>
+
+              <!-- Informational line after a removal: nothing failed, so it is
+                   not rendered as an error. -->
+              <p v-if="warning" class="text-xs text-muted-foreground">
+                {{ warning }}
+              </p>
             </section>
 
-            <!-- S5: this whole block exists only when the build set
-                 VITE_ENABLE_CUSTOM_PROVIDERS; with the flag off there is nothing
-                 to click and nothing to explain. -->
+            <!-- S5: this whole block is ON unless the build sets
+                 VITE_ENABLE_CUSTOM_PROVIDERS to `0`/`false`/`off`; with the flag
+                 off there is nothing to click and nothing to explain. -->
             <template v-if="customProvidersEnabled">
               <Separator />
 
@@ -551,6 +781,40 @@ watch(open, (isOpen) => {
                 />
               </section>
             </template>
+
+            <!-- S1/S3: one confirmation dialog for the whole list, the same
+                 pattern the session rows use: the trigger only says which
+                 provider it is about. -->
+            <Dialog v-model:open="removalOpen">
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>
+                    {{ t("settings.providers.remove.title") }}
+                  </DialogTitle>
+                  <DialogDescription>
+                    {{
+                      t("settings.providers.remove.description", {
+                        id: pendingRemoval?.id ?? "",
+                      })
+                    }}
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogFooter>
+                  <DialogClose as-child>
+                    <Button variant="outline">
+                      {{ t("common.cancel") }}
+                    </Button>
+                  </DialogClose>
+                  <Button
+                    variant="destructive"
+                    :disabled="removing"
+                    @click="confirmRemove"
+                  >
+                    {{ t("settings.providers.remove") }}
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
           </div>
 
           <Alert v-if="error" variant="destructive" class="mb-4">

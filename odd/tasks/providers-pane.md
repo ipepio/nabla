@@ -56,3 +56,7 @@ save_provider(draft: ProviderDraft) -> ProviderSummary        // backup + merge 
 
 - **L5** Verificación orchestrator: `cargo test` 95/95 (22 nuevos), clippy 0; `npm run build` OK; `en`/`es` con 120 claves idénticas (30 de providers); contratos `list_providers`/`save_provider`/`discover_models` con los nombres de argumento que espera Rust; el bloque de alta sólo existe con `VITE_ENABLE_CUSTOM_PROVIDERS`.
 - **L6** Pestaña renombrada a Providers (PlugIcon); las claves antiguas `settings.models.*` se retiraron de ambos catálogos.
+
+- **L7** Segunda tanda (misma rama): flags **ON por defecto** con kill switch (`0`/`false`/`off`); `delete_provider` (sólo entradas presentes en `models.json`, con backup y escritura atómica; id desconocido = no-op) y `set_provider_key` (actualiza `providers.<id>.apiKey` en sitio). UI: por fila, activar + `API key` (input en blanco, guarda y refresca desde el archivo) + `Remove` con confirmación; si se elimina el provider activo se cae al primero restante. Login sigue sin implementarse: no hay sección falsa.
+- **L8** Tests: 103/103 cargo (8 nuevos), clippy 0, build OK, i18n 131/131 claves.
+- **L9** Lectura del pedido del usuario («no quiero un custom provider implementado»): se interpreta como *no hay una vía especial para providers personalizados*; todo provider listado en `models.json` se gestiona igual (activar, clave, eliminar) y los built-in de pi no se tocan porque no viven en ese archivo.
