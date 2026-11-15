@@ -1,7 +1,7 @@
 # Agent working contract — Nabla
 
 Nabla is a desktop harness built on Pi (`@earendil-works/pi-coding-agent`): a Tauri v2 host in Rust,
-a Vue 3 + Vuetify webview, and a headless pi child process per session that the host owns, supervises
+a Vue 3 + shadcn-vue (Tailwind v4) webview, and a headless pi child process per session that the host owns, supervises
 and kills with the app. This file is the entry point for any agent working here.
 
 ## Start here
@@ -42,8 +42,9 @@ and kills with the app. This file is the entry point for any agent working here.
    (Engram is the pattern reference). A shared database is never the integration point.
 5. **Contract shape flows Rust → TS, never back.** Payloads serialize camelCase
    (`#[serde(rename_all = "camelCase")]`) and are mirrored field by field in `src/contracts/types.ts`.
-6. **CSP stays enabled** in `src-tauri/tauri.conf.json`. `style-src 'unsafe-inline'` is required by
-   Vuetify; `"csp": null` is a known defect in reference projects and is not acceptable here.
+6. **CSP stays enabled** in `src-tauri/tauri.conf.json`. `style-src 'unsafe-inline'` is currently
+   required by the Tailwind v4 dev pipeline (HMR style injection); revisit when packaging (ADR 0007).
+   `"csp": null` is a known defect in reference projects and is not acceptable here.
 7. **Roadmap order:** general desktop assistant → agent coordination → development environment
    (P-001). Do not build a later stage early because a reference project has it.
 8. **Scope respect.** `.docs/` is local-only and `odd/` is orchestrator-owned; do not edit either

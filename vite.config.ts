@@ -1,12 +1,23 @@
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
+import tailwindcss from "@tailwindcss/vite";
 // @ts-expect-error type error without @types/node package
 import process from "node:process";
 const host = process.env.TAURI_DEV_HOST;
 
+// `@/…` resolves to `src/…` (shadcn-vue convention). Built from this file's URL
+// so the config needs no extra Node typings.
+const srcAlias = new URL("./src", import.meta.url).pathname;
+
 // https://vite.dev/config/
 export default defineConfig(() => ({
-  plugins: [vue()],
+  plugins: [vue(), tailwindcss()],
+
+  resolve: {
+    alias: {
+      "@": srcAlias,
+    },
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

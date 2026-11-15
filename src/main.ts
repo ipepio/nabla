@@ -1,15 +1,7 @@
 import { createApp } from "vue";
 import App from "./App.vue";
+// Tailwind v4 entry (design tokens + base layer). The `.dark` class on <html>
+// decides the palette; index.html ships it as the default.
+import "./assets/index.css";
 
-// Vuetify
-import "vuetify/styles";
-import "@mdi/font/css/materialdesignicons.css";
-import { createVuetify } from "vuetify";
-
-const vuetify = createVuetify({
-  theme: {
-    defaultTheme: "dark",
-  },
-});
-
-createApp(App).use(vuetify).mount("#app");
+createApp(App).mount("#app");

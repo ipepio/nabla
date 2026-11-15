@@ -14,6 +14,13 @@
     "noEmit": true,
     "jsx": "preserve",
 
+    /* Import alias (`@/…` → `src/…`), required by shadcn-vue components.
+       `paths` is resolved relative to this file; no `baseUrl` (deprecated in
+       TypeScript 6). */
+    "paths": {
+      "@/*": ["./src/*"]
+    },
+
     /* Linting */
     "strict": true,
     "noUnusedLocals": true,

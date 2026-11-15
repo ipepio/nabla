@@ -25,8 +25,9 @@ Tauri applies this policy to the packaged app's own assets. `npm run tauri dev` 
 (`http://localhost:1420`) from the Vite dev server, and the unused `security.devCsp` field means that
 page is not covered by this policy: a policy violation must be confirmed against a packaged build.
 
-`'unsafe-inline'` is accepted only in `style-src`, because Vuetify generates style attributes at
-runtime; it is not a licence to loosen `script-src`, `connect-src` or `default-src`. Bundled assets
+`'unsafe-inline'` is accepted only in `style-src`, because the Tailwind v4 dev pipeline injects
+styles at runtime (and some components set inline style attributes); it is not a licence to loosen `script-src`, `connect-src` or `default-src`. Revisit this entry when the app is packaged
+(see Conditions to revisit). Bundled assets
 must be satisfied by `'self'` or by an explicit entry added with a reason. `"csp": null` is a defect,
 not an option.
 

@@ -9,7 +9,7 @@ one contracts module. Do not add layers that the current screens do not need.
 | --- | --- | --- | --- |
 | Shell view | `src/App.vue` | Screen composition and the user flow of the shell | Transport details, DTO mapping, process lifecycle |
 | Domain component | `src/<domain>/components/` (when created) | One coherent interaction | Unrelated domains, hidden global side effects |
-| Shared UI | Vuetify (`v-card`, `v-list`, `v-row`) | Presentation and interaction contract | Domain state, command calls |
+| Shared UI | shadcn-vue (`src/components/ui/*`, Tailwind v4) | Presentation and interaction contract | Domain state, command calls |
 | Composable | `src/<domain>/` (when created) | A cohesive reactive responsibility and its cleanup | A grab bag of helpers |
 | Contracts module | `src/contracts/commands.ts` | The only IPC channel and error normalization | Navigation, dialogs, form state |
 | Contracts types | `src/contracts/types.ts` | Mirrors of Rust DTOs | Logic, defaults, derived values |
@@ -24,16 +24,20 @@ one contracts module. Do not add layers that the current screens do not need.
   the UI never shows `[object Object]`. Typed error payloads are a pending gap, not a rule.
 - No component knows a command name as a string; each one has a typed wrapper.
 
-## Vuetify and the shell
+## shadcn-vue and the shell
 
-- Vuetify 4 with the dark theme as default (`src/main.ts`). Keep one UI system; do not add another
-  component library or a CSS framework.
-- `src/main.ts` installs the Vuetify plugin without a component registry, so each SFC imports the
-  components it uses from `vuetify/components`. Keep that convention.
-- Build screens from cards: `v-card` + `v-card-title` + `v-card-text`, `v-row`/`v-col` for layout,
-  `v-alert` for errors and `v-snackbar` for confirmations. Match the established spacing classes.
-- Accessibility belongs to the component: every icon-only `v-btn` carries an `aria-label`.
-- CSP stays enabled; inline styles are allowed for Vuetify, remote assets are not.
+- The UI system is shadcn-vue on Tailwind CSS v4, dark theme as default (`.dark` on `<html>`;
+  tokens in `src/assets/index.css`). Keep one UI system; do not add another component library or
+  CSS framework.
+- Generated shadcn-vue components live in `src/components/ui/*` and are owned like vendored code:
+  edit them only with a reason, prefer composing them. `src/lib/utils.ts` exposes `cn()`.
+- Build screens from the shell parts: `AppSidebar` (left drawer: logo, workspaces, settings
+  dialog, collapse trigger) + `SidebarInset` (central area; currently the chat). A right drawer is
+  a documented seam, not yet built.
+- Icons come from lucide (one icon family only); accessibility belongs to the component: every
+  icon-only button carries an `aria-label`.
+- CSP stays enabled; `style-src 'unsafe-inline'` is currently required by the Tailwind dev
+  pipeline, remote assets are not (see ADR 0007).
 
 ## State ownership
 

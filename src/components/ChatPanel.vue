@@ -3,22 +3,26 @@
 // streaming assistant text and tool activity into a minimal transcript.
 // Everything pi sends arrives through the contracts seam (`subscribeAgentEvents`
 // → `agent-event` envelope), never from a view-level Tauri import.
+//
+// S5/S1: this rewrite changes presentation only. The subscription, the delta
+// folding, the tool-state machine and the status mapping are the same code the
+// Vuetify panel had.
+import type { Component } from "vue";
 import { computed, onMounted, onUnmounted, ref } from "vue";
-// Imported locally: main.ts installs the Vuetify plugin without a component
-// registry, so each view registers what it renders (same pattern as App.vue).
 import {
-  VAlert,
-  VBtn,
-  VCard,
-  VCardText,
-  VCardTitle,
-  VChip,
-  VCol,
-  VRow,
-  VSelect,
-  VTextField,
-} from "vuetify/components";
-import type { AgentEvent, RuntimeStatus } from "../contracts/agent-events";
+  CheckIcon,
+  CircleAlertIcon,
+  LoaderIcon,
+  SquareIcon,
+  XIcon,
+} from "@lucide/vue";
+import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { SidebarTrigger } from "@/components/ui/sidebar";
+import { Textarea } from "@/components/ui/textarea";
+import type { AgentEvent, RuntimeStatus } from "@/contracts/agent-events";
 import {
   commandErrorMessage,
   sendPrompt,
@@ -26,10 +30,11 @@ import {
   startSession,
   stopSession,
   subscribeAgentEvents,
-} from "../contracts/commands";
-import type { SessionDto, WorkspaceInfo } from "../contracts/types";
+} from "@/contracts/commands";
+import type { SessionDto, WorkspaceInfo } from "@/contracts/types";
 
-defineProps<{ workspaces: WorkspaceInfo[] }>();
+/** The drawer owns the workspace list; the active one arrives already chosen. */
+const props = defineProps<{ workspace: WorkspaceInfo | null }>();
 
 /** One rendered turn. Assistant text grows as deltas arrive. */
 interface ChatMessage {
@@ -49,7 +54,6 @@ interface StatusAlert {
   text: string;
 }
 
-const selectedWorkspaceId = ref<number | null>(null);
 const session = ref<SessionDto | null>(null);
 const prompt = ref("");
 const messages = ref<ChatMessage[]>([]);
@@ -69,6 +73,10 @@ let unsubscribe: (() => void) | null = null;
 
 const canSend = computed(
   () => session.value !== null && prompt.value.trim() !== "" && !sending.value,
+);
+
+const canStart = computed(
+  () => props.workspace !== null && session.value === null && !starting.value,
 );
 
 /** Human-readable lifecycle state, the same five states the runtime models. */
@@ -172,25 +180,25 @@ function handleEvent(event: AgentEvent) {
   }
 }
 
-function toolIcon(state: ToolEntry["state"]): string {
+function toolIcon(state: ToolEntry["state"]): Component {
   switch (state) {
     case "running":
-      return "mdi-progress-wrench";
+      return LoaderIcon;
     case "done":
-      return "mdi-check";
+      return CheckIcon;
     case "error":
-      return "mdi-alert-circle-outline";
+      return CircleAlertIcon;
   }
 }
 
-function toolColor(state: ToolEntry["state"]): string {
+function toolBadgeVariant(state: ToolEntry["state"]): "secondary" | "outline" | "destructive" {
   switch (state) {
     case "running":
-      return "info";
+      return "secondary";
     case "done":
-      return "success";
+      return "outline";
     case "error":
-      return "error";
+      return "destructive";
   }
 }
 
@@ -206,15 +214,15 @@ function toolStateLabel(state: ToolEntry["state"]): string {
 }
 
 async function handleStart() {
-  const workspaceId = selectedWorkspaceId.value;
-  if (workspaceId === null) {
+  const workspace = props.workspace;
+  if (workspace === null) {
     error.value = "Select a workspace before starting a session.";
     return;
   }
   starting.value = true;
   error.value = null;
   try {
-    const started = await startSession(workspaceId);
+    const started = await startSession(workspace.id);
     session.value = started;
     messages.value = [];
     tools.value = [];
@@ -285,141 +293,118 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <v-card elevation="2" rounded="lg">
-    <v-card-title class="text-subtitle-1">Chat</v-card-title>
-    <v-card-text>
-      <v-alert
-        v-if="error"
-        class="mb-4"
-        type="error"
-        variant="tonal"
-        closable
-        @click:close="error = null"
+  <div class="flex h-full min-h-0 flex-col">
+    <!-- Main header: the collapse control duplicated here (S1) so the drawer can
+         be toggled from the chat side too. -->
+    <header class="flex items-center gap-3 border-b px-4 py-2">
+      <SidebarTrigger />
+      <div class="min-w-0 flex-1">
+        <h1 class="truncate text-sm font-semibold">Chat</h1>
+        <p class="truncate text-xs text-muted-foreground">
+          {{
+            workspace === null
+              ? "No workspace selected — add or pick one in the sidebar."
+              : `${workspace.name} · ${workspace.path}`
+          }}
+        </p>
+      </div>
+
+      <Badge v-if="session !== null" variant="outline" class="hidden sm:inline-flex">
+        session {{ session.sessionId }} · pid {{ session.pid }}
+      </Badge>
+      <Button v-if="session === null" :disabled="!canStart" @click="handleStart">
+        {{ starting ? "Starting…" : "Start session" }}
+      </Button>
+      <Button
+        v-else
+        variant="outline"
+        :disabled="stopping"
+        aria-label="Stop session"
+        @click="handleStop"
       >
-        {{ error }}
-      </v-alert>
+        <SquareIcon data-icon="inline-start" />
+        {{ stopping ? "Stopping…" : "Stop" }}
+      </Button>
+    </header>
 
-      <v-row density="comfortable" align="center">
-        <v-col cols="12" md="6">
-          <v-select
-            v-model="selectedWorkspaceId"
-            :items="workspaces"
-            item-title="name"
-            item-value="id"
-            label="Workspace"
-            variant="outlined"
-            density="comfortable"
-            hide-details
-            :disabled="session !== null || starting"
-          />
-        </v-col>
-        <v-col cols="12" md="6" class="d-flex align-center ga-3">
-          <v-btn
-            color="primary"
-            :loading="starting"
-            :disabled="selectedWorkspaceId === null || session !== null"
-            @click="handleStart"
-          >
-            Start session
-          </v-btn>
-          <span v-if="session !== null" class="text-caption text-medium-emphasis">
-            session {{ session.sessionId }} · pid {{ session.pid }}
-          </span>
-        </v-col>
-      </v-row>
+    <div v-if="error" class="px-4 pt-3">
+      <Alert variant="destructive">
+        <AlertDescription>{{ error }}</AlertDescription>
+        <AlertAction>
+          <Button variant="ghost" size="icon-xs" aria-label="Dismiss" @click="error = null">
+            <XIcon />
+          </Button>
+        </AlertAction>
+      </Alert>
+    </div>
 
-      <v-alert
-        v-if="statusAlert"
-        class="mt-4"
-        :type="statusAlert.type"
-        variant="tonal"
-        density="compact"
-      >
-        {{ statusAlert.text }}
-      </v-alert>
+    <div v-if="statusAlert" class="px-4 pt-3">
+      <Alert :variant="statusAlert.type === 'error' ? 'destructive' : 'default'">
+        <AlertDescription>{{ statusAlert.text }}</AlertDescription>
+      </Alert>
+    </div>
 
-      <div v-if="session !== null" class="chat-transcript mt-4">
-        <p v-if="messages.length === 0" class="text-medium-emphasis">
+    <!-- Transcript: the only scrolling region of the app (S1). -->
+    <ScrollArea class="min-h-0 flex-1">
+      <div class="flex flex-col gap-5 p-4">
+        <p v-if="session === null" class="text-sm text-muted-foreground">
+          Start a session to talk to pi.
+        </p>
+        <p v-else-if="messages.length === 0" class="text-sm text-muted-foreground">
           No messages yet — send a prompt below.
         </p>
+
         <div
           v-for="(message, index) in messages"
           :key="index"
-          class="chat-message"
-          :class="`chat-message--${message.role}`"
+          class="flex flex-col gap-1"
         >
-          <span class="text-caption text-medium-emphasis">
+          <span class="text-xs font-medium tracking-wide text-muted-foreground uppercase">
             {{ message.role === "user" ? "You" : "pi" }}
           </span>
-          <p class="chat-text">{{ message.text }}</p>
+          <p
+            class="text-sm whitespace-pre-wrap"
+            :class="message.role === 'user' ? 'text-foreground/80' : 'text-foreground'"
+          >
+            {{ message.text }}
+          </p>
         </div>
 
-        <div v-if="tools.length > 0" class="d-flex flex-wrap ga-2 mt-3">
-          <v-chip
+        <div v-if="tools.length > 0" class="flex flex-wrap gap-2">
+          <Badge
             v-for="tool in tools"
             :key="tool.toolCallId"
-            size="small"
-            variant="tonal"
-            :color="toolColor(tool.state)"
-            :prepend-icon="toolIcon(tool.state)"
+            :variant="toolBadgeVariant(tool.state)"
           >
+            <component :is="toolIcon(tool.state)" />
             {{ tool.toolName }} · {{ toolStateLabel(tool.state) }}
-          </v-chip>
+          </Badge>
         </div>
       </div>
+    </ScrollArea>
 
-      <v-row class="mt-2" density="comfortable" align="center">
-        <v-col cols="12" md="9">
-          <v-text-field
-            v-model="prompt"
-            label="Prompt"
-            placeholder="Ask pi…"
-            variant="outlined"
-            density="comfortable"
-            hide-details
-            :disabled="session === null"
-            @keyup.enter="handleSend"
-          />
-        </v-col>
-        <v-col cols="8" md="2">
-          <v-btn
-            block
-            color="primary"
-            :loading="sending"
-            :disabled="!canSend"
-            @click="handleSend"
-          >
-            Send
-          </v-btn>
-        </v-col>
-        <v-col cols="4" md="1">
-          <v-btn
-            icon="mdi-stop"
-            variant="text"
-            color="error"
-            aria-label="Stop session"
-            :loading="stopping"
-            :disabled="session === null"
-            @click="handleStop"
-          />
-        </v-col>
-      </v-row>
-    </v-card-text>
-  </v-card>
+    <!-- Composer, pinned under the transcript. -->
+    <footer class="flex items-end gap-2 border-t p-3">
+      <Textarea
+        v-model="prompt"
+        aria-label="Prompt"
+        placeholder="Ask pi…"
+        class="max-h-40 min-h-16 flex-1 resize-none"
+        :disabled="session === null"
+        @keydown.enter.exact.prevent="handleSend"
+      />
+      <Button :disabled="!canSend" @click="handleSend">
+        {{ sending ? "Sending…" : "Send" }}
+      </Button>
+      <Button
+        variant="outline"
+        size="icon"
+        aria-label="Stop session"
+        :disabled="session === null || stopping"
+        @click="handleStop"
+      >
+        <SquareIcon />
+      </Button>
+    </footer>
+  </div>
 </template>
-
-<style scoped>
-.chat-transcript {
-  max-height: 420px;
-  overflow-y: auto;
-}
-
-.chat-message--user .chat-text {
-  white-space: pre-wrap;
-  opacity: 0.75;
-}
-
-.chat-message--assistant .chat-text {
-  white-space: pre-wrap;
-}
-</style>
