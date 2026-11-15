@@ -34,10 +34,10 @@ const CHAT_COLUMN_PADDING = 32;
 export const CHAT_MIN_WIDTH = COMPOSER_MIN_WIDTH + CHAT_COLUMN_PADDING;
 
 /** Left drawer at its default (expanded) width — shadcn `--sidebar-width`. */
-export const SIDEBAR_WIDTH = 256;
+const SIDEBAR_WIDTH = 256;
 
 /** Narrowest the right tools panel may get (`ResizableAside` MIN_WIDTH). */
-export const PANEL_MIN_WIDTH = 240;
+const PANEL_MIN_WIDTH = 240;
 
 /** Minimum window width: the prompt box at half width, plus its neighbours. */
 export const APP_MIN_WIDTH = SIDEBAR_WIDTH + CHAT_MIN_WIDTH + PANEL_MIN_WIDTH;
