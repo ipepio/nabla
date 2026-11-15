@@ -1,7 +1,12 @@
 <script setup lang="ts">
 // Conversation header (spec S2): title + mode chip on the left, actions on the
-// right. Both actions are seams — theme switching and the overflow menu are not
-// wired yet, so they intentionally call nothing.
+// right. The theme control is live (spec S2 of
+// `odd/tasks/theme-modes-and-resizable-drawer.md`); the overflow menu is still a
+// seam and intentionally calls nothing.
+//
+// The header carries no theme state of its own: `isDark` is the resolved mode
+// the panel owns, and `toggleTheme` asks the panel for the next one (S4: the
+// theme is applied by `src/lib/theme.ts` only).
 import {
   MoonIcon,
   MoreHorizontalIcon,
@@ -18,9 +23,14 @@ defineProps<{
   mode: string;
   /** Right tools drawer visibility, so the control reflects the real state. */
   toolsOpen: boolean;
+  /** Is the app currently on the dark palette? Decides the icon and the label. */
+  isDark: boolean;
 }>();
 
-const emit = defineEmits<{ (e: "toggleTools"): void }>();
+const emit = defineEmits<{
+  (e: "toggleTools"): void;
+  (e: "toggleTheme"): void;
+}>();
 </script>
 
 <template>
@@ -47,15 +57,17 @@ const emit = defineEmits<{ (e: "toggleTools"): void }>();
       <PanelRightOpenIcon />
     </Button>
 
-    <!-- Seam: no theme state is persisted from the UI yet (settings.theme is
-         written by the settings file, not by this button). -->
+    <!-- Theme switch: the icon names the *target* palette (sun = light), and
+         the panel persists the new mode in settings.json. -->
     <Button
       variant="ghost"
       size="icon-sm"
-      aria-label="Toggle theme (not wired yet)"
+      :aria-label="isDark ? 'Switch to light theme' : 'Switch to dark theme'"
+      :aria-pressed="isDark"
+      @click="emit('toggleTheme')"
     >
-      <SunIcon class="hidden dark:block" />
-      <MoonIcon class="dark:hidden" />
+      <SunIcon v-if="isDark" />
+      <MoonIcon v-else />
     </Button>
 
     <!-- Seam: no session menu yet. -->

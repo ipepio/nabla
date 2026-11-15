@@ -33,18 +33,32 @@ Colors and brand images are configuration, never literals in a component (ADR 00
   (`src/lib/hero.ts`). Both empty by default, so the empty state shows only the logo, the chips and
   the composer.
 
-- **Tokens come from `.env`.** `.env.example` is the versioned reference; copy it to `.env` (ignored)
-  and edit the hex values. The keys are the contract: `VITE_COLOR_PRIMARY`, `VITE_COLOR_PRIMARY_FOREGROUND`,
-  `VITE_COLOR_SECONDARY`, `VITE_COLOR_SECONDARY_FOREGROUND`, `VITE_COLOR_TERTIARY`,
-  `VITE_COLOR_TERTIARY_FOREGROUND`, `VITE_COLOR_ACCENT`, `VITE_COLOR_ACCENT_FOREGROUND`,
-  `VITE_COLOR_BACKGROUND`, `VITE_COLOR_FOREGROUND`, `VITE_COLOR_MUTED`, `VITE_COLOR_MUTED_FOREGROUND`,
+- **Tokens come from `.env`, one palette per mode.** `.env.example` is the versioned reference; copy
+  it to `.env` (ignored) and edit the hex values. The dark palette is the app default and owns the
+  original keys: `VITE_COLOR_PRIMARY`, `VITE_COLOR_PRIMARY_FOREGROUND`, `VITE_COLOR_SECONDARY`,
+  `VITE_COLOR_SECONDARY_FOREGROUND`, `VITE_COLOR_TERTIARY`, `VITE_COLOR_TERTIARY_FOREGROUND`,
+  `VITE_COLOR_ACCENT`, `VITE_COLOR_ACCENT_FOREGROUND`, `VITE_COLOR_BACKGROUND`,
+  `VITE_COLOR_FOREGROUND`, `VITE_COLOR_MUTED`, `VITE_COLOR_MUTED_FOREGROUND`,
   `VITE_COLOR_DESTRUCTIVE`, `VITE_COLOR_SUCCESS`, `VITE_COLOR_WARNING`, `VITE_COLOR_BORDER`,
-  `VITE_COLOR_RING`, `VITE_COLOR_SIDEBAR`, `VITE_COLOR_SIDEBAR_FOREGROUND` and `VITE_RADIUS`
-  (a length: `0.625rem`, not a color).
-- **`src/lib/theme.ts` is the only reader.** It validates the values (hex, `rgb()`, `hsl()`, `oklch()`),
-  falls back to the documented default when a key is missing or unparsable, and writes the CSS custom
-  properties on `<html>` at boot. `THEME_VARS` is the env-key → CSS-property mapping. The module is
-  framework-free; importing it is enough to apply the palette.
+  `VITE_COLOR_RING`, `VITE_COLOR_SIDEBAR` and `VITE_COLOR_SIDEBAR_FOREGROUND`. The light palette
+  repeats **the same suffixes** behind a `VITE_COLOR_LIGHT_` prefix — `VITE_COLOR_LIGHT_BACKGROUND`,
+  `VITE_COLOR_LIGHT_FOREGROUND`, `VITE_COLOR_LIGHT_PRIMARY`, … `VITE_COLOR_LIGHT_SIDEBAR_FOREGROUND`.
+  `VITE_RADIUS` is shared geometry, not a color (a length: `0.625rem`), so it has one key.
+- **`src/lib/theme.ts` is the only reader.** It validates the values (hex, `rgb()`, `hsl()`, `oklch()`)
+  and injects a single `<style id="nabla-theme">` into `<head>` with two rule blocks: `:root` carries
+  the light values and `.dark` the dark ones. It never writes inline custom properties on `<html>` —
+  those would win in both modes and the light palette could not take effect. `THEME_VARS` is the
+  dark env-key → CSS-property mapping; light keys are the same names with the prefix. The module is
+  framework-free; importing it is enough to declare both palettes.
+- **Missing keys fall through to the CSS.** A key that is absent or unparsable is not declared at all,
+  so that token keeps the `:root`/`.dark` default already in `src/assets/index.css`. The defaults live
+  there exactly once; there is no second palette in TypeScript. Configured values win because the
+  injected element is kept last in `<head>`, after the bundler's stylesheet.
+- **The mode is `settings.json`'s `theme`, applied by this module.** `setThemeMode("dark" | "light"
+  | "system")` toggles `.dark` on `<html>` (resolving `system` through `prefers-color-scheme`) and
+  re-injects the palette; `applyTheme()` only re-injects and is idempotent. `asThemeMode()` narrows the
+  persisted string and `isDarkMode()` resolves a mode. No component toggles `.dark` or the palette
+  itself: the header button, the settings dialog and the boot path all call `setThemeMode`.
 - **Components use Tailwind utilities, never colors.** `bg-background`, `text-muted-foreground`,
   `bg-primary`, `text-success`, `bg-tertiary` and the rest map to the tokens in
   `src/assets/index.css` (`@theme inline`). A literal `#…`, `rgb(…)` or `text-[#…]` in a `.vue` file is
@@ -54,8 +68,8 @@ Colors and brand images are configuration, never literals in a component (ADR 00
   ones. Never write `/logo.png` or any other asset path in a component, and never inline `src`
   attributes pointing at `public/`.
 - **Re-branding requires a rebuild.** Vite bakes `import.meta.env` into the bundle, so editing `.env`
-  is picked up by `npm run dev`/`npm run build`, not by the packaged app at runtime. Runtime theming
-  from `settings.json` is a future evolution of the same module; see ADR 0009.
+  is picked up by `npm run dev`/`npm run build`, not by the packaged app at runtime. The *mode* switch
+  is runtime (it only flips the `.dark` class); the *values* are still build-time. See ADR 0009.
 
 ## The serde boundary
 

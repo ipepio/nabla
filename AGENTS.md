@@ -52,7 +52,7 @@ and kills with the app. This file is the entry point for any agent working here.
 8. **Scope respect.** `.docs/` is local-only and `odd/` is orchestrator-owned; do not edit either
    unless the task explicitly allows it.
 9. **No hardcoded colors or brand asset paths in components.** Colors come from `.env`
-   (`VITE_COLOR_*`), brand images from `src/lib/brand.ts`. See ADR 0009.
+   (`VITE_COLOR_*` dark, `VITE_COLOR_LIGHT_*` light), brand images from `src/lib/brand.ts`. See ADR 0009.
 
 ## Verify
 

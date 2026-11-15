@@ -10,6 +10,10 @@
   the build-time limitation.
 - Supersedes / superseded by: none
 
+> **Addendum (2026-02, `theme-modes-and-resizable-drawer` T1):** decision 2 below is amended — the
+> palette is no longer written as inline styles on `<html>`, and there is now a second, light palette.
+> See [Addendum — light palette and rule-block injection](#addendum--light-palette-and-rule-block-injection).
+
 ## Context
 
 The chat shell needs a palette and brand imagery, and the maintainer asked for both to be
@@ -55,16 +59,47 @@ in the `@theme inline` block, so `bg-tertiary`, `text-success` and similar utili
   replacement happens in `public/`, so paths stay public URLs and no rebuild-time import map is
   needed.
 
+## Addendum — light palette and rule-block injection
+
+Accepted with `odd/tasks/theme-modes-and-resizable-drawer.md` (specs S1, S2, S4). Decision 2 above is
+amended, the rest of the record stands:
+
+- **Inline custom properties are gone.** Writing the palette as inline custom properties on `<html>`
+  made those declarations win in *both* modes, so the light theme could never render. `src/lib/theme.ts`
+  now injects one `<style id="nabla-theme">` into `<head>` with two rule blocks: `:root` carries the
+  light values and `.dark` the dark ones. Nothing writes palette properties through
+  `documentElement.style` any more.
+- **Two env key sets, one per palette.** `VITE_COLOR_*` stays the dark palette (the app default,
+  `.dark` in `index.html`). The light palette repeats the same suffixes behind a
+  `VITE_COLOR_LIGHT_` prefix (`VITE_COLOR_LIGHT_BACKGROUND`, `VITE_COLOR_LIGHT_PRIMARY`, …,
+  `VITE_COLOR_LIGHT_SIDEBAR_FOREGROUND`). `VITE_RADIUS` stays a single shared length in the `:root`
+  block, because geometry is not a theme.
+- **Precedence is: configured env value → `src/assets/index.css` default.** Only keys whose env value
+  exists and parses are declared; a missing or unparsable key emits nothing and that token keeps the
+  `:root`/`.dark` default in the CSS, which remains the single copy of the neutral palette. The injected
+  element is kept last in `<head>`, so configured values win over the stylesheet regardless of the order
+  the bundler injected it in.
+- **Mode is runtime, values are build-time.** `setThemeMode("dark" | "light" | "system")` only toggles
+  the `dark` class (resolving `system` through `prefers-color-scheme`) and re-injects the palette;
+  `applyTheme()` re-injects alone. Switching modes needs no rebuild, changing hex values still needs
+  `npm run dev`/`npm run build`.
+- **Residual limitation.** The persisted mode is read through the Tauri settings command after the
+  first render, so a persisted *light* theme can show one dark frame at startup. Avoiding it needs a
+  synchronous pre-paint read of the mode (for example a blocking script in `index.html`), which the app
+  does not have; the limitation is documented rather than hidden.
+
 ## Consequences
 
 - Re-branding is configuration plus a rebuild: Vite bakes `import.meta.env` into the bundle, so
-  editing `.env` requires `npm run dev`/`npm run build`, and the packaged app does not re-theme at
-  runtime. `L4` records this honestly.
-- Values are build-time only and single-palette: one env value per token overrides both the light
-  and dark CSS blocks, so per-theme env keys (or runtime theming from `settings.json`) require a
-  successor decision.
-- A missing or unparsable key degrades to the documented default instead of painting an invalid
-  declaration, so `.env` mistakes are visible but not fatal.
+  editing `.env` requires `npm run dev`/`npm run build`, and the packaged app does not pick up new
+  color *values* at runtime (switching *modes* is runtime, see the addendum). `L4` records this
+  honestly.
+- Values are build-time only: one env value per token per mode, and both palettes share the same
+  build. Mode switching is runtime (`settings.json` → `setThemeMode`), changing hex values is not. See
+  the addendum above; the single-palette limitation it replaced is history.
+- A missing or unparsable key declares nothing and falls through to the `:root`/`.dark` defaults in
+  `src/assets/index.css`, so an env mistake degrades to the neutral palette instead of painting an
+  invalid declaration.
 - Component code cannot express a one-off color; a genuinely new color needs a new token and a
   decision here.
 - Brand asset paths live in one module, so replacing a file in `public/` re-brands the UI with no code
@@ -75,7 +110,9 @@ in the `@theme inline` block, so `bg-tertiary`, `text-success` and similar utili
 - When `.env` proves insufficient because the maintainer wants to switch palettes without rebuilding:
   a successor record introduces runtime theming from `settings.json` and demotes `.env` to defaults.
 - When per-theme values are needed (a light palette that is not a mechanical inversion): the env key
-  set grows a light/dark dimension.
+  set grows a light/dark dimension. *Resolved by the addendum above: `VITE_COLOR_LIGHT_*`.*
+- If the startup palette flash (see the addendum's residual limitation) becomes unacceptable: add a
+  synchronous pre-paint read of the persisted mode before the webview mounts.
 - If a design system requires palettes beyond semantic tokens (charts, per-workspace accents), decide
   where those values live rather than adding them ad hoc.
 

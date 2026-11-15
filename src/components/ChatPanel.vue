@@ -40,6 +40,12 @@ import {
   subscribeAgentEvents,
 } from "@/contracts/commands";
 import type { AppSettings, ModelInfo, SessionDto, WorkspaceInfo } from "@/contracts/types";
+import {
+  asThemeMode,
+  isDarkMode,
+  setThemeMode,
+  type ThemeMode,
+} from "@/lib/theme";
 
 /** The drawer owns the workspace list; the active one arrives already chosen. */
 const props = defineProps<{
@@ -92,6 +98,12 @@ let unsubscribe: (() => void) | null = null;
 const models = ref<ModelInfo[]>([]);
 const settings = ref<AppSettings | null>(null);
 const savingModel = ref(false);
+
+// S2 of `theme-modes-and-resizable-drawer.md`: the panel owns the live theme
+// mode; `src/lib/theme.ts` is the only module that applies it (S4). The initial
+// value mirrors the `.dark` class shipped by `index.html` until settings load.
+const theme = ref<ThemeMode>("dark");
+const isDark = computed(() => isDarkMode(theme.value));
 
 /** Selected model id, or `""` until settings load. */
 const modelId = computed(() => settings.value?.model ?? "");
@@ -315,8 +327,40 @@ async function loadModelOptions() {
 async function loadSettings() {
   try {
     settings.value = await getSettings();
+    // Apply the persisted mode as soon as the file is read, so the first paint
+    // after startup shows the theme the human chose.
+    theme.value = asThemeMode(settings.value.theme);
+    setThemeMode(theme.value);
   } catch (cause) {
     settings.value = null;
+    error.value = commandErrorMessage(cause);
+  }
+}
+
+/**
+ * S2: switches palette and persists the choice. The next mode is computed from
+ * the current one; `system` toggles to whatever the OS is *not* showing right
+ * now. The whole settings object is re-read first, so this write cannot clobber
+ * a preference the drawer changed in the meantime (`save_settings` replaces the
+ * file).
+ */
+async function handleToggleTheme() {
+  const current = theme.value;
+  const next: ThemeMode =
+    current === "system"
+      ? isDarkMode("system")
+        ? "light"
+        : "dark"
+      : current === "dark"
+        ? "light"
+        : "dark";
+  error.value = null;
+  try {
+    const stored = await getSettings();
+    settings.value = await saveSettings({ ...stored, theme: next });
+    theme.value = next;
+    setThemeMode(next);
+  } catch (cause) {
     error.value = commandErrorMessage(cause);
   }
 }
@@ -453,7 +497,9 @@ onUnmounted(() => {
         :title="workspaceName"
         mode="Standard mode"
         :tools-open="toolsOpen"
+        :is-dark="isDark"
         @toggle-tools="emit('toggleTools')"
+        @toggle-theme="handleToggleTheme"
       />
 
       <Tabs default-value="chat" class="min-h-0 flex-1 gap-0">

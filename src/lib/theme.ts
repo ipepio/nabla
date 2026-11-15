@@ -1,21 +1,31 @@
 /**
- * Theme tokens: `.env` (`VITE_COLOR_*`, `VITE_RADIUS`) is the only source of the
- * application palette. This module validates those values and writes the CSS
- * custom properties once at boot; components never carry literal colors
- * (ADR 0009, specs S4/S5 of `odd/tasks/chat-shell-and-theme-tokens.md`).
+ * Theme: one module owns the palette *and* the mode (ADR 0009, spec S1/S2/S4 of
+ * `odd/tasks/theme-modes-and-resizable-drawer.md`).
  *
- * Applied properties are written as inline custom properties on
- * `<html>`: the env palette is one set of values, so those declarations win over
- * both the `:root` (light) and the `.dark` blocks in `src/assets/index.css`.
- * Those blocks remain the fallback for a missing or invalid key, and they keep
- * the theme correct before this module runs. Per-theme env keys would need a
- * successor decision (ADR 0009).
+ * The app has two palettes, each configured from its own env keys:
  *
- * Framework-free on purpose: `src/main.ts` imports this module for its boot
- * side effect, so the palette is applied before the first render.
+ * - **Dark** (the app default, `.dark` on `<html>` in `index.html`):
+ *   `VITE_COLOR_*` — the original key set.
+ * - **Light**: `VITE_COLOR_LIGHT_*` — the same suffixes as the dark keys.
+ * - **`VITE_RADIUS`** is shared geometry, not a color, so it has one key.
+ *
+ * The values are not written as inline custom properties on `<html>`: inline
+ * declarations would win in both modes and the light palette could never take
+ * effect. Instead this module injects one `<style id="nabla-theme">` with two
+ * rule blocks, `:root` (light) and `.dark` (dark), so each mode resolves its own
+ * values through the normal cascade.
+ *
+ * Only keys whose env value exists and parses are declared. Anything missing
+ * falls through to the `:root`/`.dark` defaults already in
+ * `src/assets/index.css`, which stays the CSS fallback (and keeps the theme
+ * correct before this module runs). A second hardcoded palette is deliberately
+ * absent: one copy of each default lives in the CSS.
+ *
+ * Framework-free on purpose: importing the module applies the palettes, so the
+ * CSS variables are in place before the first render.
  */
 
-/** Env key → CSS custom property. The exact contract both workers respect. */
+/** Dark env key → CSS custom property. `THEME_VARS` is the env-key contract. */
 export const THEME_VARS = {
   VITE_COLOR_PRIMARY: "--primary",
   VITE_COLOR_PRIMARY_FOREGROUND: "--primary-foreground",
@@ -39,44 +49,26 @@ export const THEME_VARS = {
   VITE_RADIUS: "--radius",
 } as const;
 
-/** A CSS custom property name this module owns (for example `--tertiary`). */
+/** A CSS custom property name this module declares (for example `--tertiary`). */
 export type ThemeVarName = (typeof THEME_VARS)[keyof typeof THEME_VARS];
 
 /** An env key this module reads (for example `VITE_COLOR_TERTIARY`). */
 export type ThemeEnvKey = keyof typeof THEME_VARS;
 
-/**
- * Documented defaults, identical to `.env.example`. They are used when a key is
- * absent or its value does not parse, and they mirror the `:root`/`.dark`
- * declarations in `src/assets/index.css` for the tokens this module owns.
- */
-export const THEME_DEFAULTS: Record<ThemeEnvKey, string> = {
-  VITE_COLOR_PRIMARY: "#ededed",
-  VITE_COLOR_PRIMARY_FOREGROUND: "#0a0a0a",
-  VITE_COLOR_SECONDARY: "#3a3a3a",
-  VITE_COLOR_SECONDARY_FOREGROUND: "#fafafa",
-  VITE_COLOR_TERTIARY: "#60a5fa",
-  VITE_COLOR_TERTIARY_FOREGROUND: "#0a0a0a",
-  VITE_COLOR_ACCENT: "#262626",
-  VITE_COLOR_ACCENT_FOREGROUND: "#fafafa",
-  VITE_COLOR_BACKGROUND: "#0a0a0a",
-  VITE_COLOR_FOREGROUND: "#fafafa",
-  VITE_COLOR_MUTED: "#262626",
-  VITE_COLOR_MUTED_FOREGROUND: "#a3a3a3",
-  VITE_COLOR_DESTRUCTIVE: "#f87171",
-  VITE_COLOR_SUCCESS: "#4ade80",
-  VITE_COLOR_WARNING: "#fbbf24",
-  VITE_COLOR_BORDER: "#262626",
-  VITE_COLOR_RING: "#737373",
-  VITE_COLOR_SIDEBAR: "#171717",
-  VITE_COLOR_SIDEBAR_FOREGROUND: "#fafafa",
-  VITE_RADIUS: "0.625rem",
-};
+/** The three persisted modes (`settings.json` `theme`) and the runtime contract. */
+export type ThemeMode = "dark" | "light" | "system";
+
+/** The id of the single `<style>` element this module owns. */
+const STYLE_ELEMENT_ID = "nabla-theme";
+
+/** Shared length token: one value for both palettes, declared once on `:root`. */
+const RADIUS_KEY: ThemeEnvKey = "VITE_RADIUS";
 
 /**
  * Loose syntax check, not a color parser: hex, `rgb()`/`hsl()` and the
- * `oklch()` family the token files already use. Anything else falls back, which
- * keeps a typo in `.env` from painting an invalid declaration over the palette.
+ * `oklch()` family the token files already use. Anything else is dropped, which
+ * keeps a typo in the env file from painting an invalid declaration over the
+ * CSS fallback.
  */
 const COLOR_PATTERN =
   /^(?:#[0-9a-f]{3,8}|(?:rgb|rgba|hsl|hsla|oklch|oklab)\([^()]*\))$/i;
@@ -84,61 +76,106 @@ const COLOR_PATTERN =
 /** `--radius` is a length, not a color: unit-less zero or a px/rem/em value. */
 const LENGTH_PATTERN = /^(?:0|[0-9]*\.?[0-9]+(?:px|rem|em|%))$/;
 
-/** Resolved value of every property this module owns, keyed by property name. */
-export type ResolvedTheme = Record<ThemeVarName, string>;
-
-function isValid(key: ThemeEnvKey, value: string): boolean {
-  return (key === "VITE_RADIUS" ? LENGTH_PATTERN : COLOR_PATTERN).test(value);
-}
-
-function resolveValue(key: ThemeEnvKey): string {
-  // `import.meta.env` values are untyped at the boundary: read as `unknown`
-  // instead of letting `any` leak into the palette.
-  const raw: unknown = import.meta.env[key];
-  const candidate = typeof raw === "string" ? raw.trim() : "";
-  if (candidate === "" || !isValid(key, candidate)) {
-    return THEME_DEFAULTS[key];
-  }
-  return candidate;
-}
-
-/** Every owned property with its final value, without touching the DOM. */
-export function resolveTheme(): ResolvedTheme {
-  const resolved = {} as ResolvedTheme;
-  for (const key of Object.keys(THEME_VARS) as ThemeEnvKey[]) {
-    resolved[THEME_VARS[key]] = resolveValue(key);
-  }
-  return resolved;
+/** The light twin of a dark color key: `VITE_COLOR_X` → `VITE_COLOR_LIGHT_X`. */
+function lightEnvKey(key: ThemeEnvKey): string {
+  return key.replace(/^VITE_COLOR_/, "VITE_COLOR_LIGHT_");
 }
 
 /**
- * Write the palette as inline custom properties on `<html>`.
- *
- * One approach, documented: the palette comes from one env set, so the inline
- * declarations on the root element win over both the `:root` (light) and the
- * `.dark` blocks in `src/assets/index.css`. Those blocks stay as the fallback
- * used when a key is absent, and they keep the theme working before this module
- * runs. Per-theme env keys (or runtime theming from `settings.json`) would
- * arrive as a successor decision, not here.
- *
- * @param target Element to write on; defaults to `document.documentElement`.
- * @returns The applied values, useful in tooling and tests.
+ * Env value for one key, or `null` when it is absent, blank or unparsable. A
+ * `null` result means "declare nothing": the CSS fallback in
+ * `src/assets/index.css` keeps that token.
  */
-export function applyTheme(target?: HTMLElement | null): ResolvedTheme {
-  const resolved = resolveTheme();
-  const element =
-    target ?? (typeof document === "undefined" ? null : document.documentElement);
-  if (element) {
-    for (const [property, value] of Object.entries(resolved)) {
-      element.style.setProperty(property, value);
-    }
-  }
-  return resolved;
+function envValue(key: string): string | null {
+  // Env values are untyped at the boundary: read as `unknown` instead of
+  // letting `any` leak into the palette.
+  const raw: unknown = (import.meta.env as Record<string, unknown>)[key];
+  if (typeof raw !== "string") return null;
+  const value = raw.trim();
+  if (value === "") return null;
+  const pattern = key === RADIUS_KEY ? LENGTH_PATTERN : COLOR_PATTERN;
+  return pattern.test(value) ? value : null;
 }
 
-// Self-applying side effect: nothing imports this module yet (`src/main.ts` is
-// wired in a follow-up task), and the palette must be in place before the first
-// paint. Guarded so a non-DOM tooling context can import the module safely.
+/** The declarations of one mode, as CSS text; empty when no key is configured. */
+function declarations(scheme: "dark" | "light"): string {
+  const lines: string[] = [];
+  for (const key of Object.keys(THEME_VARS) as ThemeEnvKey[]) {
+    if (key === RADIUS_KEY) continue;
+    const value = envValue(scheme === "light" ? lightEnvKey(key) : key);
+    if (value !== null) lines.push(`${THEME_VARS[key]}: ${value};`);
+  }
+  if (scheme === "light") {
+    // Geometry is mode-independent, so it belongs to the `:root` block.
+    const radius = envValue(RADIUS_KEY);
+    if (radius !== null) lines.push(`${THEME_VARS.VITE_RADIUS}: ${radius};`);
+  }
+  return lines.join(" ");
+}
+
+/**
+ * The stylesheet this module injects: `:root` carries the light palette and
+ * `.dark` overrides it with the dark one, exactly like the fallback blocks in
+ * `src/assets/index.css`.
+ */
+function themeCss(): string {
+  return [
+    `:root { ${declarations("light")} }`,
+    `.dark { ${declarations("dark")} }`,
+  ].join("\n");
+}
+
+/** Narrow the persisted `settings.theme` string to one of the three modes. */
+export function asThemeMode(value: string | null | undefined): ThemeMode {
+  return value === "light" || value === "system" ? value : "dark";
+}
+
+/** Does a mode end up on the dark palette right now? `system` asks the OS. */
+export function isDarkMode(mode: ThemeMode): boolean {
+  if (mode !== "system") return mode === "dark";
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+    // No media query support: keep the app default (`index.html` ships `.dark`).
+    return true;
+  }
+  return window.matchMedia("(prefers-color-scheme: dark)").matches;
+}
+
+/**
+ * Write the two palette blocks into `<head>`, replacing the previous ones.
+ *
+ * Idempotent: every call leaves exactly one `<style id="nabla-theme">`. It is
+ * also removed and re-appended, so the palette rules stay last in `<head>` and
+ * win over the equal-specificity `:root`/`.dark` fallbacks in
+ * `src/assets/index.css` whatever order the bundler injected them in.
+ */
+export function applyTheme(): void {
+  if (typeof document === "undefined") return;
+  const style = document.createElement("style");
+  style.id = STYLE_ELEMENT_ID;
+  style.textContent = themeCss();
+  document.getElementById(STYLE_ELEMENT_ID)?.remove();
+  document.head.appendChild(style);
+}
+
+/**
+ * Put `<html>` on the requested palette and make sure the palette rules are
+ * present. `system` resolves `prefers-color-scheme` at call time; the app has no
+ * listener for a live OS change, so the next settings load or toggle re-resolves
+ * it.
+ */
+export function setThemeMode(mode: ThemeMode): void {
+  if (typeof document === "undefined") return;
+  document.documentElement.classList.toggle("dark", isDarkMode(mode));
+  applyTheme();
+}
+
+// Self-applying side effect: importing the module is enough to declare both
+// palettes, so the CSS variables exist before the first render. Guarded so a
+// non-DOM tooling context can import the module safely.
 if (typeof document !== "undefined") {
   applyTheme();
+  // The bundler appends the `index.css` <style> while the module graph is still
+  // evaluating, i.e. after the call above. One deferred call puts this module's
+  // rules back at the end of `<head>` without re-reading any env value.
+  queueMicrotask(applyTheme);
 }

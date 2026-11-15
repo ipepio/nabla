@@ -55,6 +55,7 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { asThemeMode, setThemeMode } from "@/lib/theme";
 import {
   addWorkspace,
   commandErrorMessage,
@@ -113,18 +114,6 @@ const settings = ref<AppSettings>({
 const models = ref<ModelInfo[]>([]);
 const savingSettings = ref(false);
 const settingsError = ref<string | null>(null);
-
-/**
- * The theme preference is applied to `<html>`: `.dark` is the default shipped by
- * index.html, `system` follows the OS and otherwise the light palette is used.
- */
-function applyTheme(theme: string) {
-  const root = document.documentElement;
-  const dark =
-    theme === "dark" ||
-    (theme !== "light" && window.matchMedia("(prefers-color-scheme: dark)").matches);
-  root.classList.toggle("dark", dark);
-}
 
 /**
  * `add_workspace` rejects with a plain Display string. The one rejection worth
@@ -303,7 +292,9 @@ async function loadModels() {
 async function loadSettings() {
   try {
     settings.value = await getSettings();
-    applyTheme(settings.value.theme);
+    // S2: the stored mode is applied through `src/lib/theme.ts`, the only module
+    // that touches the palette or the `dark` class (S4).
+    setThemeMode(asThemeMode(settings.value.theme));
     settingsError.value = null;
   } catch (cause) {
     settingsError.value = commandErrorMessage(cause);
@@ -315,7 +306,9 @@ async function handleSaveSettings() {
   settingsError.value = null;
   try {
     settings.value = await saveSettings({ ...settings.value });
-    applyTheme(settings.value.theme);
+    // S2: the dialog saves the mode; applying it here makes the change visible
+    // as soon as the write lands, without waiting for a reload.
+    setThemeMode(asThemeMode(settings.value.theme));
     settingsOpen.value = false;
   } catch (cause) {
     settingsError.value = commandErrorMessage(cause);
