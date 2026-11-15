@@ -49,6 +49,8 @@ defineProps<{
   activeSessionId: string | null;
   /** L4: ids the runtime reports a live pi process for. */
   liveSessionIds: string[];
+  /** Ids whose agent is producing output right now (spinner on the row). */
+  busySessionIds: string[];
 }>();
 
 const emit = defineEmits<{
@@ -107,7 +109,7 @@ function confirmDelete() {
 </script>
 
 <template>
-  <SidebarMenuSub class="border-l-0">
+  <SidebarMenuSub class="mx-0 border-l-0 pl-0">
     <SidebarMenuSubItem
       v-for="session in sessions"
       :key="session.id"
@@ -118,15 +120,24 @@ function confirmDelete() {
         type="button"
         size="sm"
         :is-active="String(session.id) === activeSessionId"
-        class="w-full pr-6"
+        class="w-full pl-2 pr-6"
         @click="emit('select', session)"
       >
         <MessageSquareIcon class="size-3.5 shrink-0" aria-hidden="true" />
         <span class="min-w-0 flex-1 truncate">{{ label(session) }}</span>
         <!-- L4: a running session says so instead of showing its age; the dot
              carries the state, the word carries it to a screen reader too. -->
+        <!-- Busy agent: a spinning ring, the same affordance a terminal-style
+             harness uses while a turn runs. Live-but-idle keeps the dot. -->
         <span
-          v-if="isRunning(session, liveSessionIds)"
+          v-if="busySessionIds.includes(String(session.id))"
+          class="size-3 shrink-0 animate-spin rounded-full border-2 border-warning/30 border-t-warning"
+          role="status"
+          aria-label="Agent is working"
+          title="Agent is working"
+        />
+        <span
+          v-else-if="isRunning(session, liveSessionIds)"
           class="flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground"
           title="pi is running"
         >

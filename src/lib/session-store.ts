@@ -50,6 +50,13 @@ export interface SessionBuffer {
    * "pi is stopped (exit code N)" as it did before the buffers existed.
    */
   exitCode: number | null;
+  /**
+   * The agent is doing work for this session right now (streaming a reply or
+   * running a tool). `turn_end`/`agent_end` clear it, so the drawer can show a
+   * spinner on the row that is actually busy — independent of whether the
+   * process merely exists.
+   */
+  busy: boolean;
 }
 
 /** Per-session state, keyed by the session index id in decimal form (S1). */
@@ -69,6 +76,16 @@ export const activeSessionId = computed<string | null>(
  * lifecycle events.
  */
 export const liveIds = ref<string[]>([]);
+
+/**
+ * Ids whose agent is currently doing work. Derived from the buffers, so the
+ * drawer shows a spinner on the row that is actually producing output.
+ */
+export const busyIds = computed<string[]>(() =>
+  [...sessions.entries()]
+    .filter(([, buffer]) => buffer.busy)
+    .map(([sessionId]) => sessionId),
+);
 
 /** Sessions whose transcript is being read from pi's file (S3, first open). */
 const transcriptLoading = reactive(new Set<string>());
@@ -173,6 +190,7 @@ function ensureBuffer(sessionId: string): SessionBuffer {
     status: null,
     error: null,
     exitCode: null,
+    busy: false,
   });
   sessions.set(sessionId, created);
   return created;
@@ -193,6 +211,22 @@ function findTool(buffer: SessionBuffer, toolCallId: string) {
 /** Applies one forwarded pi event to the buffer of the session it belongs to. */
 function applyEvent(sessionId: string, event: AgentEvent): void {
   const buffer = ensureBuffer(sessionId);
+  // Busy is "the agent is working for this session", not "a process exists":
+  // streaming and tool activity raise it, an ended turn lowers it. Events keep
+  // arriving for off-screen sessions, so this stays correct for the whole list.
+  if (
+    event.type === "message_update" ||
+    event.type === "tool_execution_start" ||
+    event.type === "tool_execution_update"
+  ) {
+    buffer.busy = true;
+  } else if (
+    event.type === "turn_end" ||
+    event.type === "agent_end" ||
+    event.type === "process_exit"
+  ) {
+    buffer.busy = false;
+  }
   switch (event.type) {
     case "message_update": {
       const slice = event.assistantMessageEvent;

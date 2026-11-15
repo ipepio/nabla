@@ -53,7 +53,7 @@ const emit = defineEmits<{
          siblings, never nested: a button inside a button is invalid HTML. -->
     <button
       type="button"
-      class="flex w-full min-w-0 items-center gap-1.5 rounded-md px-1.5 py-1.5 pr-12 text-left text-sm outline-hidden hover:bg-sidebar-accent/60 focus-visible:ring-2 focus-visible:ring-sidebar-ring group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0"
+      class="flex w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1.5 pr-9 text-left text-sm outline-hidden hover:bg-sidebar-accent/60 focus-visible:ring-2 focus-visible:ring-sidebar-ring group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0"
       :aria-expanded="expanded"
       @click="emit('activate')"
     >

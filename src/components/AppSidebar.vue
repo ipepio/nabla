@@ -54,6 +54,7 @@ import { useAppearance } from "@/lib/appearance";
 import { themedBrand } from "@/lib/brand";
 import {
   activeSession,
+  busyIds,
   liveIds,
   newSession,
   recordSessionStatus,
@@ -690,7 +691,7 @@ onUnmounted(() => {
 
       <!-- S5: the collapsible list. The divider that used to sit here was
            removed: the section header already separates the groups. -->
-      <div class="flex min-h-0 flex-col gap-1 px-1 pb-1">
+      <div class="flex min-h-0 flex-col gap-1 px-0.5 pb-1">
         <p
           v-if="workspaces.length === 0 && !workspacesLoading"
           class="px-2 py-1 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden"
@@ -726,6 +727,7 @@ onUnmounted(() => {
               :error="sessionsErrors[workspace.id] ?? null"
               :active-session-id="activeSession?.sessionId ?? null"
               :live-session-ids="liveIds"
+              :busy-session-ids="busyIds"
               :action-error="sessionActionErrorFor(workspace.id)"
               @select="handleOpenSession(workspace, $event)"
               @pause="handlePauseSession(workspace, $event)"
