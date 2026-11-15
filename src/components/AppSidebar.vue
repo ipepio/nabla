@@ -53,6 +53,7 @@ import {
   SidebarMenuItem,
   SidebarSeparator,
   SidebarTrigger,
+  useSidebar,
 } from "@/components/ui/sidebar";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { useAppearance } from "@/lib/appearance";
@@ -102,6 +103,13 @@ const { isDark, setMode } = useAppearance();
 // Referenced as a runtime URL (not a static asset import) because Vite fails the
 // build for a missing asset, and the file is expected to be missing at first.
 const logoSource = computed(() => themedBrand("mark", isDark.value));
+// Wordmark only (no mark): the header composes mark + wordmark side by side, so
+// it must never show the combined asset (that would duplicate the mark).
+const wordmarkFailed = ref(false);
+const wordmarkSource = computed(() => themedBrand("wordmark", isDark.value));
+// `SidebarTrigger` renders a fixed icon, so the collapsed state needs the raw
+// toggle: there the app mark *is* the expand control.
+const { toggleSidebar } = useSidebar();
 
 const settingsOpen = ref(false);
 // Mirrors `Settings::default()` in `src-tauri/src/settings.rs` for the moment
@@ -342,13 +350,12 @@ onMounted(() => {
   <Sidebar collapsible="icon">
     <SidebarHeader>
       <div class="flex items-center gap-2 px-1 py-1">
-        <!-- The only collapse control in the shell (S8): the central header has
-             none, so the drawer alone owns its own visibility. -->
-        <SidebarTrigger class="shrink-0" />
-        <div class="flex min-w-0 items-center gap-2 group-data-[collapsible=icon]:hidden">
-          <!-- Brand mark (S7). `aria-hidden`: the wordmark next to it already
-               names the app. The @error handler is what makes the header
-               correct both before and after the asset lands. -->
+        <!-- Expanded header, one row: [mark] [wordmark] [collapse control].
+             The drawer is still the only place with a collapse control (S8). -->
+        <div
+          class="flex min-w-0 flex-1 items-center gap-2 group-data-[collapsible=icon]:hidden"
+        >
+          <!-- Brand mark (S7), no text: the wordmark asset sits next to it. -->
           <img
             v-if="!logoFailed"
             :src="logoSource"
@@ -364,8 +371,40 @@ onMounted(() => {
             class="text-lg leading-none font-semibold text-primary select-none"
             >∇</span
           >
-          <span class="truncate text-sm font-semibold">Nabla</span>
+
+          <!-- Wordmark only, so the row never repeats the mark twice. -->
+          <img
+            v-if="!wordmarkFailed"
+            :src="wordmarkSource"
+            alt="Nabla"
+            class="h-4 w-auto shrink-0 object-contain"
+            @error="wordmarkFailed = true"
+          />
+          <span v-else class="truncate text-sm font-semibold">Nabla</span>
+
+          <SidebarTrigger class="ms-auto shrink-0" />
         </div>
+
+        <!-- Collapsed: the app mark *is* the expand control, so the rail gains
+             no extra chrome beyond the logo. -->
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          class="mx-auto hidden group-data-[collapsible=icon]:flex"
+          aria-label="Expand sidebar"
+          @click="toggleSidebar"
+        >
+          <img
+            v-if="!logoFailed"
+            :src="logoSource"
+            alt="Nabla"
+            class="size-6 rounded-md object-contain"
+            @error="logoFailed = true"
+          />
+          <span v-else aria-hidden="true" class="text-lg leading-none font-semibold"
+            >∇</span
+          >
+        </Button>
       </div>
     </SidebarHeader>
 
