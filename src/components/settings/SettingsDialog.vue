@@ -16,9 +16,9 @@
  * S5 of the same task: the custom-provider form is gated by
  * `VITE_ENABLE_CUSTOM_PROVIDERS`, a build-time switch like the rest of Nabla's
  * env configuration — and it is ON BY DEFAULT: only an explicit `0`/`false`/`off`
- * hides the block. The same helper declares `VITE_ENABLE_PROVIDER_LOGIN` and
- * `VITE_ENABLE_API_KEYS`, which render nothing yet: those two sections belong to
- * the next unit, so this build has no dead control.
+ * hides the block. No other flag is declared: the pi login flow is out of scope
+ * and api keys are handled per provider, so a switch that renders nothing never
+ * exists.
  *
  * S3/S4: every configured row also offers the api key of that provider (typed
  * inline, never prefilled, written into pi's plain-text `models.json`) and its
