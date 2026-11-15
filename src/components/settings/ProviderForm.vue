@@ -19,6 +19,13 @@ import { computed, ref } from "vue";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useI18n } from "@/lib/i18n";
 import {
   commandErrorMessage,
@@ -35,6 +42,51 @@ const emit = defineEmits<{
 
 /** S2 of `i18n-and-settings-polish.md`: every visible string, both locales. */
 const { t } = useI18n();
+
+/**
+ * Provider presets: the endpoints that really speak the OpenAI wire format, so
+ * starting a provider is a click instead of "type a base URL by hand" (the user
+ * could not see how to sign in with OpenAI at all).
+ *
+ * Anthropic is deliberately absent: its native Messages API is not
+ * OpenAI-compatible, so offering it here as one click would be a lie.
+ *
+ * Brand names stay literal — they are product names, not translated copy.
+ */
+const PROVIDER_PRESETS = [
+  {
+    value: "openai",
+    label: "OpenAI",
+    providerId: "openai",
+    providerName: "OpenAI",
+    baseUrl: "https://api.openai.com/v1",
+  },
+  {
+    value: "deepseek",
+    label: "DeepSeek",
+    providerId: "deepseek",
+    providerName: "DeepSeek",
+    baseUrl: "https://api.deepseek.com/v1",
+  },
+  {
+    value: "gemini",
+    label: "Google Gemini",
+    providerId: "gemini",
+    providerName: "Google Gemini",
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+  },
+  {
+    value: "nan",
+    label: "NaN",
+    providerId: "nan",
+    providerName: "NaN",
+    baseUrl: "https://api.nan.builders/v1",
+  },
+] as const;
+
+/** The last preset picked. "custom" is the empty preset: no values to fill. */
+const CUSTOM_PRESET = "custom";
+const preset = ref<string>(CUSTOM_PRESET);
 
 /**
  * The typed values. They are the form's own state and are never reset by a
@@ -65,6 +117,29 @@ const requiredFilled = computed(
     baseUrl.value.trim() !== "" &&
     apiKey.value.trim() !== "",
 );
+
+/**
+ * Copies one preset into the three fields it owns. It is a one-time fill, not a
+ * binding: no watcher re-applies a preset when a field is edited afterwards, so
+ * every value stays editable. "Custom" only clears the selection and never wipes
+ * what the user typed.
+ *
+ * Picking a preset that changes the base URL also drops the models of the
+ * previous endpoint: saving another endpoint's model ids would be silently wrong.
+ */
+function handlePresetChange(value: string) {
+  const next = PROVIDER_PRESETS.find((entry) => entry.value === value);
+  preset.value = next ? next.value : CUSTOM_PRESET;
+  if (!next) return;
+  if (baseUrl.value.trim() !== next.baseUrl) {
+    found.value = [];
+    selected.value = {};
+    discovered.value = false;
+  }
+  providerId.value = next.providerId;
+  providerName.value = next.providerName;
+  baseUrl.value = next.baseUrl;
+}
 
 /** Discovery needs the two values it sends, and only one run at a time. */
 const canDiscover = computed(
@@ -158,6 +233,40 @@ async function handleSave() {
       >
         {{ t("common.cancel") }}
       </Button>
+    </div>
+
+    <!-- The preset sits above the fields it fills, so the order reads
+         "pick an endpoint, then adjust it". -->
+    <div class="space-y-1">
+      <span id="provider-preset-label" class="text-xs font-medium">
+        {{ t("settings.providers.custom.preset") }}
+      </span>
+      <Select
+        :model-value="preset"
+        @update:model-value="handlePresetChange(String($event))"
+      >
+        <SelectTrigger
+          class="w-full"
+          aria-labelledby="provider-preset-label"
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem
+            v-for="entry in PROVIDER_PRESETS"
+            :key="entry.value"
+            :value="entry.value"
+          >
+            {{ entry.label }}
+          </SelectItem>
+          <SelectItem :value="CUSTOM_PRESET">
+            {{ t("settings.providers.custom.preset.custom") }}
+          </SelectItem>
+        </SelectContent>
+      </Select>
+      <p class="text-xs text-muted-foreground">
+        {{ t("settings.providers.custom.preset.description") }}
+      </p>
     </div>
 
     <div class="grid gap-3 sm:grid-cols-2">
