@@ -358,6 +358,21 @@ export function clearSession(): void {
 }
 
 /**
+ * Forgets a session the app just deleted: its buffer, its seeded/loading marks
+ * and its liveness entry go with it, so a deleted session can never come back as
+ * a stale row in the chat. When it was the active session the chat is left with
+ * nothing bound, which is the honest state — the row no longer exists.
+ */
+export function removeSession(sessionId: string | number): void {
+  const key = String(sessionId);
+  sessions.delete(key);
+  transcriptSeeded.delete(key);
+  transcriptLoading.delete(key);
+  liveIds.value = liveIds.value.filter((id) => id !== key);
+  if (activeSession.value?.sessionId === key) activeSession.value = null;
+}
+
+/**
  * Records a turn the human just sent. pi answers with deltas, it does not echo
  * the prompt back, so the store is what makes the transcript read as a
  * conversation.

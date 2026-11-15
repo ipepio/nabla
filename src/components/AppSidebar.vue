@@ -56,13 +56,16 @@ import {
   activeSession,
   liveIds,
   newSession,
+  recordSessionStatus,
   refreshLiveSessions,
+  removeSession,
   selectSession,
   sessionGeneration,
 } from "@/lib/session-store";
 import {
   addWorkspace,
   commandErrorMessage,
+  deleteSession,
   getSettings,
   listModels,
   listSessions,
@@ -70,6 +73,7 @@ import {
   removeWorkspace,
   saveSettings,
   setWorkspacePinned,
+  stopSession,
   touchWorkspace,
 } from "../contracts/commands";
 import type {
@@ -117,6 +121,11 @@ const sessionsByWorkspace = ref<Record<number, SessionSummary[]>>({});
 /** S5: workspaces whose session fetch is in flight. */
 const sessionsLoading = ref<number[]>([]);
 const sessionsErrors = ref<Record<number, string>>({});
+/**
+ * A row action (pause / delete) that failed, per workspace. Kept apart from the
+ * fetch error so the list still renders: an action must never break it.
+ */
+const sessionActionErrors = ref<Record<number, string>>({});
 
 // The brand mark is theme-aware: the white-on-dark variant on the dark palette
 // and its black-on-light sibling otherwise, so a theme switch switches the logo
@@ -238,6 +247,21 @@ function sessionsFor(workspaceId: number): SessionSummary[] {
   return sessionsByWorkspace.value[workspaceId] ?? [];
 }
 
+function sessionActionErrorFor(workspaceId: number): string | null {
+  return sessionActionErrors.value[workspaceId] ?? null;
+}
+
+/** One row action failed: say so under the rows instead of throwing. */
+function setSessionActionError(workspaceId: number, message: string | null) {
+  const next = { ...sessionActionErrors.value };
+  if (message === null) {
+    delete next[workspaceId];
+  } else {
+    next[workspaceId] = message;
+  }
+  sessionActionErrors.value = next;
+}
+
 function sessionsLoadingFor(workspaceId: number): boolean {
   return sessionsLoading.value.includes(workspaceId);
 }
@@ -338,6 +362,45 @@ async function handleTogglePin(workspace: WorkspaceInfo) {
     workspaceError.value = commandErrorMessage(cause);
   } finally {
     pinPendingId.value = null;
+  }
+}
+
+/**
+ * Per-session "Pause": the existing `stop_session`. The row, its transcript and
+ * its index entry stay; only the pi process goes, so re-selecting the session
+ * opens it again on the same file.
+ */
+async function handlePauseSession(
+  workspace: WorkspaceInfo,
+  session: SessionSummary,
+) {
+  setSessionActionError(workspace.id, null);
+  try {
+    await stopSession(workspace.id, session.id);
+    recordSessionStatus(String(session.id), "stopped", null);
+    await refreshLiveSessions();
+  } catch (cause) {
+    setSessionActionError(workspace.id, commandErrorMessage(cause));
+  }
+}
+
+/**
+ * Per-session "Delete", after the list's own confirmation: Rust stops any live
+ * process, archives the transcript and drops the index row; the store forgets
+ * the session and the list is re-read from the index. On failure the message
+ * lands under the rows — the list itself never breaks.
+ */
+async function handleDeleteSession(
+  workspace: WorkspaceInfo,
+  session: SessionSummary,
+) {
+  setSessionActionError(workspace.id, null);
+  try {
+    await deleteSession(session.id);
+    removeSession(session.id);
+    await loadSessions(workspace.id);
+  } catch (cause) {
+    setSessionActionError(workspace.id, commandErrorMessage(cause));
   }
 }
 
@@ -663,7 +726,10 @@ onUnmounted(() => {
               :error="sessionsErrors[workspace.id] ?? null"
               :active-session-id="activeSession?.sessionId ?? null"
               :live-session-ids="liveIds"
+              :action-error="sessionActionErrorFor(workspace.id)"
               @select="handleOpenSession(workspace, $event)"
+              @pause="handlePauseSession(workspace, $event)"
+              @delete="handleDeleteSession(workspace, $event)"
             />
           </SidebarMenuItem>
         </SidebarMenu>

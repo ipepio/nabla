@@ -536,6 +536,108 @@ pub fn session_status(
     }
 }
 
+/// Directory (under the sessions dir) where a deleted session's transcript is
+/// parked instead of being destroyed.
+const TRASH_DIR: &str = ".trash";
+
+/// Moves a session transcript into `<data_dir>/sessions/.trash/`, keeping a
+/// unique file name, and answers where it landed.
+///
+/// `None` means there was nothing to archive, and it is not an error: a
+/// transcript pi never wrote has no file, and a path outside the app data dir is
+/// not ours to move (older rows could point anywhere), so those stay in place.
+/// Only the index row is ever removed for them.
+fn archive_session_file(
+    data_dir: &Path,
+    session_file: &Path,
+) -> std::io::Result<Option<PathBuf>> {
+    if !session_file.starts_with(data_dir) {
+        return Ok(None);
+    }
+    let metadata = match std::fs::metadata(session_file) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let Some(name) = session_file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+    else {
+        return Ok(None);
+    };
+
+    let trash = data_dir.join(SESSIONS_DIR).join(TRASH_DIR);
+    std::fs::create_dir_all(&trash)?;
+
+    // `<stem>.jsonl` first, then `<stem>.1.jsonl`, `<stem>.2.jsonl`… so two
+    // same-named transcripts never overwrite the earlier archive.
+    let (stem, extension) = match name.rsplit_once('.') {
+        Some((stem, extension)) => (stem.to_string(), format!(".{extension}")),
+        None => (name.clone(), String::new()),
+    };
+    for counter in 0..1_000 {
+        let candidate = if counter == 0 {
+            name.clone()
+        } else {
+            format!("{stem}.{counter}{extension}")
+        };
+        let target = trash.join(candidate);
+        if target.exists() {
+            continue;
+        }
+        std::fs::rename(session_file, &target)?;
+        return Ok(Some(target));
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free name in the session archive",
+    ))
+}
+
+/// Removes a session from the app: stops its pi process when it is live, moves
+/// the pi-owned transcript into the app's archive folder, then drops the index
+/// row. Archiving happens before the row goes, so a delete stays recoverable and
+/// a failed archive leaves the index intact instead of orphaning the file.
+fn delete_session_core(
+    store: &Store,
+    runtime: &ProcessManager,
+    data_dir: &Path,
+    session_id: i64,
+) -> Result<bool, String> {
+    // The index row is the runtime key: an id that is not indexed is an error,
+    // exactly like the other session commands.
+    let row = store
+        .session_by_id(session_id)
+        .map_err(display_err)?
+        .ok_or_else(|| unknown_session(&session_id.to_string()))?;
+
+    // Best effort: `stop_and_wait` is idempotent, so a session that was never
+    // started (or already stopped) is not an error — the row still has to go.
+    let _ = runtime.stop_and_wait(&session_id.to_string());
+
+    archive_session_file(data_dir, Path::new(&row.pi_session_path)).map_err(|err| {
+        format!(
+            "cannot archive session file {}: {err}",
+            row.pi_session_path
+        )
+    })?;
+
+    store.delete_session(session_id).map_err(display_err)
+}
+
+/// Deletes a session from the app entirely (the row's ⋯ menu): the process is
+/// stopped, the transcript is archived under the app data dir, and the index row
+/// is removed. Returns whether a row was removed.
+#[tauri::command]
+pub fn delete_session(state: State<'_, AppState>, session_id: i64) -> Result<bool, String> {
+    delete_session_core(&state.store, &state.runtime, &state.data_dir, session_id)
+}
+
 // ── session lifecycle seam (S1, S3, S5) ────────────────────────────────────
 
 /// Cap on messages returned by `session_transcript`: the newest are kept, so a
@@ -1372,6 +1474,125 @@ done
         let err = session_transcript_for(&fixture.store, "919191")
             .expect_err("an unindexed id has no transcript");
         assert!(err.contains("unknown session"), "got {err:?}");
+    }
+
+    // ── per-session actions (pause / delete) ────────────────────────────────
+
+    // Deleting a session archives its transcript under the app's own folder: the
+    // file belongs to pi, so a delete stays recoverable instead of shredding it.
+    // Same-named transcripts never overwrite each other.
+    #[test]
+    fn archive_session_file_moves_the_transcript_into_the_trash() {
+        let fixture = SessionFixture::new("archive_move");
+        let data_dir = fixture.dir.clone();
+        let transcript = fixture.path("s1.jsonl");
+        std::fs::write(&transcript, "{\"type\":\"message\"}\n").expect("write transcript");
+
+        let archived = archive_session_file(&data_dir, &transcript)
+            .expect("archive")
+            .expect("an existing file inside the app data dir is archived");
+
+        assert!(
+            !transcript.exists(),
+            "the transcript leaves its indexed path"
+        );
+        assert_eq!(
+            archived,
+            data_dir.join("sessions").join(".trash").join("s1.jsonl"),
+            "the archive lives in <app data dir>/sessions/.trash"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&archived).expect("read archived transcript"),
+            "{\"type\":\"message\"}\n",
+            "archiving preserves the content"
+        );
+
+        // A second transcript with the same file name gets its own unique name.
+        let colliding = fixture.path("workspace").join("s1.jsonl");
+        std::fs::write(&colliding, "second\n").expect("write second transcript");
+        let second = archive_session_file(&data_dir, &colliding)
+            .expect("archive")
+            .expect("the colliding transcript is archived too");
+        assert_ne!(second, archived, "a collision must never overwrite");
+        assert_eq!(
+            std::fs::read_to_string(&second).expect("read second archived transcript"),
+            "second\n"
+        );
+    }
+
+    // Negative guard: a delete never destroys a path the app did not create, and
+    // a transcript pi never wrote is not an error.
+    #[test]
+    fn archive_session_file_leaves_foreign_and_missing_files_in_place() {
+        let fixture = SessionFixture::new("archive_foreign");
+        let outside = TempSeedDir::new("archive_outside");
+        let foreign = outside.home().join("elsewhere.jsonl");
+        std::fs::write(&foreign, "someone else's file\n").expect("write foreign file");
+
+        assert_eq!(
+            archive_session_file(&fixture.dir, &foreign).expect("archive"),
+            None,
+            "a file outside the app data dir is not ours to move"
+        );
+        assert!(foreign.exists(), "the foreign file stays where it was");
+
+        let missing = fixture.path("never-written.jsonl");
+        assert_eq!(
+            archive_session_file(&fixture.dir, &missing).expect("archive"),
+            None,
+            "a missing transcript is nothing to archive"
+        );
+        assert!(
+            !fixture.dir.join("sessions").exists(),
+            "no archive folder is created for nothing"
+        );
+    }
+
+    // The delete command: stop the process (if any), archive the transcript, then
+    // drop the index row. An id that is not indexed is an error, never a silent
+    // success.
+    #[test]
+    fn delete_session_core_archives_the_transcript_and_removes_the_row() {
+        let fixture = SessionFixture::new("delete_session");
+        let runtime = lifecycle_runtime();
+        let row = fixture.add_session("s1.jsonl", true, "hola\n");
+
+        let removed = delete_session_core(&fixture.store, &runtime, &fixture.dir, row.id)
+            .expect("delete a session");
+        assert!(removed, "the deleted session reports the removed row");
+        assert_eq!(
+            fixture.store.session_by_id(row.id).expect("lookup"),
+            None,
+            "the index row is gone"
+        );
+        assert!(
+            fixture
+                .store
+                .list_sessions(fixture.workspace_id)
+                .expect("list")
+                .is_empty()
+        );
+        assert!(!fixture.path("s1.jsonl").exists(), "the file left its path");
+        assert!(
+            fixture
+                .dir
+                .join("sessions")
+                .join(".trash")
+                .join("s1.jsonl")
+                .exists(),
+            "the transcript is archived, not destroyed"
+        );
+
+        // A session pi never wrote still deletes: only the row existed.
+        let bare = fixture.add_session("never-written.jsonl", false, "");
+        assert!(
+            delete_session_core(&fixture.store, &runtime, &fixture.dir, bare.id)
+                .expect("delete a session without a transcript")
+        );
+
+        let err = delete_session_core(&fixture.store, &runtime, &fixture.dir, row.id)
+            .expect_err("an unindexed id cannot be deleted");
+        assert_eq!(err, format!("unknown session: {}", row.id));
     }
 
     // S3: a long session is capped at the newest 400 messages, oldest first, so

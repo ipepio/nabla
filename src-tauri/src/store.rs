@@ -303,6 +303,16 @@ impl Store {
         Ok(row)
     }
 
+    /// Removes one session from the index. Metadata only: the transcript file
+    /// belongs to pi, and the command layer archives it before calling this, so
+    /// no file operation happens here. Returns whether a row changed, so an id
+    /// that is not indexed is reported instead of passing as a silent success.
+    pub fn delete_session(&self, id: i64) -> StoreResult<bool> {
+        let conn = self.conn()?;
+        let affected = conn.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
+        Ok(affected > 0)
+    }
+
     pub fn list_sessions(&self, workspace_id: i64) -> StoreResult<Vec<SessionRow>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
@@ -751,6 +761,39 @@ mod tests {
         let listed = store.list_sessions(ws.id).expect("list");
         assert_eq!(listed[0].pi_session_path, "/sessions/new.jsonl");
         assert_eq!(listed[1].pi_session_path, "/sessions/old.jsonl");
+    }
+
+    // S1/S3: deleting a session removes its index row and nothing else. The row
+    // is metadata only, so the transcript file pi owns is untouched here; the
+    // command layer archives it before calling this.
+    #[test]
+    fn delete_session_removes_its_index_row_only() {
+        let db = TempDb::new("session_delete");
+        let store = Store::open(&db.0).expect("open");
+        let ws = ws_new(&store, "/tmp/proj-a");
+        let doomed = store
+            .upsert_session(&session_new(ws.id, "/sessions/doomed.jsonl"))
+            .expect("insert doomed");
+        let kept = store
+            .upsert_session(&session_new(ws.id, "/sessions/kept.jsonl"))
+            .expect("insert kept");
+
+        assert!(
+            store.delete_session(doomed.id).expect("delete"),
+            "deleting an indexed session reports the row it removed"
+        );
+        assert_eq!(
+            store.session_by_id(doomed.id).expect("lookup"),
+            None,
+            "the deleted row is gone from the index"
+        );
+        let remaining = store.list_sessions(ws.id).expect("list");
+        assert_eq!(remaining.len(), 1, "sibling sessions survive the delete");
+        assert_eq!(remaining[0].id, kept.id);
+
+        // Deleting again changes no row, and the caller learns it.
+        assert!(!store.delete_session(doomed.id).expect("delete again"));
+        assert!(!store.delete_session(9_999).expect("unknown id"));
     }
 
     // S1 negative guard: the session index holds metadata only. The schema has no

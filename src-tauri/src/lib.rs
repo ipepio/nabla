@@ -72,6 +72,9 @@ pub fn run() {
             commands::live_session_ids,
             commands::send_prompt,
             commands::stop_session,
+            // Per-session actions: pause is the existing stop, delete archives
+            // the transcript and removes the row.
+            commands::delete_session,
             commands::session_status
         ])
         .run(tauri::generate_context!())

@@ -99,6 +99,16 @@ export function stopSession(
   return invoke<void>("stop_session", { workspaceId, sessionId });
 }
 
+/**
+ * Deletes a session from the app: its pi process is stopped when it is live, its
+ * transcript is moved to the archive folder under the app data dir, and the
+ * index row is removed. `true` means a row was removed; an id that is not
+ * indexed rejects instead of reporting a quiet success.
+ */
+export function deleteSession(sessionId: number): Promise<boolean> {
+  return invoke<boolean>("delete_session", { sessionId });
+}
+
 export function sessionStatus(
   workspaceId: number,
   sessionId: number,
