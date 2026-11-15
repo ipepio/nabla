@@ -172,21 +172,12 @@ function readFlag(name: string): boolean {
 }
 
 /**
- * S5: the three independent switches of this task.
- *
- * `customProviders` is rendered below. `providerLogin` and `apiKeys` are DECLARED
- * here for the next unit — the login section and the known-provider api-key section
- * — and deliberately render nothing yet: this build shows no dead control. They
- * live in one object so a build can flip them without touching the pane.
+ * S5 of `providers-pane.md`: build-time switch, read the same way the palette and
+ * the hero copy are. The custom-provider block is the only gated section of this
+ * pane; the pi login flow was dropped from scope, so no flag is declared for it
+ * (a switch that renders nothing is dead configuration).
  */
-const PROVIDER_FLAGS = {
-  customProviders: readFlag("VITE_ENABLE_CUSTOM_PROVIDERS"),
-  // Next unit (S5/S6): login with pi's own options. No UI yet.
-  providerLogin: readFlag("VITE_ENABLE_PROVIDER_LOGIN"),
-  // Next unit (S5): api keys for providers pi already knows. No UI yet.
-  apiKeys: readFlag("VITE_ENABLE_API_KEYS"),
-} as const;
-const customProvidersEnabled = PROVIDER_FLAGS.customProviders;
+const customProvidersEnabled = readFlag("VITE_ENABLE_CUSTOM_PROVIDERS");
 
 // The applied mode, not the stored one: the ring shows what the app is actually
 // painting, and both agree because opening the dialog applies the stored mode.

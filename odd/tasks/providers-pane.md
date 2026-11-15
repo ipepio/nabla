@@ -11,8 +11,7 @@ Alcance: pestaña **Providers** en Ajustes (sustituye a Models): lista de provid
 - **S4** «En el archivo (texto plano)» (respuesta del usuario) — la apiKey se guarda en ese archivo. Deuda anotada: keychain del SO si se quiere endurecer.
 - **S5** Interruptores de entorno. Tres flags independientes, en tiempo de build (como el resto de la configuración de Nabla):
   - `VITE_ENABLE_CUSTOM_PROVIDERS` — muestra el alta de providers personalizados. **Implementado en esta unidad.**
-  - `VITE_ENABLE_PROVIDER_LOGIN` — sección de login con las opciones de pi. Unidad siguiente.
-  - `VITE_ENABLE_API_KEYS` — alta de api-keys de providers conocidos de pi. Unidad siguiente.
+  - ~~`VITE_ENABLE_PROVIDER_LOGIN`~~ y ~~`VITE_ENABLE_API_KEYS`~~: **descartadas**. El login de pi se retiró del alcance por decisión del usuario; las api-keys se cubren con el editor de key por provider. No se declaran flags que no renderizan nada.
   Sin flags activos, esas secciones no existen (no hay controles muertos).
 - **S6** `VITE_DEFAULT_PROVIDER` (respuesta del usuario: «cadena con url que es el provider») — si está definida, ese provider aparece siempre, pide su key y **no se puede cambiar**. Se deriva `id`/`name` del host (o `VITE_DEFAULT_PROVIDER_NAME` si se define). **Unidad siguiente**, junto con las flags de S5.
 
@@ -60,3 +59,5 @@ save_provider(draft: ProviderDraft) -> ProviderSummary        // backup + merge 
 - **L7** Segunda tanda (misma rama): flags **ON por defecto** con kill switch (`0`/`false`/`off`); `delete_provider` (sólo entradas presentes en `models.json`, con backup y escritura atómica; id desconocido = no-op) y `set_provider_key` (actualiza `providers.<id>.apiKey` en sitio). UI: por fila, activar + `API key` (input en blanco, guarda y refresca desde el archivo) + `Remove` con confirmación; si se elimina el provider activo se cae al primero restante. Login sigue sin implementarse: no hay sección falsa.
 - **L8** Tests: 103/103 cargo (8 nuevos), clippy 0, build OK, i18n 131/131 claves.
 - **L9** Lectura del pedido del usuario («no quiero un custom provider implementado»): se interpreta como *no hay una vía especial para providers personalizados*; todo provider listado en `models.json` se gestiona igual (activar, clave, eliminar) y los built-in de pi no se tocan porque no viven en ese archivo.
+
+- **L10** El usuario pidió tirar la parte de login de pi: se eliminaron las dos flags declaradas sin uso (`VITE_ENABLE_PROVIDER_LOGIN`, `VITE_ENABLE_API_KEYS`) para no dejar configuración muerta. El login queda fuera de alcance hasta que exista un contrato de auth verificado; las api-keys ya se gestionan por provider (set/update).
