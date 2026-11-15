@@ -404,10 +404,10 @@ onUnmounted(() => {
 <template>
   <div class="relative flex h-full min-h-0 flex-col">
     <!-- Tools drawer toggle for the no-conversation state: the header (which
-         carries the other toggle) does not exist yet, so without this the
-         drawer would be unreachable until the first message. -->
+         carries the other toggle) does not exist yet. Hidden while the drawer
+         is open — the drawer itself owns the collapse control. -->
     <Button
-      v-if="isEmptyState"
+      v-if="isEmptyState && !toolsOpen"
       variant="ghost"
       size="icon-sm"
       class="absolute top-2 right-2 z-10"
@@ -531,6 +531,7 @@ onUnmounted(() => {
           <div class="border-t border-border px-4 py-3">
             <Composer
               v-model="prompt"
+              class="mx-auto w-full max-w-[760px]"
               :model-id="modelId"
               :models="models"
               :workspace-name="workspace?.name ?? 'no workspace'"

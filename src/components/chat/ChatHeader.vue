@@ -5,7 +5,6 @@
 import {
   MoonIcon,
   MoreHorizontalIcon,
-  PanelRightCloseIcon,
   PanelRightOpenIcon,
   SunIcon,
 } from "@lucide/vue";
@@ -33,17 +32,19 @@ const emit = defineEmits<{ (e: "toggleTools"): void }>();
       </Badge>
     </div>
 
-    <!-- Tools drawer toggle: collapsed by default, reachable from here and
-         from the empty state so it never becomes unreachable. -->
+    <!-- Tools drawer toggle: collapsed by default and reachable from here and
+         from the empty state. Hidden while the drawer is open, because the
+         drawer carries its own collapse control (no duplicate affordance in
+         the central area). -->
     <Button
+      v-if="!toolsOpen"
       variant="ghost"
       size="icon-sm"
-      :aria-label="toolsOpen ? 'Collapse tools panel' : 'Expand tools panel'"
+      aria-label="Expand tools panel"
       :aria-pressed="toolsOpen"
       @click="emit('toggleTools')"
     >
-      <PanelRightCloseIcon v-if="toolsOpen" />
-      <PanelRightOpenIcon v-else />
+      <PanelRightOpenIcon />
     </Button>
 
     <!-- Seam: no theme state is persisted from the UI yet (settings.theme is

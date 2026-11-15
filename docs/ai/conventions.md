@@ -26,6 +26,13 @@ the rules in [AGENTS.md](../../AGENTS.md), report the conflict instead of extend
 Colors and brand images are configuration, never literals in a component (ADR 0009, specs S3–S5 of
 `odd/tasks/chat-shell-and-theme-tokens.md`).
 
+- **Brand images live in `public/` and are resolved through `src/lib/brand.ts`.** Replace the file
+  and the app re-brands: `logo_white.png` (combined mark + wordmark, dark), `logo.png` (light),
+  plus the separate `mark`/`wordmark` variants. Never write an image path in a component.
+- **Empty-state copy is optional and configured too**: `VITE_HERO_TITLE` and `VITE_HERO_SUBTITLE`
+  (`src/lib/hero.ts`). Both empty by default, so the empty state shows only the logo, the chips and
+  the composer.
+
 - **Tokens come from `.env`.** `.env.example` is the versioned reference; copy it to `.env` (ignored)
   and edit the hex values. The keys are the contract: `VITE_COLOR_PRIMARY`, `VITE_COLOR_PRIMARY_FOREGROUND`,
   `VITE_COLOR_SECONDARY`, `VITE_COLOR_SECONDARY_FOREGROUND`, `VITE_COLOR_TERTIARY`,

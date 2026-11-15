@@ -1,14 +1,15 @@
 <script setup lang="ts">
-// Empty chat (spec S1): the brand mark, two inert mode/provider chips and the
-// composer, centred in the panel — no conversation header yet.
+// Empty chat (spec S1): one brand image, an optional configurable hero line,
+// two inert mode/provider chips and the composer, centred in the panel.
 //
 // Brand paths belong to `src/lib/brand.ts` (S3, ADR 0009): replacing the file in
-// `public/` re-brands the app without touching this component.
+// `public/` re-brands the app without touching this component. The image is the
+// combined mark + wordmark asset, so the panel never renders two logos.
 import { ChevronDownIcon } from "@lucide/vue";
 import { brandAsset } from "@/lib/brand";
+import { HERO } from "@/lib/hero";
 
-const mark = brandAsset("mark");
-const wordmark = brandAsset("wordmark");
+const logo = brandAsset("logo");
 
 defineProps<{
   /** Provider id from settings.json, shown in the first chip. */
@@ -22,14 +23,26 @@ defineProps<{
   <div
     class="flex h-full min-h-0 flex-col items-center justify-center overflow-y-auto px-6 py-10"
   >
-    <div class="flex w-full max-w-[820px] flex-col items-center gap-6">
-      <div class="flex flex-col items-center gap-2">
+    <div class="flex w-full max-w-[760px] flex-col items-center gap-6">
+      <div class="flex flex-col items-center gap-3">
         <img
-          :src="mark"
+          :src="logo"
           alt="Nabla"
-          class="size-16 object-contain opacity-95"
+          class="h-28 w-auto object-contain opacity-95"
         />
-        <img :src="wordmark" alt="" class="h-3 object-contain opacity-70" />
+        <!-- Optional copy under the logo; both lines hide when unset. -->
+        <p
+          v-if="HERO.title"
+          class="text-center text-base font-medium text-foreground"
+        >
+          {{ HERO.title }}
+        </p>
+        <p
+          v-if="HERO.subtitle"
+          class="max-w-[52ch] text-center text-sm text-muted-foreground"
+        >
+          {{ HERO.subtitle }}
+        </p>
       </div>
 
       <!-- Both chips are deliberately inert: the mode is a seam, the provider
