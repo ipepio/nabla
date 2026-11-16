@@ -266,6 +266,10 @@ async function probeOne(provider: string): Promise<void> {
  * `pi auth logout <provider>` behind a confirmation. Credentials stay in pi's
  * `auth.json`: this component never sees a secret, only a state word.
  *
+ * A row shows one action, derived from that badge: "Sign out" for `ready`, and
+ * "Sign in" for every other state, including the row that has not been painted
+ * yet. Both buttons on the same row were noise — one of them never applied.
+ *
  * S2/S5 of `providers-pane-refinements.md`: asking for a badge means booting a
  * whole CLI, so the badges are painted from `nabla.db` at once and refreshed in
  * the background, in one batch, from the answer pi gives (see the module block
@@ -557,6 +561,20 @@ let disposed = false;
 
 function stateOf(provider: string): PiAuthState {
   return statuses.value[provider]?.state ?? "unknown";
+}
+
+/**
+ * The one action a row offers, derived from the painted state. `ready` is the
+ * only answer that says pi holds a credential for this account, so it is the
+ * only one with something to sign out of. Every other answer describes a row
+ * with no credential behind it and offers "Sign in" alone: `not_ready` and
+ * `invalid` say so explicitly, `unknown` is the honest word for "nobody observed
+ * this account", and a row still showing the "checking" placeholder reads as
+ * `unknown` here (`stateOf` never leaves it blank) — the safe default, because
+ * nobody observed a credential for it.
+ */
+function offersSignOut(provider: string): boolean {
+  return stateOf(provider) === "ready";
 }
 
 /**
@@ -1022,20 +1040,13 @@ onBeforeUnmount(() => {
           >
             {{ t("settings.accounts.state.checking") }}
           </Badge>
+          <!-- One action per row, derived from the painted state: the account
+               pi observed as `ready` offers "Sign out", every other state —
+               and the row that is still "checking" — offers "Sign in" alone.
+               The busy label and the disable rules of each control stay exactly
+               as they already were. -->
           <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            :disabled="starting === id || signingOut === id"
-            @click="startLogin(id)"
-          >
-            {{
-              starting === id
-                ? t("settings.accounts.signInBusy")
-                : t("settings.accounts.signIn")
-            }}
-          </Button>
-          <Button
+            v-if="offersSignOut(id)"
             type="button"
             variant="ghost"
             size="sm"
@@ -1046,6 +1057,20 @@ onBeforeUnmount(() => {
               signingOut === id
                 ? t("settings.accounts.signOutBusy")
                 : t("settings.accounts.signOut")
+            }}
+          </Button>
+          <Button
+            v-else
+            type="button"
+            variant="ghost"
+            size="sm"
+            :disabled="starting === id || signingOut === id"
+            @click="startLogin(id)"
+          >
+            {{
+              starting === id
+                ? t("settings.accounts.signInBusy")
+                : t("settings.accounts.signIn")
             }}
           </Button>
         </div>
