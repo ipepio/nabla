@@ -47,35 +47,45 @@ interface ProviderOption {
   models: ProviderModels["models"];
 }
 
-const props = defineProps<{
-  /** Prompt text (v-model). */
-  modelValue: string;
-  /**
-   * Providers with their models, from `list_provider_models` (S1 of
-   * `providers-pane-refinements.md`). The UI never hardcodes a model id: the
-   * picker paints exactly what pi's file holds.
-   */
-  providerModels: ProviderModels[];
-  /** Persisted provider id from settings.json, `""` until settings load. */
-  providerId: string;
-  /** Persisted model id from settings.json, `""` until settings load. */
-  modelId: string;
-  /** Workspace the turn is written into, for the scope chip. */
-  workspaceName: string;
-  /** A send is in flight: the primary control becomes stop. */
-  streaming: boolean;
-  /** Nothing can be sent yet (no workspace selected). */
-  disabled: boolean;
-  /** The prompt is non-empty and no send is in flight. */
-  canSend: boolean;
-  /**
-   * Provider/model selection is unavailable (saving, or no enabled model
-   * reported): the single trigger is disabled, so no half choice is possible.
-   */
-  modelDisabled: boolean;
-  /** A session exists, so stop is meaningful. */
-  canStop: boolean;
-}>();
+const props = withDefaults(
+  defineProps<{
+    /** Prompt text (v-model). */
+    modelValue: string;
+    /**
+     * Providers with their models, from `list_provider_models` (S1 of
+     * `providers-pane-refinements.md`). The UI never hardcodes a model id: the
+     * picker paints exactly what pi's file holds.
+     */
+    providerModels: ProviderModels[];
+    /** Persisted provider id from settings.json, `""` until settings load. */
+    providerId: string;
+    /** Persisted model id from settings.json, `""` until settings load. */
+    modelId: string;
+    /** Workspace the turn is written into, for the scope chip. */
+    workspaceName: string;
+    /** A send is in flight: the primary control becomes stop. */
+    streaming: boolean;
+    /** Nothing can be sent yet (no workspace selected). */
+    disabled: boolean;
+    /** The prompt is non-empty and no send is in flight. */
+    canSend: boolean;
+    /**
+     * Provider/model selection is unavailable (saving, or no enabled model
+     * reported): the single trigger is disabled, so no half choice is possible.
+     */
+    modelDisabled: boolean;
+    /** A session exists, so stop is meaningful. */
+    canStop: boolean;
+    /**
+     * Ceiling for the card, chosen by the caller from `src/lib/layout.ts`: the
+     * empty state keeps `COMPOSER_MAX_WIDTH`, the conversation state may use the
+     * wider `CONVERSATION_COMPOSER_MAX_WIDTH`. Only the ceiling moves — the floor
+     * is always `COMPOSER_MIN_WIDTH`, because it is the chat section's minimum.
+     */
+    maxWidth?: number;
+  }>(),
+  { maxWidth: COMPOSER_MAX_WIDTH },
+);
 
 const emit = defineEmits<{
   (e: "update:modelValue", value: string): void;
@@ -216,14 +226,13 @@ function chooseModel(provider: string, model: string) {
 </script>
 
 <template>
-  <!-- The composer owns its own max width (single source of truth): the empty
-       state and the transcript composer must stay the same size, and parents no
-       longer pass a conflicting cap. -->
+  <!-- The card is centred and bounded by the caller: the empty state passes the
+       narrow ceiling, the conversation state the wide one. -->
   <!-- Bounds come from `src/lib/layout.ts`: the box shrinks with its column and
        stops at half of its normal width, which is also the chat's floor. -->
   <div
     class="mx-auto w-full min-w-0 rounded-2xl border border-border bg-card/60 shadow-sm"
-    :style="{ maxWidth: `${COMPOSER_MAX_WIDTH}px`, minWidth: `${COMPOSER_MIN_WIDTH}px` }"
+    :style="{ maxWidth: `${maxWidth}px`, minWidth: `${COMPOSER_MIN_WIDTH}px` }"
   >
     <Textarea
       :model-value="modelValue"

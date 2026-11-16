@@ -47,6 +47,11 @@ import type {
 import { useAppearance } from "@/lib/appearance";
 import { t } from "@/lib/i18n";
 import {
+  COMPOSER_MAX_WIDTH,
+  CONVERSATION_COMPOSER_MAX_WIDTH,
+  CONVERSATION_TRANSCRIPT_MAX_WIDTH,
+} from "@/lib/layout";
+import {
   loadProviderModels,
   providerModels,
   providerModelsError,
@@ -706,6 +711,7 @@ onUnmounted(() => {
       <template #composer>
         <Composer
           v-model="prompt"
+          :max-width="COMPOSER_MAX_WIDTH"
           :provider-id="providerId"
           :model-id="modelId"
           :provider-models="providerModels"
@@ -742,9 +748,16 @@ onUnmounted(() => {
         </div>
 
         <TabsContent value="chat" class="flex min-h-0 flex-1 flex-col">
-          <!-- Transcript: the only scrolling region of the panel. -->
+          <!-- Transcript: the only scrolling region of the panel. The column is
+               centred and bounded (a maximum, not a floor): the header, the tabs
+               and the composer still span the panel, only the conversation is
+               held to a readable measure. -->
           <ScrollArea class="min-h-0 flex-1">
-            <div ref="transcriptContent" class="flex flex-col gap-4 p-4">
+            <div
+              ref="transcriptContent"
+              class="mx-auto flex w-full flex-col gap-4 p-4"
+              :style="{ maxWidth: `${CONVERSATION_TRANSCRIPT_MAX_WIDTH}px` }"
+            >
               <Alert
                 v-if="statusAlert"
                 :variant="statusAlert.type === 'error' ? 'destructive' : 'default'"
@@ -840,6 +853,7 @@ onUnmounted(() => {
           <div class="border-t border-border px-4 py-3">
             <Composer
               v-model="prompt"
+              :max-width="CONVERSATION_COMPOSER_MAX_WIDTH"
               :provider-id="providerId"
               :model-id="modelId"
               :provider-models="providerModels"
