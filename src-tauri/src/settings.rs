@@ -33,6 +33,24 @@ pub struct Settings {
     /// written before this preference existed) hides nothing.
     #[serde(default)]
     pub hidden_models: Vec<String>,
+    /// S2 of `chat-preferences-and-queue.md`: the "Mostrar razonamiento"
+    /// toggle. Off, the reasoning block is not rendered (neither live nor in
+    /// recorded history). An absent field (a file written before this
+    /// preference existed) means `true`, like pi and a fresh install.
+    #[serde(default = "default_true")]
+    pub show_reasoning: bool,
+    /// S3 of `chat-preferences-and-queue.md`: the "Encolar mensajes" toggle.
+    /// On, a message sent while the agent is working is queued for the session
+    /// instead of being rejected. An absent field means `true`.
+    #[serde(default = "default_true")]
+    pub queue_messages: bool,
+}
+
+/// S2/S3 of `chat-preferences-and-queue.md`: both chat toggles ship enabled, so
+/// a settings file written before they existed keeps today's behaviour with
+/// reasoning shown and sending turned into a queue.
+fn default_true() -> bool {
+    true
 }
 
 /// S7 default provider. Also the value a settings file written before this
@@ -63,6 +81,8 @@ impl Default for Settings {
             language: default_language(),
             // Nothing is hidden until the human hides it.
             hidden_models: Vec::new(),
+            show_reasoning: default_true(),
+            queue_messages: default_true(),
         }
     }
 }
@@ -246,6 +266,10 @@ mod tests {
         // S7: a settings file written by hand sets the engine to use.
         assert_eq!(s.provider, "nan");
         assert_eq!(s.model, "glm5.3");
+        // S2/S3 of `chat-preferences-and-queue.md`: an unknown field does not
+        // stop the known ones (or the new defaults) from being read.
+        assert!(s.show_reasoning);
+        assert!(s.queue_messages);
     }
 
     // S7 + settings header rule: a file written before provider/model existed
@@ -261,6 +285,63 @@ mod tests {
         assert_eq!(s.pi_binary, "/opt/pi");
         assert_eq!(s.provider, "nan");
         assert_eq!(s.model, "deepseek-v4-flash");
+    }
+
+    // S2/S3 of `chat-preferences-and-queue.md`: both chat preferences ship on,
+    // like pi: reasoning visible and sending while the agent works queues.
+    #[test]
+    fn defaults_show_reasoning_and_queue_messages() {
+        let s = Settings::default();
+        assert!(
+            s.show_reasoning,
+            "S2: the reasoning block is shown by default"
+        );
+        assert!(
+            s.queue_messages,
+            "S3: sending while the agent works queues by default"
+        );
+
+        // camelCase on the wire, so `preferences.ts` mirrors these keys.
+        let json = serde_json::to_value(Settings::default()).expect("serialize");
+        assert_eq!(json["showReasoning"], serde_json::json!(true));
+        assert_eq!(json["queueMessages"], serde_json::json!(true));
+    }
+
+    // Settings header rule + S2/S3: a file written before these preferences
+    // existed must load, with both toggles on and every other key preserved.
+    #[test]
+    fn settings_file_without_chat_preferences_uses_the_true_defaults() {
+        let cfg = TempCfg::new("pre_chat_prefs");
+        std::fs::write(
+            &cfg.0,
+            r#"{"theme":"light","piBinary":"pi","provider":"nan","model":"glm5.3","language":"es"}"#,
+        )
+        .expect("write fixture");
+        let s = load(&cfg.0).expect("an older settings file must load");
+        assert_eq!(s.language, "es");
+        assert!(s.show_reasoning, "an absent preference means reasoning on");
+        assert!(s.queue_messages, "an absent preference means queueing on");
+    }
+
+    // S2/S3: `false` is a real choice, so it survives save then load — the
+    // toggle would otherwise flip back on every relaunch.
+    #[test]
+    fn chat_preferences_round_trip_as_false() {
+        let cfg = TempCfg::new("chat_prefs_roundtrip");
+        let s = Settings {
+            show_reasoning: false,
+            queue_messages: false,
+            ..Settings::default()
+        };
+        save(&cfg.0, &s).expect("save");
+
+        let loaded = load(&cfg.0).expect("load");
+        assert!(!loaded.show_reasoning, "reasoning stays hidden");
+        assert!(!loaded.queue_messages, "sending stays blocked");
+
+        let json = serde_json::to_value(&loaded).expect("serialize");
+        assert_eq!(json["showReasoning"], serde_json::json!(false));
+        assert_eq!(json["queueMessages"], serde_json::json!(false));
     }
 
     // S2 of `i18n-and-settings-polish.md`: the language is a preference like the
