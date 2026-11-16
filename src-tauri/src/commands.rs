@@ -12,7 +12,10 @@ use tauri_plugin_opener::OpenerExt;
 
 use crate::cli::{self, AuthState, CliSessions, CliSink, PiAuthStatus, PiCliResult};
 use crate::process::{ProcessManager, StartupOutcome};
-use crate::providers::{ModelOption, ProviderDraft, ProviderSummary};
+use crate::providers::{
+    ModelInfo as ProviderModelInfo, ModelOption, ProviderDraft, ProviderModelDraft, ProviderModels,
+    ProviderSummary,
+};
 use crate::rpc::{AgentEvent, RuntimeStatus};
 use crate::settings::{self, Settings};
 use crate::store::{SessionNew, SessionRow, Store, StoreResult, Workspace};
@@ -272,6 +275,46 @@ pub fn set_provider_key(
     api_key: String,
 ) -> Result<ProviderSummary, String> {
     crate::providers::set_provider_key(&models_path(&state), &provider_id, &api_key)
+        .map_err(display_err)
+}
+
+// ── models of one provider (S2, S3 of `models-by-provider.md`) ──────────────
+
+/// S2: every provider with its models, read from pi's own `models.json`.
+///
+/// This is what the grouped selector and the per-model editor are built on: a
+/// provider with no models comes back with an empty list, and the api key never
+/// crosses (the DTO has no field for it).
+#[tauri::command]
+pub fn list_provider_models(
+    state: State<'_, AppState>,
+) -> Result<Vec<ProviderModels>, String> {
+    crate::providers::read_provider_models(&models_path(&state)).map_err(display_err)
+}
+
+/// S3: writes one model inside `providers.<provider>.models` — backup, merge and
+/// atomic write. The answer is the entry as the file now holds it, so the editor
+/// refreshes from what was written. The provider must already exist; nothing is
+/// invented here.
+#[tauri::command]
+pub fn update_provider_model(
+    state: State<'_, AppState>,
+    draft: ProviderModelDraft,
+) -> Result<ProviderModelInfo, String> {
+    crate::providers::update_provider_model(&models_path(&state), &draft).map_err(display_err)
+}
+
+/// S3: removes one model from one provider, backup and atomic write included.
+/// `true` means an entry was removed; a provider or model the file does not have
+/// is `false`, which keeps the delete idempotent. A malformed id is still
+/// rejected before the file is touched.
+#[tauri::command]
+pub fn remove_provider_model(
+    state: State<'_, AppState>,
+    provider: String,
+    model_id: String,
+) -> Result<bool, String> {
+    crate::providers::remove_provider_model(&models_path(&state), &provider, &model_id)
         .map_err(display_err)
 }
 

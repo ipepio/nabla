@@ -30,6 +30,65 @@ pub struct ModelOption {
     pub name: String,
 }
 
+/// S2/S3 of `models-by-provider.md`: one provider with the models pi would use,
+/// in the order the file declares them. This is the read the grouped selector
+/// and the per-model editor both build on.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModels {
+    pub provider: String,
+    pub name: String,
+    pub models: Vec<ModelInfo>,
+}
+
+/// S3: one model of a provider, as the editor reads it. Pi's own field names
+/// (`contextWindow`, `maxTokens`, `cost.input`, `cost.output`, `input`) are
+/// mapped onto flat camelCase fields; `enabled` is Nabla's mark, not pi's, and
+/// defaults to `true` when the file does not carry it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String,
+    pub context_window: Option<u64>,
+    pub max_tokens: Option<u64>,
+    pub input_cost: Option<f64>,
+    pub output_cost: Option<f64>,
+    /// Input modalities: `"text"` and `"image"`, pi's `input` array.
+    pub modalities: Vec<String>,
+    pub enabled: bool,
+}
+
+/// S3: what the editor writes for one model. An absent number means "keep what
+/// the file has", so a form that only edits the cost never wipes a context
+/// window; an absent `enabled` means enabled, the same default the read side
+/// applies.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModelDraft {
+    pub provider: String,
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    #[serde(default)]
+    pub input_cost: Option<f64>,
+    #[serde(default)]
+    pub output_cost: Option<f64>,
+    #[serde(default)]
+    pub modalities: Vec<String>,
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+}
+
+/// The flag is enabled unless the payload says otherwise (L3/S3).
+fn enabled_by_default() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderDraft {
@@ -49,6 +108,8 @@ pub enum ProvidersError {
     Io(String),
     Parse(String),
     InvalidId(String),
+    /// S3 of `models-by-provider.md`: a model id the file must not receive.
+    InvalidModelId(String),
     InvalidBaseUrl(String),
     EmptyApiKey,
     /// A provider entry the file does not have. Only `set_provider_key` can hit
@@ -65,6 +126,11 @@ impl std::fmt::Display for ProvidersError {
             ProvidersError::InvalidId(id) => write!(
                 f,
                 "provider id must match ^[a-z0-9-]{{1,32}}$: {id:?}"
+            ),
+            ProvidersError::InvalidModelId(id) => write!(
+                f,
+                "model id must be 1-{MODEL_ID_MAX} chars of [a-z0-9-._/:] and contain a \
+                 letter or digit: {id:?}"
             ),
             ProvidersError::InvalidBaseUrl(url) => {
                 write!(f, "provider base url must be http(s): {url:?}")
@@ -217,6 +283,253 @@ pub fn delete_provider(path: &Path, provider_id: &str) -> ProvidersResult<bool> 
     Ok(true)
 }
 
+/// S2/S3 of `models-by-provider.md`: every provider with its models, the models
+/// in the order the file declares them.
+///
+/// A provider without a `models` array is listed with an empty vector (the
+/// editor still shows the provider, the selector simply offers nothing) and the
+/// api key stays in the file: `ModelInfo` has no field for it (S4).
+///
+/// Providers come back sorted by id: serde_json's default map is a `BTreeMap`, so
+/// the file's provider order is not kept across the read (that would need the
+/// `preserve_order` feature, a Cargo change outside this task). The models array
+/// is a JSON array and does keep file order, which is the order the editor and
+/// the selector show.
+pub fn read_provider_models(path: &Path) -> ProvidersResult<Vec<ProviderModels>> {
+    let (root, _) = read_root(path)?;
+    let Some(providers) = root.get("providers").and_then(|v| v.as_object()) else {
+        return Ok(Vec::new());
+    };
+    Ok(providers
+        .iter()
+        .map(|(id, entry)| ProviderModels {
+            provider: id.clone(),
+            name: provider_name_of(id, entry),
+            models: entry
+                .get("models")
+                .and_then(|v| v.as_array())
+                .map(|models| models.iter().filter_map(model_info_of).collect())
+                .unwrap_or_default(),
+        })
+        .collect())
+}
+
+/// S3: writes one model inside `providers.<provider>.models` — backup, merge,
+/// atomic write.
+///
+/// Only that one entry changes: an id the provider already lists is merged into
+/// (every field the draft does not cover survives — `reasoning`, sampling
+/// params, the costs it did not set), a new id is appended in file order, and
+/// every other model, provider and top-level key stays as it was. The provider
+/// itself must already exist: nothing invents a provider (`UnknownProvider`),
+/// exactly like `set_provider_key`.
+pub fn update_provider_model(
+    path: &Path,
+    draft: &ProviderModelDraft,
+) -> ProvidersResult<ModelInfo> {
+    let provider = draft.provider.trim();
+    validate_id(provider)?;
+    let id = draft.id.trim();
+    validate_model_id(id)?;
+
+    let (mut root, existed) = read_root(path)?;
+    let entry = root
+        .get_mut("providers")
+        .and_then(|v| v.as_object_mut())
+        .and_then(|providers| providers.get_mut(provider))
+        .and_then(|v| v.as_object_mut())
+        .ok_or_else(|| ProvidersError::UnknownProvider(provider.to_string()))?;
+
+    // A provider the file lists without models gets the array it needs; anything
+    // other than an array there is a file Nabla must not guess at.
+    if !entry.get("models").map(serde_json::Value::is_array).unwrap_or(false) {
+        match entry.get("models") {
+            None | Some(serde_json::Value::Null) => {
+                entry.insert(
+                    "models".to_string(),
+                    serde_json::Value::Array(Vec::new()),
+                );
+            }
+            Some(_) => {
+                return Err(ProvidersError::Parse(format!(
+                    "{}: `providers.{provider}.models` is not a JSON array",
+                    path.display()
+                )));
+            }
+        }
+    }
+    let models = entry
+        .get_mut("models")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| {
+            ProvidersError::Parse(format!(
+                "{}: `providers.{provider}.models` is not a JSON array",
+                path.display()
+            ))
+        })?;
+
+    let index = models
+        .iter()
+        .position(|model| model_id_of(model) == Some(id));
+    // Merge into the entry the file already has instead of replacing it, so the
+    // keys pi owns inside a model are not dropped by an edit (S3).
+    let mut model = match index {
+        Some(position) => match &models[position] {
+            serde_json::Value::Object(map) => serde_json::Value::Object(map.clone()),
+            _ => {
+                return Err(ProvidersError::Parse(format!(
+                    "{}: `providers.{provider}.models[{position}]` is not a JSON object",
+                    path.display()
+                )));
+            }
+        },
+        None => serde_json::Value::Object(serde_json::Map::new()),
+    };
+    let object = model
+        .as_object_mut()
+        .expect("the entry was built as a JSON object above");
+    merge_model_draft(object, id, draft).map_err(|message| {
+        ProvidersError::Parse(format!("{}: {}: {message}", path.display(), model_ref(provider, id)))
+    })?;
+
+    // The answer is the entry as it now stands, so the editor refreshes from what
+    // was written instead of from what was sent.
+    let info = model_info_of(&model).ok_or_else(|| {
+        ProvidersError::Parse(format!(
+            "{}: {} could not be read back",
+            path.display(),
+            model_ref(provider, id)
+        ))
+    })?;
+
+    match index {
+        Some(position) => models[position] = model,
+        None => models.push(model),
+    }
+
+    backup_before_rewrite(path, existed)?;
+    write_root(path, &root)?;
+    Ok(info)
+}
+
+/// `providers.<provider>.models[<id>]`, the path an error message names.
+fn model_ref(provider: &str, id: &str) -> String {
+    format!("`providers.{provider}.models[{id}]`")
+}
+
+/// S3: merges the draft into one model entry, writing only the fields the draft
+/// covers. Everything else the entry already has — `reasoning`, sampling params,
+/// the costs Nabla does not model, the numeric fields the draft left as `None` —
+/// survives untouched.
+///
+/// The error is the offending field's name only: the caller owns the file path
+/// and builds the message, so the wording never drifts between call sites.
+fn merge_model_draft(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    id: &str,
+    draft: &ProviderModelDraft,
+) -> Result<(), &'static str> {
+    object.insert("id".to_string(), serde_json::Value::String(id.to_string()));
+    // A blank name keeps the one the file has (and falls back to the id, exactly
+    // like every other listing), so an edit that only touches the cost never
+    // drops the label.
+    let name = {
+        let trimmed = draft.name.trim();
+        if trimmed.is_empty() {
+            object
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .unwrap_or(id)
+                .to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    object.insert("name".to_string(), serde_json::Value::String(name));
+
+    if let Some(value) = draft.context_window {
+        object.insert("contextWindow".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = draft.max_tokens {
+        object.insert("maxTokens".to_string(), serde_json::json!(value));
+    }
+    // The costs live in pi's nested `cost` object, which may already carry values
+    // Nabla does not model (`cacheRead`, `cacheWrite`): merge, never replace.
+    if draft.input_cost.is_some() || draft.output_cost.is_some() {
+        let mut cost = match object.get("cost") {
+            None | Some(serde_json::Value::Null) => serde_json::Map::new(),
+            Some(serde_json::Value::Object(existing)) => existing.clone(),
+            Some(_) => return Err("`cost` is not a JSON object"),
+        };
+        if let Some(value) = draft.input_cost {
+            cost.insert("input".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = draft.output_cost {
+            cost.insert("output".to_string(), serde_json::json!(value));
+        }
+        object.insert("cost".to_string(), serde_json::Value::Object(cost));
+    }
+    // Modalities are pi's `input` array. An empty list means "the form did not
+    // send them", so the file keeps what it has instead of losing every modality.
+    let modalities: Vec<&str> = draft
+        .modalities
+        .iter()
+        .map(|m| m.trim())
+        .filter(|m| !m.is_empty())
+        .collect();
+    if !modalities.is_empty() {
+        object.insert("input".to_string(), serde_json::json!(modalities));
+    }
+    // L3: disabling is a mark in the file, never a delete.
+    object.insert(
+        "enabled".to_string(),
+        serde_json::Value::Bool(draft.enabled),
+    );
+    Ok(())
+}
+
+/// S3: removes one model from one provider's array — same backup and atomic
+/// write as every other writer of this file.
+///
+/// A provider or model the file does not have is a no-op (`false`), never an
+/// error: deleting is idempotent and nothing is rewritten or backed up for a
+/// change that did not happen. Both ids are validated first, so a malformed id
+/// can never reach the file.
+pub fn remove_provider_model(
+    path: &Path,
+    provider_id: &str,
+    model_id: &str,
+) -> ProvidersResult<bool> {
+    let provider = provider_id.trim();
+    validate_id(provider)?;
+    let id = model_id.trim();
+    validate_model_id(id)?;
+
+    let (mut root, existed) = read_root(path)?;
+    let removed = root
+        .get_mut("providers")
+        .and_then(|v| v.as_object_mut())
+        .and_then(|providers| providers.get_mut(provider))
+        .and_then(|v| v.as_object_mut())
+        .and_then(|entry| entry.get_mut("models"))
+        .and_then(|v| v.as_array_mut())
+        .map(|models| {
+            let before = models.len();
+            models.retain(|model| model_id_of(model) != Some(id));
+            models.len() != before
+        })
+        .unwrap_or(false);
+    if !removed {
+        return Ok(false);
+    }
+
+    backup_before_rewrite(path, existed)?;
+    write_root(path, &root)?;
+    Ok(true)
+}
+
 /// S4: rewrites `providers.<provider_id>.apiKey` in place, in plain text (the
 /// user's own decision, with the keychain noted as debt).
 ///
@@ -312,6 +625,29 @@ fn validate_id(id: &str) -> ProvidersResult<()> {
     }
 }
 
+/// Longest model id accepted; pi's own ids (`deepseek-v4-flash`) are far shorter.
+pub const MODEL_ID_MAX: usize = 64;
+
+/// S3: a model id follows the provider discipline — lowercase, bounded, no
+/// whitespace — but must admit the separators pi's real ids carry (`qwen3.6`,
+/// `qwen3:8b`, `meta-llama/llama-3.2-1b`); rejecting a dot would make most of the
+/// models a provider already lists impossible to edit.
+fn validate_model_id(id: &str) -> ProvidersResult<()> {
+    let valid = !id.is_empty()
+        && id.len() <= MODEL_ID_MAX
+        && id.chars().any(|c| c.is_ascii_alphanumeric())
+        && id.chars().all(|c| {
+            c.is_ascii_lowercase()
+                || c.is_ascii_digit()
+                || matches!(c, '-' | '.' | '_' | '/' | ':')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(ProvidersError::InvalidModelId(id.to_string()))
+    }
+}
+
 /// S3: the base url is an http(s) endpoint; discovery appends `/models` to it.
 fn validate_base_url(base_url: &str) -> ProvidersResult<()> {
     let host = base_url
@@ -361,14 +697,97 @@ fn write_atomic(path: &Path, contents: &str) -> ProvidersResult<()> {
     })
 }
 
-fn summary_of(id: &str, entry: &serde_json::Value) -> ProviderSummary {
-    let name = entry
+/// Display name of a provider entry; an unnamed provider is listed by its id.
+fn provider_name_of(id: &str, entry: &serde_json::Value) -> String {
+    entry
         .get("name")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .unwrap_or(id)
+        .to_string()
+}
+
+/// The `id` of a model entry, trimmed; `None` when it has none, which is a model
+/// the UI cannot select or edit.
+fn model_id_of(model: &serde_json::Value) -> Option<&str> {
+    model
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+}
+
+/// A whole-number field of a model entry. pi writes integers; a float that names
+/// an integer (`131072.0`) is read as one instead of being dropped.
+fn model_u64(model: &serde_json::Value, field: &str) -> Option<u64> {
+    match model.get(field)? {
+        serde_json::Value::Number(number) => number.as_u64().or_else(|| {
+            let value = number.as_f64()?;
+            let integral = value.is_finite()
+                && value >= 0.0
+                && value.fract() == 0.0
+                && value <= u64::MAX as f64;
+            integral.then_some(value as u64)
+        }),
+        _ => None,
+    }
+}
+
+/// A per-token cost out of pi's nested `cost` object.
+fn model_cost(model: &serde_json::Value, field: &str) -> Option<f64> {
+    model
+        .get("cost")
+        .and_then(|cost| cost.get(field))
+        .and_then(serde_json::Value::as_f64)
+}
+
+/// pi's `input` array; a model that declares none is text-only, which is pi's
+/// own default.
+fn model_modalities(model: &serde_json::Value) -> Vec<String> {
+    match model.get("input") {
+        Some(serde_json::Value::Array(entries)) => entries
+            .iter()
+            .filter_map(|entry| entry.as_str())
+            .map(|entry| entry.trim().to_string())
+            .filter(|entry| !entry.is_empty())
+            .collect(),
+        _ => vec!["text".to_string()],
+    }
+}
+
+/// One model entry of pi's file as the contract's `ModelInfo`. `None` when the
+/// entry is not an object or carries no id: nothing the UI could select.
+fn model_info_of(model: &serde_json::Value) -> Option<ModelInfo> {
+    if !model.is_object() {
+        return None;
+    }
+    let id = model_id_of(model)?.to_string();
+    let name = model
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(&id)
         .to_string();
+    Some(ModelInfo {
+        id,
+        name,
+        context_window: model_u64(model, "contextWindow"),
+        max_tokens: model_u64(model, "maxTokens"),
+        input_cost: model_cost(model, "input"),
+        output_cost: model_cost(model, "output"),
+        modalities: model_modalities(model),
+        // S3/L3: Nabla's own mark, enabled unless the file says otherwise.
+        enabled: model
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+    })
+}
+
+fn summary_of(id: &str, entry: &serde_json::Value) -> ProviderSummary {
+    let name = provider_name_of(id, entry);
     let base_url = entry
         .get("baseUrl")
         .and_then(|v| v.as_str())
@@ -1115,6 +1534,537 @@ mod tests {
             assert_eq!(dir.read(), before, "a rejected id changes nothing");
             assert_eq!(dir.entries(), vec!["models.json".to_string()]);
         }
+    }
+
+    // ── models of one provider (S2, S3 of `models-by-provider.md`) ──────────
+
+    /// A pi-shaped file: one provider whose models carry the fields pi
+    /// understands, one provider with no `models` key at all.
+    const PI_FILE: &str = r#"{
+      "theme": "dark",
+      "providers": {
+        "nan": {
+          "name": "NaN",
+          "baseUrl": "https://nan.test/v1",
+          "api": "openai-completions",
+          "apiKey": "sk-nan-secret",
+          "timeoutSeconds": 300,
+          "modelOverrides": { "qwen3.6": { "contextWindow": 4096 } },
+          "models": [
+            {
+              "id": "qwen3.6",
+              "name": "Qwen 3.6",
+              "contextWindow": 131072,
+              "maxTokens": 8192,
+              "cost": { "input": 0.5, "output": 1.5, "cacheRead": 0.1 },
+              "input": ["text", "image"],
+              "reasoning": true,
+              "temperature": 0.7
+            },
+            {
+              "id": "glm5.3",
+              "name": "GLM 5.3",
+              "contextWindow": 200000,
+              "cost": { "input": 1.0, "output": 2.0 },
+              "input": ["text"]
+            }
+          ]
+        },
+        "empty": {
+          "name": "Empty",
+          "baseUrl": "https://empty.test/v1",
+          "apiKey": "sk-empty"
+        }
+      }
+    }"#;
+
+    /// A draft that changes nothing by itself: every optional field is `None`
+    /// ("keep what the file has") and the model stays enabled.
+    fn model_draft(provider: &str, id: &str) -> ProviderModelDraft {
+        ProviderModelDraft {
+            provider: provider.to_string(),
+            id: id.to_string(),
+            name: String::new(),
+            context_window: None,
+            max_tokens: None,
+            input_cost: None,
+            output_cost: None,
+            modalities: Vec::new(),
+            enabled: true,
+        }
+    }
+
+    /// The file as parsed JSON, for asserting what a write produced.
+    fn written(dir: &TempModelsDir) -> serde_json::Value {
+        serde_json::from_str(&dir.read()).expect("parse written models.json")
+    }
+
+    /// The model ids of one provider, in file order.
+    fn model_ids(root: &serde_json::Value, provider: &str) -> Vec<String> {
+        root["providers"][provider]["models"]
+            .as_array()
+            .expect("models array")
+            .iter()
+            .map(|model| model["id"].as_str().expect("model id").to_string())
+            .collect()
+    }
+
+    // S2/S3: every provider comes back with its models in file order, pi's field
+    // names are mapped onto the contract, and the api key never leaves the file.
+    #[test]
+    fn provider_models_are_listed_with_pi_fields_mapped() {
+        let dir = TempModelsDir::new("list_provider_models");
+        dir.write(PI_FILE);
+
+        let providers = read_provider_models(&dir.path()).expect("list provider models");
+        assert_eq!(
+            providers
+                .iter()
+                .map(|p| p.provider.as_str())
+                .collect::<Vec<_>>(),
+            vec!["empty", "nan"],
+            "every provider of the file is listed"
+        );
+
+        let nan = providers.iter().find(|p| p.provider == "nan").expect("nan");
+        assert_eq!(nan.name, "NaN");
+        assert_eq!(
+            nan.models
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["qwen3.6", "glm5.3"],
+            "models keep the order the file declares"
+        );
+        assert_eq!(
+            nan.models[0],
+            ModelInfo {
+                id: "qwen3.6".to_string(),
+                name: "Qwen 3.6".to_string(),
+                context_window: Some(131072),
+                max_tokens: Some(8192),
+                input_cost: Some(0.5),
+                output_cost: Some(1.5),
+                modalities: vec!["text".to_string(), "image".to_string()],
+                enabled: true,
+            }
+        );
+        assert_eq!(nan.models[1].id, "glm5.3");
+        assert_eq!(nan.models[1].context_window, Some(200000));
+        assert_eq!(nan.models[1].max_tokens, None);
+        assert_eq!(nan.models[1].input_cost, Some(1.0));
+        assert_eq!(nan.models[1].output_cost, Some(2.0));
+
+        // A provider without a `models` array is listed with an empty list.
+        let empty = providers.iter().find(|p| p.provider == "empty").expect("empty");
+        assert_eq!(empty.name, "Empty");
+        assert!(empty.models.is_empty());
+
+        // S4: the key is in the file and in none of the payloads.
+        let json = serde_json::to_string(&providers).expect("serialize");
+        assert!(!json.contains("sk-nan-secret"), "no api key: {json}");
+        assert!(!json.contains("apiKey"), "no apiKey field: {json}");
+    }
+
+    // S3: a model that declares none of the editable fields still reads, with the
+    // contract's defaults (enabled, text-only input, unnamed model = its id).
+    #[test]
+    fn a_bare_model_gets_the_documented_defaults() {
+        let dir = TempModelsDir::new("bare_model");
+        dir.write(r#"{"providers":{"p":{"models":[{"id":"bare"},{"id":"off","enabled":false}]}}}"#);
+
+        let providers = read_provider_models(&dir.path()).expect("list");
+        assert_eq!(
+            providers[0].models[0],
+            ModelInfo {
+                id: "bare".to_string(),
+                name: "bare".to_string(),
+                context_window: None,
+                max_tokens: None,
+                input_cost: None,
+                output_cost: None,
+                modalities: vec!["text".to_string()],
+                enabled: true,
+            }
+        );
+        // The Nabla-side flag is read back when the file carries it.
+        assert!(!providers[0].models[1].enabled);
+    }
+
+    #[test]
+    fn a_missing_file_lists_no_provider_models() {
+        let dir = TempModelsDir::new("list_missing");
+        let providers = read_provider_models(&dir.path()).expect("a missing file is not an error");
+        assert!(providers.is_empty());
+    }
+
+    // S3: a new model is appended to its provider and everything else — the other
+    // models, the keys pi owns inside the provider, the other provider and the
+    // top-level settings — survives byte for byte.
+    #[test]
+    fn update_creates_a_new_model_and_preserves_the_rest_of_the_provider() {
+        let dir = TempModelsDir::new("update_create");
+        dir.write(PI_FILE);
+
+        let mut draft = model_draft("nan", "hy4");
+        draft.name = "Hy4".to_string();
+        draft.context_window = Some(32768);
+        draft.max_tokens = Some(4096);
+        draft.input_cost = Some(0.25);
+        draft.output_cost = Some(0.75);
+        draft.modalities = vec!["text".to_string(), "image".to_string()];
+
+        let info = update_provider_model(&dir.path(), &draft).expect("update model");
+        assert_eq!(
+            info,
+            ModelInfo {
+                id: "hy4".to_string(),
+                name: "Hy4".to_string(),
+                context_window: Some(32768),
+                max_tokens: Some(4096),
+                input_cost: Some(0.25),
+                output_cost: Some(0.75),
+                modalities: vec!["text".to_string(), "image".to_string()],
+                enabled: true,
+            }
+        );
+
+        let root = written(&dir);
+        assert_eq!(model_ids(&root, "nan"), vec!["qwen3.6", "glm5.3", "hy4"]);
+        let created = &root["providers"]["nan"]["models"][2];
+        assert_eq!(created["id"], serde_json::json!("hy4"));
+        assert_eq!(created["name"], serde_json::json!("Hy4"));
+        assert_eq!(created["contextWindow"], serde_json::json!(32768));
+        assert_eq!(created["maxTokens"], serde_json::json!(4096));
+        assert_eq!(created["cost"]["input"], serde_json::json!(0.25));
+        assert_eq!(created["cost"]["output"], serde_json::json!(0.75));
+        assert_eq!(created["input"], serde_json::json!(["text", "image"]));
+        assert_eq!(created["enabled"], serde_json::json!(true));
+
+        // The rest of the file is exactly what it was.
+        let original: serde_json::Value = serde_json::from_str(PI_FILE).expect("parse fixture");
+        let mut expected = original.clone();
+        expected["providers"]["nan"]["models"]
+            .as_array_mut()
+            .expect("array")
+            .push(created.clone());
+        assert_eq!(root, expected, "only the new model entry was added");
+
+        assert_eq!(backups(&dir).len(), 1, "the rewrite is backed up");
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join(&backups(&dir)[0])).expect("read backup"),
+            PI_FILE
+        );
+        assert!(
+            !dir.entries().iter().any(|name| name.contains(".tmp")),
+            "left behind: {:?}",
+            dir.entries()
+        );
+    }
+
+    // S3: "preserving every other field of that model" — an update writes only
+    // the fields the draft covers; reasoning, sampling params, the other costs and
+    // the untouched numeric fields stay as pi has them.
+    #[test]
+    fn update_preserves_unknown_model_fields_and_only_changes_what_it_covers() {
+        let dir = TempModelsDir::new("update_merge");
+        dir.write(PI_FILE);
+
+        let mut draft = model_draft("nan", "qwen3.6");
+        draft.name = "Qwen 3.6 Turbo".to_string();
+        draft.context_window = Some(65536);
+        draft.input_cost = Some(1.25);
+        draft.modalities = vec!["text".to_string()];
+        draft.enabled = false;
+
+        let info = update_provider_model(&dir.path(), &draft).expect("update model");
+        assert_eq!(info.name, "Qwen 3.6 Turbo");
+        assert_eq!(info.context_window, Some(65536));
+        // `None` means "keep": the file's values are reported back unchanged.
+        assert_eq!(info.max_tokens, Some(8192));
+        assert_eq!(info.output_cost, Some(1.5));
+        assert!(!info.enabled);
+
+        let root = written(&dir);
+        let model = &root["providers"]["nan"]["models"][0];
+        assert_eq!(model["id"], serde_json::json!("qwen3.6"));
+        assert_eq!(model["name"], serde_json::json!("Qwen 3.6 Turbo"));
+        assert_eq!(model["contextWindow"], serde_json::json!(65536));
+        assert_eq!(model["maxTokens"], serde_json::json!(8192));
+        assert_eq!(model["cost"]["input"], serde_json::json!(1.25));
+        assert_eq!(model["cost"]["output"], serde_json::json!(1.5));
+        assert_eq!(model["cost"]["cacheRead"], serde_json::json!(0.1));
+        assert_eq!(model["input"], serde_json::json!(["text"]));
+        // Fields Nabla does not model survive the merge.
+        assert_eq!(model["reasoning"], serde_json::json!(true));
+        assert_eq!(model["temperature"], serde_json::json!(0.7));
+        // Nothing else in the file moved.
+        let original: serde_json::Value = serde_json::from_str(PI_FILE).expect("parse fixture");
+        assert_eq!(
+            root["providers"]["nan"]["models"][1],
+            original["providers"]["nan"]["models"][1]
+        );
+        assert_eq!(root["providers"]["nan"]["timeoutSeconds"], serde_json::json!(300));
+        assert_eq!(
+            root["providers"]["nan"]["modelOverrides"]["qwen3.6"]["contextWindow"],
+            serde_json::json!(4096)
+        );
+        assert_eq!(root["providers"]["nan"]["apiKey"], serde_json::json!("sk-nan-secret"));
+        assert_eq!(root["theme"], serde_json::json!("dark"));
+    }
+
+    // L3/S3: disabling is a mark, never a delete — the entry keeps its settings.
+    #[test]
+    fn update_writes_enabled_false_without_deleting_the_model() {
+        let dir = TempModelsDir::new("disable_model");
+        dir.write(r#"{"providers":{"nan":{"models":[{"id":"qwen3.6","name":"Qwen 3.6","contextWindow":131072}]}}}"#);
+
+        let mut draft = model_draft("nan", "qwen3.6");
+        draft.enabled = false;
+        let info = update_provider_model(&dir.path(), &draft).expect("disable model");
+
+        assert!(!info.enabled);
+        let root = written(&dir);
+        assert_eq!(model_ids(&root, "nan"), vec!["qwen3.6"], "nothing is dropped");
+        let model = &root["providers"]["nan"]["models"][0];
+        assert_eq!(model["enabled"], serde_json::json!(false));
+        assert_eq!(model["name"], serde_json::json!("Qwen 3.6"));
+        assert_eq!(model["contextWindow"], serde_json::json!(131072));
+
+        // And the editor reads the flag back.
+        let providers = read_provider_models(&dir.path()).expect("list");
+        assert_eq!(providers[0].models.len(), 1);
+        assert!(!providers[0].models[0].enabled);
+    }
+
+    // S3: removal drops one model from one provider, with the same backup and
+    // atomic write as every other writer of this file.
+    #[test]
+    fn remove_drops_only_that_model_and_writes_a_backup() {
+        let dir = TempModelsDir::new("remove_model");
+        dir.write(PI_FILE);
+
+        assert!(remove_provider_model(&dir.path(), "nan", "qwen3.6").expect("remove"));
+
+        let root = written(&dir);
+        assert_eq!(model_ids(&root, "nan"), vec!["glm5.3"], "only one model is gone");
+        let original: serde_json::Value = serde_json::from_str(PI_FILE).expect("parse fixture");
+        assert_eq!(
+            root["providers"]["nan"]["models"][0],
+            original["providers"]["nan"]["models"][1],
+            "the surviving model is untouched"
+        );
+        assert_eq!(root["providers"]["empty"], original["providers"]["empty"]);
+        assert_eq!(root["providers"]["nan"]["apiKey"], serde_json::json!("sk-nan-secret"));
+        assert_eq!(root["theme"], serde_json::json!("dark"));
+
+        let written_backups = backups(&dir);
+        assert_eq!(written_backups.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join(&written_backups[0])).expect("read backup"),
+            PI_FILE
+        );
+        assert!(
+            !dir.entries().iter().any(|name| name.contains(".tmp")),
+            "left behind: {:?}",
+            dir.entries()
+        );
+    }
+
+    // S3: removing what the file does not have is a no-op, never an error and
+    // never a rewrite.
+    #[test]
+    fn remove_of_an_unknown_model_or_provider_is_a_no_op() {
+        let dir = TempModelsDir::new("remove_unknown");
+        dir.write(PI_FILE);
+        let before = dir.read();
+
+        assert!(!remove_provider_model(&dir.path(), "nan", "absent").expect("no-op"));
+        assert!(!remove_provider_model(&dir.path(), "empty", "qwen3.6").expect("no-op"));
+        assert!(!remove_provider_model(&dir.path(), "absent", "qwen3.6").expect("no-op"));
+
+        assert_eq!(dir.read(), before, "nothing is rewritten");
+        assert_eq!(dir.entries(), vec!["models.json".to_string()], "no backup");
+    }
+
+    // S3: "nunca tocar providers no presentes en models.json" — an update for a
+    // provider the file does not have is an error, and no provider is invented.
+    #[test]
+    fn update_of_a_provider_absent_from_the_file_is_rejected() {
+        let dir = TempModelsDir::new("update_unknown_provider");
+        dir.write(PI_FILE);
+        let before = dir.read();
+
+        let err = update_provider_model(&dir.path(), &model_draft("absent", "qwen3.6"))
+            .expect_err("an unknown provider cannot receive a model");
+        match err {
+            ProvidersError::UnknownProvider(id) => assert_eq!(id, "absent"),
+            other => panic!("expected UnknownProvider, got {other:?}"),
+        }
+        assert_eq!(dir.read(), before, "the file is not rewritten");
+        assert_eq!(dir.entries(), vec!["models.json".to_string()], "no backup");
+        assert!(
+            written(&dir)["providers"].get("absent").is_none(),
+            "no provider is created"
+        );
+
+        // A missing file has no provider either, and none is created.
+        let missing = TempModelsDir::new("update_missing_file");
+        assert!(matches!(
+            update_provider_model(&missing.path(), &model_draft("absent", "qwen3.6")),
+            Err(ProvidersError::UnknownProvider(_))
+        ));
+        assert_eq!(missing.entries(), Vec::<String>::new(), "nothing is written");
+    }
+
+    // S3: both ids are validated before the file is touched, so a malformed id
+    // can never reach a write.
+    #[test]
+    fn invalid_provider_and_model_ids_are_rejected_without_touching_the_file() {
+        let dir = TempModelsDir::new("model_bad_id");
+        dir.write(PI_FILE);
+        let before = dir.read();
+
+        for id in ["", "NaN", "na n", "nan/nested", &"n".repeat(33)] {
+            let err = update_provider_model(&dir.path(), &model_draft(id, "qwen3.6"))
+                .expect_err("a malformed provider id is rejected");
+            match err {
+                ProvidersError::InvalidId(value) => assert_eq!(value, id),
+                other => panic!("expected InvalidId for {id:?}, got {other:?}"),
+            }
+        }
+
+        for id in [
+            "",
+            "Qwen 3.6",
+            "qwen 3.6",
+            "qwen3.6; rm -rf /",
+            "mo\u{301}del",
+            &"q".repeat(65),
+        ] {
+            let err = update_provider_model(&dir.path(), &model_draft("nan", id))
+                .expect_err("a malformed model id is rejected");
+            match err {
+                ProvidersError::InvalidModelId(value) => assert_eq!(value, id),
+                other => panic!("expected InvalidModelId for {id:?}, got {other:?}"),
+            }
+            let err = remove_provider_model(&dir.path(), "nan", id)
+                .expect_err("a malformed model id is rejected");
+            match err {
+                ProvidersError::InvalidModelId(value) => assert_eq!(value, id),
+                other => panic!("expected InvalidModelId for {id:?}, got {other:?}"),
+            }
+        }
+
+        assert_eq!(dir.read(), before, "a rejected id changes nothing");
+        assert_eq!(dir.entries(), vec!["models.json".to_string()], "no backup");
+    }
+
+    // S3: the ids pi's own models carry (`qwen3.6`, `glm5.3`, `qwen3:8b`, a
+    // namespaced `meta-llama/...`) must be editable, so the model id rule admits
+    // the separators the provider id rule does not need.
+    #[test]
+    fn model_ids_pi_really_uses_are_accepted() {
+        let dir = TempModelsDir::new("real_model_ids");
+        dir.write(PI_FILE);
+        let ids = [
+            "qwen3.6",
+            "glm5.3-flash",
+            "deepseek-v4-pro",
+            "qwen3:8b",
+            "meta-llama/llama-3.2-1b",
+            &"a".repeat(64),
+        ];
+        for id in ids {
+            update_provider_model(&dir.path(), &model_draft("nan", id))
+                .unwrap_or_else(|err| panic!("model id {id:?} must be accepted: {err}"));
+        }
+
+        let listed = read_provider_models(&dir.path()).expect("list");
+        let nan = listed.iter().find(|p| p.provider == "nan").expect("nan");
+        let listed_ids: Vec<&str> = nan.models.iter().map(|m| m.id.as_str()).collect();
+        for id in ids {
+            assert!(listed_ids.contains(&id), "{id:?} is missing: {listed_ids:?}");
+        }
+    }
+
+    // S3: a surrounding whitespace is trimmed, exactly like a provider id, so
+    // the same model written by hand and by the form is one entry.
+    #[test]
+    fn a_model_id_is_trimmed_before_it_is_written() {
+        let dir = TempModelsDir::new("trim_model_id");
+        dir.write(PI_FILE);
+
+        let info = update_provider_model(&dir.path(), &model_draft("nan", "  qwen3.6\n"))
+            .expect("surrounding whitespace is trimmed");
+
+        assert_eq!(info.id, "qwen3.6");
+        assert_eq!(model_ids(&written(&dir), "nan"), vec!["qwen3.6", "glm5.3"]);
+    }
+
+    // Frozen contract: camelCase keys, mirrored field by field in TS.
+    #[test]
+    fn provider_model_payloads_serialize_camel_case() {
+        let provider = ProviderModels {
+            provider: "nan".to_string(),
+            name: "NaN".to_string(),
+            models: vec![ModelInfo {
+                id: "qwen3.6".to_string(),
+                name: "Qwen 3.6".to_string(),
+                context_window: Some(131072),
+                max_tokens: Some(8192),
+                input_cost: Some(0.5),
+                output_cost: Some(1.5),
+                modalities: vec!["text".to_string()],
+                enabled: false,
+            }],
+        };
+        let json = serde_json::to_value(&provider).expect("serialize");
+        assert_eq!(json["provider"], serde_json::json!("nan"));
+        assert_eq!(json["name"], serde_json::json!("NaN"));
+        let model = &json["models"][0];
+        assert_eq!(model["id"], serde_json::json!("qwen3.6"));
+        assert_eq!(model["contextWindow"], serde_json::json!(131072));
+        assert_eq!(model["maxTokens"], serde_json::json!(8192));
+        assert_eq!(model["inputCost"], serde_json::json!(0.5));
+        assert_eq!(model["outputCost"], serde_json::json!(1.5));
+        assert_eq!(model["modalities"], serde_json::json!(["text"]));
+        assert_eq!(model["enabled"], serde_json::json!(false));
+        assert!(model.get("context_window").is_none(), "camelCase only");
+
+        let draft: ProviderModelDraft = serde_json::from_value(serde_json::json!({
+            "provider": "nan",
+            "id": "qwen3.6",
+            "name": "Qwen 3.6",
+            "contextWindow": 131072,
+            "maxTokens": 8192,
+            "inputCost": 0.5,
+            "outputCost": 1.5,
+            "modalities": ["text", "image"],
+            "enabled": false
+        }))
+        .expect("deserialize draft");
+        assert_eq!(draft.provider, "nan");
+        assert_eq!(draft.context_window, Some(131072));
+        assert_eq!(draft.max_tokens, Some(8192));
+        assert_eq!(draft.input_cost, Some(0.5));
+        assert_eq!(draft.output_cost, Some(1.5));
+        assert_eq!(draft.modalities, vec!["text", "image"]);
+        assert!(!draft.enabled);
+
+        // A payload that omits the optional halves still builds a draft: absent
+        // numbers mean "keep" and an absent flag means "enabled", the same
+        // default the read side applies.
+        let minimal: ProviderModelDraft = serde_json::from_value(serde_json::json!({
+            "provider": "nan",
+            "id": "qwen3.6",
+            "name": "Qwen 3.6"
+        }))
+        .expect("deserialize minimal draft");
+        assert_eq!(minimal.context_window, None);
+        assert_eq!(minimal.input_cost, None);
+        assert!(minimal.modalities.is_empty());
+        assert!(minimal.enabled);
     }
 
     // ── discovery ───────────────────────────────────────────────────────────

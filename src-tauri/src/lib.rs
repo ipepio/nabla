@@ -85,6 +85,12 @@ pub fn run() {
             // with the same backup and atomic write as `save_provider`.
             commands::delete_provider,
             commands::set_provider_key,
+            // S2/S3 of `models-by-provider.md`: the models of each provider and
+            // the per-model editor, over the same file and the same backup and
+            // atomic write.
+            commands::list_provider_models,
+            commands::update_provider_model,
+            commands::remove_provider_model,
             commands::list_sessions,
             commands::get_settings,
             commands::save_settings,
