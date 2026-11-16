@@ -376,6 +376,10 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
       // Belt to the `done` slice above: a stream that ends without one still
       // lands in the transcript instead of vanishing.
       flushStreaming(sessionId, buffer);
+      // A finished turn is activity the drawer must see: bump the generation so
+      // the session list re-reads and the row moves up now, instead of waiting
+      // for the next poll tick.
+      sessionGeneration.value += 1;
       return;
     case "process_status":
       buffer.status = event.status;

@@ -244,7 +244,15 @@ function toggleExpanded(workspaceId: number) {
 
 /** S5: the cached sessions of a workspace, empty until its first fetch lands. */
 function sessionsFor(workspaceId: number): SessionSummary[] {
-  return sessionsByWorkspace.value[workspaceId] ?? [];
+  const cached = sessionsByWorkspace.value[workspaceId] ?? [];
+  // Defensive ordering: the query already sorts by activity, but sorting here
+  // too means any refresh — poll, send or turn end — lands in the right order
+  // even if a response arrives out of band. `updatedAt` is ISO-8601, so the
+  // string comparison is the chronological one.
+  return [...cached].sort((a, b) => {
+    if (a.updatedAt === b.updatedAt) return b.id - a.id;
+    return a.updatedAt < b.updatedAt ? 1 : -1;
+  });
 }
 
 function sessionActionErrorFor(workspaceId: number): string | null {
