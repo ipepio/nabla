@@ -56,8 +56,9 @@ const SUBSCRIPTION_PROVIDERS = [
 
 /**
  * S5: one painted row. The persisted contract carries the instant of the check;
- * a row nobody ever observed carries none, and then it paints no provenance and
- * claims no check.
+ * a row nobody ever observed carries none, and then it claims no check. The
+ * instant is kept because it orders the rows against each other (see
+ * `checkedMs`); it is not painted.
  */
 type PaintedRow = Omit<ProviderStatusRow, "checkedAt"> & {
   checkedAt: string | null;
@@ -145,7 +146,7 @@ function cachedRow(row: ProviderStatusRow): PaintedRow {
  * so Vue patches its badge not at all: no variant swap, no re-mount, no flicker.
  * Only a row that actually changed gets a new object and a repaint. The stamp of
  * every answered row moves in place, because the check did just run and a stale
- * "2h ago" would contradict the row Rust just persisted.
+ * instant would misjudge the row against the one Rust just persisted.
  */
 function applyRows(incoming: readonly PaintedRow[]): void {
   const next = { ...statuses.value };
@@ -307,7 +308,7 @@ import {
 import type { PiAuthState, PiCliEvent } from "@/contracts/types";
 
 /** S3/S4: every visible string, both locales (S2 of `i18n-and-settings-polish.md`). */
-const { t, locale } = useI18n();
+const { t } = useI18n();
 
 /**
  * S4: the deadline of the logout call. Rust defaults to 20 s as well; passing it
@@ -573,43 +574,6 @@ function isUnobserved(provider: string): boolean {
  * never flashes a placeholder before the real badge.
  */
 const cacheSettled = ref(false);
-
-/** S5: how often the relative stamp re-reads the clock, so "just now" ages. */
-const PROVENANCE_TICK_MS = 30_000;
-
-/** S5: the clock the relative stamps are read against. */
-const now = ref(Date.now());
-
-/**
- * S5: how long ago this row was checked — "just now", minutes, hours, days, and
- * the plain date once it is a week old. A row nobody stamped (`checkedAt` null)
- * says nothing instead of inventing an age.
- */
-function checkedAgo(provider: string): string {
-  const then = checkedMs(statuses.value[provider]);
-  if (!Number.isFinite(then)) return "";
-  const minutes = Math.floor((now.value - then) / 60_000);
-  if (minutes < 1) return t("settings.accounts.checked.justNow");
-  if (minutes < 60) {
-    return t("settings.accounts.checked.minutes", { count: minutes });
-  }
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) {
-    return t("settings.accounts.checked.hours", { count: hours });
-  }
-  const days = Math.floor(hours / 24);
-  if (days < 7) return t("settings.accounts.checked.days", { count: days });
-  return new Date(then).toLocaleDateString(locale.value);
-}
-
-/** S5: the tooltip of that stamp — the absolute instant, in the reader's locale. */
-function checkedAtLabel(provider: string): string {
-  const then = checkedMs(statuses.value[provider]);
-  if (!Number.isFinite(then)) return "";
-  return t("settings.accounts.checked.at", {
-    time: new Date(then).toLocaleString(locale.value),
-  });
-}
 
 /**
  * S2: the explicit re-probe behind "Refresh status". It asks for all four in one
@@ -929,8 +893,6 @@ async function paintFromCache(): Promise<void> {
 /** S2: the scheduled fill of this mount, so leaving the pane cancels it. */
 let probeTimer: ReturnType<typeof setTimeout> | null = null;
 let idleHandle: number | null = null;
-/** S5: the clock behind the relative stamps; it dies with the pane. */
-let clockTimer: ReturnType<typeof setInterval> | null = null;
 
 /** S2: nothing scheduled may outlive the section that scheduled it. */
 function cancelScheduledProbe() {
@@ -988,19 +950,11 @@ onMounted(async () => {
 onMounted(() => {
   void paintFromCache();
   probeTimer = setTimeout(deferProbe, PROBE_DELAY_MS);
-  // S5: a relative stamp is a clock: it ages on its own between two probes.
-  clockTimer = setInterval(() => {
-    now.value = Date.now();
-  }, PROVENANCE_TICK_MS);
 });
 
 onBeforeUnmount(() => {
   disposed = true;
   cancelScheduledProbe();
-  if (clockTimer !== null) {
-    clearInterval(clockTimer);
-    clockTimer = null;
-  }
   unsubscribeEvents?.();
   unsubscribeEvents = null;
   // S3: no login flow outlives the pane that started it.
@@ -1050,9 +1004,8 @@ onBeforeUnmount(() => {
             {{ id }}
           </span>
           <!-- S5: the painted row comes first — from the persisted cache, the
-               session rows or the probe — and only it carries a provenance
-               stamp. S2: a row nobody observed yet shows the neutral
-               placeholder, pulsing while the batch is queued or on its way,
+               session rows or the probe. S2: a row nobody observed yet shows the
+               neutral placeholder, pulsing while the batch is queued or on its way,
                but only after the cache read settled: an empty initial row would
                be a skeleton, and a cache with an entry must never flash one. -->
           <Badge
@@ -1069,16 +1022,6 @@ onBeforeUnmount(() => {
           >
             {{ t("settings.accounts.state.checking") }}
           </Badge>
-          <!-- S5: when pi was last asked, muted next to the badge; the tooltip
-               carries the absolute instant. It disappears with the stamp, so a
-               row that was never checked claims no age. -->
-          <span
-            v-if="checkedAgo(id) !== ''"
-            class="shrink-0 text-xs text-muted-foreground"
-            :title="checkedAtLabel(id)"
-          >
-            {{ checkedAgo(id) }}
-          </span>
           <Button
             type="button"
             variant="ghost"
