@@ -117,6 +117,9 @@ pub fn run() {
             commands::pi_cli_start,
             commands::pi_cli_write,
             commands::pi_cli_stop,
+            // S2 of `providers-pane-refinements.md`: the account state of many
+            // providers in one call, probed with a bounded pool.
+            commands::pi_auth_check_many,
             commands::pi_auth_check
         ])
         .run(tauri::generate_context!())

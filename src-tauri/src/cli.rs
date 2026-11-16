@@ -23,6 +23,11 @@
 //   without a TTY, and its OAuth flow waits at a prompt for a pasted redirect URL.
 //   Terminal output is split into lines and stripped of ANSI before it reaches the
 //   webview, which is a log view and not a terminal emulator (defect L6).
+// - `auth_check_many` is the batch form of the account probe: one `pi auth check`
+//   boots a whole CLI, so asking six providers one after another costs ~7 s. The
+//   batch runs them through a bounded pool (`AUTH_CHECK_POOL`) with the same
+//   per-provider deadline, keeps request order, and answers `unknown` per entry
+//   instead of failing the call (S2 of `providers-pane-refinements.md`).
 //
 // Frozen contract (see `odd/tasks/pi-cli-bridge.md`): `PiCliResult` is the
 // non-interactive answer, `CliEvent` is the `pi-cli` event payload, and
@@ -56,6 +61,13 @@ pub const KILL_GRACE: Duration = Duration::from_millis(500);
 
 /// Grace given to a child to leave after `stop` terminates it.
 pub const STOP_GRACE: Duration = Duration::from_millis(500);
+
+/// How many `pi auth check` probes may run at once (S2 of
+/// `providers-pane-refinements.md`). Each probe boots a whole CLI, so the cost of
+/// six providers is dominated by how many waves they need: four in flight turns
+/// six probes into two waves. Bounded on purpose — a pool as wide as the provider
+/// list would spawn as many CLIs as the file happens to name.
+pub const AUTH_CHECK_POOL: usize = 4;
 
 /// Geometry of an interactive session's pty. Wide on purpose: `pi auth login`
 /// prints a long authorization URL, and a child that wraps to the terminal width
@@ -129,6 +141,19 @@ pub struct PiAuthStatus {
     pub provider: String,
     pub state: AuthState,
     pub credential: bool,
+}
+
+impl PiAuthStatus {
+    /// What an entry answers when its probe produced nothing usable: a timeout, a
+    /// child that could not run, a blank provider id. Never a guess about the
+    /// account, and never a reason to fail a whole batch.
+    fn unknown(provider: &str) -> Self {
+        PiAuthStatus {
+            provider: provider.to_string(),
+            state: AuthState::Unknown,
+            credential: false,
+        }
+    }
 }
 
 /// The three streams one interactive session reports (S3).
@@ -263,6 +288,116 @@ pub fn auth_status(provider: &str, json: &str, exit_code: Option<i32>) -> PiAuth
         return status;
     }
     interpret_auth_json(provider, json, exit_code)
+}
+
+/// Exact argv of the account probe (S4): `pi auth check --provider <p> --json`.
+/// Typed arguments, so the provider name can never be read as a flag or a shell
+/// fragment.
+pub fn auth_check_args(provider: &str) -> Vec<String> {
+    vec![
+        "auth".to_string(),
+        "check".to_string(),
+        "--provider".to_string(),
+        provider.to_string(),
+        "--json".to_string(),
+    ]
+}
+
+/// Maps one finished probe to the typed account state (S4): a probe that ran out
+/// of time says nothing about the account, so it answers `unknown` instead of
+/// inventing a login state. Both the single and the batch command share this
+/// mapping, so they can never disagree about what a timeout means.
+pub fn auth_status_from_result(provider: &str, result: &PiCliResult) -> PiAuthStatus {
+    if result.timed_out {
+        return PiAuthStatus::unknown(provider);
+    }
+    auth_status(provider, &result.stdout, result.exit_code)
+}
+
+/// S2 of `providers-pane-refinements.md`: the typed account state of many
+/// providers in one call, probed concurrently.
+///
+/// One `pi auth check` boots a whole CLI (~1.15 s measured), so six providers
+/// asked one after another cost ~7 s. The pool below caps the probes in flight at
+/// `AUTH_CHECK_POOL`, which turns that into two waves instead of six spawns; the
+/// deadline stays per provider (never a shared batch budget), so a slow provider
+/// costs its own timeout and nothing else.
+///
+/// The answer has one entry per requested provider, in request order: the UI maps
+/// by provider id, but a stable order keeps the batch honest and testable. It
+/// cannot fail per batch — a provider that times out, answers garbage or cannot
+/// even be spawned answers `unknown` for its own slot and never aborts the rest.
+pub fn auth_check_many(
+    providers: &[String],
+    timeout: Duration,
+    binary: &str,
+) -> Vec<PiAuthStatus> {
+    // Every slot starts `unknown`, so a probe only ever replaces its own entry.
+    let mut statuses: Vec<PiAuthStatus> = providers
+        .iter()
+        .map(|provider| PiAuthStatus::unknown(provider))
+        .collect();
+    // A blank id names no provider, so it is never handed to `pi`: it keeps its
+    // slot and its id, and stays `unknown`.
+    let jobs: Arc<Vec<usize>> = Arc::new(
+        providers
+            .iter()
+            .enumerate()
+            .filter(|(_, provider)| !provider.trim().is_empty())
+            .map(|(index, _)| index)
+            .collect(),
+    );
+    if jobs.is_empty() {
+        return statuses;
+    }
+
+    // A pool wider than the work would just start threads that immediately find
+    // nothing to claim.
+    let workers = jobs.len().min(AUTH_CHECK_POOL.max(1));
+    let providers: Arc<Vec<String>> = Arc::new(providers.to_vec());
+    let binary: Arc<str> = Arc::from(binary);
+    let next = Arc::new(AtomicUsize::new(0));
+    let (results_tx, results_rx) = mpsc::channel::<(usize, PiAuthStatus)>();
+
+    let mut workers_handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let jobs = Arc::clone(&jobs);
+        let providers = Arc::clone(&providers);
+        let binary = Arc::clone(&binary);
+        let next = Arc::clone(&next);
+        let results_tx = results_tx.clone();
+        workers_handles.push(thread::spawn(move || {
+            // Each worker claims the next unclaimed slot, so a slow provider idles
+            // at most one worker and no slot is probed twice: no barrier to wait
+            // on, and no fixed partition that could strand the tail of the list.
+            while let Some(&index) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                let status = probe_auth(&providers[index], timeout, &binary);
+                if results_tx.send((index, status)).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+    drop(results_tx);
+
+    // Collected on the calling thread: the batch is over when every slot's probe
+    // has answered, and a lost worker can never drop a result silently.
+    for (index, status) in results_rx {
+        statuses[index] = status;
+    }
+    for handle in workers_handles {
+        let _ = handle.join();
+    }
+    statuses
+}
+
+/// One probe of the batch. A probe that cannot even run is `unknown` for its own
+/// entry only: a broken provider must never fail the whole batch.
+fn probe_auth(provider: &str, timeout: Duration, binary: &str) -> PiAuthStatus {
+    match run(&auth_check_args(provider), timeout, binary) {
+        Ok(result) => auth_status_from_result(provider, &result),
+        Err(_) => PiAuthStatus::unknown(provider),
+    }
 }
 
 /// One reading of `pi auth check --json`.
@@ -880,6 +1015,30 @@ sleep 30
 head -c 200000 /dev/zero | tr '\0' 'a'
 "#;
 
+    /// Delay of one `auth check` probe in the batch tests, in milliseconds. Small
+    /// enough to keep the suite quick, long enough that a sequential run cannot
+    /// fit inside the assertion's bound. Injected into the script below, so the
+    /// body and the assertions can never drift apart.
+    const AUTH_MANY_DELAY_MS: u64 = 300;
+
+    /// Account probe: reads `--provider <id>` from its argv, appends a line to the
+    /// marker for every run, and answers per id — `hang` never returns, `broken`
+    /// answers garbage, everything else is a ready provider after the delay.
+    const FAKE_AUTH_MANY: &str = r#"#!/bin/sh
+printf 'ran\n' >> '@MARKER@'
+prev=''
+provider=''
+for arg in "$@"; do
+  if [ "$prev" = '--provider' ]; then provider="$arg"; fi
+  prev="$arg"
+done
+case "$provider" in
+  hang) sleep 30 ;;
+  broken) printf 'boom\n'; exit 3 ;;
+  *) sleep @DELAY@; printf '{"provider":"%s","status":"ready","credential":true}\n' "$provider" ;;
+esac
+"#;
+
     /// Interactive: greets, then echoes every stdin line back on stdout.
     const FAKE_ECHO: &str = r#"#!/bin/sh
 printf 'ready line\n'
@@ -943,6 +1102,20 @@ exit 0
     #[cfg(unix)]
     fn binary(path: &Path) -> &str {
         path.to_str().expect("utf-8 path")
+    }
+
+    /// The account-probe script with its delay injected from
+    /// `AUTH_MANY_DELAY_MS`, so the body and the wall-time bound share one number.
+    #[cfg(unix)]
+    fn auth_many_body() -> String {
+        FAKE_AUTH_MANY.replace(
+            "@DELAY@",
+            &format!(
+                "{}.{:03}",
+                AUTH_MANY_DELAY_MS / 1000,
+                AUTH_MANY_DELAY_MS % 1000
+            ),
+        )
     }
 
     /// Events collected from a session sink.
@@ -1178,6 +1351,198 @@ exit 0
         let garbage = auth_status("nan", "boom", Some(0));
         assert_eq!(garbage.state, AuthState::Unknown);
         assert_eq!(garbage.provider, "nan");
+    }
+
+    // A single probe that outlived its deadline says nothing about the account.
+    // Both the single and the batch path share this mapping, so they can never
+    // disagree about what `timedOut` means.
+    #[test]
+    fn auth_status_from_result_keeps_the_probe_mapping() {
+        let timed_out = PiCliResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: None,
+            timed_out: true,
+            truncated: false,
+        };
+        assert_eq!(
+            auth_status_from_result("nan", &timed_out).state,
+            AuthState::Unknown
+        );
+
+        let ready = PiCliResult {
+            stdout: r#"{"provider":"nan","status":"ready"}"#.to_string(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            timed_out: false,
+            truncated: false,
+        };
+        let status = auth_status_from_result("nan", &ready);
+        assert_eq!(status.state, AuthState::Ready);
+        assert_eq!(status.provider, "nan");
+
+        let garbage = PiCliResult {
+            stdout: "boom".to_string(),
+            ..ready
+        };
+        assert_eq!(
+            auth_status_from_result("nan", &garbage).state,
+            AuthState::Unknown
+        );
+    }
+
+    // ── many-provider auth probe (S2 of `providers-pane-refinements.md`) ─────
+
+    // S2: every requested provider is reported, in the order the caller asked
+    // for, so the batch is a drop-in replacement for the sequential loop.
+    #[cfg(unix)]
+    #[test]
+    fn auth_check_many_reports_every_provider_in_the_requested_order() {
+        let scratch = Scratch::new("auth_many_order");
+        let script = write_script(&scratch, "pi-auth-many.sh", &auth_many_body());
+        let requested = [
+            "openai-codex",
+            "anthropic",
+            "google",
+            "openai",
+            "helmcode",
+            "nan",
+        ];
+        let providers: Vec<String> = requested.iter().map(|name| name.to_string()).collect();
+
+        let statuses = auth_check_many(&providers, Duration::from_secs(20), binary(&script));
+
+        assert_eq!(statuses.len(), providers.len(), "one entry per provider");
+        let reported: Vec<&str> = statuses.iter().map(|s| s.provider.as_str()).collect();
+        assert_eq!(reported, requested, "the order must match the request");
+        for status in &statuses {
+            assert_eq!(status.state, AuthState::Ready, "{status:?}");
+            assert!(status.credential, "{status:?}");
+        }
+    }
+
+    // S2: the point of the command. Six probes of `AUTH_MANY_DELAY` each take
+    // ~1.8 s one after another; a pool of four needs two batches. The bound is
+    // deliberately loose (4x the parallel expectation, well under the sequential
+    // sum) so a busy machine cannot make it flaky.
+    #[cfg(unix)]
+    #[test]
+    fn auth_check_many_runs_the_probes_within_a_bounded_pool() {
+        let scratch = Scratch::new("auth_many_pool");
+        let script = write_script(&scratch, "pi-auth-many.sh", &auth_many_body());
+        let providers: Vec<String> = (0..6).map(|index| format!("p{index}")).collect();
+        let sequential = Duration::from_millis(AUTH_MANY_DELAY_MS * providers.len() as u64);
+
+        let started = Instant::now();
+        let statuses = auth_check_many(&providers, Duration::from_secs(20), binary(&script));
+        let elapsed = started.elapsed();
+
+        assert_eq!(statuses.len(), providers.len());
+        assert!(statuses.iter().all(|s| s.state == AuthState::Ready));
+        assert!(
+            elapsed < Duration::from_millis(1200),
+            "a pool of {AUTH_CHECK_POOL} must finish six {AUTH_MANY_DELAY_MS} ms probes in two \
+             batches, not {sequential:?}; took {elapsed:?}"
+        );
+    }
+
+    // S2: one provider that never answers must not abort the batch; it answers
+    // `unknown` and every other provider keeps its real state.
+    #[cfg(unix)]
+    #[test]
+    fn auth_check_many_marks_a_timed_out_provider_unknown_without_failing_the_rest() {
+        let scratch = Scratch::new("auth_many_timeout");
+        let script = write_script(&scratch, "pi-auth-many.sh", &auth_many_body());
+        let providers = args(&["first", "hang", "last"]);
+
+        let started = Instant::now();
+        // The deadline is per provider and this one is global to the call: wide
+        // enough for the fast probes (`AUTH_MANY_DELAY_MS`) and narrow enough to
+        // cut the hanging one short.
+        let statuses = auth_check_many(&providers, Duration::from_millis(1000), binary(&script));
+        let elapsed = started.elapsed();
+
+        assert_eq!(statuses.len(), 3);
+        assert_eq!(statuses[0].state, AuthState::Ready, "{:?}", statuses[0]);
+        assert_eq!(statuses[1].state, AuthState::Unknown, "{:?}", statuses[1]);
+        assert_eq!(statuses[1].provider, "hang", "the entry keeps its provider");
+        assert!(!statuses[1].credential, "{:?}", statuses[1]);
+        assert_eq!(statuses[2].state, AuthState::Ready, "{:?}", statuses[2]);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the per-provider deadline must bound the batch, took {elapsed:?}"
+        );
+    }
+
+    // S2: a provider whose answer is not usable is `unknown`, next to providers
+    // that did answer.
+    #[cfg(unix)]
+    #[test]
+    fn auth_check_many_marks_a_garbage_answer_unknown() {
+        let scratch = Scratch::new("auth_many_garbage");
+        let script = write_script(&scratch, "pi-auth-many.sh", &auth_many_body());
+        let providers = args(&["broken", "fine"]);
+
+        let statuses = auth_check_many(&providers, Duration::from_secs(20), binary(&script));
+
+        assert_eq!(statuses[0].state, AuthState::Unknown, "{:?}", statuses[0]);
+        assert_eq!(statuses[1].state, AuthState::Ready, "{:?}", statuses[1]);
+    }
+
+    // S2: no providers means no probes, and the answer is empty, not an error.
+    #[cfg(unix)]
+    #[test]
+    fn auth_check_many_answers_empty_for_no_providers() {
+        let scratch = Scratch::new("auth_many_empty");
+        let script = write_script(&scratch, "pi-auth-many.sh", &auth_many_body());
+
+        let statuses = auth_check_many(&[], Duration::from_secs(20), binary(&script));
+
+        assert!(statuses.is_empty(), "{statuses:?}");
+        assert!(
+            !scratch.path("marker").exists(),
+            "an empty request must not spawn anything"
+        );
+    }
+
+    // S2: a blank id cannot name a provider, so it is reported `unknown` as-is
+    // (the entry keeps its slot and its provider, so callers mapping by index or
+    // by id both stay aligned) and it is never handed to the CLI.
+    #[cfg(unix)]
+    #[test]
+    fn auth_check_many_answers_unknown_for_blank_provider_ids_without_spawning() {
+        let scratch = Scratch::new("auth_many_blank");
+        let script = write_script(&scratch, "pi-auth-many.sh", &auth_many_body());
+        let providers = args(&["  ", "fine"]);
+
+        let statuses = auth_check_many(&providers, Duration::from_secs(20), binary(&script));
+
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0].provider, "  ", "the slot keeps its input id");
+        assert_eq!(statuses[0].state, AuthState::Unknown, "{:?}", statuses[0]);
+        assert_eq!(statuses[1].state, AuthState::Ready, "{:?}", statuses[1]);
+        let runs = std::fs::read_to_string(scratch.path("marker")).unwrap_or_default();
+        assert_eq!(
+            runs.lines().count(),
+            1,
+            "only the real provider may be spawned, marker: {runs:?}"
+        );
+    }
+
+    // S2: a binary that cannot run is not a batch failure either: every entry is
+    // `unknown`, which is exactly what the UI paints.
+    #[test]
+    fn auth_check_many_answers_unknown_when_the_probe_cannot_spawn() {
+        let providers = args(&["openai", "anthropic"]);
+
+        let statuses = auth_check_many(&providers, Duration::from_secs(20), "/nonexistent/pi");
+
+        assert_eq!(statuses.len(), 2);
+        for (status, provider) in statuses.iter().zip(providers.iter()) {
+            assert_eq!(status.provider, *provider, "{status:?}");
+            assert_eq!(status.state, AuthState::Unknown, "{status:?}");
+            assert!(!status.credential, "{status:?}");
+        }
     }
 
     // ── terminal text (S3) ─────────────────────────────────────────

@@ -10,7 +10,7 @@ use std::time::Duration;
 use tauri::State;
 use tauri_plugin_opener::OpenerExt;
 
-use crate::cli::{self, AuthState, CliSessions, CliSink, PiAuthStatus, PiCliResult};
+use crate::cli::{self, CliSessions, CliSink, PiAuthStatus, PiCliResult};
 use crate::process::{ProcessManager, StartupOutcome};
 use crate::providers::{
     ModelInfo as ProviderModelInfo, ModelOption, ProviderDraft, ProviderModelDraft, ProviderModels,
@@ -1179,34 +1179,33 @@ pub fn pi_cli_stop(state: State<'_, AppState>, cli_session_id: String) -> Result
 pub fn pi_auth_check(state: State<'_, AppState>, provider: String) -> Result<PiAuthStatus, String> {
     let settings = settings::load(&settings_path(&state)).map_err(display_err)?;
     let result = cli::run(
-        &auth_check_args(&provider),
+        &cli::auth_check_args(&provider),
         Duration::from_millis(cli::DEFAULT_TIMEOUT_MS),
         &settings.pi_binary,
     )
     .map_err(display_err)?;
     // A probe that ran out of time says nothing about the account: report it as
     // unknown instead of inventing a login state.
-    if result.timed_out {
-        return Ok(PiAuthStatus {
-            provider,
-            state: AuthState::Unknown,
-            credential: false,
-        });
-    }
-    Ok(cli::auth_status(&provider, &result.stdout, result.exit_code))
+    Ok(cli::auth_status_from_result(&provider, &result))
 }
 
-/// Exact argv of the account probe (S4): `pi auth check --provider <p> --json`.
-/// Typed arguments, so the provider name can never be read as a flag or a shell
-/// fragment.
-fn auth_check_args(provider: &str) -> Vec<String> {
-    vec![
-        "auth".to_string(),
-        "check".to_string(),
-        "--provider".to_string(),
-        provider.to_string(),
-        "--json".to_string(),
-    ]
+/// R1/S2 of `providers-pane-refinements.md`: the typed account state of many
+/// providers in one IPC, probed concurrently with a bounded pool. Six providers
+/// that each boot the CLI cost ~7 s one by one and two waves here.
+///
+/// It never fails per provider: an entry that times out, answers garbage or
+/// cannot be spawned is `unknown`, so one broken provider never blanks the pane.
+#[tauri::command]
+pub fn pi_auth_check_many(
+    state: State<'_, AppState>,
+    providers: Vec<String>,
+) -> Result<Vec<PiAuthStatus>, String> {
+    let settings = settings::load(&settings_path(&state)).map_err(display_err)?;
+    Ok(cli::auth_check_many(
+        &providers,
+        Duration::from_millis(cli::DEFAULT_TIMEOUT_MS),
+        &settings.pi_binary,
+    ))
 }
 
 #[cfg(test)]
@@ -1319,7 +1318,7 @@ mod tests {
     #[test]
     fn auth_check_args_match_the_documented_invocation() {
         assert_eq!(
-            auth_check_args("nan"),
+            crate::cli::auth_check_args("nan"),
             vec![
                 "auth".to_string(),
                 "check".to_string(),
