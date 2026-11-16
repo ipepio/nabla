@@ -47,6 +47,16 @@
  * becoming a stack of sections. The login and custom-provider flags keep their
  * meaning.
  *
+ * Catalogue models: the pane also reads `list_provider_models`, because two of the
+ * things it shows are not in `list_providers`. A provider only pi's catalogue knows
+ * — the usual result of signing in to a subscription — gets a row of its own below
+ * the configured list, with the two actions that read it (activate, edit) and
+ * without the two that write `models.json` (api key, remove), because there is no
+ * such entry. The model count of every row is the number the editor will list, so a
+ * catalogue an account just populated is visible here instead of behind a stale
+ * summary. A finished sign-in re-reads both lists (`AccountsSection` emits it) and
+ * bumps `editorRefresh`, so an open editor shows the new rows without reopening.
+ *
  * S1 of `i18n-and-settings-polish.md`: the pane has no rule between single rows.
  * Blocks are separated by spacing plus ONE rule, between the accounts block and
  * the provider list; the custom-provider form belongs to the list it adds to, so
@@ -107,12 +117,17 @@ import {
   configFilePath,
   deleteProvider,
   getSettings,
+  listProviderModels,
   listProviders,
   openConfigFile,
   saveSettings,
   setProviderKey,
 } from "@/contracts/commands";
-import type { AppSettings, ProviderSummary } from "@/contracts/types";
+import type {
+  AppSettings,
+  ProviderModels,
+  ProviderSummary,
+} from "@/contracts/types";
 
 /** The dialog is open when the drawer's gear button says so. */
 const open = defineModel<boolean>("open", { default: false });
@@ -156,6 +171,13 @@ const LANGUAGE_OPTIONS: { value: Locale; labelKey: MessageKey }[] = [
 const settings = ref<AppSettings | null>(null);
 /** S1 of `providers-pane.md`: the providers pi knows, as Rust summarizes them. */
 const providers = ref<ProviderSummary[]>([]);
+/**
+ * The models of every provider, configured and catalogued (`list_provider_models`
+ * mirrors pi's two files). The pane reads it for two things: the model count a
+ * row shows, which is what the editor below it lists, and the providers only
+ * pi's catalogue knows — a subscription signed in from the block above.
+ */
+const providerModels = ref<ProviderModels[]>([]);
 /** S3: the absolute preferences path, resolved by Rust. */
 const configPath = ref<string | null>(null);
 const loading = ref(false);
@@ -187,16 +209,85 @@ const warning = ref<string | null>(null);
  */
 const editTargetId = ref<string | null>(null);
 const editOpen = ref(false);
+/**
+ * Bumped when pi may have rewritten its cached catalogue behind our back (a
+ * finished sign-in). The editor watches it and re-reads its rows, so an open
+ * dialog shows the models pi just published without being reopened.
+ */
+const editorRefresh = ref(0);
+
+/** What the edit dialog shows about one provider, wherever pi keeps it. */
+interface EditTarget {
+  id: string;
+  name: string;
+  /** The provider's own API root; `null` when only pi's catalogue knows it. */
+  baseUrl: string | null;
+  modelCount: number;
+  /** `true` when pi's catalogue is its only source: nothing of it is writable. */
+  catalogOnly: boolean;
+}
 
 /**
- * S4: the provider the edit dialog shows, resolved from the pane's own list on
- * every render. A model write refreshes `providers`, and the dialog's details
- * follow the fresh summary instead of a stale copy taken when it opened.
+ * How many models the editor of this provider will list. `providerModels` is the
+ * same read the editor does, so a provider whose catalogue an already signed-in
+ * account populated shows the models it really has, not the count `models.json`
+ * alone would give.
  */
-const editTarget = computed(
-  () =>
-    providers.value.find((entry) => entry.id === editTargetId.value) ?? null,
-);
+function modelCountOf(providerId: string, fallback: number): number {
+  const entry = providerModels.value.find(
+    (item) => item.provider === providerId,
+  );
+  return entry ? entry.models.length : fallback;
+}
+
+/**
+ * The providers pi's catalogue knows and `models.json` does not: signing in to a
+ * subscription is what makes them exist, and there is no configured entry of
+ * theirs to activate, key or remove. They are listed so their models are
+ * reachable, and editing them is the only write-free action left.
+ */
+const catalogOnlyRows = computed(() => {
+  const known = new Set(providers.value.map((entry) => entry.id));
+  return providerModels.value
+    .filter((entry) => !known.has(entry.provider))
+    .filter((entry) => entry.models.some((model) => model.source === "catalog"))
+    .map((entry) => ({
+      id: entry.provider,
+      name: entry.name,
+      modelCount: entry.models.length,
+    }));
+});
+
+/**
+ * S4: the provider the edit dialog shows, resolved from the pane's own lists on
+ * every render. A model write refreshes them, and the dialog's details follow the
+ * fresh read instead of a stale copy taken when it opened.
+ */
+const editTarget = computed<EditTarget | null>(() => {
+  const id = editTargetId.value;
+  if (id === null) return null;
+  const configured = providers.value.find((entry) => entry.id === id);
+  if (configured) {
+    return {
+      id: configured.id,
+      name: configured.name,
+      baseUrl: configured.baseUrl,
+      modelCount: modelCountOf(configured.id, configured.modelCount),
+      catalogOnly: false,
+    };
+  }
+  const catalogOnly = catalogOnlyRows.value.find((row) => row.id === id);
+  if (!catalogOnly) return null;
+  return {
+    id: catalogOnly.id,
+    name: catalogOnly.name,
+    // pi's catalogue carries model data, not an endpoint: there is no URL to
+    // show and none was read.
+    baseUrl: null,
+    modelCount: catalogOnly.modelCount,
+    catalogOnly: true,
+  };
+});
 
 /**
  * S2 of `providers-pane-refinements.md`: the ids pi already has in `models.json`.
@@ -272,6 +363,41 @@ async function loadProviders() {
     providers.value = [];
     error.value = commandErrorMessage(cause);
   }
+}
+
+/**
+ * The models of every provider, read from pi's two files at once. The pane needs
+ * them for the model count of each row and for the providers only pi's catalogue
+ * has; the editor re-reads them for its own rows. A failure leaves an empty list
+ * — the configured providers are still listed and still work.
+ */
+async function loadProviderModels() {
+  try {
+    providerModels.value = await listProviderModels();
+  } catch (cause) {
+    providerModels.value = [];
+    error.value = commandErrorMessage(cause);
+  }
+}
+
+/** The providers and their models are one read of pi's files: they travel together. */
+async function refreshProviderData() {
+  await Promise.all([loadProviders(), loadProviderModels()]);
+}
+
+/**
+ * A sign-in finished: pi may have written its cached catalogue, so both lists are
+ * read again and an open editor is told (it re-reads its own rows). Nothing is
+ * guessed from the login itself.
+ */
+function handleSignedIn() {
+  editorRefresh.value += 1;
+  void refreshProviderData();
+}
+
+/** A model write landed: the counts and the catalogue-only rows may have changed. */
+function handleModelsChanged() {
+  void refreshProviderData();
 }
 
 async function loadConfigPath() {
@@ -378,7 +504,7 @@ async function handleSaveKey() {
  * The row keeps only actions; the details and the models of that provider live
  * in the dialog, which is keyboard reachable like every other dialog of the app.
  */
-function openEditor(entry: ProviderSummary) {
+function openEditor(entry: { id: string }) {
   editTargetId.value = entry.id;
   editOpen.value = true;
   error.value = null;
@@ -417,7 +543,7 @@ async function confirmRemove() {
       editOpen.value = false;
     }
     const removed = await deleteProvider(target.id);
-    await loadProviders();
+    await refreshProviderData();
     if (!removed) {
       // The entry was already gone from the file: report it instead of
       // pretending the removal happened.
@@ -449,7 +575,7 @@ async function confirmRemove() {
  */
 function handleProviderSaved(_summary: ProviderSummary) {
   showProviderForm.value = false;
-  void loadProviders();
+  void refreshProviderData();
 }
 
 /**
@@ -509,6 +635,7 @@ watch(open, (isOpen) => {
   error.value = null;
   void loadPreferences();
   void loadProviders();
+  void loadProviderModels();
   void loadConfigPath();
 });
 </script>
@@ -677,7 +804,10 @@ watch(open, (isOpen) => {
                list it adds to. -->
           <div v-else class="space-y-6 py-4">
             <template v-if="providerLoginEnabled">
-              <AccountsSection :configured="configuredProviderIds" />
+              <AccountsSection
+                :configured="configuredProviderIds"
+                @signed-in="handleSignedIn"
+              />
               <Separator />
             </template>
 
@@ -741,7 +871,7 @@ watch(open, (isOpen) => {
                         <span class="shrink-0">
                           {{
                             t("settings.providers.models", {
-                              count: entry.modelCount,
+                              count: modelCountOf(entry.id, entry.modelCount),
                             })
                           }}
                           ·
@@ -833,9 +963,85 @@ watch(open, (isOpen) => {
                   </form>
                 </li>
               </ul>
-              <p v-else class="text-xs text-muted-foreground">
+              <p
+                v-if="!providers.length && !catalogOnlyRows.length"
+                class="text-xs text-muted-foreground"
+              >
                 {{ t("settings.providers.empty") }}
               </p>
+
+              <!-- Providers pi's catalogue lists and `models.json` does not: a
+                   subscription signed in from the accounts block above. There is
+                   no configured entry of theirs to activate, key or remove, so
+                   the row offers the one action that reads them — Edit. They are
+                   separated from the list above by the row's own label, not by a
+                   second rule. -->
+              <ul v-if="catalogOnlyRows.length" class="space-y-0.5">
+                <li
+                  v-for="row in catalogOnlyRows"
+                  :key="row.id"
+                  :class="[
+                    'rounded-md transition-colors',
+                    row.id === activeProvider
+                      ? 'bg-sidebar-accent text-sidebar-accent-foreground'
+                      : 'hover:bg-muted',
+                  ]"
+                >
+                  <div class="flex items-center gap-1 px-2 py-1.5">
+                    <button
+                      type="button"
+                      :aria-pressed="row.id === activeProvider"
+                      :disabled="saving || removing"
+                      class="min-w-0 flex-1 rounded-sm text-left outline-hidden focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+                      @click="handleProviderActivate(row.id)"
+                    >
+                      <span class="flex items-center justify-between gap-2">
+                        <span class="flex min-w-0 items-baseline gap-2">
+                          <span class="min-w-0 truncate text-sm font-medium">
+                            {{ row.name }}
+                          </span>
+                          <span
+                            class="min-w-0 truncate font-mono text-xs text-muted-foreground"
+                          >
+                            {{ row.id }}
+                          </span>
+                        </span>
+                        <CheckIcon
+                          v-if="row.id === activeProvider"
+                          class="size-4 shrink-0"
+                          aria-hidden="true"
+                        />
+                      </span>
+                      <span
+                        class="mt-0.5 flex items-center justify-between gap-2 text-xs text-muted-foreground"
+                      >
+                        <span class="min-w-0 truncate">
+                          {{ t("settings.providers.catalog") }}
+                        </span>
+                        <span class="shrink-0">
+                          {{
+                            t("settings.providers.models", {
+                              count: row.modelCount,
+                            })
+                          }}
+                        </span>
+                      </span>
+                    </button>
+
+                    <!-- The models of this provider, read-only: pi owns the
+                         catalogue they come from. -->
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      :disabled="removing"
+                      @click="openEditor(row)"
+                    >
+                      {{ t("settings.providers.edit") }}
+                    </Button>
+                  </div>
+                </li>
+              </ul>
 
               <!-- Informational line after a removal: nothing failed, so it is
                    not rendered as an error. -->
@@ -896,7 +1102,7 @@ watch(open, (isOpen) => {
                     </dt>
                     <dd class="min-w-0 truncate font-mono">{{ editTarget.id }}</dd>
                   </div>
-                  <div class="flex gap-3">
+                  <div v-if="editTarget.baseUrl !== null" class="flex gap-3">
                     <dt class="w-24 shrink-0 text-muted-foreground">
                       {{ t("settings.providers.edit.baseUrl") }}
                     </dt>
@@ -919,7 +1125,9 @@ watch(open, (isOpen) => {
 
                 <ProviderModelsEditor
                   :provider="editTarget"
-                  @changed="loadProviders"
+                  :catalog-only="editTarget.catalogOnly"
+                  :refresh="editorRefresh"
+                  @changed="handleModelsChanged"
                 />
 
                 <DialogFooter>

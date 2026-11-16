@@ -11,7 +11,7 @@
 // nothing here starts, stops or resets a process, and the previous session keeps
 // running and keeps accumulating events off screen.
 import type { Component } from "vue";
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import {
   CheckIcon,
   CircleAlertIcon,
@@ -339,6 +339,16 @@ async function loadProviderModels() {
   }
 }
 
+/**
+ * Coming back from the browser after a subscription sign-in is exactly when pi
+ * may have refreshed its catalogue, and the window regaining focus is the moment
+ * we learn about it. Re-reading here keeps the model menu honest without polling
+ * and without reopening the app.
+ */
+function handleWindowFocus(): void {
+  void loadProviderModels();
+}
+
 async function loadSettings() {
   try {
     settings.value = await getSettings();
@@ -459,6 +469,7 @@ async function handleStop() {
 }
 
 onMounted(() => {
+  window.addEventListener("focus", handleWindowFocus);
   // Presentation-only additions (S5): the header needs the active space's name
   // (already a prop) plus the provider-grouped models and the persisted choice.
   void loadProviderModels();
@@ -467,6 +478,12 @@ onMounted(() => {
   // every session, so this panel only asks for it to be installed. It is never
   // torn down with the panel: a background session must keep receiving events.
   void ensureSessionEvents();
+});
+
+onUnmounted(() => {
+  // Only the focus listener is ours: the agent-event subscription belongs to the
+  // store and must survive a panel swap.
+  window.removeEventListener("focus", handleWindowFocus);
 });
 </script>
 

@@ -292,6 +292,14 @@ const rows = SUBSCRIPTION_PROVIDERS;
  */
 const props = defineProps<{ configured: string[] }>();
 
+/**
+ * A sign-in just finished successfully, so pi may have refreshed its cached model
+ * catalogue (`models-store.json`) on the way. The pane re-reads the providers it
+ * lists and its open editor re-reads the models: nothing is guessed here, the
+ * file is simply read again.
+ */
+const emit = defineEmits<{ signedIn: [provider: string] }>();
+
 /** Inline failures per provider: a rejected call keeps its reason on its row. */
 const errors = ref<Record<string, string>>({});
 
@@ -548,7 +556,13 @@ function handleCliEvent(event: PiCliEvent) {
     // S1: a login that worked leaves one confirmation and nothing to read, so
     // the transcript of a successful child is dropped here. A failed one keeps
     // its lines: they are the detail behind the quoted error.
-    if (event.exitCode === 0) loginLines.value = [];
+    if (event.exitCode === 0) {
+      loginLines.value = [];
+      // A successful sign-in is what makes pi write its cached catalogue, so the
+      // pane is told and re-reads the providers instead of showing a list that
+      // predates the login.
+      emit("signedIn", live.provider);
+    }
     // Rust keeps a session registered until it is stopped, so reap the finished
     // child here instead of leaving an id in the registry for the whole app run.
     void piCliStop(live.sessionId).catch(() => {});

@@ -163,9 +163,17 @@ export function setProviderKey(
 
 /**
  * S2: every provider pi's `models.json` lists, each with its own models in file
- * order. The grouped selector and the per-model editor are both built on this
- * one read; a provider with no models comes back with an empty list instead of
- * disappearing, and the api key never crosses (the DTO has no field for it).
+ * order, followed by the models of pi's cached catalogue that the file does not
+ * carry yet (a provider only the catalogue knows — a freshly signed-in `openai`
+ * — is included too). The grouped selector and the per-model editor are both
+ * built on this one read; a provider with no models comes back with an empty
+ * list instead of disappearing, and the api key never crosses (the DTO has no
+ * field for it).
+ *
+ * Every entry carries `source`: only `configured` rows may be written back
+ * through `update_provider_model` / `remove_provider_model`, because `catalog`
+ * rows belong to pi's cache and pi rewrites them on its own schedule. The editor
+ * renders those rows read-only for exactly that reason.
  */
 export function listProviderModels(): Promise<ProviderModels[]> {
   return invoke<ProviderModels[]>("list_provider_models");

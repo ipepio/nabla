@@ -75,6 +75,15 @@ export interface ProviderDraft {
 // ── models of one provider (S2, S3 of `odd/tasks/models-by-provider.md`) ─────
 
 /**
+ * `ProviderModel.source`: which of pi's two model files the entry came from.
+ * `configured` is `models.json` — the file the human edits, so the settings editor
+ * may offer to change it; `catalog` is pi's own cached catalogue
+ * (`~/.pi/agent/models-store.json`), which pi rewrites on its own schedule and
+ * Nabla never writes.
+ */
+export type ProviderModelSource = "configured" | "catalog";
+
+/**
  * One model of one provider, as `list_provider_models` reports it (S2/S3). Pi's
  * own field names (`contextWindow`, `maxTokens`, `cost.input`, `cost.output`,
  * `input`) are already flattened by Rust, so this is the shape the grouped
@@ -84,6 +93,12 @@ export interface ProviderDraft {
  * `models.json` with `"enabled": false` instead of being deleted, and the
  * selector hides it while the editor keeps showing it. Rust defaults a missing
  * mark to `true`.
+ *
+ * `source` says which of pi's two files the entry came from: `configured` is
+ * `models.json`, `catalog` is pi's own cached catalogue
+ * (`~/.pi/agent/models-store.json`), which pi refreshes on sign-in and owns
+ * outright. A catalog entry is therefore READ-ONLY for Nabla: the editor shows
+ * it and never writes it.
  *
  * Mirrors `ModelInfo` in `src-tauri/src/providers.rs`. The TS name is
  * `ProviderModel` because the flat `list_models` DTO above already owns
@@ -100,12 +115,17 @@ export interface ProviderModel {
   modalities: string[];
   /** L3: the model is offered by the selector and usable by a session. */
   enabled: boolean;
+  /** Which of pi's files the entry came from; `catalog` is read-only. */
+  source: ProviderModelSource;
 }
 
 /**
- * One provider with the models pi would use, in the order the file declares them
- * (S2 of `models-by-provider.md`). A provider with no models comes back with an
- * empty list, never filtered out; the api key has no field here (S4).
+ * One provider with the models pi would use, in the order Rust lists them: the
+ * `models.json` entries first, then the catalogue entries whose id the file does
+ * not already carry (S2 of `models-by-provider.md`). A provider only pi's
+ * catalogue knows — a freshly signed-in `openai` — is included too, so the
+ * selector and the editor can show it. A provider with no models comes back with
+ * an empty list, never filtered out; the api key has no field here (S4).
  * Mirrors `ProviderModels` in `src-tauri/src/providers.rs`.
  */
 export interface ProviderModels {

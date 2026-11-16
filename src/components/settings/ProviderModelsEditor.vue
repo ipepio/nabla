@@ -35,8 +35,19 @@
  * Errors are one line above the rows: a rejected write leaves every typed value
  * where it is, so fixing one field costs a retry, not a retyped row.
  *
+ * Catalogue models: `list_provider_models` answers entries from two of pi's files
+ * — `models.json` (`source: "configured"`) and pi's own cached catalogue
+ * `models-store.json` (`source: "catalog"`). Only the first kind is ours to
+ * write. A catalogue entry is listed with the same columns so the human can read
+ * the context window and the costs pi will actually use, but every field of it is
+ * disabled and it has no Save and no Remove: pi owns that file and rewrites it on
+ * its own schedule. The two sets carry one label each (and no label at all when
+ * only configured models exist, because then there is nothing to tell apart), and
+ * a provider only the catalogue knows still renders — read-only rows and no
+ * error.
+ *
  * Layout: rows carry no rule of their own and no border; the dialog's own
- * spacing separates them.
+ * spacing separates them, and the whole editor adds no second separator.
  */
 import { computed, ref, watch } from "vue";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -61,12 +72,31 @@ import {
 import type {
   ModelOption,
   ProviderModel,
-  ProviderSummary,
+  ProviderModelSource,
 } from "@/contracts/types";
 import { useI18n } from "@/lib/i18n";
 
-/** S4: the provider being edited — the only one this editor reads and writes. */
-const props = defineProps<{ provider: ProviderSummary }>();
+/** The provider this editor is about: the dialog hands over its own row. */
+interface ModelsTarget {
+  id: string;
+  name: string;
+}
+
+/**
+ * S4: the provider being edited — the only one this editor reads and writes —
+ * plus the two signals the pane owns: `catalogOnly` when pi's catalogue is the
+ * provider's only source (nothing here is writable, not even discovery, because
+ * `models.json` has no entry to write to), and `refresh`, which the pane bumps
+ * when pi may have rewritten its catalogue behind our back (a finished sign-in).
+ */
+const props = withDefaults(
+  defineProps<{
+    provider: ModelsTarget;
+    catalogOnly?: boolean;
+    refresh?: number;
+  }>(),
+  { catalogOnly: false, refresh: 0 },
+);
 
 /**
  * S3: a write landed, so the pane above can re-read its own summaries — the model
@@ -90,6 +120,8 @@ interface ModelDraft {
 
 interface ModelRow {
   id: string;
+  /** Which of pi's files the entry came from: only `configured` is writable. */
+  source: ProviderModelSource;
   draft: ModelDraft;
 }
 
@@ -126,6 +158,41 @@ const discoveryRan = ref(false);
 const selectedDiscovered = computed(() =>
   discovered.value.filter((option) => selected.value[option.id] === true),
 );
+
+/** The configured models of this provider: the editable half of the list. */
+const configuredRows = computed(() =>
+  models.value.filter((row) => row.source === "configured"),
+);
+
+/** The models pi's catalogue contributes: shown, never written. */
+const catalogRows = computed(() =>
+  models.value.filter((row) => row.source === "catalog"),
+);
+
+/**
+ * One label per set only when both are on screen: a provider whose models all
+ * come from the same file has nothing to tell apart.
+ */
+const showGroupLabels = computed(() => catalogRows.value.length > 0);
+
+/**
+ * Where the catalogue label and its one-line hint are painted. Rust lists the
+ * configured entries first, so its `-1` means "this provider has none".
+ */
+const firstCatalogIndex = computed(() =>
+  models.value.findIndex((row) => row.source === "catalog"),
+);
+
+/**
+ * Discovery writes into `models.json`, so a provider pi's catalogue alone knows
+ * has no file to write to: the action is not offered instead of failing.
+ */
+const canDiscover = computed(() => !props.catalogOnly);
+
+/** `true` for a row pi owns: every control of it is disabled and it has none. */
+function isCatalog(row: ModelRow): boolean {
+  return row.source === "catalog";
+}
 
 /** A stable, HTML-safe id: model ids may carry `/` and `.`. */
 function fieldId(modelId: string, field: string): string {
@@ -170,7 +237,13 @@ async function load(syncedModelId: string | null = null, silent = false) {
     const entry = list.find((item) => item.provider === props.provider.id);
     const previous = models.value;
     models.value = (entry?.models ?? []).map((model) => {
-      const fresh: ModelRow = { id: model.id, draft: draftOf(model) };
+      const fresh: ModelRow = {
+        id: model.id,
+        // A read that predates the `source` field reads as configured: that is
+        // what every entry was before pi's catalogue joined the list.
+        source: model.source === "catalog" ? "catalog" : "configured",
+        draft: draftOf(model),
+      };
       if (model.id === syncedModelId) return fresh;
       return previous.find((existing) => existing.id === model.id) ?? fresh;
     });
@@ -394,6 +467,16 @@ watch(
   },
   { immediate: true },
 );
+
+// A sign-in elsewhere in the pane may have made pi rewrite its catalogue, so the
+// pane bumps `refresh` and the rows are read again silently: what was typed stays
+// where it is and nothing flashes back to the loading line.
+watch(
+  () => props.refresh,
+  () => {
+    void load(null, true);
+  },
+);
 </script>
 
 <template>
@@ -420,140 +503,170 @@ watch(
       {{ t("settings.providers.modelsEditor.empty") }}
     </p>
 
-    <!-- One model per group, separated by spacing only. -->
+    <!-- One model per block, separated by spacing only. The two sets pi's read
+         returns — the configured entries and the catalogue's — are told apart by
+         one label each and by nothing else: no rule per row, no second separator. -->
     <div v-else class="space-y-4">
-      <div v-for="row in models" :key="row.id" class="space-y-2">
-        <div class="flex items-center justify-between gap-2">
-          <span class="min-w-0 truncate font-mono text-xs text-muted-foreground">
-            {{ row.id }}
-          </span>
-          <!-- L3: the enabled mark is written to the file; nothing is deleted. -->
-          <div class="flex shrink-0 items-center gap-1.5">
-            <span class="text-xs text-muted-foreground">
-              {{ t("settings.providers.modelsEditor.enabled") }}
+      <template v-for="(row, index) in models" :key="row.id">
+        <!-- Labels exist only when both sets are on screen: a provider whose
+             models all come from one file has nothing to tell apart. -->
+        <p
+          v-if="showGroupLabels && configuredRows.length > 0 && index === 0"
+          class="text-xs font-medium text-muted-foreground"
+        >
+          {{ t("settings.providers.modelsEditor.configuredGroup") }}
+        </p>
+        <template v-if="index === firstCatalogIndex">
+          <p class="text-xs font-medium text-muted-foreground">
+            {{ t("settings.providers.modelsEditor.catalogGroup") }}
+          </p>
+          <!-- One muted line: why these rows cannot be touched. -->
+          <p class="text-xs text-muted-foreground">
+            {{ t("settings.providers.modelsEditor.catalogHint") }}
+          </p>
+        </template>
+
+        <div class="space-y-2">
+          <div class="flex items-center justify-between gap-2">
+            <span class="min-w-0 truncate font-mono text-xs text-muted-foreground">
+              {{ row.id }}
             </span>
-            <button
-              type="button"
-              role="switch"
-              :aria-checked="row.draft.enabled"
-              :aria-label="
-                t('settings.providers.modelsEditor.enabledFor', {
-                  model: row.id,
-                })
-              "
-              :class="[
-                'relative inline-flex h-5 w-9 shrink-0 items-center rounded-full outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
-                row.draft.enabled ? 'bg-primary' : 'bg-input',
-              ]"
-              @click="row.draft.enabled = !row.draft.enabled"
-            >
-              <span
+            <!-- L3: the enabled mark is written to the file; nothing is deleted.
+                 A catalogue entry is pi's, so it carries no mark to flip. -->
+            <div v-if="!isCatalog(row)" class="flex shrink-0 items-center gap-1.5">
+              <span class="text-xs text-muted-foreground">
+                {{ t("settings.providers.modelsEditor.enabled") }}
+              </span>
+              <button
+                type="button"
+                role="switch"
+                :aria-checked="row.draft.enabled"
+                :aria-label="
+                  t('settings.providers.modelsEditor.enabledFor', {
+                    model: row.id,
+                  })
+                "
                 :class="[
-                  'size-4 rounded-full bg-background shadow-sm transition-transform',
-                  row.draft.enabled ? 'translate-x-4.5' : 'translate-x-0.5',
+                  'relative inline-flex h-5 w-9 shrink-0 items-center rounded-full outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                  row.draft.enabled ? 'bg-primary' : 'bg-input',
                 ]"
-                aria-hidden="true"
-              />
-            </button>
+                @click="row.draft.enabled = !row.draft.enabled"
+              >
+                <span
+                  :class="[
+                    'size-4 rounded-full bg-background shadow-sm transition-transform',
+                    row.draft.enabled ? 'translate-x-4.5' : 'translate-x-0.5',
+                  ]"
+                  aria-hidden="true"
+                />
+              </button>
+            </div>
           </div>
-        </div>
 
-        <div class="space-y-1">
-          <label :for="fieldId(row.id, 'name')" class="text-xs font-medium">
-            {{ t("settings.providers.modelsEditor.name") }}
-          </label>
-          <Input
-            :id="fieldId(row.id, 'name')"
-            v-model="row.draft.name"
-            autocomplete="off"
-            spellcheck="false"
-            :aria-label="`${t('settings.providers.modelsEditor.name')} · ${row.id}`"
-          />
-        </div>
-
-        <!-- Numeric fields: empty is "not covered by this form", which the
-             contract sends as `null` and Rust merges as "keep the file's". -->
-        <div class="grid gap-2 sm:grid-cols-2">
-          <div v-for="field in NUMERIC_FIELDS" :key="field" class="space-y-1">
-            <label :for="fieldId(row.id, field)" class="text-xs font-medium">
-              {{ t(`settings.providers.modelsEditor.${field}`) }}
+          <div class="space-y-1">
+            <label :for="fieldId(row.id, 'name')" class="text-xs font-medium">
+              {{ t("settings.providers.modelsEditor.name") }}
             </label>
             <Input
-              :id="fieldId(row.id, field)"
-              v-model="row.draft[field]"
-              type="number"
-              min="0"
-              :step="field === 'inputCost' || field === 'outputCost' ? '0.01' : '1'"
-              inputmode="decimal"
-              :placeholder="t('settings.providers.modelsEditor.notSet')"
-              :aria-label="`${t(`settings.providers.modelsEditor.${field}`)} · ${row.id}`"
+              :id="fieldId(row.id, 'name')"
+              v-model="row.draft.name"
+              autocomplete="off"
+              spellcheck="false"
+              :disabled="isCatalog(row)"
+              :aria-label="`${t('settings.providers.modelsEditor.name')} · ${row.id}`"
             />
           </div>
-        </div>
 
-        <div class="flex flex-wrap items-center gap-x-4 gap-y-1">
-          <span class="text-xs font-medium">
-            {{ t("settings.providers.modelsEditor.modalities") }}
-          </span>
-          <label class="flex items-center gap-1.5 text-xs">
-            <input
-              v-model="row.draft.modalities.text"
-              type="checkbox"
-              class="size-3.5 shrink-0 accent-primary"
-              :aria-label="
-                t('settings.providers.modelsEditor.modality.textFor', {
-                  model: row.id,
-                })
-              "
-            />
-            {{ t("settings.providers.modelsEditor.modality.text") }}
-          </label>
-          <label class="flex items-center gap-1.5 text-xs">
-            <input
-              v-model="row.draft.modalities.image"
-              type="checkbox"
-              class="size-3.5 shrink-0 accent-primary"
-              :aria-label="
-                t('settings.providers.modelsEditor.modality.imageFor', {
-                  model: row.id,
-                })
-              "
-            />
-            {{ t("settings.providers.modelsEditor.modality.image") }}
-          </label>
-        </div>
+          <!-- Numeric fields: empty is "not covered by this form", which the
+               contract sends as `null` and Rust merges as "keep the file's". -->
+          <div class="grid gap-2 sm:grid-cols-2">
+            <div v-for="field in NUMERIC_FIELDS" :key="field" class="space-y-1">
+              <label :for="fieldId(row.id, field)" class="text-xs font-medium">
+                {{ t(`settings.providers.modelsEditor.${field}`) }}
+              </label>
+              <Input
+                :id="fieldId(row.id, field)"
+                v-model="row.draft[field]"
+                type="number"
+                min="0"
+                :step="field === 'inputCost' || field === 'outputCost' ? '0.01' : '1'"
+                inputmode="decimal"
+                :placeholder="t('settings.providers.modelsEditor.notSet')"
+                :disabled="isCatalog(row)"
+                :aria-label="`${t(`settings.providers.modelsEditor.${field}`)} · ${row.id}`"
+              />
+            </div>
+          </div>
 
-        <div class="flex items-center justify-end gap-2">
-          <Button
-            type="button"
-            size="sm"
-            :disabled="busy !== null || removing"
-            @click="handleSave(row)"
-          >
-            {{
-              busy === row.id
-                ? t("settings.providers.modelsEditor.saving")
-                : t("settings.providers.modelsEditor.save")
-            }}
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            :disabled="busy !== null || removing"
-            @click="askRemove(row.id)"
-          >
-            {{ t("settings.providers.modelsEditor.remove") }}
-          </Button>
+          <div class="flex flex-wrap items-center gap-x-4 gap-y-1">
+            <span class="text-xs font-medium">
+              {{ t("settings.providers.modelsEditor.modalities") }}
+            </span>
+            <label class="flex items-center gap-1.5 text-xs">
+              <input
+                v-model="row.draft.modalities.text"
+                type="checkbox"
+                class="size-3.5 shrink-0 accent-primary"
+                :disabled="isCatalog(row)"
+                :aria-label="
+                  t('settings.providers.modelsEditor.modality.textFor', {
+                    model: row.id,
+                  })
+                "
+              />
+              {{ t("settings.providers.modelsEditor.modality.text") }}
+            </label>
+            <label class="flex items-center gap-1.5 text-xs">
+              <input
+                v-model="row.draft.modalities.image"
+                type="checkbox"
+                class="size-3.5 shrink-0 accent-primary"
+                :disabled="isCatalog(row)"
+                :aria-label="
+                  t('settings.providers.modelsEditor.modality.imageFor', {
+                    model: row.id,
+                  })
+                "
+              />
+              {{ t("settings.providers.modelsEditor.modality.image") }}
+            </label>
+          </div>
+
+          <!-- A catalogue row has no actions at all: nothing here writes pi's
+               cache, so Save and Remove are not offered instead of failing. -->
+          <div v-if="!isCatalog(row)" class="flex items-center justify-end gap-2">
+            <Button
+              type="button"
+              size="sm"
+              :disabled="busy !== null || removing"
+              @click="handleSave(row)"
+            >
+              {{
+                busy === row.id
+                  ? t("settings.providers.modelsEditor.saving")
+                  : t("settings.providers.modelsEditor.save")
+              }}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              :disabled="busy !== null || removing"
+              @click="askRemove(row.id)"
+            >
+              {{ t("settings.providers.modelsEditor.remove") }}
+            </Button>
+          </div>
         </div>
-      </div>
+      </template>
     </div>
 
     <!-- S5: adding models the file does not list yet. The endpoint is asked
          explicitly (never on open), only the unconfigured models are offered, and
          the add itself writes one entry per ticked model. Nothing here replaces a
-         configured model. -->
-    <div class="space-y-2">
+         configured model, and a provider pi's catalogue alone knows has no entry
+         to write to, so the block is not offered for it. -->
+    <div v-if="canDiscover" class="space-y-2">
       <Button
         type="button"
         variant="outline"
