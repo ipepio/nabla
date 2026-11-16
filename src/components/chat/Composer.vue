@@ -238,7 +238,7 @@ function chooseModel(provider: string, model: string) {
       :model-value="modelValue"
       :aria-label="t('chat.composer.prompt')"
       :placeholder="t('chat.composer.placeholder')"
-      class="max-h-64 min-h-[1.8rem] resize-none border-0 bg-transparent px-3.5 py-1 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
+      class="max-h-64 min-h-[3.7rem] resize-none border-0 bg-transparent px-3.5 pt-2 pb-1.5 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
       :disabled="disabled"
       @update:model-value="emit('update:modelValue', String($event))"
       @keydown.enter.exact.prevent="emit('send')"
