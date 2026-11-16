@@ -95,6 +95,8 @@
   "settings.providers.modelsEditor.modality.imageFor": "Entrada de imagen para {model}",
   "settings.providers.modelsEditor.enabled": "Activado",
   "settings.providers.modelsEditor.enabledFor": "Activar {model}",
+  "settings.providers.modelsEditor.showInPicker": "Mostrar en el selector",
+  "settings.providers.modelsEditor.showInPickerFor": "Mostrar {model} en el selector de modelos",
   "settings.providers.modelsEditor.save": "Guardar",
   "settings.providers.modelsEditor.saving": "Guardando…",
   "settings.providers.modelsEditor.invalidNumber": "Los límites y los costes deben ser números; déjalos vacíos para mantener el valor guardado.",

@@ -87,17 +87,25 @@ const emit = defineEmits<{
 /**
  * One dropdown in the footer: every provider is a row that opens that provider's
  * models in a lateral submenu, so a pick is still one interaction (and one
- * settings write) for the provider + model pair. `enabled === false` is hidden
- * here, not deleted from the file (L3), so a disabled model is never offered.
- * Providers are all painted — a provider with no enabled model keeps its row and
- * is disabled instead of silently vanishing.
+ * settings write) for the provider + model pair. Two marks keep a model out of
+ * that list: `enabled === false` is pi's usability mark and `hidden === true` is
+ * Nabla's display preference — both are marks, never deletes, so the entry stays
+ * in the file either way.
+ *
+ * A provider keeps its row — disabled when it has nothing usable — as long as the
+ * human has not hidden every model of it: a provider whose whole list is hidden is
+ * not offered at all.
  */
 const providerRows = computed<ProviderOption[]>(() =>
-  props.providerModels.map((entry) => ({
-    id: entry.provider,
-    name: entry.name.trim() === "" ? entry.provider : entry.name,
-    models: entry.models.filter((model) => model.enabled),
-  })),
+  props.providerModels
+    .filter((entry) => entry.models.some((model) => model.hidden !== true))
+    .map((entry) => ({
+      id: entry.provider,
+      name: entry.name.trim() === "" ? entry.provider : entry.name,
+      models: entry.models.filter(
+        (model) => model.enabled && model.hidden !== true,
+      ),
+    })),
 );
 
 /** Rows that can actually be picked from: the trigger's enabled/fallback set. */
@@ -106,26 +114,56 @@ const providerOptions = computed<ProviderOption[]>(() =>
 );
 
 /**
+ * The pair the session is really using while the picker no longer offers it: the
+ * persisted provider and model still resolve in pi's read, but the human hid the
+ * model. The trigger keeps naming it — the session keeps using it — and the menu
+ * keeps not offering it. View-only: nothing is written until the human picks.
+ */
+const keptSelection = computed<ProviderOption | null>(() => {
+  if (props.modelId === "") return null;
+  const entry = props.providerModels.find(
+    (candidate) => candidate.provider === props.providerId,
+  );
+  const model = entry?.models.find((item) => item.id === props.modelId);
+  if (!entry || !model || model.hidden !== true) return null;
+  return {
+    id: entry.provider,
+    name: entry.name.trim() === "" ? entry.provider : entry.name,
+    models: [model],
+  };
+});
+
+/**
  * The provider on screen: the persisted one while it still has models, otherwise
- * the first provider that has any (S1). That fallback is view-only — settings are
- * written only when the human picks, never on render.
+ * the provider of a persisted model the human just hid (it is still in use), else
+ * the first provider that has anything (S1). That fallback is view-only — settings
+ * are written only when the human picks, never on render — and it is also what a
+ * provider that just disappeared from pi's read leaves on screen.
  */
 const activeProvider = computed<ProviderOption | null>(() => {
   const option = providerOptions.value.find(
     (candidate) => candidate.id === props.providerId,
   );
-  return option ?? providerOptions.value[0] ?? null;
+  return option ?? keptSelection.value ?? providerOptions.value[0] ?? null;
 });
 
 /**
- * The model on screen: the persisted one while the provider on screen carries it,
- * `null` otherwise, so the trigger shows its placeholder instead of a value from
- * another provider.
+ * The model on screen: the persisted one while the provider on screen carries it
+ * — including a model the human hid, because the session keeps using that one —
+ * and the first usable model of the fallback provider, so a selection whose
+ * provider vanished names something real instead of a placeholder. `null` means
+ * the trigger shows its placeholder instead of a value from another provider.
  */
 const activeModel = computed(() => {
   const provider = activeProvider.value;
-  if (provider === null || props.modelId === "") return null;
-  return provider.models.find((model) => model.id === props.modelId) ?? null;
+  if (provider === null) return null;
+  if (provider.id !== props.providerId) return provider.models[0] ?? null;
+  if (props.modelId === "") return null;
+  return (
+    provider.models.find((model) => model.id === props.modelId) ??
+    keptSelection.value?.models[0] ??
+    null
+  );
 });
 
 /**
@@ -264,8 +302,9 @@ function chooseModel(provider: string, model: string) {
               v-for="row in providerRows"
               :key="row.id"
             >
-              <!-- Disabled, not removed: a provider with no enabled model keeps
-                   its row but cannot be opened. -->
+              <!-- Disabled, not removed: a provider with nothing usable keeps its
+                   row but cannot be opened. A provider whose every model is
+                   hidden is not listed at all. -->
               <DropdownMenuSubTrigger
                 :disabled="row.models.length === 0"
                 class="text-xs data-[disabled]:opacity-50"

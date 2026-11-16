@@ -115,6 +115,16 @@ export interface ProviderModel {
   modalities: string[];
   /** L3: the model is offered by the selector and usable by a session. */
   enabled: boolean;
+  /**
+   * Nabla's own "do not offer it" mark: stored on the Nabla side, never in pi's
+   * files. It is a display preference, so it is independent of `enabled` (pi's
+   * usability mark) and it applies to a `catalog` row too, because hiding one
+   * writes nothing pi owns. A hidden model is still usable — the session that
+   * already chose it keeps it, and the editor keeps listing it — but the
+   * composer's picker does not offer it. Rust defaults a missing mark to
+   * `false`, so a payload from a build that predates it reads as visible.
+   */
+  hidden: boolean;
   /** Which of pi's files the entry came from; `catalog` is read-only. */
   source: ProviderModelSource;
 }

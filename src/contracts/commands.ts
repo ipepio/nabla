@@ -210,6 +210,26 @@ export function removeProviderModel(
 }
 
 /**
+ * Hides or shows one model in the composer's picker. `hidden` is Nabla's own mark
+ * — stored on the Nabla side, not in pi's files — so the model stays exactly where
+ * it is and a session already using it keeps it; only the picker stops offering
+ * it. Because nothing of pi's is written, the mark is available for every row
+ * `listProviderModels` returns, a read-only `catalog` row included.
+ *
+ * Answers whether the stored mark changed: the call is idempotent, so hiding an
+ * already hidden model (or showing a visible one) writes nothing and answers
+ * `false`. The caller therefore updates its row from the mark it asked for, not
+ * from the answer. Mirrors `set_model_hidden` in `src-tauri/src/commands.rs`.
+ */
+export function setModelHidden(
+  provider: string,
+  modelId: string,
+  hidden: boolean,
+): Promise<boolean> {
+  return invoke<boolean>("set_model_hidden", { provider, modelId, hidden });
+}
+
+/**
  * S5 of `providers-pane-refinements.md`: the models one CONFIGURED provider
  * offers, read by Rust from `GET {baseUrl}/models` with the base URL and api key
  * of that provider in pi's `models.json`. Resolving both server-side is what

@@ -46,6 +46,14 @@
  * a provider only the catalogue knows still renders — read-only rows and no
  * error.
  *
+ * One mark is not pi's at all: "Show in picker" (`hidden`) says whether the chat's
+ * model picker offers the model. It is stored on Nabla's side, so it writes
+ * through `set_model_hidden` the moment it is flipped — not with the row's Save —
+ * and it is offered on BOTH kinds of row, because hiding a catalogue model writes
+ * nothing pi owns. The row is muted while its model is hidden, and the update is
+ * local (the mark that was asked for is painted), so no re-read is needed and
+ * nothing else on screen moves.
+ *
  * Layout: rows carry no rule of their own and no border; the dialog's own
  * spacing separates them, and the whole editor adds no second separator.
  */
@@ -67,6 +75,7 @@ import {
   discoverProviderModels,
   listProviderModels,
   removeProviderModel,
+  setModelHidden,
   updateProviderModel,
 } from "@/contracts/commands";
 import type {
@@ -122,6 +131,12 @@ interface ModelRow {
   id: string;
   /** Which of pi's files the entry came from: only `configured` is writable. */
   source: ProviderModelSource;
+  /**
+   * Nabla's own "not offered in the picker" mark, outside `draft` on purpose:
+   * the switch writes it the moment it is flipped, while every other field of
+   * the row travels in the Save draft.
+   */
+  hidden: boolean;
   draft: ModelDraft;
 }
 
@@ -140,6 +155,8 @@ const loading = ref(false);
 const error = ref<string | null>(null);
 /** The model a write is in flight for, so the row cannot fire twice. */
 const busy = ref<string | null>(null);
+/** The model whose "show in picker" mark is being written, `null` when idle. */
+const hiddenBusy = ref<string | null>(null);
 /** The model the removal confirmation is about, `null` when it is closed. */
 const pendingRemoval = ref<string | null>(null);
 const removalOpen = ref(false);
@@ -242,6 +259,9 @@ async function load(syncedModelId: string | null = null, silent = false) {
         // A read that predates the `source` field reads as configured: that is
         // what every entry was before pi's catalogue joined the list.
         source: model.source === "catalog" ? "catalog" : "configured",
+        // Rust defaults a missing mark to `false`, so an answer from a build
+        // that predates it reads as offered.
+        hidden: model.hidden === true,
         draft: draftOf(model),
       };
       if (model.id === syncedModelId) return fresh;
@@ -414,6 +434,32 @@ async function handleAddDiscovered() {
   }
 }
 
+/**
+ * The one switch that owns Nabla's own mark: "offer this model in the picker".
+ *
+ * It writes the moment it is flipped instead of travelling with the row's Save
+ * draft, for a configured row and for a catalogue row alike — the mark lives on
+ * the Nabla side, so hiding a catalogue model writes nothing pi owns and needs no
+ * writable entry in `models.json`. The answer says whether the stored mark
+ * changed (the call is idempotent), so the row takes the mark that was asked for
+ * instead of a re-read: nothing else on screen moves. A rejection leaves both the
+ * mark and every typed field exactly as they were and reports its reason inline.
+ */
+async function toggleHidden(row: ModelRow) {
+  if (hiddenBusy.value !== null || busy.value !== null || removing.value) return;
+  hiddenBusy.value = row.id;
+  error.value = null;
+  const next = !row.hidden;
+  try {
+    await setModelHidden(props.provider.id, row.id, next);
+    row.hidden = next;
+  } catch (cause) {
+    error.value = commandErrorMessage(cause);
+  } finally {
+    hiddenBusy.value = null;
+  }
+}
+
 /** Opens the confirmation of one model (S3). */
 function askRemove(modelId: string) {
   pendingRemoval.value = modelId;
@@ -526,40 +572,78 @@ watch(
           </p>
         </template>
 
-        <div class="space-y-2">
-          <div class="flex items-center justify-between gap-2">
+        <!-- A hidden model stays fully editable, but the whole row is muted so
+             the state is obvious at a glance. -->
+        <div class="space-y-2" :class="row.hidden ? 'opacity-60' : ''">
+          <div class="flex flex-wrap items-center justify-between gap-2">
             <span class="min-w-0 truncate font-mono text-xs text-muted-foreground">
               {{ row.id }}
             </span>
-            <!-- L3: the enabled mark is written to the file; nothing is deleted.
-                 A catalogue entry is pi's, so it carries no mark to flip. -->
-            <div v-if="!isCatalog(row)" class="flex shrink-0 items-center gap-1.5">
-              <span class="text-xs text-muted-foreground">
-                {{ t("settings.providers.modelsEditor.enabled") }}
-              </span>
-              <button
-                type="button"
-                role="switch"
-                :aria-checked="row.draft.enabled"
-                :aria-label="
-                  t('settings.providers.modelsEditor.enabledFor', {
-                    model: row.id,
-                  })
-                "
-                :class="[
-                  'relative inline-flex h-5 w-9 shrink-0 items-center rounded-full outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
-                  row.draft.enabled ? 'bg-primary' : 'bg-input',
-                ]"
-                @click="row.draft.enabled = !row.draft.enabled"
-              >
-                <span
+            <div class="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1.5">
+              <!-- L3: the enabled mark is written to the file; nothing is deleted.
+                   A catalogue entry is pi's, so it carries no mark to flip. -->
+              <div v-if="!isCatalog(row)" class="flex items-center gap-1.5">
+                <span class="text-xs text-muted-foreground">
+                  {{ t("settings.providers.modelsEditor.enabled") }}
+                </span>
+                <button
+                  type="button"
+                  role="switch"
+                  :aria-checked="row.draft.enabled"
+                  :aria-label="
+                    t('settings.providers.modelsEditor.enabledFor', {
+                      model: row.id,
+                    })
+                  "
                   :class="[
-                    'size-4 rounded-full bg-background shadow-sm transition-transform',
-                    row.draft.enabled ? 'translate-x-4.5' : 'translate-x-0.5',
+                    'relative inline-flex h-5 w-9 shrink-0 items-center rounded-full outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                    row.draft.enabled ? 'bg-primary' : 'bg-input',
                   ]"
-                  aria-hidden="true"
-                />
-              </button>
+                  @click="row.draft.enabled = !row.draft.enabled"
+                >
+                  <span
+                    :class="[
+                      'size-4 rounded-full bg-background shadow-sm transition-transform',
+                      row.draft.enabled ? 'translate-x-4.5' : 'translate-x-0.5',
+                    ]"
+                    aria-hidden="true"
+                  />
+                </button>
+              </div>
+
+              <!-- Nabla's own mark, so it needs no writable entry in pi's files
+                   and a catalogue row gets it too. It writes on click, not with
+                   Save, and the row is muted while the model is out of the
+                   picker. -->
+              <div class="flex items-center gap-1.5">
+                <span class="text-xs text-muted-foreground">
+                  {{ t("settings.providers.modelsEditor.showInPicker") }}
+                </span>
+                <button
+                  type="button"
+                  role="switch"
+                  :aria-checked="!row.hidden"
+                  :aria-label="
+                    t('settings.providers.modelsEditor.showInPickerFor', {
+                      model: row.id,
+                    })
+                  "
+                  :disabled="hiddenBusy !== null || busy !== null || removing"
+                  :class="[
+                    'relative inline-flex h-5 w-9 shrink-0 items-center rounded-full outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50',
+                    row.hidden ? 'bg-input' : 'bg-primary',
+                  ]"
+                  @click="toggleHidden(row)"
+                >
+                  <span
+                    :class="[
+                      'size-4 rounded-full bg-background shadow-sm transition-transform',
+                      row.hidden ? 'translate-x-0.5' : 'translate-x-4.5',
+                    ]"
+                    aria-hidden="true"
+                  />
+                </button>
+              </div>
             </div>
           </div>
 

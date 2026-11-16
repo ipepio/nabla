@@ -95,6 +95,8 @@
   "settings.providers.modelsEditor.modality.imageFor": "Image input for {model}",
   "settings.providers.modelsEditor.enabled": "Enabled",
   "settings.providers.modelsEditor.enabledFor": "Enable {model}",
+  "settings.providers.modelsEditor.showInPicker": "Show in picker",
+  "settings.providers.modelsEditor.showInPickerFor": "Show {model} in the model picker",
   "settings.providers.modelsEditor.save": "Save",
   "settings.providers.modelsEditor.saving": "Saving…",
   "settings.providers.modelsEditor.invalidNumber": "Limits and costs must be numbers; leave them empty to keep the stored value.",
