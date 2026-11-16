@@ -213,6 +213,20 @@ export function piAuthCheck(provider: string): Promise<PiAuthStatus> {
 }
 
 /**
+ * S2 of `providers-pane-refinements.md`: the account state of many providers in
+ * one call. One `pi auth check` boots a whole CLI (~1.15 s), so the pane asks
+ * once instead of once per row: Rust probes them through a bounded pool, keeps
+ * the request order, and answers `unknown` for a provider that times out or
+ * cannot be spawned instead of failing the batch.
+ *
+ * The answer has one entry per requested provider, so the caller maps by
+ * `provider` and never by position.
+ */
+export function piAuthCheckMany(providers: string[]): Promise<PiAuthStatus[]> {
+  return invoke<PiAuthStatus[]>("pi_auth_check_many", { providers });
+}
+
+/**
  * S1/S2: runs one allowlisted `pi` invocation and captures its output. The
  * allowlist (`auth`, `models`, `config`, `--version`, `--help`), the argv-only
  * spawn and the bounded output live in Rust; `timeoutMs` is optional and Rust

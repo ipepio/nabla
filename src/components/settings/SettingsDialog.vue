@@ -32,10 +32,25 @@
  * first remaining one; with none left the settings stay untouched and the pane
  * says so.
  *
+ * S2 of `providers-pane-refinements.md`: opening this pane is a file read and
+ * nothing else. The provider list renders as soon as `list_providers()` answers
+ * (milliseconds); the account badges are a background fill owned by
+ * `AccountsSection.vue`, cached for the session, and never awaited here.
+ *
+ * S3 of the same task: the subscription accounts above the list are exactly the
+ * four subscription providers and nothing else — a configured endpoint is a
+ * Providers row, never an account.
+ *
+ * S4 of the same task: the models of a provider are no longer a standalone block
+ * of the pane. Every row offers "Edit", which opens one dialog with that
+ * provider's details and its models editor, so providers stay a list instead of
+ * becoming a stack of sections. The login and custom-provider flags keep their
+ * meaning.
+ *
  * S1 of `i18n-and-settings-polish.md`: the pane has no rule between single rows.
- * Blocks are separated by spacing plus at most two rules, one between each pair
- * of major blocks (Appearance / Configuration file / Language), so the pane reads
- * as three groups instead of a wall of lines.
+ * Blocks are separated by spacing plus ONE rule, between the accounts block and
+ * the provider list; the custom-provider form belongs to the list it adds to, so
+ * it needs no rule of its own.
  *
  * S4: the configuration-file action exists exactly once, at the end of the
  * General pane; the header no longer repeats it.
@@ -166,6 +181,22 @@ const removing = ref(false);
  * fallback could not happen). Informational, not an error: nothing failed.
  */
 const warning = ref<string | null>(null);
+/**
+ * S4 of `providers-pane-refinements.md`: the provider whose edit dialog is open,
+ * by id. One dialog at a time: opening another provider replaces this id.
+ */
+const editTargetId = ref<string | null>(null);
+const editOpen = ref(false);
+
+/**
+ * S4: the provider the edit dialog shows, resolved from the pane's own list on
+ * every render. A model write refreshes `providers`, and the dialog's details
+ * follow the fresh summary instead of a stale copy taken when it opened.
+ */
+const editTarget = computed(
+  () =>
+    providers.value.find((entry) => entry.id === editTargetId.value) ?? null,
+);
 
 /**
  * S5 of `providers-pane.md`: build-time switches, read the same way the palette
@@ -332,6 +363,17 @@ async function handleSaveKey() {
   }
 }
 
+/**
+ * S4 of `providers-pane-refinements.md`: opens the edit dialog of one provider.
+ * The row keeps only actions; the details and the models of that provider live
+ * in the dialog, which is keyboard reachable like every other dialog of the app.
+ */
+function openEditor(entry: ProviderSummary) {
+  editTargetId.value = entry.id;
+  editOpen.value = true;
+  error.value = null;
+}
+
 /** Opens the removal confirmation for one provider (S1/S3). */
 function requestRemove(entry: ProviderSummary) {
   pendingRemoval.value = entry;
@@ -359,6 +401,11 @@ async function confirmRemove() {
   try {
     // An editor left open on the removed row would have no provider to write.
     if (keyTarget.value === target.id) closeKeyEditor();
+    // S4: the same goes for the edit dialog of the row that is going away.
+    if (editTargetId.value === target.id) {
+      editTargetId.value = null;
+      editOpen.value = false;
+    }
     const removed = await deleteProvider(target.id);
     await loadProviders();
     if (!removed) {
@@ -444,6 +491,8 @@ watch(open, (isOpen) => {
   closeKeyEditor();
   pendingRemoval.value = null;
   removalOpen.value = false;
+  editTargetId.value = null;
+  editOpen.value = false;
   savingKey.value = false;
   removing.value = false;
   warning.value = null;
@@ -611,10 +660,14 @@ watch(open, (isOpen) => {
           <!-- S3/S4 of `pi-cli-bridge.md`: the subscription accounts, above the
                provider list because signing in is what makes a provider usable.
                S5: the whole block is ON unless the build sets
-               `VITE_ENABLE_PROVIDER_LOGIN` to `0`/`false`/`off`. -->
+               `VITE_ENABLE_PROVIDER_LOGIN` to `0`/`false`/`off`.
+               S3 of `providers-pane-refinements.md`: this is the ONLY rule of
+               the pane — the accounts block and the provider list are the two
+               major blocks here, and the custom-provider form belongs to the
+               list it adds to. -->
           <div v-else class="space-y-6 py-4">
             <template v-if="providerLoginEnabled">
-              <AccountsSection :providers="providers" />
+              <AccountsSection />
               <Separator />
             </template>
 
@@ -631,8 +684,8 @@ watch(open, (isOpen) => {
               <!-- S1: the name, url and state are one activate control; the row's
                    other actions are siblings of it (a button inside a button is
                    invalid HTML). The active row is marked by the accent fill, not
-                   by a rule: this pane only rules between major blocks (accounts
-                   | providers | custom). -->
+                   by a rule: this pane rules only between its major blocks
+                   (accounts | providers). -->
               <ul v-if="providers.length" class="space-y-0.5">
                 <li
                   v-for="entry in providers"
@@ -691,6 +744,18 @@ watch(open, (isOpen) => {
                       </span>
                     </button>
 
+                    <!-- S4 of `providers-pane-refinements.md`: the models of
+                         this provider and its details live in one dialog, opened
+                         from here. One dialog at a time. -->
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      :disabled="removing"
+                      @click="openEditor(entry)"
+                    >
+                      {{ t("settings.providers.edit") }}
+                    </Button>
                     <!-- S4: the api-key action of this row. -->
                     <Button
                       type="button"
@@ -769,23 +834,12 @@ watch(open, (isOpen) => {
               </p>
             </section>
 
-            <!-- S3 of `models-by-provider.md`: one collapsible block per provider
-                 with its models' context, limits, costs, modalities and enabled
-                 mark. It reads pi's file itself (`list_provider_models`) and is
-                 handed the pane's list for two things: so a provider added or
-                 removed here makes it re-read, and so a model write refreshes
-                 the model count of the row above. -->
-            <template v-if="providers.length">
-              <Separator />
-              <ProviderModelsEditor :providers="providers" @changed="loadProviders" />
-            </template>
-
             <!-- S5: this whole block is ON unless the build sets
                  VITE_ENABLE_CUSTOM_PROVIDERS to `0`/`false`/`off`; with the flag
-                 off there is nothing to click and nothing to explain. -->
+                 off there is nothing to click and nothing to explain. It adds a
+                 provider to the list above, so it sits inside this block without
+                 a rule of its own. -->
             <template v-if="customProvidersEnabled">
-              <Separator />
-
               <section class="space-y-3">
                 <Button
                   v-if="!showProviderForm"
@@ -804,6 +858,69 @@ watch(open, (isOpen) => {
                 />
               </section>
             </template>
+
+            <!-- S4 of `providers-pane-refinements.md`: the edit dialog of one
+                 provider — its details (read-only: they belong to the file) and
+                 the editor of its models. `Dialog` handles focus, Escape and the
+                 focus trap, so the surface is keyboard reachable; the target is
+                 resolved from the pane's list, so a refreshed model count shows
+                 up here without reopening the dialog. -->
+            <Dialog v-model:open="editOpen">
+              <DialogContent
+                v-if="editTarget"
+                class="max-h-[min(85vh,44rem)] overflow-y-auto sm:max-w-xl"
+              >
+                <DialogHeader>
+                  <DialogTitle>
+                    {{ t("settings.providers.edit.title", { name: editTarget.name }) }}
+                  </DialogTitle>
+                  <DialogDescription>
+                    {{ t("settings.providers.edit.description") }}
+                  </DialogDescription>
+                </DialogHeader>
+
+                <dl class="grid gap-1.5 text-xs">
+                  <div class="flex gap-3">
+                    <dt class="w-24 shrink-0 text-muted-foreground">
+                      {{ t("settings.providers.edit.id") }}
+                    </dt>
+                    <dd class="min-w-0 truncate font-mono">{{ editTarget.id }}</dd>
+                  </div>
+                  <div class="flex gap-3">
+                    <dt class="w-24 shrink-0 text-muted-foreground">
+                      {{ t("settings.providers.edit.baseUrl") }}
+                    </dt>
+                    <dd
+                      class="min-w-0 truncate font-mono"
+                      :title="editTarget.baseUrl"
+                    >
+                      {{ editTarget.baseUrl }}
+                    </dd>
+                  </div>
+                  <div class="flex gap-3">
+                    <dt class="w-24 shrink-0 text-muted-foreground">
+                      {{ t("settings.providers.edit.models") }}
+                    </dt>
+                    <dd>{{ editTarget.modelCount }}</dd>
+                  </div>
+                </dl>
+
+                <Separator />
+
+                <ProviderModelsEditor
+                  :provider="editTarget"
+                  @changed="loadProviders"
+                />
+
+                <DialogFooter>
+                  <DialogClose as-child>
+                    <Button variant="outline">
+                      {{ t("common.close") }}
+                    </Button>
+                  </DialogClose>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
 
             <!-- S1/S3: one confirmation dialog for the whole list, the same
                  pattern the session rows use: the trigger only says which

@@ -1,12 +1,116 @@
+<script lang="ts">
+/**
+ * S2 of `providers-pane-refinements.md`: the account states are a session cache,
+ * so they live at module scope and outlive the pane.
+ *
+ * One `pi auth check` boots a whole CLI (~1.15 s), so the badges are a
+ * background fill and never a prerequisite of anything: the rows paint from the
+ * fixed subscription list, the states arrive from ONE batched call
+ * (`pi_auth_check_many`, bounded pool in Rust) fired after that first paint, and
+ * the answer is kept here. Reopening the pane paints the cached badges at once
+ * and probes nothing; "Refresh status" is the explicit way to ask pi again.
+ *
+ * Module scope is the point: this component is unmounted every time the pane is
+ * left, and a `ref` inside it would die with the pane and re-probe on every open.
+ */
+import {
+  computed,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  ref,
+  watch,
+  type ComponentPublicInstance,
+} from "vue";
+import { piAuthCheck, piAuthCheckMany } from "@/contracts/commands";
+import type { PiAuthStatus } from "@/contracts/types";
+
+/**
+ * S3: the only providers this section lists. A subscription login exists for
+ * these four and for nothing else: a configured endpoint (HelmCode, NaN, any
+ * custom one) belongs to the Providers list, not here. The list is fixed on
+ * purpose — a row exists so the account can be enabled, even when nothing
+ * configured that provider yet.
+ */
+const SUBSCRIPTION_PROVIDERS = [
+  "openai",
+  "openai-codex",
+  "anthropic",
+  "google",
+] as const;
+
+/** S2: the states observed this session, by provider id. Empty means "not seen". */
+const statuses = ref<Record<string, PiAuthStatus>>({});
+
+/** S2: a batch is in flight, so a badge with no cached state shows its pending face. */
+const probing = ref(false);
+
+/** The batch in flight, so a second trigger joins it instead of spawning another. */
+let batch: Promise<void> | null = null;
+
+/**
+ * S2: one batched probe. A provider that could not be probed lands as `unknown`
+ * — the honest word for "nobody observed this account" — never as a guess.
+ * Providers that already have a state keep it unless the batch answers again.
+ */
+async function probeMany(providers: string[]): Promise<void> {
+  if (providers.length === 0) return;
+  if (batch !== null) {
+    await batch;
+    return;
+  }
+  probing.value = true;
+  batch = (async () => {
+    try {
+      const answer = await piAuthCheckMany(providers);
+      const next = { ...statuses.value };
+      for (const status of answer) next[status.provider] = status;
+      statuses.value = next;
+    } catch {
+      const next = { ...statuses.value };
+      for (const provider of providers) {
+        next[provider] = { provider, state: "unknown", credential: false };
+      }
+      statuses.value = next;
+    } finally {
+      probing.value = false;
+      batch = null;
+    }
+  })();
+  await batch;
+}
+
+/** S2: the single-provider re-read a finished sign-in or sign-out asks for. */
+async function probeOne(provider: string): Promise<void> {
+  try {
+    const status = await piAuthCheck(provider);
+    statuses.value = { ...statuses.value, [provider]: status };
+  } catch {
+    statuses.value = {
+      ...statuses.value,
+      [provider]: { provider, state: "unknown", credential: false },
+    };
+  }
+}
+</script>
+
 <script setup lang="ts">
 /**
- * Subscription accounts (specs S3, S4, S5 of `odd/tasks/pi-cli-bridge.md`).
+ * Subscription accounts (specs S3, S4, S5 of `odd/tasks/pi-cli-bridge.md`, S2/S3
+ * of `odd/tasks/providers-pane-refinements.md`).
  *
  * S5: the parent renders this section only when `VITE_ENABLE_PROVIDER_LOGIN` is
  * on. The flag is read by `SettingsDialog.vue` with the same `readFlag` helper as
  * `VITE_ENABLE_CUSTOM_PROVIDERS` (on by default, only an explicit
  * `0`/`false`/`off` turns it off), because that is where every build-time switch
  * of the dialog lives; this component never declares a second copy of the rule.
+ *
+ * S3 of `providers-pane-refinements.md`: the rows are exactly the four providers
+ * a subscription can sign in to (`openai`, `openai-codex`, `anthropic`,
+ * `google`) — never pi's configured providers. A configured endpoint (HelmCode,
+ * NaN, a custom one) is a Providers row, not an account; and a subscription
+ * provider nobody configured still gets a row, because signing in is what makes
+ * it exist at all.
  *
  * S3: "Sign in" is the pi subscription login, not an api key. It starts
  * `pi auth login <provider> --no-browser` through the Rust bridge, which is the
@@ -23,9 +127,14 @@
  * a disclosure the human opens on purpose. A finished login collapses to its
  * outcome: one confirmation on success, the last meaningful line on failure.
  *
- * S4: the badge is `pi auth check` per provider — never a guess — and "Sign out"
- * runs `pi auth logout <provider>` behind a confirmation. Credentials stay in
- * pi's `auth.json`: this component never sees a secret, only a state word.
+ * S4: the badge is pi's own answer — never a guess — and "Sign out" runs
+ * `pi auth logout <provider>` behind a confirmation. Credentials stay in pi's
+ * `auth.json`: this component never sees a secret, only a state word.
+ *
+ * S2 of `providers-pane-refinements.md`: asking for a badge means booting a
+ * whole CLI, so the badges are read in the background, in one batch, and cached
+ * for the session (see the module block above). "Refresh status" is the only
+ * other way to ask, and nothing in the pane waits for an answer.
  *
  * Sign-in URL: pi prints "Open this URL to sign in:" followed by the OAuth URL
  * whose callback points at `127.0.0.1:1455`. That URL is read out of the streamed
@@ -36,15 +145,6 @@
  * Layout: rows carry no rule of their own (no `border-b`), and this section adds
  * no separator at all — the pane's rules only sit between major blocks.
  */
-import {
-  computed,
-  nextTick,
-  onBeforeUnmount,
-  onMounted,
-  ref,
-  watch,
-  type ComponentPublicInstance,
-} from "vue";
 import { ChevronRightIcon } from "@lucide/vue";
 import { Badge, type BadgeVariants } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -62,40 +162,16 @@ import { useI18n, type MessageKey } from "@/lib/i18n";
 import {
   commandErrorMessage,
   openExternalUrl,
-  piAuthCheck,
   piCliRun,
   piCliStart,
   piCliStop,
   piCliWrite,
   subscribePiCli,
 } from "@/contracts/commands";
-import type {
-  PiAuthState,
-  PiAuthStatus,
-  PiCliEvent,
-  ProviderSummary,
-} from "@/contracts/types";
-
-/**
- * S4: the providers pi knows, as the parent already read them from pi's own
- * configuration. Passed in so opening the dialog reads the file once.
- */
-const props = defineProps<{ providers: ProviderSummary[] }>();
+import type { PiAuthState, PiCliEvent } from "@/contracts/types";
 
 /** S3/S4: every visible string, both locales (S2 of `i18n-and-settings-polish.md`). */
 const { t } = useI18n();
-
-/**
- * S5: the subscription-capable ids that must get a row even when pi's
- * `models.json` does not mention them — a provider nobody configured is exactly
- * the one whose sign-in button has to be reachable.
- */
-const WELL_KNOWN_PROVIDERS = [
-  "openai",
-  "openai-codex",
-  "anthropic",
-  "google",
-] as const;
 
 /**
  * S4: the deadline of the logout call. Rust defaults to 20 s as well; passing it
@@ -176,21 +252,8 @@ function extractSignInUrl(lines: string[]): string | null {
   return fallback;
 }
 
-/**
- * S5: the rows are the configured providers plus the well-known subscription
- * ids, deduplicated in first-seen order so a provider that is both never shows
- * twice.
- */
-const rows = computed<string[]>(() => {
-  const ids = [
-    ...props.providers.map((entry) => entry.id),
-    ...WELL_KNOWN_PROVIDERS,
-  ];
-  return [...new Set(ids.filter((id) => id.trim() !== ""))];
-});
-
-/** S4: the last state pi reported per provider id. Absent means "not asked yet". */
-const statuses = ref<Record<string, PiAuthStatus>>({});
+/** S3: the rows are the subscription providers, fixed — the pane's providers are elsewhere. */
+const rows = SUBSCRIPTION_PROVIDERS;
 
 /** Inline failures per provider: a rejected call keeps its reason on its row. */
 const errors = ref<Record<string, string>>({});
@@ -344,6 +407,23 @@ function stateOf(provider: string): PiAuthState {
   return statuses.value[provider]?.state ?? "unknown";
 }
 
+/**
+ * S2: this row was never observed and the batch is on its way, so the badge says
+ * "checking" instead of claiming the account is unknown. Nothing is blocked
+ * while it waits: sign in, sign out and the rest of the pane stay usable.
+ */
+function isPending(provider: string): boolean {
+  return probing.value && statuses.value[provider] === undefined;
+}
+
+/**
+ * S2: the explicit re-probe behind "Refresh status". It asks for all four in one
+ * call; the cached badges stay on screen while the answer travels.
+ */
+function refreshStatuses() {
+  void probeMany([...SUBSCRIPTION_PROVIDERS]);
+}
+
 function setRowError(provider: string, message: string) {
   errors.value = { ...errors.value, [provider]: message };
 }
@@ -365,27 +445,6 @@ async function scrollOutputToEnd() {
   await nextTick();
   const el = outputEl.value;
   if (el) el.scrollTop = el.scrollHeight;
-}
-
-/**
- * S4: asks pi for one provider's account state. A probe that could not run says
- * nothing about the account, so it lands as `unknown` instead of inventing a
- * login state nobody observed.
- */
-async function refreshStatus(provider: string) {
-  try {
-    const status = await piAuthCheck(provider);
-    statuses.value = { ...statuses.value, [provider]: status };
-  } catch {
-    statuses.value = {
-      ...statuses.value,
-      [provider]: { provider, state: "unknown", credential: false },
-    };
-  }
-}
-
-async function refreshAll(providers: string[]) {
-  await Promise.all(providers.map((provider) => refreshStatus(provider)));
 }
 
 /**
@@ -456,7 +515,7 @@ function handleCliEvent(event: PiCliEvent) {
     // child here instead of leaving an id in the registry for the whole app run.
     void piCliStop(live.sessionId).catch(() => {});
     // The login may have changed the account: ask pi again rather than guessing.
-    void refreshStatus(live.provider);
+    void probeOne(live.provider);
     return;
   }
   if (event.line === undefined) return;
@@ -582,23 +641,13 @@ async function confirmSignOut() {
       );
     }
     // Even a failed logout may have cleared something: the badge is re-read.
-    await refreshStatus(provider);
+    await probeOne(provider);
   } catch (cause) {
     setRowError(provider, commandErrorMessage(cause));
   } finally {
     signingOut.value = null;
   }
 }
-
-// S4: the states are read once per row set, so a provider list reload does not
-// re-probe every account in a loop.
-watch(
-  () => rows.value.join("\n"),
-  (key) => {
-    void refreshAll(key === "" ? [] : key.split("\n"));
-  },
-  { immediate: true },
-);
 
 // S3: the sign-in URL is read out of the stream as it arrives and kept for the
 // rest of the session. Re-reading the whole stream is cheap (pi prints a handful
@@ -638,6 +687,20 @@ onMounted(async () => {
   unsubscribeEvents = unsubscribe;
 });
 
+// S2: the states are a background fill. The rows are already on screen by the
+// time this runs — nothing here is awaited by the first render — and only the
+// providers nothing observed yet are asked for, so reopening the pane paints the
+// cache and spawns no CLI at all.
+onMounted(async () => {
+  await nextTick();
+  setTimeout(() => {
+    if (disposed) return;
+    void probeMany(
+      SUBSCRIPTION_PROVIDERS.filter((id) => statuses.value[id] === undefined),
+    );
+  }, 0);
+});
+
 onBeforeUnmount(() => {
   disposed = true;
   unsubscribeEvents?.();
@@ -649,17 +712,35 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="space-y-2">
-    <div class="min-w-0">
-      <h3 class="text-sm font-medium">
-        {{ t("settings.accounts.title") }}
-      </h3>
-      <p class="mt-0.5 text-xs text-muted-foreground">
-        {{ t("settings.accounts.description") }}
-      </p>
+    <div class="flex flex-wrap items-start justify-between gap-2">
+      <div class="min-w-0">
+        <h3 class="text-sm font-medium">
+          {{ t("settings.accounts.title") }}
+        </h3>
+        <p class="mt-0.5 text-xs text-muted-foreground">
+          {{ t("settings.accounts.description") }}
+        </p>
+      </div>
+      <!-- S2: the only way to ask pi again once the states are cached. It never
+           disables the rows: a probe in flight is visible on the badges. -->
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        class="shrink-0"
+        :disabled="probing"
+        @click="refreshStatuses"
+      >
+        {{
+          probing
+            ? t("settings.accounts.refreshing")
+            : t("settings.accounts.refresh")
+        }}
+      </Button>
     </div>
 
-    <!-- S5: rows are the configured providers plus the well-known subscription
-         ids. No rule per row: the pane keeps its separators between blocks. -->
+    <!-- S3: the rows are the four subscription providers, fixed. No rule per
+         row: the pane keeps its separator between blocks. -->
     <ul class="space-y-0.5">
       <li
         v-for="id in rows"
@@ -670,8 +751,16 @@ onBeforeUnmount(() => {
           <span class="min-w-0 flex-1 truncate font-mono text-xs" :title="id">
             {{ id }}
           </span>
-          <!-- S4: the badge is pi's own answer, never a guess. -->
-          <Badge :variant="AUTH_STATE_VARIANTS[stateOf(id)]">
+          <!-- S4: the badge is pi's own answer, never a guess. S2: a row that was
+               never observed while a batch is on its way says so, quietly. -->
+          <Badge
+            v-if="isPending(id)"
+            variant="outline"
+            class="animate-pulse text-muted-foreground"
+          >
+            {{ t("settings.accounts.state.checking") }}
+          </Badge>
+          <Badge v-else :variant="AUTH_STATE_VARIANTS[stateOf(id)]">
             {{ t(AUTH_STATE_KEYS[stateOf(id)]) }}
           </Badge>
           <Button
