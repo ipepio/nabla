@@ -116,6 +116,13 @@ const buffer = computed<SessionBuffer | null>(() =>
 const transcript = computed(() => buffer.value?.transcript ?? []);
 const tools = computed<ToolEntry[]>(() => buffer.value?.tools ?? []);
 const streamingText = computed(() => buffer.value?.streamingText ?? "");
+/**
+ * The reasoning still streaming for the turn in progress. Rendered by the same
+ * `ReasoningBlock` as a completed turn's, under the id the turn will flush into,
+ * so opening it mid-stream keeps it open afterwards.
+ */
+const streamingReasoning = computed(() => buffer.value?.streamingReasoning ?? "");
+const liveMessageId = computed(() => buffer.value?.liveMessageId);
 const transcriptLoading = computed(() =>
   isTranscriptLoading(currentSession.value?.sessionId ?? null),
 );
@@ -283,6 +290,7 @@ const isEmptyState = computed(() => {
   return (
     current.transcript.length === 0 &&
     current.streamingText === "" &&
+    current.streamingReasoning === "" &&
     current.tools.length === 0 &&
     errorText.value === null
   );
@@ -392,6 +400,7 @@ const transcriptSignature = computed(() =>
   [
     transcript.value.length,
     streamingText.value.length,
+    streamingReasoning.value.length,
     tools.value.length,
     errorText.value?.length ?? 0,
     statusAlert.value?.text ?? "",
@@ -780,7 +789,7 @@ onUnmounted(() => {
 
               <!-- L3/S4: the active session's buffer, which kept filling while
                    this session was off screen. -->
-              <template v-for="(message, index) in transcript" :key="index">
+              <template v-for="message in transcript" :key="message.id">
                 <div
                   v-if="message.role === 'tool'"
                   class="flex items-start gap-2 text-xs text-muted-foreground"
@@ -793,15 +802,21 @@ onUnmounted(() => {
                   :role="bubbleRole(message.role)"
                   :text="message.text"
                   :at="timeLabel(message.at)"
+                  :reasoning="message.reasoning"
+                  :message-id="message.id"
                 />
               </template>
 
               <!-- The turn still streaming: it becomes a transcript entry when
-                   pi closes the message. -->
+                   pi closes the message. Reasoning streams above the answer and
+                   keeps its own open/closed state under the id it flushes into. -->
               <MessageBubble
-                v-if="streamingText !== ''"
+                v-if="streamingText !== '' || streamingReasoning !== ''"
                 role="assistant"
                 :text="streamingText"
+                :reasoning="streamingReasoning === '' ? undefined : streamingReasoning"
+                :message-id="liveMessageId ?? undefined"
+                reasoning-live
               />
 
               <div v-if="tools.length > 0" class="flex flex-wrap gap-2">

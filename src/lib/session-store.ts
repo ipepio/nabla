@@ -23,7 +23,12 @@ import {
   subscribeAgentEvents,
 } from "../contracts/commands";
 import type { AgentEvent, RuntimeStatus } from "../contracts/agent-events";
-import type { SessionDto, SessionSummary, TranscriptMessage } from "../contracts/types";
+import type {
+  SessionDto,
+  SessionSummary,
+  TranscriptMessage,
+  TranscriptRole,
+} from "../contracts/types";
 
 /** One tool call of a session, kept as the compact chip the panel renders. */
 export interface ToolEntry {
@@ -33,14 +38,56 @@ export interface ToolEntry {
 }
 
 /**
+ * One completed entry of a session's transcript, as this UI renders it.
+ *
+ * It extends pi's own line (`TranscriptMessage`, read back from the JSONL file)
+ * with UI-only state: `id` is this store's stable handle on the message and
+ * `reasoning` is what pi streamed as `thinking_delta` for the same turn. Neither
+ * crosses the contracts seam — the Rust DTOs stay exactly as pi wrote them.
+ */
+export interface ChatMessage {
+  /** Stable for as long as the store lives; keys the reasoning open/closed state. */
+  id: string;
+  role: TranscriptRole;
+  text: string;
+  at: string | null;
+  /** The turn's reasoning, absent when pi streamed none. */
+  reasoning?: string;
+}
+
+/**
+ * Id of the next message. Prefixed with the session id so a deleted session's
+ * bookkeeping (the reasoning toggle state) can be pruned by prefix, and
+ * monotonic so an id is never reused inside one app run.
+ */
+let messageSequence = 0;
+function nextMessageId(sessionId: string): string {
+  messageSequence += 1;
+  return `${sessionId}:${messageSequence}`;
+}
+
+/**
  * Everything one session has accumulated. One of these exists per session the
  * store has seen, whether or not it is on screen: that is what makes S4 work.
  */
 export interface SessionBuffer {
   /** Completed turns, oldest first: seeded from pi's file, then appended live. */
-  transcript: TranscriptMessage[];
+  transcript: ChatMessage[];
   /** The assistant turn being streamed right now; flushed into `transcript`. */
   streamingText: string;
+  /**
+   * The reasoning pi is streaming for the turn in progress (`thinking_delta`).
+   * It is folded into the message `flushStreaming` writes and then cleared: the
+   * live field only ever holds the current turn, so a session switch shows a
+   * completed turn's reasoning from the transcript and never from here.
+   */
+  streamingReasoning: string;
+  /**
+   * Id of the message being streamed. Minted on the turn's first delta and
+   * reused by the message it flushes into, so the reasoning block a human opens
+   * while it streams stays open once the turn lands in the transcript.
+   */
+  liveMessageId: string | null;
   tools: ToolEntry[];
   status: RuntimeStatus | null;
   /** Runtime diagnosis (a crash's stderr tail) or the last command failure. */
@@ -86,6 +133,25 @@ export const busyIds = computed<string[]>(() =>
     .filter(([, buffer]) => buffer.busy)
     .map(([sessionId]) => sessionId),
 );
+
+/**
+ * Open/closed state of the reasoning blocks the human toggled, keyed by message
+ * id. Collapsed is the default (pi's own setting keeps reasoning hidden), so an
+ * entry exists only after an explicit toggle and survives re-renders and session
+ * switches for as long as the session lives in this store.
+ */
+const reasoningExpanded = reactive(new Map<string, boolean>());
+
+/** Whether a message's reasoning block is open. Collapsed until toggled. */
+export function isReasoningExpanded(messageId: string): boolean {
+  return reasoningExpanded.get(messageId) === true;
+}
+
+/** Flips one message's reasoning block; the state is remembered here, not in a
+ * component, so switching sessions does not collapse it. */
+export function toggleReasoning(messageId: string): void {
+  reasoningExpanded.set(messageId, !isReasoningExpanded(messageId));
+}
 
 /** Sessions whose transcript is being read from pi's file (S3, first open). */
 const transcriptLoading = reactive(new Set<string>());
@@ -186,6 +252,8 @@ function ensureBuffer(sessionId: string): SessionBuffer {
   const created = reactive<SessionBuffer>({
     transcript: [],
     streamingText: "",
+    streamingReasoning: "",
+    liveMessageId: null,
     tools: [],
     status: null,
     error: null,
@@ -196,12 +264,37 @@ function ensureBuffer(sessionId: string): SessionBuffer {
   return created;
 }
 
-/** Moves the streamed assistant text into the completed transcript. */
-function flushStreaming(buffer: SessionBuffer): void {
+/**
+ * The message id of the turn in progress, minting it on the turn's first delta.
+ * One id per turn, shared by the live view and by whatever it flushes into.
+ */
+function ensureLiveMessageId(sessionId: string, buffer: SessionBuffer): string {
+  buffer.liveMessageId ??= nextMessageId(sessionId);
+  return buffer.liveMessageId;
+}
+
+/**
+ * Moves the streamed assistant turn into the completed transcript: text and
+ * reasoning land as one message, and both live fields are emptied so the next
+ * turn starts clean in every session that stayed open off screen.
+ */
+function flushStreaming(sessionId: string, buffer: SessionBuffer): void {
   const text = buffer.streamingText;
-  if (text === "") return;
+  const reasoning = buffer.streamingReasoning;
+  if (text === "" && reasoning === "") return;
   buffer.streamingText = "";
-  buffer.transcript.push({ role: "assistant", text, at: new Date().toISOString() });
+  buffer.streamingReasoning = "";
+  // The live id becomes the message's id, so an open reasoning block stays open.
+  const id = buffer.liveMessageId ?? nextMessageId(sessionId);
+  buffer.liveMessageId = null;
+  const message: ChatMessage = {
+    id,
+    role: "assistant",
+    text,
+    at: new Date().toISOString(),
+  };
+  if (reasoning !== "") message.reasoning = reasoning;
+  buffer.transcript.push(message);
 }
 
 function findTool(buffer: SessionBuffer, toolCallId: string) {
@@ -230,11 +323,18 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
   switch (event.type) {
     case "message_update": {
       const slice = event.assistantMessageEvent;
-      if (slice.type === "text_delta" && slice.delta !== undefined && slice.delta !== "") {
-        buffer.streamingText += slice.delta;
+      const delta = slice.delta;
+      if (delta !== undefined && delta !== "") {
+        // Both kinds of delta grow the same turn; the kind only decides whether
+        // the text is the answer or the reasoning kept behind its own block.
+        if (slice.type === "text_delta" || slice.type === "thinking_delta") {
+          ensureLiveMessageId(sessionId, buffer);
+          if (slice.type === "thinking_delta") buffer.streamingReasoning += delta;
+          else buffer.streamingText += delta;
+        }
       } else if (slice.type === "done" || slice.type === "error") {
         // The turn is complete on pi's side; the growing tail becomes a message.
-        flushStreaming(buffer);
+        flushStreaming(sessionId, buffer);
       }
       return;
     }
@@ -275,7 +375,7 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
     case "agent_end":
       // Belt to the `done` slice above: a stream that ends without one still
       // lands in the transcript instead of vanishing.
-      flushStreaming(buffer);
+      flushStreaming(sessionId, buffer);
       return;
     case "process_status":
       buffer.status = event.status;
@@ -312,11 +412,23 @@ function dtoFromSummary(
 }
 
 /** Seeds a buffer with the history pi already has on disk (S3). */
-function seedTranscript(buffer: SessionBuffer, history: TranscriptMessage[]): void {
+function seedTranscript(
+  sessionId: string,
+  buffer: SessionBuffer,
+  history: TranscriptMessage[],
+): void {
   if (history.length === 0) return;
+  // pi's lines carry no id and no reasoning (it never stored them for us), so
+  // each one gets a handle here: the panel needs a stable key per message.
+  const seeded: ChatMessage[] = history.map((message) => ({
+    id: nextMessageId(sessionId),
+    role: message.role,
+    text: message.text,
+    at: message.at,
+  }));
   // History goes in front: anything already in the buffer arrived live while
   // the file was being read and is newer than what the file holds.
-  buffer.transcript = [...history, ...buffer.transcript];
+  buffer.transcript = [...seeded, ...buffer.transcript];
 }
 
 /**
@@ -353,7 +465,7 @@ export async function selectSession(session: SessionSummary): Promise<void> {
   transcriptLoading.add(sessionId);
   try {
     const history = await sessionTranscript(sessionId);
-    seedTranscript(buffer, history);
+    seedTranscript(sessionId, buffer, history);
     transcriptSeeded.add(sessionId);
   } catch (cause) {
     // Not fatal: the session still streams, and the next selection retries.
@@ -400,6 +512,11 @@ export function clearSession(): void {
 export function removeSession(sessionId: string | number): void {
   const key = String(sessionId);
   sessions.delete(key);
+  // The toggle state of a session that no longer exists has nothing left to
+  // open: message ids are prefixed with their session, so they prune by prefix.
+  for (const messageId of [...reasoningExpanded.keys()]) {
+    if (messageId.startsWith(`${key}:`)) reasoningExpanded.delete(messageId);
+  }
   transcriptSeeded.delete(key);
   transcriptLoading.delete(key);
   liveIds.value = liveIds.value.filter((id) => id !== key);
@@ -414,6 +531,7 @@ export function removeSession(sessionId: string | number): void {
 export function appendUserTurn(sessionId: string, text: string): void {
   const buffer = ensureBuffer(sessionId);
   buffer.transcript.push({
+    id: nextMessageId(sessionId),
     role: "user",
     text,
     at: new Date().toISOString(),
