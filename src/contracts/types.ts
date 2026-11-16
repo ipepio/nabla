@@ -196,6 +196,22 @@ export interface AppSettings {
    * `"en"`, and the UI normalizes anything else to English as well.
    */
   language: string;
+  /**
+   * S2 of `odd/tasks/chat-preferences-and-queue.md`: the "Show reasoning"
+   * toggle. Off, the chat renders no reasoning block at all — neither the turn
+   * being streamed nor a message read back from pi's file. Rust defaults the
+   * field to `true` (`serde(default = ...)`), so a settings file written before
+   * this preference existed keeps showing the reasoning.
+   */
+  showReasoning: boolean;
+  /**
+   * S3 of the same task: the "Queue messages" toggle. On, a prompt sent while
+   * the agent is working is queued for that session instead of being blocked,
+   * and the queue hands one prompt to the session each time a turn ends. Rust
+   * defaults the field to `true`, so a settings file written before this
+   * preference existed behaves like a fresh install.
+   */
+  queueMessages: boolean;
 }
 
 /**

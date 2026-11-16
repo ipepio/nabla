@@ -107,6 +107,13 @@ import {
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { useAppearance } from "@/lib/appearance";
+import {
+  applyPreferences,
+  queueMessages,
+  setQueueMessages,
+  setShowReasoning,
+  showReasoning,
+} from "@/lib/preferences";
 import { useI18n, type Locale, type MessageKey } from "@/lib/i18n";
 import {
   invalidateProviderModels,
@@ -335,9 +342,12 @@ async function loadPreferences() {
     settings.value = loaded;
     // S3 of `settings-dialog.md`: the file may have been edited outside the app,
     // so the stored mode is applied again on every open. S2 of
-    // `i18n-and-settings-polish.md`: same rule for the language.
+    // `i18n-and-settings-polish.md`: same rule for the language. S2/S3 of
+    // `chat-preferences-and-queue.md`: same rule for the two chat toggles, which
+    // live in the shared module so the chat reads the same values.
     setMode(loaded.theme);
     setLocale(loaded.language);
+    applyPreferences(loaded);
   } catch (cause) {
     settings.value = null;
     error.value = commandErrorMessage(cause);
@@ -430,6 +440,20 @@ async function handleThemeChange(next: ThemeMode) {
   } finally {
     saving.value = false;
   }
+}
+
+/**
+ * S2 of `chat-preferences-and-queue.md`: the "Show reasoning" switch. The card
+ * reads the shared ref, so flipping it hides or shows every reasoning block
+ * immediately; the setter persists the choice in the background.
+ */
+function handleShowReasoning(next: boolean) {
+  void setShowReasoning(next);
+}
+
+/** S3: the "Queue messages" switch, same pattern as the reasoning one. */
+function handleQueueMessages(next: boolean) {
+  void setQueueMessages(next);
 }
 
 /**
@@ -749,9 +773,88 @@ watch(open, (isOpen) => {
               </div>
             </section>
 
-            <!-- One separator only: Appearance | Language. The configuration
-                 block that used to sit here was redundant with the single
-                 "open configuration file" action at the end of the pane. -->
+            <!-- S2/S3 of `chat-preferences-and-queue.md`: the two chat toggles,
+                 right under the appearance cards because they are the other half
+                 of "how the conversation looks and behaves". One section, two
+                 rows: label and short description on the left, switch on the
+                 right (the same `role="switch"` control the model editor uses).
+                 Both read the live refs from `src/lib/preferences.ts`, so the
+                 chat reflects a flip without a reload. -->
+            <section class="space-y-3">
+              <div class="min-w-0">
+                <h3 class="text-sm font-medium">
+                  {{ t("settings.general.chat") }}
+                </h3>
+                <p class="mt-0.5 text-xs text-muted-foreground">
+                  {{ t("settings.general.chat.description") }}
+                </p>
+              </div>
+
+              <div class="flex items-start justify-between gap-4">
+                <div class="min-w-0">
+                  <p class="text-sm">
+                    {{ t("settings.general.showReasoning") }}
+                  </p>
+                  <p class="mt-0.5 text-xs text-muted-foreground">
+                    {{ t("settings.general.showReasoning.description") }}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  :aria-checked="showReasoning"
+                  :aria-label="t('settings.general.showReasoning')"
+                  :class="[
+                    'relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                    showReasoning ? 'bg-primary' : 'bg-input',
+                  ]"
+                  @click="handleShowReasoning(!showReasoning)"
+                >
+                  <span
+                    :class="[
+                      'size-4 rounded-full bg-background shadow-sm transition-transform',
+                      showReasoning ? 'translate-x-4.5' : 'translate-x-0.5',
+                    ]"
+                    aria-hidden="true"
+                  />
+                </button>
+              </div>
+
+              <div class="flex items-start justify-between gap-4">
+                <div class="min-w-0">
+                  <p class="text-sm">
+                    {{ t("settings.general.queueMessages") }}
+                  </p>
+                  <p class="mt-0.5 text-xs text-muted-foreground">
+                    {{ t("settings.general.queueMessages.description") }}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  :aria-checked="queueMessages"
+                  :aria-label="t('settings.general.queueMessages')"
+                  :class="[
+                    'relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                    queueMessages ? 'bg-primary' : 'bg-input',
+                  ]"
+                  @click="handleQueueMessages(!queueMessages)"
+                >
+                  <span
+                    :class="[
+                      'size-4 rounded-full bg-background shadow-sm transition-transform',
+                      queueMessages ? 'translate-x-4.5' : 'translate-x-0.5',
+                    ]"
+                    aria-hidden="true"
+                  />
+                </button>
+              </div>
+            </section>
+
+            <!-- One separator only: the two appearance-flavoured blocks above |
+                 Language. The configuration block that used to sit here was
+                 redundant with the single "open configuration file" action at
+                 the end of the pane. -->
             <Separator />
 
             <section class="flex flex-wrap items-center justify-between gap-4">

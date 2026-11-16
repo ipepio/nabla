@@ -59,14 +59,17 @@ import {
   activeSession,
   appendUserTurn,
   ensureSessionEvents,
+  enqueuePrompt,
   isTranscriptLoading,
   newSession,
+  queuedCount,
   recordSessionStatus,
   sessionBuffer,
   sessionGeneration,
   type SessionBuffer,
   type ToolEntry,
 } from "@/lib/session-store";
+import { applyPreferences, queueMessages, showReasoning } from "@/lib/preferences";
 import { isDarkMode, type ThemeMode } from "@/lib/theme";
 
 /** The drawer owns the workspace list; the active one arrives already chosen. */
@@ -306,6 +309,37 @@ const isEmptyState = computed(() => {
 
 const canSend = computed(
   () => props.workspace !== null && prompt.value.trim() !== "" && !sending.value && !starting.value,
+);
+
+/**
+ * Is the agent doing work right now? The buffer's `busy` flag is raised by
+ * streaming and tool events and lowered when a turn ends, so it covers the whole
+ * turn; `sending`/`starting` cover the milliseconds before the first event. This
+ * is what the composer receives as `streaming`, which is therefore also when Stop
+ * is offered and when a submit turns into a queued prompt (S3).
+ */
+const agentWorking = computed(
+  () => sending.value || starting.value || (buffer.value?.busy ?? false),
+);
+
+/**
+ * S3: the prompt can be queued instead of sent — the agent is working, the
+ * preference is on and there is something to queue. The store keeps the queue per
+ * session; the panel only decides which event the composer emits.
+ */
+const canQueue = computed(
+  () =>
+    queueMessages.value &&
+    agentWorking.value &&
+    !sending.value &&
+    !starting.value &&
+    props.workspace !== null &&
+    prompt.value.trim() !== "",
+);
+
+/** Prompts of the session on screen that are waiting for a turn to end (S3). */
+const queuedForSession = computed(() =>
+  queuedCount(currentSession.value?.sessionId ?? null),
 );
 
 /** Provider reported by settings, used by the empty-state chip (S1). */
@@ -549,6 +583,9 @@ async function loadSettings() {
     // Apply the persisted mode as soon as the file is read, so the first paint
     // after startup shows the theme the human chose.
     setMode(settings.value.theme);
+    // S2/S3 of `chat-preferences-and-queue.md`: the chat preferences live in the
+    // shared module, so the settings dialog and this panel read the same values.
+    applyPreferences(settings.value);
   } catch (cause) {
     settings.value = null;
     panelError.value = commandErrorMessage(cause);
@@ -635,6 +672,21 @@ async function handleSend() {
 }
 
 /**
+ * S3 of `chat-preferences-and-queue.md`: the human submitted while the agent is
+ * working and the queue is on. The prompt is kept in this session's queue and
+ * pi is not called at all — `session-store` sends it once the current turn ends.
+ * The composer is cleared so the next prompt starts empty, exactly as a send
+ * does.
+ */
+function handleQueue() {
+  const current = currentSession.value;
+  const text = prompt.value.trim();
+  if (current === null || text === "" || !queueMessages.value) return;
+  enqueuePrompt(current.sessionId, text);
+  prompt.value = "";
+}
+
+/**
  * Stops the active session. This is the only path that stops a process —
  * changing sessions never does (S4), and the button only touches the session on
  * screen.
@@ -715,13 +767,16 @@ onUnmounted(() => {
           :model-id="modelId"
           :provider-models="providerModels"
           :workspace-name="workspace?.name ?? t('chat.noWorkspace')"
-          :streaming="sending"
+          :streaming="agentWorking"
           :disabled="workspace === null"
           :can-send="canSend"
+          :can-queue="canQueue"
+          :queued-count="queuedForSession"
           :model-disabled="savingModel || enabledModelCount === 0"
           :can-stop="currentSession !== null && !stopping"
           @select-model="handleSelectModel"
           @send="handleSend"
+          @queue="handleQueue"
           @stop="handleStop"
         />
       </template>
@@ -812,19 +867,28 @@ onUnmounted(() => {
               :role="bubbleRole(message.role)"
               :text="message.text"
               :at="timeLabel(message.at)"
-              :reasoning="message.reasoning"
+              :reasoning="showReasoning ? message.reasoning : undefined"
               :message-id="message.id"
             />
           </template>
 
           <!-- The turn still streaming: it becomes a transcript entry when
                pi closes the message. Reasoning streams above the answer and
-               keeps its own open/closed state under the id it flushes into. -->
+               keeps its own open/closed state under the id it flushes into.
+               S2: with "Show reasoning" off the block is not rendered at all —
+               not merely collapsed — for this turn and for every stored one. -->
           <MessageBubble
-            v-if="streamingText !== '' || streamingReasoning !== ''"
+            v-if="
+              streamingText !== '' ||
+              (showReasoning && streamingReasoning !== '')
+            "
             role="assistant"
             :text="streamingText"
-            :reasoning="streamingReasoning === '' ? undefined : streamingReasoning"
+            :reasoning="
+              showReasoning && streamingReasoning !== ''
+                ? streamingReasoning
+                : undefined
+            "
             :message-id="liveMessageId ?? undefined"
             reasoning-live
           />
@@ -853,13 +917,16 @@ onUnmounted(() => {
           :model-id="modelId"
           :provider-models="providerModels"
           :workspace-name="workspace?.name ?? t('chat.noWorkspace')"
-          :streaming="sending"
+          :streaming="agentWorking"
           :disabled="workspace === null"
           :can-send="canSend"
+          :can-queue="canQueue"
+          :queued-count="queuedForSession"
           :model-disabled="savingModel || enabledModelCount === 0"
           :can-stop="currentSession !== null && !stopping"
           @select-model="handleSelectModel"
           @send="handleSend"
+          @queue="handleQueue"
           @stop="handleStop"
         />
         <p class="mt-2 text-center text-xs text-muted-foreground">

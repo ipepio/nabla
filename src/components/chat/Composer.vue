@@ -63,12 +63,24 @@ const props = withDefaults(
     modelId: string;
     /** Workspace the turn is written into, for the scope chip. */
     workspaceName: string;
-    /** A send is in flight: the primary control becomes stop. */
+    /**
+     * The agent is working (a send is in flight or the turn is streaming): the
+     * primary control becomes stop, and submitting queues while S3's queue is on.
+     */
     streaming: boolean;
     /** Nothing can be sent yet (no workspace selected). */
     disabled: boolean;
     /** The prompt is non-empty and no send is in flight. */
     canSend: boolean;
+    /**
+     * S3 of `chat-preferences-and-queue.md`: the agent is working, `queueMessages`
+     * is on and the prompt is non-empty — so submitting queues instead of
+     * blocking. Computed by the panel, which owns the preference and the session
+     * state; the card only decides what the click means.
+     */
+    canQueue: boolean;
+    /** How many prompts are waiting in this session's queue (S3). */
+    queuedCount: number;
     /**
      * Provider/model selection is unavailable (saving, or no enabled model
      * reported): the single trigger is disabled, so no half choice is possible.
@@ -91,8 +103,33 @@ const emit = defineEmits<{
   (e: "update:modelValue", value: string): void;
   (e: "selectModel", choice: ModelChoice): void;
   (e: "send"): void;
+  (e: "queue"): void;
   (e: "stop"): void;
 }>();
+
+/**
+ * S3: while the agent works and the queue is on, submitting enqueues the prompt
+ * for this session instead of sending it into a busy process. The panel keeps the
+ * preference and the queue; this is only which of the two events the click (or
+ * Enter) produces.
+ */
+const queueing = computed(() => props.streaming && props.canQueue);
+
+/**
+ * The submit control is live only when the click has somewhere to go: a send
+ * while the agent is idle, a queued prompt while it works. With the queue off,
+ * working means neither — the control is disabled, as it was before S3.
+ */
+const canSubmit = computed(() =>
+  props.streaming ? queueing.value : props.canSend,
+);
+
+/** The button and the Enter key share this, so they can never disagree. */
+function submit(): void {
+  if (!canSubmit.value) return;
+  if (props.streaming) emit("queue");
+  else emit("send");
+}
 
 /**
  * One dropdown in the footer: every provider is a row that opens that provider's
@@ -241,7 +278,7 @@ function chooseModel(provider: string, model: string) {
       class="max-h-64 min-h-[3.7rem] resize-none border-0 bg-transparent px-3.5 pt-2 pb-1.5 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
       :disabled="disabled"
       @update:model-value="emit('update:modelValue', String($event))"
-      @keydown.enter.exact.prevent="emit('send')"
+      @keydown.enter.exact.prevent="submit"
     />
 
     <div class="flex min-w-0 items-center gap-1 px-2 pb-2">
@@ -262,6 +299,15 @@ function chooseModel(provider: string, model: string) {
           {{ t("chat.composer.writingIn", { workspace: workspaceName }) }}
         </span>
         <ChevronDownIcon class="size-3 shrink-0" />
+      </span>
+
+      <!-- S3: how many prompts of this session are waiting for the current
+           turn to finish. Muted, not a control: the queue drains by itself. -->
+      <span
+        v-if="queuedCount > 0"
+        class="shrink-0 px-1.5 text-xs text-muted-foreground"
+      >
+        {{ t("chat.composer.queued", { count: queuedCount }) }}
       </span>
 
       <div class="ms-auto flex min-w-0 shrink items-center gap-1.5">
@@ -339,6 +385,10 @@ function chooseModel(provider: string, model: string) {
           </DropdownMenuContent>
         </DropdownMenu>
 
+        <!-- S3: stop and submit sit side by side while the agent works, so a
+             prompt can still be queued for the turn after the current one.
+             With the queue off, submit is disabled while working: the old
+             behaviour, unchanged. -->
         <Button
           v-if="streaming && canStop"
           variant="outline"
@@ -350,12 +400,13 @@ function chooseModel(provider: string, model: string) {
           <SquareIcon />
         </Button>
         <Button
-          v-else
           size="icon-sm"
           class="rounded-full"
-          :aria-label="t('chat.composer.send')"
-          :disabled="!canSend"
-          @click="emit('send')"
+          :aria-label="
+            queueing ? t('chat.composer.queue') : t('chat.composer.send')
+          "
+          :disabled="!canSubmit"
+          @click="submit"
         >
           <ArrowUpIcon />
         </Button>

@@ -18,6 +18,7 @@ import {
   commandErrorMessage,
   liveSessionIds,
   openSession,
+  sendPrompt,
   sessionTranscript,
   startSession,
   subscribeAgentEvents,
@@ -29,6 +30,7 @@ import type {
   TranscriptMessage,
   TranscriptRole,
 } from "../contracts/types";
+import { queueMessages } from "./preferences";
 
 /** One tool call of a session, kept as the compact chip the panel renders. */
 export interface ToolEntry {
@@ -104,6 +106,21 @@ export interface SessionBuffer {
    * process merely exists.
    */
   busy: boolean;
+  /**
+   * Owning workspace, remembered when the session is created, opened or seeded.
+   * `send_prompt` takes the pair, so a queued prompt cannot be resent without
+   * it; `null` for a session the store only learned about from an event.
+   */
+  workspaceId: number | null;
+  /**
+   * S3 of `chat-preferences-and-queue.md`: prompts the human sent while this
+   * session's agent was working, oldest first. Per session, never global — a
+   * queue belongs to the conversation it was typed into. One entry is shifted
+   * and sent each time a turn ends, so it drains in order. A queue left over
+   * after the toggle is turned off simply waits and drains on the next finished
+   * turn once it is back on.
+   */
+  queue: string[];
 }
 
 /** Per-session state, keyed by the session index id in decimal form (S1). */
@@ -243,10 +260,21 @@ export function ensureSessionEvents(): Promise<void> {
   return eventsInstalling;
 }
 
-/** Creates the buffer for a session the store has not seen yet. */
-function ensureBuffer(sessionId: string): SessionBuffer {
+/**
+ * Creates the buffer for a session the store has not seen yet.
+ *
+ * `workspaceId` is optional because an event can arrive for a session this store
+ * never opened; a later call that does know the workspace fills it in, so the
+ * queue of a session learned from an event still becomes sendable.
+ */
+function ensureBuffer(sessionId: string, workspaceId: number | null = null): SessionBuffer {
   const existing = sessions.get(sessionId);
-  if (existing !== undefined) return existing;
+  if (existing !== undefined) {
+    if (existing.workspaceId === null && workspaceId !== null) {
+      existing.workspaceId = workspaceId;
+    }
+    return existing;
+  }
   // `reactive` here keeps the proxy identity stable: the map stores the raw
   // target and hands back this same proxy, so callers may hold either.
   const created = reactive<SessionBuffer>({
@@ -259,6 +287,8 @@ function ensureBuffer(sessionId: string): SessionBuffer {
     error: null,
     exitCode: null,
     busy: false,
+    workspaceId,
+    queue: [],
   });
   sessions.set(sessionId, created);
   return created;
@@ -295,6 +325,68 @@ function flushStreaming(sessionId: string, buffer: SessionBuffer): void {
   };
   if (reasoning !== "") message.reasoning = reasoning;
   buffer.transcript.push(message);
+}
+
+// ── per-session prompt queue (S3) ────────────────────────────────────────────
+
+/**
+ * S3: adds one prompt to the session's queue. ChatPanel calls this instead of
+ * `sendPrompt` when the composer's submit arrives while the agent is working, so
+ * the prompt is kept rather than rejected or sent into a busy session.
+ *
+ * Nothing is echoed into the transcript here: the turn appears when it is really
+ * sent (see `sendQueuedTurn`), so a dropped item never leaves a phantom message.
+ */
+export function enqueuePrompt(sessionId: string, text: string): void {
+  const prompt = text.trim();
+  if (prompt === "") return;
+  ensureBuffer(sessionId).queue.push(prompt);
+}
+
+/** How many prompts of one session are waiting; `0` when there are none. */
+export function queuedCount(sessionId: string | null): number {
+  if (sessionId === null) return 0;
+  return sessions.get(sessionId)?.queue.length ?? 0;
+}
+
+/**
+ * S3: hands the next queued prompt of a session to pi, after the turn that just
+ * ended. Exactly one per turn end, so a queue of three takes three turns — same
+ * order the human typed them.
+ *
+ * A session the store never learned the workspace of cannot address
+ * `send_prompt`, which takes the pair: that item is dropped instead of being
+ * retried forever or sent to a guessed workspace.
+ */
+function drainQueue(sessionId: string, buffer: SessionBuffer): void {
+  if (!queueMessages.value) return;
+  const next = buffer.queue.shift();
+  if (next === undefined) return;
+  const workspaceId = buffer.workspaceId;
+  if (workspaceId === null) return;
+  void sendQueuedTurn(sessionId, buffer, workspaceId, next);
+}
+
+/**
+ * Sends one dequeued prompt and records it as a human turn, exactly as the
+ * composer's own send path does (pi answers with deltas, it never echoes the
+ * prompt back). A failure lands on the session's error field, which the panel
+ * already renders, instead of being swallowed or thrown into the event loop.
+ */
+async function sendQueuedTurn(
+  sessionId: string,
+  buffer: SessionBuffer,
+  workspaceId: number,
+  text: string,
+): Promise<void> {
+  try {
+    await sendPrompt(workspaceId, Number(sessionId), text);
+    appendUserTurn(sessionId, text);
+    // The drawer sorts by activity, so a queued turn is activity too.
+    sessionGeneration.value += 1;
+  } catch (cause) {
+    buffer.error = commandErrorMessage(cause);
+  }
 }
 
 function findTool(buffer: SessionBuffer, toolCallId: string) {
@@ -380,6 +472,10 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
       // the session list re-reads and the row moves up now, instead of waiting
       // for the next poll tick.
       sessionGeneration.value += 1;
+      // S3: the finished turn is the only moment a queued prompt is sent, so
+      // nothing ever talks to pi while it is working. Flushing first keeps the
+      // conversation in order: the answer lands above the next question.
+      drainQueue(sessionId, buffer);
       return;
     case "process_status":
       buffer.status = event.status;
@@ -446,7 +542,9 @@ function seedTranscript(
  */
 export async function selectSession(session: SessionSummary): Promise<void> {
   const sessionId = String(session.id);
-  const buffer = ensureBuffer(sessionId);
+  // S3: the workspace travels with the buffer, so a prompt queued in this
+  // session can be resent even if the panel has moved on by then.
+  const buffer = ensureBuffer(sessionId, session.workspaceId);
   activeSession.value = dtoFromSummary(session, buffer.status);
   void ensureSessionEvents();
 
@@ -489,7 +587,7 @@ export async function selectSession(session: SessionSummary): Promise<void> {
  */
 export async function newSession(workspaceId: number): Promise<SessionDto> {
   const started = await startSession(workspaceId);
-  const buffer = ensureBuffer(started.sessionId);
+  const buffer = ensureBuffer(started.sessionId, workspaceId);
   buffer.status = started.status;
   buffer.error = null;
   markLive(started.sessionId, started.status);
