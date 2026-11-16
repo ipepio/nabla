@@ -17,11 +17,19 @@ const delegatedProps = reactiveOmit(props, 'class')
     data-slot="scroll-area-scrollbar"
     :data-orientation="orientation"
     v-bind="delegatedProps"
-    :class="cn('data-horizontal:h-1 data-horizontal:flex-col data-horizontal:border-t data-horizontal:border-t-transparent data-vertical:h-full data-vertical:w-1 data-vertical:border-l data-vertical:border-l-transparent flex touch-none p-px transition-colors select-none', props.class)"
+    :class="cn('data-horizontal:h-1.5 data-horizontal:flex-col data-vertical:h-full data-vertical:w-1.5 flex touch-none transition-colors select-none', props.class)"
   >
+    <!-- Hairline thumb inside a slightly wider hit area: the track paints
+         nothing, so the eye reads a 2px line while the pointer still gets a
+         comfortable strip to grab. -->
     <ScrollAreaThumb
       data-slot="scroll-area-thumb"
-      class="rounded-full relative flex-1 bg-border/80"
+      :class="
+        cn(
+          'relative flex-1 rounded-full bg-border/70',
+          orientation === 'vertical' ? 'mx-auto w-0.5' : 'my-auto h-0.5',
+        )
+      "
     />
   </ScrollAreaScrollbar>
 </template>
