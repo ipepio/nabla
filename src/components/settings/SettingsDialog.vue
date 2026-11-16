@@ -108,6 +108,12 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { useAppearance } from "@/lib/appearance";
 import { useI18n, type Locale, type MessageKey } from "@/lib/i18n";
+import {
+  invalidateProviderModels,
+  loadProviderModels,
+  providerModels,
+  providerModelsError,
+} from "@/lib/provider-models";
 import type { ThemeMode } from "@/lib/theme";
 import AccountsSection from "./AccountsSection.vue";
 import ProviderForm from "./ProviderForm.vue";
@@ -117,17 +123,12 @@ import {
   configFilePath,
   deleteProvider,
   getSettings,
-  listProviderModels,
   listProviders,
   openConfigFile,
   saveSettings,
   setProviderKey,
 } from "@/contracts/commands";
-import type {
-  AppSettings,
-  ProviderModels,
-  ProviderSummary,
-} from "@/contracts/types";
+import type { AppSettings, ProviderSummary } from "@/contracts/types";
 
 /** The dialog is open when the drawer's gear button says so. */
 const open = defineModel<boolean>("open", { default: false });
@@ -171,13 +172,6 @@ const LANGUAGE_OPTIONS: { value: Locale; labelKey: MessageKey }[] = [
 const settings = ref<AppSettings | null>(null);
 /** S1 of `providers-pane.md`: the providers pi knows, as Rust summarizes them. */
 const providers = ref<ProviderSummary[]>([]);
-/**
- * The models of every provider, configured and catalogued (`list_provider_models`
- * mirrors pi's two files). The pane reads it for two things: the model count a
- * row shows, which is what the editor below it lists, and the providers only
- * pi's catalogue knows — a subscription signed in from the block above.
- */
-const providerModels = ref<ProviderModels[]>([]);
 /** S3: the absolute preferences path, resolved by Rust. */
 const configPath = ref<string | null>(null);
 const loading = ref(false);
@@ -366,36 +360,44 @@ async function loadProviders() {
 }
 
 /**
- * The models of every provider, read from pi's two files at once. The pane needs
- * them for the model count of each row and for the providers only pi's catalogue
- * has; the editor re-reads them for its own rows. A failure leaves an empty list
- * — the configured providers are still listed and still work.
+ * The catalogue is read through the shared store and, when the read fails, its
+ * reason is reported on this pane's one error line. The store keeps the previous
+ * list on a failure, so the counts and the catalogue-only rows keep rendering
+ * instead of collapsing to zero.
  */
-async function loadProviderModels() {
-  try {
-    providerModels.value = await listProviderModels();
-  } catch (cause) {
-    providerModels.value = [];
-    error.value = commandErrorMessage(cause);
-  }
+async function refreshModels(options: { force?: boolean } = {}): Promise<void> {
+  await loadProviderModels(options);
+  if (providerModelsError.value !== null) error.value = providerModelsError.value;
 }
 
-/** The providers and their models are one read of pi's files: they travel together. */
-async function refreshProviderData() {
-  await Promise.all([loadProviders(), loadProviderModels()]);
+/**
+ * The providers and their models are one read of pi's files: they travel
+ * together. This is the path every write takes, so the catalogue is read with
+ * `force` — a write must be visible even when a read already answered — and the
+ * store's debounce folds the requests of one write into one read.
+ */
+async function refreshProviderData(): Promise<void> {
+  await Promise.all([loadProviders(), refreshModels({ force: true })]);
 }
 
 /**
  * A sign-in finished: pi may have written its cached catalogue, so both lists are
  * read again and an open editor is told (it re-reads its own rows). Nothing is
- * guessed from the login itself.
+ * guessed from the login itself. The forced catalogue read is also what hands the
+ * new models to the chat's picker, which renders the same shared list.
  */
 function handleSignedIn() {
   editorRefresh.value += 1;
   void refreshProviderData();
 }
 
-/** A model write landed: the counts and the catalogue-only rows may have changed. */
+/**
+ * A model write landed: the counts and the catalogue-only rows may have changed,
+ * so both lists are read again. The write already refreshed the shared catalogue
+ * (the read the editor does before it emits), and this one keeps the pane's own
+ * summary honest — the same two reads a save cost before the catalogue was
+ * shared.
+ */
 function handleModelsChanged() {
   void refreshProviderData();
 }
@@ -635,7 +637,13 @@ watch(open, (isOpen) => {
   error.value = null;
   void loadPreferences();
   void loadProviders();
-  void loadProviderModels();
+  // The catalogue is re-read on every open — the file may have been edited
+  // outside the app — through the shared store, so this pane and the chat's
+  // picker always agree. `invalidate` marks it stale and lets the read below (or
+  // the one a write is already queued behind) answer, instead of asking for a
+  // second read of a file that is already being read.
+  invalidateProviderModels();
+  void refreshModels();
   void loadConfigPath();
 });
 </script>

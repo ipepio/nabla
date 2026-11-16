@@ -189,6 +189,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { useI18n, type MessageKey } from "@/lib/i18n";
+import { loadProviderModels } from "@/lib/provider-models";
 import {
   commandErrorMessage,
   openExternalUrl,
@@ -562,6 +563,13 @@ function handleCliEvent(event: PiCliEvent) {
       // pane is told and re-reads the providers instead of showing a list that
       // predates the login.
       emit("signedIn", live.provider);
+      // The same catalogue is what the chat's model picker renders, so the shared
+      // list is reloaded here as well: the picker must not wait for a window
+      // focus to offer the models the fresh account just made usable. Forced
+      // because a load almost certainly already answered, and harmless to
+      // duplicate: the store's debounce folds this read together with the one the
+      // pane starts from `signedIn`.
+      void loadProviderModels({ force: true });
     }
     // Rust keeps a session registered until it is stopped, so reap the finished
     // child here instead of leaving an id in the registry for the whole app run.

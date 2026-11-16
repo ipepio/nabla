@@ -15,11 +15,18 @@
  * nothing else — new models come from the custom-provider form's discovery.
  *
  * The whole surface is built on the frozen contract: `list_provider_models` for
- * the read, `update_provider_model` for a row and `remove_provider_model` for the
- * removal behind a confirmation. Every write answers with what the file now
- * holds, so the row is rebuilt from the file after a save or a removal instead of
- * patching a local guess, and the parent refreshes its model count through
- * `changed`.
+ * the read (through the shared store, `src/lib/provider-models.ts`, so the chat's
+ * picker reads the same answer), `update_provider_model` for a row and
+ * `remove_provider_model` for the removal behind a confirmation. Every write
+ * answers with what the file now holds, so the row is rebuilt from the file after
+ * a save or a removal instead of patching a local guess, and the parent refreshes
+ * its model count through `changed`.
+ *
+ * Every write also re-reads the shared catalogue with `force`, because that list
+ * is what the chat's model menu renders: a model hidden, saved, added or removed
+ * here shows up there without reopening anything. The reload is the
+ * cross-component guarantee; the row still updates locally first, so the switch
+ * answers the click instead of waiting for the file.
  *
  * S5 of `providers-pane-refinements.md` (user feedback): the row's name is an
  * edited field like every other one — it travels in the same
@@ -51,8 +58,9 @@
  * through `set_model_hidden` the moment it is flipped — not with the row's Save —
  * and it is offered on BOTH kinds of row, because hiding a catalogue model writes
  * nothing pi owns. The row is muted while its model is hidden, and the update is
- * local (the mark that was asked for is painted), so no re-read is needed and
- * nothing else on screen moves.
+ * local (the mark that was asked for is painted), so nothing else on screen moves
+ * while the shared catalogue is reloaded behind it: a burst of toggles is one
+ * read, and the chat's picker is right by the time it is opened.
  *
  * Layout: rows carry no rule of their own and no border; the dialog's own
  * spacing separates them, and the whole editor adds no second separator.
@@ -73,7 +81,6 @@ import { Input } from "@/components/ui/input";
 import {
   commandErrorMessage,
   discoverProviderModels,
-  listProviderModels,
   removeProviderModel,
   setModelHidden,
   updateProviderModel,
@@ -84,6 +91,7 @@ import type {
   ProviderModelSource,
 } from "@/contracts/types";
 import { useI18n } from "@/lib/i18n";
+import { loadProviderModels, providerModelsError } from "@/lib/provider-models";
 
 /** The provider this editor is about: the dialog hands over its own row. */
 interface ModelsTarget {
@@ -246,11 +254,23 @@ function draftOf(model: ProviderModel): ModelDraft {
  * every row still being edited keeps what was typed and a row the file no longer
  * has disappears. `silent` is the refresh that follows a write: the rows stay on
  * screen instead of flashing back to the loading line.
+ *
+ * The read goes through the shared store (`src/lib/provider-models.ts`) with
+ * `force`, because this is either the first read of the provider or the answer to
+ * a write: both need what the file holds now, and the store's single-flight rule
+ * is what stops this read and the chat's from racing. The store keeps the previous
+ * list when the read fails and answers with it, so the failure is taken from
+ * `providerModelsError` instead of from an exception: the rows on screen stay
+ * exactly as they are.
  */
 async function load(syncedModelId: string | null = null, silent = false) {
   if (!silent) loading.value = true;
   try {
-    const list = await listProviderModels();
+    const list = await loadProviderModels({ force: true });
+    if (providerModelsError.value !== null) {
+      error.value = providerModelsError.value;
+      return;
+    }
     const entry = list.find((item) => item.provider === props.provider.id);
     const previous = models.value;
     models.value = (entry?.models ?? []).map((model) => {
@@ -269,8 +289,8 @@ async function load(syncedModelId: string | null = null, silent = false) {
     });
     error.value = null;
   } catch (cause) {
-    // A failed first read has no rows to keep; a failed refresh keeps the ones
-    // on screen and only reports the reason.
+    // The store answers instead of rejecting, so this is the last resort: a failed
+    // first read has no rows to keep, a failed refresh keeps the ones on screen.
     if (!silent) models.value = [];
     error.value = commandErrorMessage(cause);
   } finally {
@@ -403,7 +423,11 @@ async function handleAddDiscovered() {
   adding.value = true;
   error.value = null;
   try {
-    const list = await listProviderModels();
+    const list = await loadProviderModels({ force: true });
+    if (providerModelsError.value !== null) {
+      error.value = providerModelsError.value;
+      return;
+    }
     const entry = list.find((item) => item.provider === props.provider.id);
     const configured = new Set((entry?.models ?? []).map((model) => model.id));
     for (const model of picks) {
@@ -444,6 +468,11 @@ async function handleAddDiscovered() {
  * changed (the call is idempotent), so the row takes the mark that was asked for
  * instead of a re-read: nothing else on screen moves. A rejection leaves both the
  * mark and every typed field exactly as they were and reports its reason inline.
+ *
+ * The shared catalogue is reloaded behind that local update, because this mark is
+ * exactly what the chat's picker filters by: the picker must not keep offering a
+ * model the human just hid. It is not awaited — the switch answers the click — and
+ * the store's debounce folds several toggles into one read.
  */
 async function toggleHidden(row: ModelRow) {
   if (hiddenBusy.value !== null || busy.value !== null || removing.value) return;
@@ -453,6 +482,7 @@ async function toggleHidden(row: ModelRow) {
   try {
     await setModelHidden(props.provider.id, row.id, next);
     row.hidden = next;
+    void loadProviderModels({ force: true });
   } catch (cause) {
     error.value = commandErrorMessage(cause);
   } finally {

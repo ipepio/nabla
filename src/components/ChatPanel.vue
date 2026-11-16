@@ -33,7 +33,6 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   commandErrorMessage,
   getSettings,
-  listProviderModels,
   saveSettings,
   sendPrompt,
   sessionStatus,
@@ -41,13 +40,17 @@ import {
 } from "@/contracts/commands";
 import type {
   AppSettings,
-  ProviderModels,
   SessionDto,
   TranscriptRole,
   WorkspaceInfo,
 } from "@/contracts/types";
 import { useAppearance } from "@/lib/appearance";
 import { t } from "@/lib/i18n";
+import {
+  loadProviderModels,
+  providerModels,
+  providerModelsError,
+} from "@/lib/provider-models";
 import {
   activeSession,
   appendUserTurn,
@@ -120,7 +123,12 @@ const transcriptLoading = computed(() =>
 // S5/S7: the model selector's data. `providerModels` is whatever Rust reports
 // from pi's own file — grouped by provider, never a hardcoded list here — and
 // `settings` holds the persisted choice (provider *and* model).
-const providerModels = ref<ProviderModels[]>([]);
+//
+// The catalogue itself comes from `src/lib/provider-models.ts`, the module the
+// settings pane writes to as well: hiding a model there, saving or discovering
+// one, saving a provider or finishing a sign-in reloads that shared list, so this
+// picker reflects the change without reopening anything. A failed read keeps the
+// previous list (the store never blanks it out).
 const settings = ref<AppSettings | null>(null);
 const savingModel = ref(false);
 
@@ -328,25 +336,28 @@ async function ensureSession(): Promise<SessionDto | null> {
   }
 }
 
-async function loadProviderModels() {
-  try {
-    providerModels.value = await listProviderModels();
-  } catch (cause) {
-    // A missing model list must not break the chat: the session still starts
-    // with whatever the settings file already names.
-    providerModels.value = [];
-    panelError.value = commandErrorMessage(cause);
-  }
+/**
+ * Reads the catalogue through the shared store and reports a failure on this
+ * panel's error card. Nothing here owns the list: the store keeps it across
+ * panels and across the settings pane's writes, and a failed read leaves the
+ * previous answer in place instead of emptying the picker.
+ */
+async function refreshProviderModels(options: { force?: boolean } = {}) {
+  const list = await loadProviderModels(options);
+  // The store resolves instead of rejecting (so joining callers cannot diverge);
+  // the reason travels separately and is surfaced where the human can read it.
+  if (providerModelsError.value !== null) panelError.value = providerModelsError.value;
+  return list;
 }
 
 /**
  * Coming back from the browser after a subscription sign-in is exactly when pi
  * may have refreshed its catalogue, and the window regaining focus is the moment
- * we learn about it. Re-reading here keeps the model menu honest without polling
- * and without reopening the app.
+ * we learn about it. `force` because the store's answer is usually still fresh by
+ * its own rule, and this read exists precisely to replace it.
  */
 function handleWindowFocus(): void {
-  void loadProviderModels();
+  void refreshProviderModels({ force: true });
 }
 
 async function loadSettings() {
@@ -472,7 +483,9 @@ onMounted(() => {
   window.addEventListener("focus", handleWindowFocus);
   // Presentation-only additions (S5): the header needs the active space's name
   // (already a prop) plus the provider-grouped models and the persisted choice.
-  void loadProviderModels();
+  // The models are read through the shared store, so a write of the settings pane
+  // is already reflected here.
+  void refreshProviderModels();
   void loadSettings();
   // L3/S4: the store owns the single `agent-event` subscription and buffers
   // every session, so this panel only asks for it to be installed. It is never
