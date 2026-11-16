@@ -37,3 +37,10 @@ pi_auth_check(provider: String) -> PiAuthStatus                    // ya existe,
 - **L3** Decisión: un comando Rust que ejecuta los checks en paralelo (pool 4) y devuelve todo junto; la UI pinta primero lo que sale del archivo y rellena badges después, con caché por sesión.
 
 - **L4** Verificación orchestrator: `cargo test` 150/150 (4 nuevos), clippy 0; `npm run build` OK; i18n 198/198; la sección de cuentas lista exactamente los cuatro providers de suscripción; el bloque `ProviderModelsEditor` ya no existe suelto (0 ocurrencias) y vive dentro del diálogo Edit; el panel tiene 3 separadores en total (General, Providers, y uno dentro del diálogo), dentro de lo pedido («algunas de vez en cuando»).
+
+## Segunda tanda: estado de auth persistido
+
+- **S5** «no podemos guardar el status de un provider en la bbdd y solo actualizar la ui si este ha cambiado? se comprueba en background» — el estado (`ready`/`not_ready`/`invalid`/`unknown`) y el momento de la comprobación viven en `nabla.db`; al abrir el panel se pinta desde la caché persistida y el probe en background actualiza **sólo** las filas cuyo estado cambió.
+- Migración v3: tabla `provider_status(provider TEXT PRIMARY KEY, state TEXT NOT NULL, credential INTEGER NOT NULL, checked_at TEXT NOT NULL)`.
+- Contrato: `cached_provider_statuses() -> ProviderStatusRow[]` con `{ provider, state, credential, checkedAt }`; `pi_auth_check_many` persiste cada resultado (best-effort) manteniendo su forma de retorno.
+- La UI muestra hace cuánto se comprobó, y no repinta si el estado no cambió.

@@ -1,20 +1,26 @@
 <script lang="ts">
 /**
- * S2 of `providers-pane-refinements.md`: the account states are a session cache,
- * so they live at module scope and outlive the pane.
+ * S2/S5 of `providers-pane-refinements.md`: the account states live in two
+ * places, and neither of them costs a CLI boot.
+ *
+ * - `nabla.db` (`provider_status`) is the source of truth on mount: the pane
+ *   reads it once, immediately, and paints the badges of the previous run with
+ *   the instant they were checked. A plain table read takes milliseconds, so
+ *   there is no skeleton and nothing to wait for.
+ * - Module scope is the fast path on the way back: the rows painted this session
+ *   outlive the pane, so reopening it shows them in the same frame and the
+ *   persisted read only adds the rows it did not have.
  *
  * One `pi auth check` boots a whole CLI (~1.15 s), so the badges are genuinely
- * background work and never a prerequisite of anything: the rows paint from the
- * fixed subscription list, the batch is scheduled a beat after the section is on
- * screen (and deferred to an idle callback when the webview has one), and only
- * then does a single `pi_auth_check_many` (bounded pool in Rust) run. Nothing in
- * the pane awaits it: the badges start as a neutral placeholder and fill in.
+ * background work and never a prerequisite of anything: the refresh is scheduled
+ * a beat after the section is on screen (and deferred to an idle callback when
+ * the webview has one), and only then does a single `pi_auth_check_many`
+ * (bounded pool in Rust) run and persist what it answered. Nothing in the pane
+ * awaits it, and the answer repaints only the rows whose state actually moved —
+ * an unchanged badge is never patched, so it cannot flicker.
  *
- * The answer is kept here. Reopening the pane paints the cached badges at once
- * and probes nothing; "Refresh status" is the explicit way to ask pi again.
+ * "Refresh status" is the explicit way to ask pi again at any time.
  *
- * Module scope is the point: this component is unmounted every time the pane is
- * left, and a `ref` inside it would die with the pane and re-probe on every open.
  * A scheduled probe belongs to the mount that scheduled it, so leaving the pane
  * cancels it and no batch ever runs behind a hidden section.
  */
@@ -27,8 +33,12 @@ import {
   watch,
   type ComponentPublicInstance,
 } from "vue";
-import { piAuthCheck, piAuthCheckMany } from "@/contracts/commands";
-import type { PiAuthStatus } from "@/contracts/types";
+import {
+  cachedProviderStatuses,
+  piAuthCheck,
+  piAuthCheckMany,
+} from "@/contracts/commands";
+import type { PiAuthStatus, ProviderStatusRow } from "@/contracts/types";
 
 /**
  * S3: the only providers this section lists. A subscription login exists for
@@ -44,8 +54,21 @@ const SUBSCRIPTION_PROVIDERS = [
   "google",
 ] as const;
 
-/** S2: the states observed this session, by provider id. Empty means "not seen". */
-const statuses = ref<Record<string, PiAuthStatus>>({});
+/**
+ * S5: one painted row. The persisted contract carries the instant of the check;
+ * a row nobody ever observed carries none, and then it paints no provenance and
+ * claims no check.
+ */
+type PaintedRow = Omit<ProviderStatusRow, "checkedAt"> & {
+  checkedAt: string | null;
+};
+
+/**
+ * S5: the rows on screen, by provider id. It starts empty and is seeded from the
+ * persisted cache, then from the session rows of an earlier mount, then from the
+ * probe: every source is merged by `applyRows`.
+ */
+const statuses = ref<Record<string, PaintedRow>>({});
 
 /**
  * S2: how long the section waits after mount before the first probe. The delay
@@ -72,23 +95,106 @@ let queuedBatches = 0;
 /** The tail of the queue: waves run one after another, never in parallel. */
 let queue: Promise<void> = Promise.resolve();
 
+/** S5: when a row was checked, in ms; a row nobody stamped sorts as oldest. */
+function checkedMs(row: PaintedRow | undefined): number {
+  if (row === undefined || row.checkedAt === null) {
+    return Number.NEGATIVE_INFINITY;
+  }
+  const at = Date.parse(row.checkedAt);
+  return Number.isNaN(at) ? Number.NEGATIVE_INFINITY : at;
+}
+
+/** S5: the row a check paints, stamped with the instant it was observed. */
+function observedRow(status: PiAuthStatus, checkedAt: string | null): PaintedRow {
+  return {
+    provider: status.provider,
+    state: status.state,
+    credential: status.credential,
+    checkedAt,
+  };
+}
+
+/**
+ * S5: the states this build can paint. `provider_status.state` is text, so a
+ * word from a newer pi can be read back; it is then painted as the honest
+ * `unknown` instead of leaving the badge blank.
+ */
+const AUTH_STATES: readonly PiAuthState[] = [
+  "ready",
+  "not_ready",
+  "invalid",
+  "unknown",
+];
+
+/** S5: the row the persisted cache paints. An empty stamp is no stamp. */
+function cachedRow(row: ProviderStatusRow): PaintedRow {
+  const state: PiAuthState = AUTH_STATES.includes(row.state)
+    ? row.state
+    : "unknown";
+  return observedRow(
+    { ...row, state },
+    row.checkedAt === "" ? null : row.checkedAt,
+  );
+}
+
+/**
+ * S5: paints a batch of rows — newest observation wins, unchanged rows are left
+ * alone.
+ *
+ * A row whose `state` and `credential` are already on screen keeps its object,
+ * so Vue patches its badge not at all: no variant swap, no re-mount, no flicker.
+ * Only a row that actually changed gets a new object and a repaint. The stamp of
+ * every answered row moves in place, because the check did just run and a stale
+ * "2h ago" would contradict the row Rust just persisted.
+ */
+function applyRows(incoming: readonly PaintedRow[]): void {
+  const next = { ...statuses.value };
+  let replaced = false;
+  for (const row of incoming) {
+    // Read through the ref, so `current` is the reactive object on screen: the
+    // in-place stamp below is the only write an unchanged row ever receives.
+    const current = statuses.value[row.provider];
+    // An older observation never overwrites a newer one, so a slow cache read
+    // cannot undo a probe that already answered.
+    if (checkedMs(row) < checkedMs(current)) continue;
+    if (
+      current !== undefined &&
+      current.state === row.state &&
+      current.credential === row.credential
+    ) {
+      if (row.checkedAt !== null) current.checkedAt = row.checkedAt;
+      continue;
+    }
+    next[row.provider] = row;
+    replaced = true;
+  }
+  if (replaced) statuses.value = next;
+}
+
 /**
  * S2: one batched probe. A provider that could not be probed lands as `unknown`
  * — the honest word for "nobody observed this account" — never as a guess.
- * Providers that already have a state keep it unless the batch answers again.
+ *
+ * S5: the answer is diffed against what is on screen, so only the rows that moved
+ * are repainted, and Rust persisted the same answer on its way out: that write is
+ * what makes the next mount instant.
  */
 async function runBatch(providers: string[]): Promise<void> {
   try {
     const answer = await piAuthCheckMany(providers);
-    const next = { ...statuses.value };
-    for (const status of answer) next[status.provider] = status;
-    statuses.value = next;
+    const checkedAt = new Date().toISOString();
+    applyRows(answer.map((status) => observedRow(status, checkedAt)));
   } catch {
-    const next = { ...statuses.value };
-    for (const provider of providers) {
-      next[provider] = { provider, state: "unknown", credential: false };
-    }
-    statuses.value = next;
+    // A rejected batch observed nothing: the painted cache stays exactly as it
+    // is. Rows nobody ever painted get the honest `unknown`, unstamped, instead
+    // of staying on a "checking" face with no check behind it.
+    applyRows(
+      providers
+        .filter((provider) => statuses.value[provider] === undefined)
+        .map((provider) =>
+          observedRow({ provider, state: "unknown", credential: false }, null),
+        ),
+    );
   }
 }
 
@@ -114,12 +220,10 @@ function probeMany(providers: string[]): Promise<void> {
 async function probeOne(provider: string): Promise<void> {
   try {
     const status = await piAuthCheck(provider);
-    statuses.value = { ...statuses.value, [provider]: status };
+    applyRows([observedRow(status, new Date().toISOString())]);
   } catch {
-    statuses.value = {
-      ...statuses.value,
-      [provider]: { provider, state: "unknown", credential: false },
-    };
+    // Nothing was observed, so nothing is repainted: the badge keeps the last
+    // answer pi actually gave.
   }
 }
 </script>
@@ -161,10 +265,11 @@ async function probeOne(provider: string): Promise<void> {
  * `pi auth logout <provider>` behind a confirmation. Credentials stay in pi's
  * `auth.json`: this component never sees a secret, only a state word.
  *
- * S2 of `providers-pane-refinements.md`: asking for a badge means booting a
- * whole CLI, so the badges are read in the background, in one batch, and cached
- * for the session (see the module block above). "Refresh status" is the only
- * other way to ask, and nothing in the pane waits for an answer.
+ * S2/S5 of `providers-pane-refinements.md`: asking for a badge means booting a
+ * whole CLI, so the badges are painted from `nabla.db` at once and refreshed in
+ * the background, in one batch, from the answer pi gives (see the module block
+ * above). "Refresh status" is the explicit way to ask again, and nothing in the
+ * pane ever waits for one.
  *
  * Sign-in URL: pi prints "Open this URL to sign in:" followed by the OAuth URL
  * whose callback points at `127.0.0.1:1455`. That URL is read out of the streamed
@@ -202,7 +307,7 @@ import {
 import type { PiAuthState, PiCliEvent } from "@/contracts/types";
 
 /** S3/S4: every visible string, both locales (S2 of `i18n-and-settings-polish.md`). */
-const { t } = useI18n();
+const { t, locale } = useI18n();
 
 /**
  * S4: the deadline of the logout call. Rust defaults to 20 s as well; passing it
@@ -454,13 +559,56 @@ function stateOf(provider: string): PiAuthState {
 }
 
 /**
- * S2: this row was never observed — the batch is scheduled, on its way, or the
- * cached states are from an earlier mount. The badge says "checking" instead of
- * claiming the account is unknown, and nothing in the pane waits for the answer.
- * Sign in, sign out and the rest of the pane stay usable while it fills in.
+ * S2: this row was never observed — the persisted cache did not know it, no
+ * probe answered it, and nothing is on its way yet. The badge says "checking"
+ * instead of claiming the account is unknown, and nothing in the pane waits.
  */
 function isUnobserved(provider: string): boolean {
   return statuses.value[provider] === undefined;
+}
+
+/**
+ * S5: whether the persisted cache has already answered this mount. Unobserved
+ * rows show their placeholder only after it did, so a cache that has an entry
+ * never flashes a placeholder before the real badge.
+ */
+const cacheSettled = ref(false);
+
+/** S5: how often the relative stamp re-reads the clock, so "just now" ages. */
+const PROVENANCE_TICK_MS = 30_000;
+
+/** S5: the clock the relative stamps are read against. */
+const now = ref(Date.now());
+
+/**
+ * S5: how long ago this row was checked — "just now", minutes, hours, days, and
+ * the plain date once it is a week old. A row nobody stamped (`checkedAt` null)
+ * says nothing instead of inventing an age.
+ */
+function checkedAgo(provider: string): string {
+  const then = checkedMs(statuses.value[provider]);
+  if (!Number.isFinite(then)) return "";
+  const minutes = Math.floor((now.value - then) / 60_000);
+  if (minutes < 1) return t("settings.accounts.checked.justNow");
+  if (minutes < 60) {
+    return t("settings.accounts.checked.minutes", { count: minutes });
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return t("settings.accounts.checked.hours", { count: hours });
+  }
+  const days = Math.floor(hours / 24);
+  if (days < 7) return t("settings.accounts.checked.days", { count: days });
+  return new Date(then).toLocaleDateString(locale.value);
+}
+
+/** S5: the tooltip of that stamp — the absolute instant, in the reader's locale. */
+function checkedAtLabel(provider: string): string {
+  const then = checkedMs(statuses.value[provider]);
+  if (!Number.isFinite(then)) return "";
+  return t("settings.accounts.checked.at", {
+    time: new Date(then).toLocaleString(locale.value),
+  });
 }
 
 /**
@@ -739,34 +887,50 @@ watch(signInUrl, (url) => {
 });
 
 /**
- * S2: the two waves of the background fill. Wave 1 is the subscription providers
- * that already exist in `models.json`; wave 2 is the rest of the fixed list. Both
- * go through the batched wrapper, so each wave is ONE CLI pool — the useful
- * accounts land in ~1 s instead of after the whole list.
+ * S2/S5: the background refresh of this mount. Wave 1 is the subscription
+ * providers that already exist in `models.json`; wave 2 is the rest of the fixed
+ * list. Both go through the batched wrapper, so each wave is ONE CLI pool — the
+ * accounts the human can already see land first.
+ *
+ * S5: every row is asked again, cached or not, because this refresh is exactly
+ * what the persisted state is for. The answer only repaints the rows whose state
+ * moved, so asking again costs no flicker.
  */
 function scheduleProbe() {
   const configured = new Set(props.configured);
-  const unseen = (ids: readonly string[]) =>
-    ids.filter((id) => statuses.value[id] === undefined);
-  const firstWave = unseen(
-    SUBSCRIPTION_PROVIDERS.filter((id) => configured.has(id)),
-  );
-  const secondWave = unseen(
-    SUBSCRIPTION_PROVIDERS.filter((id) => !configured.has(id)),
-  );
-  if (firstWave.length === 0 && secondWave.length === 0) return;
+  const firstWave = SUBSCRIPTION_PROVIDERS.filter((id) => configured.has(id));
+  const secondWave = SUBSCRIPTION_PROVIDERS.filter((id) => !configured.has(id));
   void (async () => {
     if (firstWave.length > 0) await probeMany(firstWave);
     if (disposed) return;
-    // Re-filtered: a sign-out or a refresh may have answered while wave 1 ran.
-    const rest = unseen(secondWave);
-    if (rest.length > 0) await probeMany(rest);
+    if (secondWave.length > 0) await probeMany(secondWave);
   })();
+}
+
+/**
+ * S5: the persisted cache, read once per mount. It is issued before anything
+ * else and never awaited by the rows: the module-scope rows of an earlier mount
+ * keep painting, and this read adds the ones they did not have — milliseconds of
+ * table read, no CLI, no skeleton.
+ */
+async function paintFromCache(): Promise<void> {
+  try {
+    const cached = await cachedProviderStatuses();
+    if (disposed) return;
+    applyRows(cached.map(cachedRow));
+  } catch {
+    // An unreadable cache is not a state: the scheduled probe is the other
+    // source, and it is already on its way.
+  } finally {
+    if (!disposed) cacheSettled.value = true;
+  }
 }
 
 /** S2: the scheduled fill of this mount, so leaving the pane cancels it. */
 let probeTimer: ReturnType<typeof setTimeout> | null = null;
 let idleHandle: number | null = null;
+/** S5: the clock behind the relative stamps; it dies with the pane. */
+let clockTimer: ReturnType<typeof setInterval> | null = null;
 
 /** S2: nothing scheduled may outlive the section that scheduled it. */
 function cancelScheduledProbe() {
@@ -814,18 +978,29 @@ onMounted(async () => {
 });
 
 /**
- * S2: mount schedules the badges and awaits nothing else. The section exists only
- * while it is on screen (the pane renders it with `v-if`), so a hidden section
- * schedules no probe at all — and one timer, cancelled on unmount, is the whole
- * cost of a pane the human leaves immediately.
+ * S5: mount paints the persisted cache first and schedules the refresh second,
+ * and awaits neither. The rows exist as soon as the read answers (usually before
+ * the human clicks anything), and the section exists only while it is on screen
+ * (the pane renders it with `v-if`), so a hidden section schedules no probe at
+ * all — one timer, cancelled on unmount, is the whole cost of a pane the human
+ * leaves immediately.
  */
 onMounted(() => {
+  void paintFromCache();
   probeTimer = setTimeout(deferProbe, PROBE_DELAY_MS);
+  // S5: a relative stamp is a clock: it ages on its own between two probes.
+  clockTimer = setInterval(() => {
+    now.value = Date.now();
+  }, PROVENANCE_TICK_MS);
 });
 
 onBeforeUnmount(() => {
   disposed = true;
   cancelScheduledProbe();
+  if (clockTimer !== null) {
+    clearInterval(clockTimer);
+    clockTimer = null;
+  }
   unsubscribeEvents?.();
   unsubscribeEvents = null;
   // S3: no login flow outlives the pane that started it.
@@ -874,20 +1049,36 @@ onBeforeUnmount(() => {
           <span class="min-w-0 flex-1 truncate font-mono text-xs" :title="id">
             {{ id }}
           </span>
-          <!-- S4: the badge is pi's own answer, never a guess. S2: a row that was
-               never observed shows the neutral placeholder — pulsing while the
-               batch is queued or on its way — and never blocks anything. -->
+          <!-- S5: the painted row comes first — from the persisted cache, the
+               session rows or the probe — and only it carries a provenance
+               stamp. S2: a row nobody observed yet shows the neutral
+               placeholder, pulsing while the batch is queued or on its way,
+               but only after the cache read settled: an empty initial row would
+               be a skeleton, and a cache with an entry must never flash one. -->
           <Badge
-            v-if="isUnobserved(id)"
+            v-if="!isUnobserved(id)"
+            :variant="AUTH_STATE_VARIANTS[stateOf(id)]"
+          >
+            {{ t(AUTH_STATE_KEYS[stateOf(id)]) }}
+          </Badge>
+          <Badge
+            v-else-if="cacheSettled"
             variant="outline"
             class="text-muted-foreground"
             :class="probing ? 'animate-pulse' : ''"
           >
             {{ t("settings.accounts.state.checking") }}
           </Badge>
-          <Badge v-else :variant="AUTH_STATE_VARIANTS[stateOf(id)]">
-            {{ t(AUTH_STATE_KEYS[stateOf(id)]) }}
-          </Badge>
+          <!-- S5: when pi was last asked, muted next to the badge; the tooltip
+               carries the absolute instant. It disappears with the stamp, so a
+               row that was never checked claims no age. -->
+          <span
+            v-if="checkedAgo(id) !== ''"
+            class="shrink-0 text-xs text-muted-foreground"
+            :title="checkedAtLabel(id)"
+          >
+            {{ checkedAgo(id) }}
+          </span>
           <Button
             type="button"
             variant="ghost"

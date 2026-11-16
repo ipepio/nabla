@@ -16,6 +16,7 @@ import type {
   ProviderModel,
   ProviderModelDraft,
   ProviderModels,
+  ProviderStatusRow,
   ProviderSummary,
   SessionDto,
   SessionStatusDto,
@@ -269,6 +270,21 @@ export function piAuthCheck(provider: string): Promise<PiAuthStatus> {
  */
 export function piAuthCheckMany(providers: string[]): Promise<PiAuthStatus[]> {
   return invoke<PiAuthStatus[]>("pi_auth_check_many", { providers });
+}
+
+/**
+ * S5 of `providers-pane-refinements.md`: the last observation of every provider,
+ * read straight out of `nabla.db`. It boots no CLI — it is a plain table read,
+ * milliseconds — so the pane uses it to paint the badges of a previous run
+ * before any probe is scheduled, and every row carries the instant of the check
+ * that produced it. An empty table is an empty answer, not an error.
+ *
+ * The batched probe above is what writes it: `pi_auth_check_many` persists each
+ * result on its way out, so the cache is always a copy of an answer pi already
+ * gave, never a value this side invented.
+ */
+export function cachedProviderStatuses(): Promise<ProviderStatusRow[]> {
+  return invoke<ProviderStatusRow[]>("cached_provider_statuses");
 }
 
 /**

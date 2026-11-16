@@ -264,6 +264,22 @@ export interface PiAuthStatus {
 }
 
 /**
+ * One row of the persisted account cache (S5 of
+ * `providers-pane-refinements.md`). It is the same observation as
+ * `PiAuthStatus` plus the instant it was made, because a badge read from
+ * `nabla.db` has to say how old it is. `checkedAt` is the ISO-8601 stamp Rust
+ * keeps in `provider_status.checked_at`. Mirrors the Rust `ProviderStatusRow`
+ * payload of the `provider_status` table.
+ */
+export interface ProviderStatusRow {
+  provider: string;
+  state: PiAuthState;
+  credential: boolean;
+  /** ISO-8601 instant of the last check that produced this row. */
+  checkedAt: string;
+}
+
+/**
  * Answer of one non-interactive `pi` call (S1, S2). A non-zero `exitCode` is an
  * answer, not an error; `timedOut` says the deadline killed the child and
  * `truncated` says a stream hit Rust's 64 KiB cap. Mirrors `PiCliResult` in
