@@ -30,6 +30,10 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 # sees the api key and CORS/CSP stay out of the way. rustls keeps the build free
 # of an OpenSSL system dependency.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+# S3 (interactive login): `pi auth login` refuses to run without a TTY, so the
+# interactive sessions need a real pseudo-terminal. wezterm's `portable-pty`
+# exposes one API over Unix ptys and Windows ConPTY; `run` stays on plain pipes.
+portable-pty = "0.9"
 
 # S5 (cross-platform kill): std exposes `Command::process_group` but no way to
 # signal a process group, so reaping pi's descendants on Unix needs killpg/kill.

@@ -17,6 +17,12 @@
 // - no busy loop: `run` waits on a channel fed by a waiter thread, and a timeout
 //   terminates the child's whole process group (the same kill path the runtime
 //   uses), escalating from the polite signal to the force kill.
+// - two process models, on purpose: `run` is a batch call on plain pipes, while an
+//   interactive session runs on a real pseudo-terminal (`portable-pty`: a Unix pty
+//   or a Windows ConPTY under the same API). `pi auth login` refuses to start
+//   without a TTY, and its OAuth flow waits at a prompt for a pasted redirect URL.
+//   Terminal output is split into lines and stripped of ANSI before it reaches the
+//   webview, which is a log view and not a terminal emulator (defect L6).
 //
 // Frozen contract (see `odd/tasks/pi-cli-bridge.md`): `PiCliResult` is the
 // non-interactive answer, `CliEvent` is the `pi-cli` event payload, and
@@ -24,13 +30,17 @@
 // the TS contracts (C3) mirror them field by field.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{ChildStdin, Command, Stdio};
+use std::io::{Read, Write};
+use std::iter::Peekable;
+use std::process::{Command, Stdio};
+use std::str::Chars;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtyPair, PtySize};
 
 /// Cap of each captured stream in `run`, in bytes (S2: "salida acotada", 64 KiB
 /// per stream). Interactive sessions stream line by line instead, so they are not
@@ -46,6 +56,13 @@ pub const KILL_GRACE: Duration = Duration::from_millis(500);
 
 /// Grace given to a child to leave after `stop` terminates it.
 pub const STOP_GRACE: Duration = Duration::from_millis(500);
+
+/// Geometry of an interactive session's pty. Wide on purpose: `pi auth login`
+/// prints a long authorization URL, and a child that wraps to the terminal width
+/// would split it across two lines for no reason. Nothing renders this width; it
+/// only tells the child how much room it has.
+pub const PTY_ROWS: u16 = 50;
+pub const PTY_COLS: u16 = 200;
 
 /// The subcommands this bridge is allowed to run (S2). The first argument of
 /// every call must be exactly one of these: nothing is matched by prefix, so
@@ -345,6 +362,129 @@ fn terminate(pid: u32, exit: &mpsc::Receiver<Option<i32>>) -> Option<i32> {
     }
 }
 
+/// Removes terminal control sequences from one line of pty output (S3).
+///
+/// A terminal child (pi's login flow) emits colors, cursor moves and a window
+/// title on top of the text the webview has to show. The webview is a log view,
+/// not a terminal emulator, so the sequences are stripped here instead of being
+/// forwarded (`ESC[1G` would otherwise render as garbage).
+///
+/// Kept inline and dependency-free: the rules are small, and a crate would only
+/// add a version to pin for four escape forms.
+pub fn strip_ansi(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            // ESC introduces a control sequence: CSI (`ESC [`), OSC (`ESC ]`) or
+            // a two-byte escape with an optional intermediate byte.
+            '\u{1b}' => match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    skip_csi(&mut chars);
+                }
+                Some(']') => {
+                    chars.next();
+                    skip_osc(&mut chars);
+                }
+                // Charset designators (`ESC ( B`) carry one intermediate byte.
+                Some('(' | ')' | '*' | '+' | '#' | '%') => {
+                    chars.next();
+                    chars.next();
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
+            // The C1 single-byte forms of the same sequences.
+            '\u{9b}' => skip_csi(&mut chars),
+            '\u{9d}' => skip_osc(&mut chars),
+            // A carriage return redraws from column 0, so what was collected for
+            // this line is being overwritten.
+            '\r' => out.clear(),
+            // A backspace erases one visible character.
+            '\u{8}' => {
+                out.pop();
+            }
+            '\t' => out.push('\t'),
+            // Every other control character (BEL, NUL, ...) is not text.
+            other if other.is_control() => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Consumes one CSI sequence: parameters, then intermediates, then the final
+/// byte that ends it (`m`, `G`, `K`, `J`, `H`, ...). A sequence cut by the end of
+/// the line consumes the rest of the line, which is the only reading that cannot
+/// leak half a color code into the text.
+fn skip_csi(chars: &mut Peekable<Chars<'_>>) {
+    for ch in chars.by_ref() {
+        if ('\u{40}'..='\u{7e}').contains(&ch) {
+            return;
+        }
+    }
+}
+
+/// Consumes one OSC string, which ends at BEL or at the two-byte ST (`ESC \`).
+fn skip_osc(chars: &mut Peekable<Chars<'_>>) {
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\u{7}' => return,
+            '\u{1b}' if chars.peek() == Some(&'\\') => {
+                chars.next();
+                return;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Splits pty output into complete lines (S3).
+#[derive(Default)]
+pub struct LineSplitter {
+    pending: Vec<u8>,
+}
+
+impl LineSplitter {
+    /// Feeds one chunk of pty bytes and answers the lines it completed. The
+    /// chunk boundary is invisible to the caller: a line cut in two is rejoined
+    /// here, never emitted twice.
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        let mut lines = Vec::new();
+        for &byte in chunk {
+            match byte {
+                // The pty turns every newline a child writes into `\r\n`, and a
+                // bare `\r` is a redraw: all three end a line here.
+                b'\n' | b'\r' => self.finish(&mut lines),
+                other => self.pending.push(other),
+            }
+        }
+        lines
+    }
+
+    /// Answers the last line, which a closed pty delivered without a terminator.
+    pub fn flush(&mut self) -> Option<String> {
+        let mut lines = Vec::new();
+        if !self.pending.is_empty() {
+            self.finish(&mut lines);
+        }
+        lines.into_iter().next()
+    }
+
+    fn finish(&mut self, lines: &mut Vec<String>) {
+        let raw = std::mem::take(&mut self.pending);
+        // Decoded lossily: a cut can land inside a multi-byte character.
+        let line = strip_ansi(&String::from_utf8_lossy(&raw));
+        // A line with nothing visible left is not a row in the webview.
+        if !line.trim().is_empty() {
+            lines.push(line);
+        }
+    }
+}
+
 /// Registry of live interactive sessions (S3). Owned by `AppState`.
 #[derive(Default)]
 pub struct CliSessions {
@@ -357,10 +497,14 @@ impl CliSessions {
         CliSessions::default()
     }
 
-    /// Spawns one allowlisted child and starts streaming its output (S3).
+    /// Spawns one allowlisted child on a pseudo-terminal and starts streaming its
+    /// output (S3).
     ///
-    /// The session is registered before its reader threads start, so the first
-    /// event can never arrive for an id nobody knows yet.
+    /// A pty is not a nicety here: `pi auth login` refuses to run without a TTY
+    /// (`requires an interactive terminal`, exit 1, no URL), which is exactly the
+    /// defect this bridge exists to avoid. The session is registered before its
+    /// reader threads start, so the first event can never arrive for an id nobody
+    /// knows yet.
     pub fn start(
         &self,
         args: &[String],
@@ -368,36 +512,49 @@ impl CliSessions {
         sink: CliSink,
     ) -> Result<CliSessionId, CliError> {
         check_allowlist(args)?;
-        let mut child = build_command(binary, args)
-            .spawn()
+        let PtyPair { slave, master } = native_pty_system()
+            .openpty(PtySize {
+                rows: PTY_ROWS,
+                cols: PTY_COLS,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|err| CliError::Spawn(format!("failed to open a pty: {err}")))?;
+        let mut child = slave
+            .spawn_command(pty_command(binary, args))
             .map_err(|err| CliError::Spawn(format!("failed to spawn {binary}: {err}")))?;
-        let pid = child.id();
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        // The slave end must not stay open in this process: the reader only sees
+        // the terminal hang up when the last slave descriptor is gone. The pair
+        // already drops it first, and this makes the intent explicit.
+        drop(slave);
+
+        let pid = child.process_id();
+        let reader = master
+            .try_clone_reader()
+            .map_err(|err| CliError::Spawn(format!("failed to read the pty: {err}")))?;
+        let writer = master
+            .take_writer()
+            .map_err(|err| CliError::Spawn(format!("failed to write to the pty: {err}")))?;
+        let killer = child.clone_killer();
         let id = self.next_session_id();
         let exited = Arc::new(AtomicBool::new(false));
         lock(&self.sessions).insert(
             id.clone(),
             Arc::new(CliSession {
                 pid,
-                stdin: Mutex::new(stdin),
+                writer: Mutex::new(Some(writer)),
+                killer: Mutex::new(Some(killer)),
                 exited: Arc::clone(&exited),
             }),
         );
 
-        if let Some(pipe) = stdout {
-            stream_lines(pipe, id.clone(), CliStream::Stdout, Arc::clone(&sink));
-        }
-        if let Some(pipe) = stderr {
-            stream_lines(pipe, id.clone(), CliStream::Stderr, Arc::clone(&sink));
-        }
+        stream_pty(reader, id.clone(), Arc::clone(&sink));
 
         // Exit watcher: it owns the `Child`, so it can reap the process without
         // holding any lock the writer needs.
         let exit_id = id.clone();
         thread::spawn(move || {
-            let code = child.wait().ok().and_then(|status| status.code());
+            let code = child.wait().ok().as_ref().and_then(exit_code_of);
             exited.store(true, Ordering::SeqCst);
             sink(&CliEvent {
                 cli_session_id: exit_id,
@@ -409,7 +566,7 @@ impl CliSessions {
         Ok(id)
     }
 
-    /// Writes `text` plus a newline to the session's stdin. `Ok(false)` for an
+    /// Writes `text` plus a newline to the session's terminal. `Ok(false)` for an
     /// unknown session id, so a late write is not an error.
     pub fn write(&self, session_id: &str, text: &str) -> Result<bool, CliError> {
         let Some(session) = lock(&self.sessions).get(session_id).cloned() else {
@@ -419,15 +576,21 @@ impl CliSessions {
         if session.exited.load(Ordering::SeqCst) {
             return Ok(false);
         }
-        let mut guard = lock(&session.stdin);
-        let Some(pipe) = guard.as_mut() else {
+        let mut guard = lock(&session.writer);
+        let Some(master) = guard.as_mut() else {
             return Ok(false);
         };
+        // A terminal line ends in `\n`: the pty turns it into the carriage return
+        // the child sees, so a pasted redirect URL arrives exactly as one line.
+        // A URL pasted with its own line ending is collapsed instead of sending an
+        // empty second line the child would read as an empty answer.
+        let text = text.trim_end_matches(['\r', '\n']);
         let mut line = String::with_capacity(text.len() + 1);
         line.push_str(text);
         line.push('\n');
-        pipe.write_all(line.as_bytes())
-            .and_then(|()| pipe.flush())
+        master
+            .write_all(line.as_bytes())
+            .and_then(|()| master.flush())
             .map_err(|err| CliError::Write(err.to_string()))?;
         Ok(true)
     }
@@ -438,16 +601,16 @@ impl CliSessions {
         let Some(session) = lock(&self.sessions).remove(session_id) else {
             return Ok(false);
         };
-        // Close stdin first: a child that reads it sees EOF and may leave on its
-        // own before any signal is needed.
-        lock(&session.stdin).take();
+        // Close the terminal first: a child that reads it sees EOF and may leave
+        // on its own before any signal is needed.
+        lock(&session.writer).take();
         if session.exited.load(Ordering::SeqCst) {
             return Ok(true);
         }
-        crate::process::signal_terminate(session.pid);
+        terminate_session(&session);
         if !wait_exit(&session.exited, STOP_GRACE) {
             // A child that ignores the polite signal must not outlive the host.
-            crate::process::signal_kill(session.pid);
+            force_kill_session(&session);
             let _ = wait_exit(&session.exited, STOP_GRACE);
         }
         Ok(true)
@@ -482,36 +645,49 @@ impl Drop for CliSessions {
     }
 }
 
-/// Forwards one pipe as `line` events until the pipe closes (S3). A last line
-/// without its newline is still a line, and the trailing newline is dropped so
-/// the webview never renders an empty row per line.
-fn stream_lines<R: Read + Send + 'static>(
-    pipe: R,
-    id: CliSessionId,
-    stream: CliStream,
-    sink: CliSink,
-) {
+/// Forwards pty output as `line` events until the terminal closes (S3).
+///
+/// Everything is reported as `stdout`: a terminal merges the child's stderr into
+/// the one stream it renders, so a separate `stderr` channel would be a fiction.
+/// The ANSI a login flow emits is stripped before it leaves this thread, because
+/// the webview is a log view and not a terminal emulator.
+fn stream_pty<R: Read + Send + 'static>(reader: R, id: CliSessionId, sink: CliSink) {
     thread::spawn(move || {
-        let mut reader = BufReader::new(pipe);
-        let mut line = String::new();
+        let mut reader = reader;
+        let mut splitter = LineSplitter::default();
+        let mut chunk = [0u8; 8192];
         loop {
-            line.clear();
-            match reader.read_line(&mut line) {
+            match reader.read(&mut chunk) {
                 Ok(0) => break,
-                Ok(_) => {
-                    let text = line.trim_end_matches(['\r', '\n']).to_string();
-                    sink(&CliEvent {
-                        cli_session_id: id.clone(),
-                        stream,
-                        line: Some(text),
-                        exit_code: None,
-                    });
-                }
+                Ok(filled) => emit_lines(splitter.push(&chunk[..filled]), &id, &sink),
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                // A pty whose child is gone reports EIO on some platforms and a
+                // clean end of file on others: both mean the session is over.
                 Err(_) => break,
             }
         }
+        // A last line without a terminator is still a line.
+        if let Some(last) = splitter.flush() {
+            sink(&CliEvent {
+                cli_session_id: id,
+                stream: CliStream::Stdout,
+                line: Some(last),
+                exit_code: None,
+            });
+        }
     });
+}
+
+/// Emits one `stdout` event per completed line.
+fn emit_lines(lines: Vec<String>, id: &CliSessionId, sink: &CliSink) {
+    for line in lines {
+        sink(&CliEvent {
+            cli_session_id: id.clone(),
+            stream: CliStream::Stdout,
+            line: Some(line),
+            exit_code: None,
+        });
+    }
 }
 
 /// Waits for the exit latch within `budget`. Polled, never spun: the interval is
@@ -539,9 +715,24 @@ fn check_allowlist(args: &[String]) -> Result<(), CliError> {
     }
 }
 
-/// Builds the child invocation: piped stdio, allowlisted env, own process group
-/// on Unix (so a kill reaches the whole tree). Every mainstream OS is covered by
-/// the shared branches; only the platform extras are conditional.
+/// Builds the child of an interactive session. The pty supplies its stdio on
+/// both platforms (a Unix pty pair, a Windows ConPTY), so only the argv and the
+/// environment are configured here.
+fn pty_command(binary: &str, args: &[String]) -> CommandBuilder {
+    let mut command = CommandBuilder::new(binary);
+    command.args(args);
+    // The same environment allowlist `run` and the pi runtime use: a login flow
+    // can never read more of the host environment than the runtime may.
+    command.env_clear();
+    for (name, value) in crate::process::forwarded_env(std::env::vars()) {
+        command.env(name, value);
+    }
+    command
+}
+
+/// Builds the non-interactive child: piped stdio, allowlisted env, own process
+/// group on Unix (so a kill reaches the whole tree). Every mainstream OS is
+/// covered by the shared branches; only the platform extras are conditional.
 fn build_command(binary: &str, args: &[String]) -> Command {
     let mut command = Command::new(binary);
     command.args(args);
@@ -573,11 +764,49 @@ fn build_command(binary: &str, args: &[String]) -> Command {
 
 /// One managed interactive child and the handles its threads need.
 struct CliSession {
-    pid: u32,
-    /// Taken by `stop` to close the child's stdin; a live session always has it.
-    stdin: Mutex<Option<ChildStdin>>,
+    /// Session leader of the pty, when the platform reports one.
+    pid: Option<u32>,
+    /// Taken by `stop` to close the terminal; a live session always has it.
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
+    /// The pty's own kill path, used only when no pid is available.
+    killer: Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>,
     /// Set by the waiter thread once the child is reaped.
     exited: Arc<AtomicBool>,
+}
+
+/// Exit code of a pty child, or `None` when a signal ended it (no code exists).
+fn exit_code_of(status: &portable_pty::ExitStatus) -> Option<i32> {
+    match status.signal() {
+        Some(_) => None,
+        None => Some(status.exit_code() as i32),
+    }
+}
+
+/// Polite termination of one interactive child: the shared process-group signal
+/// when the pty named a session leader (so pi's descendants go too), the pty
+/// handle otherwise.
+fn terminate_session(session: &CliSession) {
+    match session.pid {
+        Some(pid) => crate::process::signal_terminate(pid),
+        None => kill_with_handle(session),
+    }
+}
+
+/// Last resort for a child that ignores the polite signal.
+fn force_kill_session(session: &CliSession) {
+    match session.pid {
+        Some(pid) => crate::process::signal_kill(pid),
+        None => kill_with_handle(session),
+    }
+}
+
+/// Kills through the pty's own handle, which is the only option when the
+/// platform did not report a pid.
+fn kill_with_handle(session: &CliSession) {
+    let mut guard = lock(&session.killer);
+    if let Some(killer) = guard.as_mut() {
+        let _ = killer.kill();
+    }
 }
 
 /// Locks without panicking: a poisoned lock in a background thread must not turn
@@ -674,6 +903,24 @@ exit 0
 printf 'started\n'
 printf 'started\n' >> '@MARKER@'
 sleep 30
+"#;
+
+    /// Interactive login: refuses to run without a TTY (exactly what the real
+    /// `pi auth login` does), then prints an ANSI-laden banner plus the URL,
+    /// reads one pasted line and leaves cleanly.
+    const FAKE_LOGIN: &str = r#"#!/bin/sh
+if [ ! -t 0 ]; then
+  printf 'requires an interactive terminal\n'
+  exit 1
+fi
+printf '\033[1G\033[2K'
+printf '\033[1mOpen this URL to sign in:\033[0m\n'
+printf '\033[32mhttps://auth.example.test/oauth/authorize?client_id=abc&state=xyz\033[0m\n'
+printf 'Callback: \033[36mhttp://127.0.0.1:1455/auth/callback\033[0m\n'
+printf 'Paste the redirect URL here:\n'
+IFS= read -r line
+printf 'got:%s\n' "$line"
+exit 0
 "#;
 
     /// Writes a fake CLI script and makes it executable. `@MARKER@` becomes a
@@ -933,12 +1180,101 @@ sleep 30
         assert_eq!(garbage.provider, "nan");
     }
 
+    // ── terminal text (S3) ─────────────────────────────────────────
+
+    // S3: colors and SGR attributes never reach the webview.
+    #[test]
+    fn strip_ansi_removes_colors_and_attributes() {
+        assert_eq!(
+            strip_ansi("\x1b[1mSign in\x1b[0m with \x1b[38;5;208mChatGPT\x1b[39m"),
+            "Sign in with ChatGPT"
+        );
+    }
+
+    // S3: cursor, erase and screen sequences are dropped whole, including the
+    // private-mode ones a login flow uses to hide the cursor.
+    #[test]
+    fn strip_ansi_removes_cursor_and_screen_sequences() {
+        for raw in [
+            "\x1b[1G\x1b[0Jopen",
+            "\x1b[2J\x1b[Hopen",
+            "\x1b[3A\x1b[Kopen",
+            "\x1b[?25lopen\x1b[?25h",
+            "\x1b[2;3Hopen",
+        ] {
+            assert_eq!(strip_ansi(raw), "open", "raw: {raw:?}");
+        }
+    }
+
+    // S3: a carriage return overwrites the line it returns to, so only what came
+    // after the last one is visible text.
+    #[test]
+    fn strip_ansi_keeps_only_what_survives_a_carriage_return() {
+        assert_eq!(strip_ansi("loading 10%\rloading 40%\rDone"), "Done");
+        assert_eq!(strip_ansi("discarded\rkept"), "kept");
+        assert_eq!(strip_ansi("no carriage return"), "no carriage return");
+        assert_eq!(strip_ansi("\x08\x08ok"), "ok", "a backspace erases one char");
+    }
+
+    // S3: window titles arrive as OSC strings, BEL- or ST-terminated, and carry
+    // no text worth showing.
+    #[test]
+    fn strip_ansi_drops_osc_sequences() {
+        assert_eq!(
+            strip_ansi("\x1b]0;pi \u{2014} login\x07Open this URL to sign in:"),
+            "Open this URL to sign in:"
+        );
+        assert_eq!(
+            strip_ansi("\x1b]8;;https://example.test\x1b\\after"),
+            "after"
+        );
+    }
+
+    // S3: the URL the human has to open must survive byte for byte.
+    #[test]
+    fn strip_ansi_leaves_a_url_untouched() {
+        let url = "http://127.0.0.1:1455/auth/callback?code=abc123&state=xyz";
+        assert_eq!(strip_ansi(&format!("\x1b[32m{url}\x1b[0m")), url);
+    }
+
+    // S3: pty output is split on `\r\n`, `\r` and `\n`, and a line cut by a
+    // chunk boundary is rejoined instead of shown twice.
+    #[test]
+    fn line_splitter_splits_on_crlf_cr_and_lf() {
+        let mut splitter = LineSplitter::default();
+        assert_eq!(
+            splitter.push(b"one\r\ntwo\rthree\nfour"),
+            vec!["one".to_string(), "two".to_string(), "three".to_string()]
+        );
+        assert_eq!(splitter.flush().as_deref(), Some("four"));
+        assert_eq!(splitter.flush(), None, "the buffer is empty after a flush");
+    }
+
+    #[test]
+    fn line_splitter_joins_chunks_that_split_a_line() {
+        let mut splitter = LineSplitter::default();
+        assert!(splitter.push(b"Open this URL").is_empty());
+        assert_eq!(
+            splitter.push(b" to sign in:\n"),
+            vec!["Open this URL to sign in:".to_string()]
+        );
+        assert_eq!(splitter.flush(), None);
+    }
+
+    // S3: a line with nothing left after stripping is not a row in the webview.
+    #[test]
+    fn line_splitter_drops_lines_that_are_empty_after_stripping() {
+        let mut splitter = LineSplitter::default();
+        assert!(splitter.push(b"\n\x1b[2K\n   \n").is_empty());
+    }
+
     // ── interactive bridge (S1, S3) ─────────────────────────────────────────
 
-    // S3: stdout and stderr arrive line by line, and the exit is reported.
+    // S3: the pty merges both streams into the one line stream a terminal has,
+    // in write order, and the exit is reported.
     #[cfg(unix)]
     #[test]
-    fn start_streams_stdout_stderr_and_the_exit_event() {
+    fn start_streams_lines_and_the_exit_event() {
         let scratch = Scratch::new("start_stream");
         let script = write_script(&scratch, "pi-stream.sh", FAKE_STREAM);
         let sessions = CliSessions::new();
@@ -955,10 +1291,17 @@ sleep 30
 
         assert_eq!(
             lines_of(&events, CliStream::Stdout),
-            vec!["line one".to_string(), "line two".to_string()],
-            "stdout lines arrive whole and in order: {events:#?}"
+            vec![
+                "line one".to_string(),
+                "warn one".to_string(),
+                "line two".to_string()
+            ],
+            "a terminal merges stderr into stdout, whole and in order: {events:#?}"
         );
-        assert_eq!(lines_of(&events, CliStream::Stderr), vec!["warn one".to_string()]);
+        assert!(
+            lines_of(&events, CliStream::Stderr).is_empty(),
+            "the pty has one stream, so nothing is reported as stderr: {events:#?}"
+        );
         let exit = events
             .iter()
             .find(|event| event.stream == CliStream::Exit)
@@ -977,6 +1320,90 @@ sleep 30
             sessions.live_ids().is_empty(),
             "a stopped session is no longer live"
         );
+    }
+
+    // S3 (defect L6 of `pi-cli-bridge.md`): the interactive session runs on a
+    // pty, so a child that demands a terminal starts; the ANSI is stripped, the
+    // URL survives byte for byte, a pasted redirect URL reaches the child as one
+    // line and the child's own exit code is reported.
+    #[cfg(unix)]
+    #[test]
+    fn pty_session_emits_clean_lines_and_receives_the_pasted_url() {
+        let scratch = Scratch::new("pty_login");
+        let script = write_script(&scratch, "pi-login.sh", FAKE_LOGIN);
+        let sessions = CliSessions::new();
+        let collected = Arc::new(Collected::default());
+
+        let id = sessions
+            .start(
+                &args(&["auth", "login", "openai", "--no-browser"]),
+                binary(&script),
+                collected.sink(),
+            )
+            .expect("start the login flow");
+
+        let events = collected.wait_for("the paste prompt", |events| {
+            lines_of(events, CliStream::Stdout)
+                .iter()
+                .any(|line| line == "Paste the redirect URL here:")
+        });
+        let lines = lines_of(&events, CliStream::Stdout);
+        assert!(
+            lines.iter().all(|line| !line.contains('\x1b')),
+            "no escape character may reach the webview: {lines:#?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains('\x07')),
+            "no bell from an OSC title may reach the webview: {lines:#?}"
+        );
+        assert!(
+            lines.contains(&"Open this URL to sign in:".to_string()),
+            "the prompt is intact: {lines:#?}"
+        );
+        assert!(
+            lines.contains(&"https://auth.example.test/oauth/authorize?client_id=abc&state=xyz".to_string()),
+            "the URL survives byte for byte: {lines:#?}"
+        );
+        assert!(
+            lines.contains(&"Callback: http://127.0.0.1:1455/auth/callback".to_string()),
+            "the callback line is intact: {lines:#?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.trim().is_empty()),
+            "empty lines are dropped instead of becoming rows: {lines:#?}"
+        );
+
+        let pasted = "http://127.0.0.1:1455/auth/callback?code=abc123&state=xyz";
+        assert!(
+            sessions
+                .write(&id, &format!("{pasted}\r\n"))
+                .expect("paste the redirect URL"),
+            "a live pty session accepts input"
+        );
+
+        let events = collected.wait_for("the child's answer and exit", |events| {
+            events.iter().any(|event| event.stream == CliStream::Exit)
+        });
+        let lines = lines_of(&events, CliStream::Stdout);
+        assert!(
+            lines.contains(&format!("got:{pasted}")),
+            "the pasted URL arrives as a single line: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line == "got:"),
+            "a pasted line ending must not become an empty answer: {lines:#?}"
+        );
+        let exit = events
+            .iter()
+            .find(|event| event.stream == CliStream::Exit)
+            .expect("exit event");
+        assert_eq!(
+            exit.exit_code,
+            Some(0),
+            "the child's own exit code is reported: {events:#?}"
+        );
+
+        assert!(sessions.stop(&id).expect("stop after a natural exit"));
     }
 
     // S3: a pasted device code reaches the child's stdin, newline included.
