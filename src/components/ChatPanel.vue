@@ -11,7 +11,7 @@
 // nothing here starts, stops or resets a process, and the previous session keeps
 // running and keeps accumulating events off screen.
 import type { Component } from "vue";
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   CheckIcon,
   CircleAlertIcon,
@@ -118,6 +118,122 @@ const tools = computed<ToolEntry[]>(() => buffer.value?.tools ?? []);
 const streamingText = computed(() => buffer.value?.streamingText ?? "");
 const transcriptLoading = computed(() =>
   isTranscriptLoading(currentSession.value?.sessionId ?? null),
+);
+
+/**
+ * Scroll behaviour of the transcript: the view follows the bottom only while the
+ * human is already there. Reading the middle of a conversation must survive the
+ * tokens that keep streaming in (and any other growth of the transcript), which
+ * is why "at the bottom" is a state this panel tracks instead of an assumption.
+ */
+const BOTTOM_SLACK_PX = 48;
+/** The human is at (or near) the end, so new content may move the view. */
+const pinnedToBottom = ref(true);
+/** The transcript's content wrapper; the scrolling element is its ancestor. */
+const transcriptContent = ref<HTMLElement | null>(null);
+/** The `ScrollArea` viewport (`data-slot` of `ui/scroll-area/ScrollArea.vue`). */
+const transcriptViewport = ref<HTMLElement | null>(null);
+let transcriptResize: ResizeObserver | null = null;
+/** The offset this panel itself last scrolled to (see `handleTranscriptScroll`). */
+let programmaticOffset = 0;
+
+/** Distance to the end under the slack still counts as "open at the bottom". */
+function isAtBottom(element: HTMLElement): boolean {
+  return element.scrollHeight - element.scrollTop - element.clientHeight <= BOTTOM_SLACK_PX;
+}
+
+/**
+ * Re-reads the pin from the live scroll position. Only used where the movement
+ * is the human's; programmatic scrolls go through `handleTranscriptScroll`.
+ */
+function syncPinnedToBottom(): void {
+  const viewport = transcriptViewport.value;
+  if (viewport === null) return;
+  pinnedToBottom.value = isAtBottom(viewport);
+}
+
+/**
+ * Moves the view to the latest message. Instant rather than smooth: a streaming
+ * answer grows per token, and an animation would chase a moving target.
+ */
+function scrollToBottom(): void {
+  const viewport = transcriptViewport.value;
+  if (viewport === null) return;
+  // Assigning past the maximum is clamped by the browser, so this also works
+  // when the content is shorter than the viewport (nothing to scroll).
+  viewport.scrollTop = viewport.scrollHeight;
+  programmaticOffset = viewport.scrollTop;
+  pinnedToBottom.value = true;
+}
+
+/**
+ * The `scroll` listener of the viewport, so the pin follows every movement the
+ * human makes (wheel, keyboard, scrollbar, touch) — not only the ones this panel
+ * performs.
+ *
+ * A scroll event does not say who moved the view, and content can grow between
+ * this panel's own `scrollTop` and the event it produces. An offset at or below
+ * the one this panel set is therefore read as "still at the end, follow the new
+ * bottom"; only an offset *above* it is the human moving up the conversation.
+ */
+function handleTranscriptScroll(): void {
+  const viewport = transcriptViewport.value;
+  if (viewport === null) return;
+  if (pinnedToBottom.value && viewport.scrollTop >= programmaticOffset) {
+    scrollToBottom();
+    return;
+  }
+  pinnedToBottom.value = isAtBottom(viewport);
+}
+
+/**
+ * A resize (window, drawer, composer) reflows the transcript: the flag is
+ * re-read from the position, and a view that was glued stays glued.
+ */
+function handleViewportResize(): void {
+  if (pinnedToBottom.value) {
+    scrollToBottom();
+    return;
+  }
+  syncPinnedToBottom();
+}
+
+function detachTranscriptViewport(): void {
+  const viewport = transcriptViewport.value;
+  if (viewport !== null) viewport.removeEventListener("scroll", handleTranscriptScroll);
+  transcriptResize?.disconnect();
+  transcriptResize = null;
+  transcriptViewport.value = null;
+  programmaticOffset = 0;
+}
+
+/**
+ * The scrolling element of a `ScrollArea` is its viewport, not its root: the
+ * wrapper only forwards attributes, so the listeners are bound to the viewport
+ * found from the content the slot renders into.
+ */
+function attachTranscriptViewport(): void {
+  const content = transcriptContent.value;
+  const viewport =
+    content?.closest<HTMLElement>('[data-slot="scroll-area-viewport"]') ?? null;
+  transcriptViewport.value = viewport;
+  if (viewport === null) return;
+  viewport.addEventListener("scroll", handleTranscriptScroll, { passive: true });
+  transcriptResize ??= new ResizeObserver(handleViewportResize);
+  transcriptResize.observe(viewport);
+  // A freshly mounted transcript has no position to preserve: open at the end.
+  scrollToBottom();
+}
+
+watch(
+  transcriptContent,
+  () => {
+    detachTranscriptViewport();
+    attachTranscriptViewport();
+  },
+  // `post`: the slot content is patched by then, so the ancestor lookup and the
+  // first scroll land on the real viewport.
+  { flush: "post" },
 );
 
 // S5/S7: the model selector's data. `providerModels` is whatever Rust reports
@@ -266,6 +382,56 @@ function timeLabel(at: string | null): string {
   const minutes = String(then.getMinutes()).padStart(2, "0");
   return `${hours}:${minutes}`;
 }
+
+/**
+ * Everything that makes the transcript taller. Watching the signature keeps the
+ * follow tied to real growth — streamed text, a closed turn, tool badges, the
+ * status and error cards — instead of to one particular field.
+ */
+const transcriptSignature = computed(() =>
+  [
+    transcript.value.length,
+    streamingText.value.length,
+    tools.value.length,
+    errorText.value?.length ?? 0,
+    statusAlert.value?.text ?? "",
+  ].join("|"),
+);
+
+/**
+ * The follow itself: while the pin holds, every growth moves the view to the new
+ * bottom; while it does not, nothing touches the scroll offset, so a human
+ * reading higher up keeps the exact place they had.
+ */
+watch(
+  transcriptSignature,
+  () => {
+    // `post` plus a tick: the scroll height read must be the grown one.
+    void nextTick(() => {
+      if (!pinnedToBottom.value) return;
+      scrollToBottom();
+    });
+  },
+  { flush: "post" },
+);
+
+/** The identity of the conversation on screen; `null` when there is none. */
+const activeSessionId = computed(() => currentSession.value?.sessionId ?? null);
+
+/**
+ * S4: opening a session seeds the view at its latest message — once per switch,
+ * plus whatever still arrives for it while the pin holds. Scrolling up drops the
+ * pin, so the seed never fights the human afterwards.
+ */
+watch(activeSessionId, () => {
+  pinnedToBottom.value = true;
+  void nextTick(() => {
+    scrollToBottom();
+    // The history may still be loading; only keep following when we truly landed
+    // at the end (a short conversation leaves nothing to scroll).
+    syncPinnedToBottom();
+  });
+});
 
 /**
  * `MessageBubble` knows the two speaking roles; a `tool` line of a recovered
@@ -491,9 +657,10 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
-  // Only the focus listener is ours: the agent-event subscription belongs to the
-  // store and must survive a panel swap.
+  // Only the focus listener and the transcript listeners are ours: the
+  // agent-event subscription belongs to the store and must survive a panel swap.
   window.removeEventListener("focus", handleWindowFocus);
+  detachTranscriptViewport();
 });
 </script>
 
@@ -564,7 +731,7 @@ onUnmounted(() => {
         <TabsContent value="chat" class="flex min-h-0 flex-1 flex-col">
           <!-- Transcript: the only scrolling region of the panel. -->
           <ScrollArea class="min-h-0 flex-1">
-            <div class="flex flex-col gap-4 p-4">
+            <div ref="transcriptContent" class="flex flex-col gap-4 p-4">
               <Alert
                 v-if="statusAlert"
                 :variant="statusAlert.type === 'error' ? 'destructive' : 'default'"

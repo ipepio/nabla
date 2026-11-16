@@ -105,9 +105,21 @@ let livePollHandle: number | null = null;
 const expandedIds = ref<number[]>([]);
 /** S5: the sessions of each workspace, keyed by workspace id. */
 const sessionsByWorkspace = ref<Record<number, SessionSummary[]>>({});
-/** S5: workspaces whose session fetch is in flight. */
-const sessionsLoading = ref<number[]>([]);
+/**
+ * S5: how many `list_sessions` requests are still in flight per workspace. A
+ * count, not a flag, so the indicator stays on for the whole burst instead of
+ * flickering off between two requests of the same workspace.
+ */
+const sessionsPending = ref<Record<number, number>>({});
 const sessionsErrors = ref<Record<number, string>>({});
+/**
+ * S5: per-workspace request sequence. Every fetch stamps a new number and a
+ * response may only be applied while its number is still the newest one for
+ * that workspace, so a slow older `list_sessions` can never overwrite the list
+ * a newer request already landed (the stale-response race behind the reorder
+ * that never showed up: send touches `updated_at`, the second response wins).
+ */
+const sessionRequestSequence = new Map<number, number>();
 /**
  * A row action (pause / delete) that failed, per workspace. Kept apart from the
  * fetch error so the list still renders: an action must never break it.
@@ -241,27 +253,66 @@ function setSessionActionError(workspaceId: number, message: string | null) {
 }
 
 function sessionsLoadingFor(workspaceId: number): boolean {
-  return sessionsLoading.value.includes(workspaceId);
+  return (sessionsPending.value[workspaceId] ?? 0) > 0;
+}
+
+/** One more request is in flight: the indicator stays on until the last lands. */
+function markSessionRequestStarted(workspaceId: number) {
+  sessionsPending.value = {
+    ...sessionsPending.value,
+    [workspaceId]: (sessionsPending.value[workspaceId] ?? 0) + 1,
+  };
+}
+
+function markSessionRequestSettled(workspaceId: number) {
+  const remaining = (sessionsPending.value[workspaceId] ?? 1) - 1;
+  const next = { ...sessionsPending.value };
+  if (remaining > 0) {
+    next[workspaceId] = remaining;
+  } else {
+    delete next[workspaceId];
+  }
+  sessionsPending.value = next;
+}
+
+/** The response's sequence is still the newest one requested for its workspace. */
+function isLatestSessionRequest(workspaceId: number, sequence: number): boolean {
+  return sessionRequestSequence.get(workspaceId) === sequence;
 }
 
 /**
  * S5: reads one workspace's session index. `list_sessions` is the only source;
  * the cache exists so the list keeps rendering while a refresh is in flight.
+ *
+ * Every call starts its own request — a refresh is never coalesced away or
+ * dropped because another one was running — and the newest one always wins:
+ * responses are applied only when they belong to the latest request of that
+ * workspace, so the older, slower answer (the one carrying the pre-send order)
+ * is discarded instead of overwriting it.
  */
 async function loadSessions(workspaceId: number) {
-  if (sessionsLoading.value.includes(workspaceId)) return;
-  sessionsLoading.value = [...sessionsLoading.value, workspaceId];
+  const sequence = (sessionRequestSequence.get(workspaceId) ?? 0) + 1;
+  sessionRequestSequence.set(workspaceId, sequence);
+  markSessionRequestStarted(workspaceId);
   try {
     const list = await listSessions(workspaceId);
+    // Late answer of a superseded request: the newer one already decided.
+    if (!isLatestSessionRequest(workspaceId, sequence)) return;
+    // The cache of a collapsed (or removed) workspace was already dropped; a
+    // leftover response must not refill it.
+    if (!isExpanded(workspaceId)) return;
     sessionsByWorkspace.value = { ...sessionsByWorkspace.value, [workspaceId]: list };
     delete sessionsErrors.value[workspaceId];
   } catch (cause) {
+    if (!isLatestSessionRequest(workspaceId, sequence)) return;
+    if (!isExpanded(workspaceId)) return;
     sessionsErrors.value = {
       ...sessionsErrors.value,
       [workspaceId]: commandErrorMessage(cause),
     };
   } finally {
-    sessionsLoading.value = sessionsLoading.value.filter((id) => id !== workspaceId);
+    // Only the last settled request turns the indicator off.
+    markSessionRequestSettled(workspaceId);
   }
 }
 
