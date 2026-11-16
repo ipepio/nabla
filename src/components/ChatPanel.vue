@@ -434,19 +434,16 @@ async function handleSend() {
   try {
     const current = await ensureSession();
     if (current === null) return;
-    // The first prompt names the session (Rust derives the alias). Detect it
-    // before the echo lands so the drawer can refetch once, not on every turn.
-    const before = sessionBuffer(current.sessionId);
-    const firstTurn =
-      before === null ||
-      !before.transcript.some((message) => message.role === "user");
     await sendPrompt(current.workspaceId, Number(current.sessionId), text);
     // Echo the turn so the transcript reads as a conversation: pi answers with
     // deltas on `agent-event`, it does not echo the prompt back. The turn lands
     // in that session's buffer, not in whatever is on screen.
     appendUserTurn(current.sessionId, text);
     prompt.value = "";
-    if (firstTurn) sessionGeneration.value += 1;
+    // The drawer sorts by activity and caches each workspace's list, so every
+    // successful send has to invalidate it — not just the first turn, which was
+    // only there to pick up the derived alias.
+    sessionGeneration.value += 1;
   } catch (cause) {
     panelError.value = commandErrorMessage(cause);
   } finally {
