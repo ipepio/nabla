@@ -148,4 +148,37 @@
   body {
     @apply bg-background text-foreground overflow-hidden;
   }
+  /* Native scrollbars, matched to the hairline thumb of `ui/scroll-area`.
+     Why here: the Tauri webview is WebKit, and every `overflow-y-auto` pane
+     (settings, reasoning blocks, model and discovery lists, the empty state)
+     scrolls with the native bar — the shadcn `ScrollArea` only covers the
+     chat transcript, so the global default is what the rest of the app shows.
+     Tokens only: the palette still comes from `.env` (ADR 0009). */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in oklab, var(--border) 70%, transparent) transparent;
+  }
+  /* WebKit ignores the two properties above once the pseudo-elements exist,
+     and the reverse is true in other engines: `@supports` keeps each engine on
+     the syntax it actually honours instead of leaving one of them unstyled. */
+  @supports selector(::-webkit-scrollbar) {
+    * {
+      scrollbar-width: auto;
+      scrollbar-color: auto;
+    }
+    ::-webkit-scrollbar {
+      width: 4px;
+      height: 4px;
+    }
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    ::-webkit-scrollbar-thumb {
+      border-radius: 9999px;
+      background-color: color-mix(in oklab, var(--border) 70%, transparent);
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background-color: var(--border);
+    }
+  }
 }

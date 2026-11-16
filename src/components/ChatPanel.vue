@@ -29,7 +29,6 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   commandErrorMessage,
   getSettings,
@@ -728,7 +727,7 @@ onUnmounted(() => {
       </template>
     </ChatEmptyState>
 
-    <!-- S2: conversation state — header, Chat/Linaje tabs, transcript, composer. -->
+    <!-- S2: conversation state — header, transcript, composer. -->
     <template v-else>
       <ChatHeader
         :title="workspaceName"
@@ -739,151 +738,134 @@ onUnmounted(() => {
         @toggle-theme="handleToggleTheme"
       />
 
-      <Tabs default-value="chat" class="min-h-0 flex-1 gap-0">
-        <div class="border-b border-border px-4">
-          <TabsList variant="line" class="h-9">
-            <TabsTrigger value="chat">{{ t("chat.tab.chat") }}</TabsTrigger>
-            <TabsTrigger value="linaje">{{ t("chat.tab.lineage") }}</TabsTrigger>
-          </TabsList>
-        </div>
-
-        <TabsContent value="chat" class="flex min-h-0 flex-1 flex-col">
-          <!-- Transcript: the only scrolling region of the panel. The column is
-               centred and bounded (a maximum, not a floor): the header, the tabs
-               and the composer still span the panel, only the conversation is
-               held to a readable measure. -->
-          <ScrollArea class="min-h-0 flex-1">
-            <div
-              ref="transcriptContent"
-              class="mx-auto flex w-full flex-col gap-4 p-4"
-              :style="{ maxWidth: `${CONVERSATION_TRANSCRIPT_MAX_WIDTH}px` }"
-            >
-              <Alert
-                v-if="statusAlert"
-                :variant="statusAlert.type === 'error' ? 'destructive' : 'default'"
-              >
-                <AlertDescription :class="statusAlertClass(statusAlert.type)">
-                  {{ statusAlert.text }}
-                </AlertDescription>
-              </Alert>
-
-              <!-- S2: failures render inside the transcript flow, not as a
-                   floating toast. -->
-              <div v-if="errorText" class="relative rounded-md border border-border p-3">
-                <div class="flex items-center gap-1.5 pr-6">
-                  <span
-                    class="size-1.5 shrink-0 rounded-full bg-destructive"
-                    aria-hidden="true"
-                  />
-                  <span class="text-xs font-semibold">{{ t("chat.error.label") }}</span>
-                </div>
-                <p class="mt-1 text-sm text-muted-foreground">{{ errorText }}</p>
-                <div class="mt-2 flex items-center justify-end">
-                  <span
-                    class="text-[10px] font-medium tracking-wider text-muted-foreground uppercase"
-                  >
-                    {{ t("chat.error.tag") }}
-                  </span>
-                </div>
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  class="absolute top-1.5 right-1.5"
-                  :aria-label="t('common.dismiss')"
-                  @click="dismissError"
-                >
-                  <XIcon />
-                </Button>
-              </div>
-
-              <!-- S3: the session's own history is being read from pi's file. -->
-              <p
-                v-if="transcriptLoading && transcript.length === 0"
-                class="text-sm text-muted-foreground"
-              >
-                {{ t("chat.loadingConversation") }}
-              </p>
-
-              <!-- L3/S4: the active session's buffer, which kept filling while
-                   this session was off screen. -->
-              <template v-for="message in transcript" :key="message.id">
-                <div
-                  v-if="message.role === 'tool'"
-                  class="flex items-start gap-2 text-xs text-muted-foreground"
-                >
-                  <WrenchIcon class="mt-0.5 size-3 shrink-0" aria-hidden="true" />
-                  <span class="min-w-0 whitespace-pre-wrap">{{ message.text }}</span>
-                </div>
-                <MessageBubble
-                  v-else
-                  :role="bubbleRole(message.role)"
-                  :text="message.text"
-                  :at="timeLabel(message.at)"
-                  :reasoning="message.reasoning"
-                  :message-id="message.id"
-                />
-              </template>
-
-              <!-- The turn still streaming: it becomes a transcript entry when
-                   pi closes the message. Reasoning streams above the answer and
-                   keeps its own open/closed state under the id it flushes into. -->
-              <MessageBubble
-                v-if="streamingText !== '' || streamingReasoning !== ''"
-                role="assistant"
-                :text="streamingText"
-                :reasoning="streamingReasoning === '' ? undefined : streamingReasoning"
-                :message-id="liveMessageId ?? undefined"
-                reasoning-live
-              />
-
-              <div v-if="tools.length > 0" class="flex flex-wrap gap-2">
-                <Badge
-                  v-for="tool in tools"
-                  :key="tool.toolCallId"
-                  :variant="toolBadgeVariant(tool.state)"
-                >
-                  <component :is="toolIcon(tool.state)" />
-                  {{ tool.toolName }} · {{ toolStateLabel(tool.state) }}
-                </Badge>
-              </div>
-            </div>
-          </ScrollArea>
-
-          <!-- Composer, pinned under the transcript, plus the turns/steps meta.
-               No rule above it: the conversation and its input read as one
-               surface instead of two panes. -->
-          <div class="px-4 py-3">
-            <Composer
-              v-model="prompt"
-              :max-width="CONVERSATION_COMPOSER_MAX_WIDTH"
-              :provider-id="providerId"
-              :model-id="modelId"
-              :provider-models="providerModels"
-              :workspace-name="workspace?.name ?? t('chat.noWorkspace')"
-              :streaming="sending"
-              :disabled="workspace === null"
-              :can-send="canSend"
-              :model-disabled="savingModel || enabledModelCount === 0"
-              :can-stop="currentSession !== null && !stopping"
-              @select-model="handleSelectModel"
-              @send="handleSend"
-              @stop="handleStop"
-            />
-            <p class="mt-2 text-center text-xs text-muted-foreground">
-              {{ t("chat.turnsAndSteps", { turns, steps }) }}
-            </p>
-          </div>
-        </TabsContent>
-
-        <TabsContent
-          value="linaje"
-          class="flex min-h-0 flex-1 items-center justify-center"
+      <!-- No tab strip any more: the panel is one pane, so the `v-else` children
+           are the flex items themselves and the ScrollArea keeps filling the
+           height between the header and the composer. -->
+      <!-- Transcript: the only scrolling region of the panel. The column is
+           centred and bounded (a maximum, not a floor): the header and the
+           composer still span the panel, only the conversation is held to a
+           readable measure. -->
+      <ScrollArea class="min-h-0 flex-1">
+        <div
+          ref="transcriptContent"
+          class="mx-auto flex w-full flex-col gap-4 p-4"
+          :style="{ maxWidth: `${CONVERSATION_TRANSCRIPT_MAX_WIDTH}px` }"
         >
-          <p class="text-center text-sm text-muted-foreground">
-            {{ t("chat.lineagePlaceholder") }}
+          <Alert
+            v-if="statusAlert"
+            :variant="statusAlert.type === 'error' ? 'destructive' : 'default'"
+          >
+            <AlertDescription :class="statusAlertClass(statusAlert.type)">
+              {{ statusAlert.text }}
+            </AlertDescription>
+          </Alert>
+
+          <!-- S2: failures render inside the transcript flow, not as a
+               floating toast. -->
+          <div v-if="errorText" class="relative rounded-md border border-border p-3">
+            <div class="flex items-center gap-1.5 pr-6">
+              <span
+                class="size-1.5 shrink-0 rounded-full bg-destructive"
+                aria-hidden="true"
+              />
+              <span class="text-xs font-semibold">{{ t("chat.error.label") }}</span>
+            </div>
+            <p class="mt-1 text-sm text-muted-foreground">{{ errorText }}</p>
+            <div class="mt-2 flex items-center justify-end">
+              <span
+                class="text-[10px] font-medium tracking-wider text-muted-foreground uppercase"
+              >
+                {{ t("chat.error.tag") }}
+              </span>
+            </div>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              class="absolute top-1.5 right-1.5"
+              :aria-label="t('common.dismiss')"
+              @click="dismissError"
+            >
+              <XIcon />
+            </Button>
+          </div>
+
+          <!-- S3: the session's own history is being read from pi's file. -->
+          <p
+            v-if="transcriptLoading && transcript.length === 0"
+            class="text-sm text-muted-foreground"
+          >
+            {{ t("chat.loadingConversation") }}
           </p>
-        </TabsContent>
-      </Tabs>
+
+          <!-- L3/S4: the active session's buffer, which kept filling while
+               this session was off screen. -->
+          <template v-for="message in transcript" :key="message.id">
+            <div
+              v-if="message.role === 'tool'"
+              class="flex items-start gap-2 text-xs text-muted-foreground"
+            >
+              <WrenchIcon class="mt-0.5 size-3 shrink-0" aria-hidden="true" />
+              <span class="min-w-0 whitespace-pre-wrap">{{ message.text }}</span>
+            </div>
+            <MessageBubble
+              v-else
+              :role="bubbleRole(message.role)"
+              :text="message.text"
+              :at="timeLabel(message.at)"
+              :reasoning="message.reasoning"
+              :message-id="message.id"
+            />
+          </template>
+
+          <!-- The turn still streaming: it becomes a transcript entry when
+               pi closes the message. Reasoning streams above the answer and
+               keeps its own open/closed state under the id it flushes into. -->
+          <MessageBubble
+            v-if="streamingText !== '' || streamingReasoning !== ''"
+            role="assistant"
+            :text="streamingText"
+            :reasoning="streamingReasoning === '' ? undefined : streamingReasoning"
+            :message-id="liveMessageId ?? undefined"
+            reasoning-live
+          />
+
+          <div v-if="tools.length > 0" class="flex flex-wrap gap-2">
+            <Badge
+              v-for="tool in tools"
+              :key="tool.toolCallId"
+              :variant="toolBadgeVariant(tool.state)"
+            >
+              <component :is="toolIcon(tool.state)" />
+              {{ tool.toolName }} · {{ toolStateLabel(tool.state) }}
+            </Badge>
+          </div>
+        </div>
+      </ScrollArea>
+
+      <!-- Composer, pinned under the transcript, plus the turns/steps meta.
+           No rule above it: the conversation and its input read as one
+           surface instead of two panes. -->
+      <div class="px-4 py-3">
+        <Composer
+          v-model="prompt"
+          :max-width="CONVERSATION_COMPOSER_MAX_WIDTH"
+          :provider-id="providerId"
+          :model-id="modelId"
+          :provider-models="providerModels"
+          :workspace-name="workspace?.name ?? t('chat.noWorkspace')"
+          :streaming="sending"
+          :disabled="workspace === null"
+          :can-send="canSend"
+          :model-disabled="savingModel || enabledModelCount === 0"
+          :can-stop="currentSession !== null && !stopping"
+          @select-model="handleSelectModel"
+          @send="handleSend"
+          @stop="handleStop"
+        />
+        <p class="mt-2 text-center text-xs text-muted-foreground">
+          {{ t("chat.turnsAndSteps", { turns, steps }) }}
+        </p>
+      </div>
     </template>
   </div>
 </template>
