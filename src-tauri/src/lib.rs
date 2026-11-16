@@ -95,6 +95,9 @@ pub fn run() {
             commands::list_provider_models,
             commands::update_provider_model,
             commands::remove_provider_model,
+            // S2/S3 of `model-visibility.md`: hiding a model is Nabla's own
+            // setting, never an edit of pi's read-only catalogues.
+            commands::set_model_hidden,
             commands::list_sessions,
             commands::get_settings,
             commands::save_settings,

@@ -58,6 +58,10 @@ pub const MODEL_SOURCE_CATALOG: &str = "catalog";
 /// `source` says which of pi's two files the entry came from
 /// (`MODEL_SOURCE_CONFIGURED` or `MODEL_SOURCE_CATALOG`), which is what decides
 /// whether the UI may edit it.
+///
+/// `hidden` is Nabla's own mark, from `Settings::hidden_models`: the catalogue
+/// itself is read-only, so hiding is a preference stored here (keyed on
+/// `"<provider>/<modelId>"`) and never an edit of pi's files.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelInfo {
@@ -70,6 +74,10 @@ pub struct ModelInfo {
     /// Input modalities: `"text"` and `"image"`, pi's `input` array.
     pub modalities: Vec<String>,
     pub enabled: bool,
+    /// Whether the human hid this model from the selector. A hidden model is
+    /// still listed and still described in full: only the choice disappears.
+    #[serde(default)]
+    pub hidden: bool,
     /// `"configured"` or `"catalog"`; see `MODEL_SOURCE_CONFIGURED`.
     pub source: String,
 }
@@ -183,6 +191,16 @@ pub fn models_store_path(home_dir: &Path) -> PathBuf {
         .join(".pi")
         .join("agent")
         .join("models-store.json")
+}
+
+/// Path of pi's credentials file inside a home directory.
+///
+/// pi writes it when the human signs in to a provider (an oauth token object or a
+/// provider api key, one entry per provider id). It is the evidence that a
+/// catalog-only provider is usable, and Nabla only ever reads it: no token is
+/// returned, logged or written from here.
+pub fn auth_path(home_dir: &Path) -> PathBuf {
+    home_dir.join(".pi").join("agent").join("auth.json")
 }
 
 /// Reads every provider pi knows, without the api keys.
@@ -351,9 +369,20 @@ pub fn read_provider_models(path: &Path) -> ProvidersResult<Vec<ProviderModels>>
         .collect())
 }
 
-/// The union of what pi has configured and what pi has cached: a provider whose
-/// models only live in the catalog (a signed-in openai or openai-codex) still
-/// lists them, and the models of `models.json` are listed exactly as before.
+/// The union of what pi has configured and what pi has cached, limited to the
+/// providers that are usable: a provider whose models only live in the catalog
+/// (a signed-in openai or openai-codex) still lists them, and the models of
+/// `models.json` are listed exactly as before.
+///
+/// Usability of a catalog-only provider (S1 of `model-visibility.md`):
+/// `models-store.json` caches the catalog of **every** provider pi has ever
+/// fetched, signed in or not (openai-codex is cached today with no credentials),
+/// so the cache alone is not evidence of a usable provider. A provider only the
+/// catalog carries is listed only when `auth.json` has an entry for it whose
+/// value is a non-empty object; a provider `models.json` already lists is
+/// exposed regardless, because that file is the human's own configuration. A
+/// cached-but-unauthenticated provider does not appear at all — not even as an
+/// empty provider.
 ///
 /// Merge rules:
 /// - a provider in both files is listed once, with its configured models first
@@ -367,18 +396,21 @@ pub fn read_provider_models(path: &Path) -> ProvidersResult<Vec<ProviderModels>>
 ///   `type` at all in an older cache); a `type: "classifier"` entry is not a
 ///   choice the selector can offer.
 ///
-/// The catalog is read-only and never a reason to fail: a missing, unreadable or
-/// corrupt `models-store.json` contributes no catalog entries, while the
+/// The catalog and the credentials file are read-only and never a reason to fail:
+/// a missing, unreadable or corrupt `models-store.json` contributes no catalog
+/// entries, and a missing or corrupt `auth.json` authenticates nothing, while the
 /// configured providers are still listed. A broken `models.json` stays a parse
 /// error, exactly like `read_provider_models` reports it.
 pub fn read_provider_models_with_catalog(
     models: &Path,
     store: &Path,
+    auth: &Path,
 ) -> ProvidersResult<Vec<ProviderModels>> {
     let mut providers = read_provider_models(models)?;
     let Some(catalog) = read_catalog(store) else {
         return Ok(providers);
     };
+    let credentials = read_credentials(auth);
 
     // serde_json's default map is a `BTreeMap`, so the catalog providers are
     // appended in id order: the listing is deterministic across reads.
@@ -399,17 +431,44 @@ pub fn read_provider_models_with_catalog(
                     configured.models.push(model);
                 }
             }
-            None => providers.push(ProviderModels {
-                provider: provider_id.clone(),
-                // pi's store has no display name for a provider, and inventing
-                // one ("OpenAI Codex") would be a label pi never uses. The id is
-                // the same fallback `models.json` gets for an unnamed entry.
-                name: provider_id,
-                models: catalog_models,
-            }),
+            None => {
+                // A cached catalogue without credentials is not a provider the
+                // human can use, so it is not listed at all.
+                if !is_authenticated(&credentials, &provider_id) {
+                    continue;
+                }
+                providers.push(ProviderModels {
+                    provider: provider_id.clone(),
+                    // pi's store has no display name for a provider, and inventing
+                    // one ("OpenAI Codex") would be a label pi never uses. The id is
+                    // the same fallback `models.json` gets for an unnamed entry.
+                    name: provider_id,
+                    models: catalog_models,
+                });
+            }
         }
     }
     Ok(providers)
+}
+
+/// S2 of `model-visibility.md`: applies the human's hidden list to a listing.
+///
+/// This is Nabla's own preference, applied on read: a model whose
+/// `"<provider>/<modelId>"` pair (see `settings::hidden_model_key`) is in the
+/// list is marked `hidden`, for a configured and a catalog entry alike. Nothing
+/// is removed or edited: the entry keeps every field it had, and a pair for a
+/// model that is no longer listed marks nothing.
+pub fn apply_hidden_models(providers: &mut [ProviderModels], hidden: &[String]) {
+    if hidden.is_empty() {
+        return;
+    }
+    for provider in providers.iter_mut() {
+        for model in provider.models.iter_mut() {
+            model.hidden = hidden
+                .iter()
+                .any(|entry| entry == &crate::settings::hidden_model_key(&provider.provider, &model.id));
+        }
+    }
 }
 
 /// S3: writes one model inside `providers.<provider>.models` — backup, merge,
@@ -894,6 +953,9 @@ fn model_info_of_source(model: &serde_json::Value, source: &str) -> Option<Model
         output_cost: model_cost(model, "output"),
         modalities: model_modalities(model),
         enabled,
+        // Neither file knows about hiding: it is Nabla's own mark, applied by
+        // `apply_hidden_models` from the settings once the listing is built.
+        hidden: false,
         source: source.to_string(),
     })
 }
@@ -907,6 +969,39 @@ fn read_catalog(store: &Path) -> Option<serde_json::Map<String, serde_json::Valu
     match serde_json::from_str::<serde_json::Value>(&raw).ok()? {
         serde_json::Value::Object(catalog) => Some(catalog),
         _ => None,
+    }
+}
+
+/// pi's credentials file as a JSON object, tolerating every failure a read of it
+/// may hit.
+///
+/// Only the **shape** of an entry is ever inspected here (`is_authenticated`); no
+/// token, key or expiry leaves this function. A missing, unreadable or corrupt
+/// `auth.json` reads as "nothing is signed in", which is the safe direction: it
+/// hides catalog-only providers instead of inventing usable ones.
+fn read_credentials(auth: &Path) -> serde_json::Map<String, serde_json::Value> {
+    let Some(raw) = std::fs::read_to_string(auth).ok() else {
+        return serde_json::Map::new();
+    };
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(serde_json::Value::Object(entries)) => entries,
+        _ => serde_json::Map::new(),
+    }
+}
+
+/// Whether `auth.json` holds usable credentials for one provider: an entry whose
+/// value is a non-empty object.
+///
+/// pi writes one object per signed-in provider (oauth tokens, or an api key) and
+/// removes the entry on sign-out. An empty object, a scalar or an array is not a
+/// sign-in, so it never makes a cached catalog usable.
+fn is_authenticated(
+    credentials: &serde_json::Map<String, serde_json::Value>,
+    provider_id: &str,
+) -> bool {
+    match credentials.get(provider_id) {
+        Some(serde_json::Value::Object(entry)) => !entry.is_empty(),
+        _ => false,
     }
 }
 
@@ -1194,6 +1289,15 @@ mod tests {
 
         fn write_store(&self, contents: &str) {
             std::fs::write(self.store_path(), contents).expect("write models-store.json");
+        }
+
+        /// pi's credentials file, next to `models.json` exactly as pi writes it.
+        fn auth_path(&self) -> PathBuf {
+            self.0.join("auth.json")
+        }
+
+        fn write_auth(&self, contents: &str) {
+            std::fs::write(self.auth_path(), contents).expect("write auth.json");
         }
 
         /// Every file name in the scratch directory, sorted.
@@ -1917,6 +2021,7 @@ mod tests {
                 output_cost: Some(1.5),
                 modalities: vec!["text".to_string(), "image".to_string()],
                 enabled: true,
+                hidden: false,
                 source: MODEL_SOURCE_CONFIGURED.to_string(),
             }
         );
@@ -1956,6 +2061,7 @@ mod tests {
                 output_cost: None,
                 modalities: vec!["text".to_string()],
                 enabled: true,
+                hidden: false,
                 source: MODEL_SOURCE_CONFIGURED.to_string(),
             }
         );
@@ -1987,9 +2093,10 @@ mod tests {
       }
     }"#;
 
-    /// The union read: the configured file plus the catalog next to it.
+    /// The union read: the configured file, the catalog and pi's credentials
+    /// file next to them.
     fn union(dir: &TempModelsDir) -> Vec<ProviderModels> {
-        read_provider_models_with_catalog(&dir.path(), &dir.store_path())
+        read_provider_models_with_catalog(&dir.path(), &dir.store_path(), &dir.auth_path())
             .expect("the union never fails for a broken catalog")
     }
 
@@ -2005,6 +2112,36 @@ mod tests {
             .collect()
     }
 
+    /// The provider ids of a listing, in payload order.
+    fn listed_providers(providers: &[ProviderModels]) -> Vec<&str> {
+        providers.iter().map(|p| p.provider.as_str()).collect()
+    }
+
+    /// pi's credentials file with one signed-in provider: the per-provider object
+    /// pi writes. Only its presence as a non-empty object matters here, so no real
+    /// token appears in the fixture.
+    const AUTH_OPENAI: &str =
+        r#"{"openai":{"type":"oauth","access":"token-value","refresh":"token-value","expires":1794769407}}"#;
+
+    /// The signed-in openai-codex entry the tests authenticate against the same
+    /// way pi writes it, plus the two chat models the cache carries.
+    const AUTH_OPENAI_CODEX: &str =
+        r#"{"openai-codex":{"type":"oauth","access":"token-value","refresh":"token-value","expires":1794769407}}"#;
+
+    /// A cached openai-codex catalogue, exactly the shape pi caches whether or
+    /// not the human ever signed in to it.
+    const CODEX_STORE: &str = r#"{
+      "openai-codex": {
+        "models": [
+          { "id": "gpt-5.6-luna", "name": "GPT-5.6 Luna", "type": "chat" },
+          { "id": "gpt-5.6-sol", "name": "GPT-5.6 Sol", "type": "chat" }
+        ],
+        "lastModified": 1794769407,
+        "etag": "etag-value",
+        "checkedAt": 1794769407
+      }
+    }"#;
+
     // A provider pi only has in the catalog (a signed-in openai-codex) is listed
     // with every chat model, marked read-only, and the pane still lists the
     // configured provider exactly as before.
@@ -2012,6 +2149,9 @@ mod tests {
     fn a_catalog_only_provider_is_listed_with_source_catalog() {
         let dir = TempModelsDir::new("catalog_only");
         dir.write(CONFIGURED_FILE);
+        // The human signed in to openai-codex: pi's credentials file carries the
+        // entry, which is what makes the cached catalog usable.
+        dir.write_auth(AUTH_OPENAI_CODEX);
         dir.write_store(
             r#"{
               "openai-codex": {
@@ -2126,6 +2266,7 @@ mod tests {
     fn non_chat_catalog_entries_are_skipped() {
         let dir = TempModelsDir::new("catalog_types");
         dir.write(CONFIGURED_FILE);
+        dir.write_auth(AUTH_OPENAI);
         dir.write_store(
             r#"{
               "openai": {
@@ -2153,6 +2294,7 @@ mod tests {
     #[test]
     fn a_catalog_model_maps_pi_fields_onto_the_contract() {
         let dir = TempModelsDir::new("catalog_mapping");
+        dir.write_auth(AUTH_OPENAI);
         dir.write_store(
             r#"{
               "openai": {
@@ -2189,6 +2331,7 @@ mod tests {
                 output_cost: Some(30.0),
                 modalities: vec!["text".to_string(), "image".to_string()],
                 enabled: true,
+                hidden: false,
                 source: MODEL_SOURCE_CATALOG.to_string(),
             }]
         );
@@ -2268,7 +2411,7 @@ mod tests {
         dir.write_store(r#"{"openai":{"models":[{"id":"chat-latest"}]}}"#);
 
         assert!(matches!(
-            read_provider_models_with_catalog(&dir.path(), &dir.store_path()),
+            read_provider_models_with_catalog(&dir.path(), &dir.store_path(), &dir.auth_path()),
             Err(ProvidersError::Parse(_))
         ));
     }
@@ -2279,6 +2422,197 @@ mod tests {
         assert_eq!(
             models_store_path(Path::new("/home/u")),
             PathBuf::from("/home/u/.pi/agent/models-store.json")
+        );
+    }
+
+    // The credentials file is pi's own too, next to models.json.
+    #[test]
+    fn auth_path_is_pis_agent_auth_json() {
+        assert_eq!(
+            auth_path(Path::new("/home/u")),
+            PathBuf::from("/home/u/.pi/agent/auth.json")
+        );
+    }
+
+    // ── usability of a cached provider ──────────────────────────────────────
+
+    // S2 of `model-visibility.md`: the catalog caches every provider pi has ever
+    // seen, signed in or not, so a cached entry alone is not evidence of a usable
+    // provider. openai-codex is exactly that case today: cached, never signed in.
+    #[test]
+    fn a_catalog_provider_without_an_auth_entry_is_not_exposed() {
+        let dir = TempModelsDir::new("catalog_unauthenticated");
+        dir.write(CONFIGURED_FILE);
+        dir.write_store(CODEX_STORE);
+
+        // No auth.json at all: a fresh install has nothing signed in.
+        assert_eq!(
+            listed_providers(&union(&dir)),
+            vec!["keep"],
+            "a cached catalogue without credentials is not a provider"
+        );
+
+        // An auth.json naming another provider does not authenticate this one.
+        dir.write_auth(AUTH_OPENAI);
+        assert_eq!(
+            listed_providers(&union(&dir)),
+            vec!["keep"],
+            "openai is signed in, openai-codex is not"
+        );
+
+        // An entry that is not a non-empty object carries no credentials.
+        dir.write_auth(r#"{"openai-codex":{},"openai":null,"other":"value","more":[1]}"#);
+        assert_eq!(
+            listed_providers(&union(&dir)),
+            vec!["keep"],
+            "an empty or non-object entry is not a sign-in, and the provider is not even \
+             listed empty"
+        );
+    }
+
+    #[test]
+    fn a_catalog_provider_with_an_auth_entry_is_exposed() {
+        let dir = TempModelsDir::new("catalog_authenticated");
+        dir.write(CONFIGURED_FILE);
+        dir.write_store(CODEX_STORE);
+        dir.write_auth(AUTH_OPENAI_CODEX);
+
+        let providers = union(&dir);
+        assert_eq!(listed_providers(&providers), vec!["keep", "openai-codex"]);
+        assert_eq!(
+            listed_ids(&providers, "openai-codex"),
+            vec!["gpt-5.6-luna", "gpt-5.6-sol"]
+        );
+        let codex = providers
+            .iter()
+            .find(|p| p.provider == "openai-codex")
+            .expect("openai-codex is listed");
+        assert!(
+            codex
+                .models
+                .iter()
+                .all(|m| m.source == MODEL_SOURCE_CATALOG),
+            "a catalog entry stays read-only: pi owns that file"
+        );
+    }
+
+    // A provider the human configured authenticates itself: models.json is the
+    // evidence, so no auth entry is needed for its cached catalog models.
+    #[test]
+    fn a_catalog_provider_configured_in_models_json_is_exposed_without_auth() {
+        let dir = TempModelsDir::new("catalog_configured_no_auth");
+        dir.write(CONFIGURED_FILE);
+        dir.write_store(
+            r#"{"keep":{"models":[
+                {"id":"alpha","name":"Alpha (catalog)"},
+                {"id":"beta","name":"Beta","type":"chat"}
+            ]}}"#,
+        );
+
+        let providers = union(&dir);
+        assert_eq!(listed_providers(&providers), vec!["keep"]);
+        assert_eq!(
+            listed_ids(&providers, "keep"),
+            vec!["alpha", "beta"],
+            "the merged catalog models are listed without any credentials"
+        );
+    }
+
+    // The credentials file is a cache of its own: a broken one never fails the
+    // listing, it only means no catalogue-only provider is exposed.
+    #[test]
+    fn a_corrupt_auth_file_lists_the_configured_providers_only() {
+        let dir = TempModelsDir::new("auth_corrupt");
+        dir.write(CONFIGURED_FILE);
+        dir.write_store(CODEX_STORE);
+
+        for contents in [
+            "{ not json",
+            "",
+            "[]",
+            r#""just a string""#,
+            r#"{"openai-codex":42}"#,
+            r#"{"openai-codex":[]}"#,
+        ] {
+            dir.write_auth(contents);
+            assert_eq!(
+                listed_providers(&union(&dir)),
+                vec!["keep"],
+                "only the configured provider survives {contents:?}"
+            );
+        }
+    }
+
+    // ── hidden models ───────────────────────────────────────────────────────
+
+    // S2 of `model-visibility.md`: the hidden list is Nabla's own preference and
+    // is applied to the listing. It marks the matching `<provider>/<modelId>`
+    // pair for a configured and a catalog model alike, marks nothing else, and
+    // never removes an entry: a hidden model is still described in full.
+    #[test]
+    fn hidden_models_mark_only_the_matching_entries() {
+        let dir = TempModelsDir::new("hidden_marks");
+        dir.write(PI_FILE);
+        dir.write_store(CODEX_STORE);
+        dir.write_auth(AUTH_OPENAI_CODEX);
+
+        let mut providers = union(&dir);
+        let hidden = vec![
+            crate::settings::hidden_model_key("nan", "qwen3.6"),
+            crate::settings::hidden_model_key("openai-codex", "gpt-5.6-sol"),
+            // A pair for a model that is not listed marks nothing.
+            crate::settings::hidden_model_key("nan", "ghost"),
+        ];
+        apply_hidden_models(&mut providers, &hidden);
+
+        let nan = providers.iter().find(|p| p.provider == "nan").expect("nan");
+        assert_eq!(listed_ids(&providers, "nan").len(), 2, "the hidden model is still listed");
+        assert!(nan.models[0].hidden, "the configured model is hidden");
+        assert!(!nan.models[1].hidden, "its sibling stays visible");
+        assert_eq!(nan.models[0].source, MODEL_SOURCE_CONFIGURED, "hiding is a mark, not an edit");
+
+        let codex = providers
+            .iter()
+            .find(|p| p.provider == "openai-codex")
+            .expect("openai-codex");
+        assert!(!codex.models[0].hidden);
+        assert!(codex.models[1].hidden, "a catalog model is hideable too");
+        assert_eq!(codex.models[1].source, MODEL_SOURCE_CATALOG);
+
+        let empty = providers
+            .iter()
+            .find(|p| p.provider == "empty")
+            .expect("empty");
+        assert!(empty.models.is_empty(), "a provider without models is untouched");
+
+        // The flag travels in the payload the UI reads.
+        let json = serde_json::to_value(&providers).expect("serialize");
+        let nan = json
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|p| p["provider"] == serde_json::json!("nan"))
+            .expect("nan in the payload");
+        assert_eq!(nan["models"][0]["hidden"], serde_json::json!(true));
+        assert_eq!(nan["models"][1]["hidden"], serde_json::json!(false));
+    }
+
+    // An empty hidden list leaves every model visible: the default of a fresh
+    // install, and of every settings file written before the preference existed.
+    #[test]
+    fn an_empty_hidden_list_leaves_every_model_visible() {
+        let dir = TempModelsDir::new("hidden_empty");
+        dir.write(PI_FILE);
+
+        let mut providers = union(&dir);
+        apply_hidden_models(&mut providers, &[]);
+
+        assert!(
+            providers
+                .iter()
+                .flat_map(|p| p.models.iter())
+                .all(|m| !m.hidden),
+            "nothing is hidden by default"
         );
     }
 
@@ -2310,6 +2644,7 @@ mod tests {
                 output_cost: Some(0.75),
                 modalities: vec!["text".to_string(), "image".to_string()],
                 enabled: true,
+                hidden: false,
                 source: MODEL_SOURCE_CONFIGURED.to_string(),
             }
         );
@@ -2602,6 +2937,7 @@ mod tests {
                 output_cost: Some(1.5),
                 modalities: vec!["text".to_string()],
                 enabled: false,
+                hidden: true,
                 source: MODEL_SOURCE_CONFIGURED.to_string(),
             }],
         };
@@ -2617,6 +2953,11 @@ mod tests {
         );
         assert_eq!(model["contextWindow"], serde_json::json!(131072));
         assert_eq!(model["maxTokens"], serde_json::json!(8192));
+        assert_eq!(
+            model["hidden"],
+            serde_json::json!(true),
+            "the hidden mark is part of the payload"
+        );
         assert_eq!(model["inputCost"], serde_json::json!(0.5));
         assert_eq!(model["outputCost"], serde_json::json!(1.5));
         assert_eq!(model["modalities"], serde_json::json!(["text"]));

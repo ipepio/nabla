@@ -233,6 +233,16 @@ fn catalog_path(state: &AppState) -> PathBuf {
     catalog_file(&state.home_dir)
 }
 
+/// Path of pi's credentials file. Read-only too: it decides which catalog-only
+/// providers are usable, and no token ever leaves `providers`.
+fn credentials_file(home_dir: &Path) -> PathBuf {
+    crate::providers::auth_path(home_dir)
+}
+
+fn credentials_path(state: &AppState) -> PathBuf {
+    credentials_file(&state.home_dir)
+}
+
 /// S1: the providers pi knows. The api key is reduced to `has_api_key` (S4).
 #[tauri::command]
 pub fn list_providers(state: State<'_, AppState>) -> Result<Vec<ProviderSummary>, String> {
@@ -319,15 +329,46 @@ pub fn set_provider_key(
 /// Every model says which file it came from (`source`: `configured` or
 /// `catalog`), which is what tells the UI whether it may be edited. A missing or
 /// corrupt catalog is not an error: it only contributes no catalog providers.
+///
+/// S1/S2 of `model-visibility.md`: a catalogue-only provider is listed only when
+/// pi's `auth.json` proves the human signed in to it (the cache alone is not
+/// evidence), and every model carries `hidden`, read from this app's settings so
+/// the selector can leave a hidden model out. A corrupt settings file cannot blank
+/// the listing: it only hides nothing.
 #[tauri::command]
 pub fn list_provider_models(
     state: State<'_, AppState>,
 ) -> Result<Vec<ProviderModels>, String> {
-    crate::providers::read_provider_models_with_catalog(
+    let mut providers = crate::providers::read_provider_models_with_catalog(
         &models_path(&state),
         &catalog_path(&state),
+        &credentials_path(&state),
     )
-    .map_err(display_err)
+    .map_err(display_err)?;
+    let hidden = settings::load(&settings_path(&state))
+        .map(|settings| settings.hidden_models)
+        .unwrap_or_default();
+    crate::providers::apply_hidden_models(&mut providers, &hidden);
+    Ok(providers)
+}
+
+/// S2/S3 of `model-visibility.md`: hides or unhides one model of one provider.
+///
+/// Hiding is Nabla's own setting, written to `settings.json` through the same
+/// writer every other preference uses: pi's `models.json` and cached catalogue
+/// are read-only, so a catalogue model is hideable exactly like a configured one.
+/// The answer is whether the file changed, so hiding twice (or unhiding a visible
+/// model) is a successful no-op that rewrites nothing. A blank provider or model
+/// id is rejected before the file is touched.
+#[tauri::command]
+pub fn set_model_hidden(
+    state: State<'_, AppState>,
+    provider: String,
+    model_id: String,
+    hidden: bool,
+) -> Result<bool, String> {
+    settings::set_hidden_model(&settings_path(&state), &provider, &model_id, hidden)
+        .map_err(display_err)
 }
 
 /// S3: writes one model inside `providers.<provider>.models` — backup, merge and

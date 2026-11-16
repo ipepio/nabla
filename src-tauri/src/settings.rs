@@ -26,6 +26,13 @@ pub struct Settings {
     /// written, so a locale added later is not silently rewritten here.
     #[serde(default = "default_language")]
     pub language: String,
+    /// Worksheet S2: models the human hid from the selector, as
+    /// `"<provider>/<modelId>"` pairs. Nabla's own preference, not pi's: the
+    /// catalogues Nabla lists are read-only, so hiding never edits pi's files and
+    /// works for a configured and a catalog model alike. An absent field (a file
+    /// written before this preference existed) hides nothing.
+    #[serde(default)]
+    pub hidden_models: Vec<String>,
 }
 
 /// S7 default provider. Also the value a settings file written before this
@@ -54,6 +61,8 @@ impl Default for Settings {
             provider: default_provider(),
             model: default_model(),
             language: default_language(),
+            // Nothing is hidden until the human hides it.
+            hidden_models: Vec::new(),
         }
     }
 }
@@ -62,6 +71,9 @@ impl Default for Settings {
 pub enum SettingsError {
     Io(String),
     Parse(String),
+    /// S3 of `model-visibility.md`: a hidden-model selection needs both halves of
+    /// the pair, so a blank provider or model id never reaches the file.
+    InvalidHiddenModel(String),
 }
 
 impl std::fmt::Display for SettingsError {
@@ -69,6 +81,10 @@ impl std::fmt::Display for SettingsError {
         match self {
             SettingsError::Io(m) => write!(f, "settings io error: {m}"),
             SettingsError::Parse(m) => write!(f, "settings parse error: {m}"),
+            SettingsError::InvalidHiddenModel(entry) => write!(
+                f,
+                "hidden model entry needs a provider and a model id: {entry:?}"
+            ),
         }
     }
 }
@@ -98,6 +114,59 @@ pub fn save(path: &Path, settings: &Settings) -> SettingsResult<()> {
     std::fs::write(&tmp, json).map_err(|e| SettingsError::Io(e.to_string()))?;
     std::fs::rename(&tmp, path).map_err(|e| SettingsError::Io(e.to_string()))?;
     Ok(())
+}
+
+/// S2 of `model-visibility.md`: the `"<provider>/<modelId>"` key of one hidden
+/// model. One function builds it, so the settings file and the listing can never
+/// disagree about the format. A provider id never carries a `/` (pi's own
+/// discipline), so the first separator is unambiguous even though a model id may
+/// carry slashes (`meta-llama/llama-3.2-1b`).
+pub fn hidden_model_key(provider: &str, model_id: &str) -> String {
+    format!("{}/{}", provider.trim(), model_id.trim())
+}
+
+/// S2/S3 of `model-visibility.md`: adds or removes one hidden model in the
+/// settings file and answers whether the file changed.
+///
+/// Hiding is Nabla state, never pi's: the pair is stored here and nothing is
+/// written to `models.json` or the cached catalogue. Both halves are trimmed and
+/// must be non-empty (`InvalidHiddenModel`), otherwise nothing is read or
+/// written. The operation is idempotent — hiding a hidden model and unhiding a
+/// visible one are no-ops that write nothing and answer `false` — and the list
+/// never holds a duplicate.
+pub fn set_hidden_model(
+    path: &Path,
+    provider: &str,
+    model_id: &str,
+    hidden: bool,
+) -> SettingsResult<bool> {
+    let provider = provider.trim();
+    let model_id = model_id.trim();
+    if provider.is_empty() || model_id.is_empty() {
+        return Err(SettingsError::InvalidHiddenModel(format!(
+            "{provider}/{model_id}"
+        )));
+    }
+    let key = hidden_model_key(provider, model_id);
+
+    let mut settings = load(path)?;
+    let changed = if hidden {
+        if settings.hidden_models.iter().any(|entry| entry == &key) {
+            false
+        } else {
+            settings.hidden_models.push(key);
+            true
+        }
+    } else {
+        let before = settings.hidden_models.len();
+        settings.hidden_models.retain(|entry| entry != &key);
+        settings.hidden_models.len() != before
+    };
+    // A no-op writes nothing, so an existing file stays byte-identical.
+    if changed {
+        save(path, &settings)?;
+    }
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -229,6 +298,129 @@ mod tests {
         assert_eq!(s.theme, "light");
         assert_eq!(s.model, "glm5.3");
         assert_eq!(s.language, "en");
+    }
+
+    // ── hidden models (S2 of `model-visibility.md`) ─────────────────────────
+
+    // S2 + settings header rule: a file written before the preference existed
+    // must still load, with nothing hidden.
+    #[test]
+    fn settings_file_without_hidden_models_loads_an_empty_list() {
+        let cfg = TempCfg::new("pre_hidden");
+        std::fs::write(
+            &cfg.0,
+            r#"{"theme":"light","piBinary":"pi","provider":"nan","model":"glm5.3","language":"es"}"#,
+        )
+        .expect("write fixture");
+        let s = load(&cfg.0).expect("an older settings file must load");
+        assert_eq!(s.language, "es");
+        assert!(
+            s.hidden_models.is_empty(),
+            "nothing is hidden until the human hides it: {:?}",
+            s.hidden_models
+        );
+    }
+
+    // S2: the list is a preference like the others — camelCase on the wire, kept
+    // verbatim by the file.
+    #[test]
+    fn hidden_models_round_trip_and_serialize_camel_case() {
+        let cfg = TempCfg::new("hidden_roundtrip");
+        let s = Settings {
+            hidden_models: vec![
+                hidden_model_key("nan", "glm5.3"),
+                hidden_model_key("openai", "gpt-5.4"),
+            ],
+            ..Settings::default()
+        };
+        save(&cfg.0, &s).expect("save");
+        let loaded = load(&cfg.0).expect("load");
+        assert_eq!(loaded, s);
+        assert_eq!(
+            loaded.hidden_models,
+            vec!["nan/glm5.3".to_string(), "openai/gpt-5.4".to_string()],
+            "an entry is `<provider>/<modelId>`"
+        );
+
+        let json = serde_json::to_value(Settings::default()).expect("serialize");
+        assert_eq!(json["hiddenModels"], serde_json::json!([]));
+    }
+
+    // S2: hiding is idempotent state, never a log: the pair is stored once and a
+    // second identical request changes nothing (so no write is reported).
+    #[test]
+    fn set_model_hidden_adds_the_pair_once() {
+        let cfg = TempCfg::new("hidden_add");
+
+        assert!(
+            set_hidden_model(&cfg.0, "nan", "glm5.3", true).expect("hide"),
+            "the first hide writes the settings file"
+        );
+        assert_eq!(
+            load(&cfg.0).expect("load").hidden_models,
+            vec!["nan/glm5.3".to_string()]
+        );
+
+        assert!(
+            !set_hidden_model(&cfg.0, "nan", "glm5.3", true).expect("hide again"),
+            "hiding an already hidden model changes nothing"
+        );
+        assert_eq!(
+            load(&cfg.0).expect("load").hidden_models,
+            vec!["nan/glm5.3".to_string()],
+            "no duplicate entry is appended"
+        );
+
+        // Surrounding whitespace is the same pair.
+        assert!(!set_hidden_model(&cfg.0, " nan ", " glm5.3 ", true).expect("trimmed"));
+        assert_eq!(load(&cfg.0).expect("load").hidden_models.len(), 1);
+    }
+
+    // S2: unhiding removes exactly that pair and leaves the rest of the list.
+    #[test]
+    fn set_model_hidden_removes_only_the_pair_asked_for() {
+        let cfg = TempCfg::new("hidden_remove");
+        let s = Settings {
+            hidden_models: vec!["nan/glm5.3".to_string(), "nan/qwen3.6".to_string()],
+            ..Settings::default()
+        };
+        save(&cfg.0, &s).expect("save");
+
+        assert!(
+            set_hidden_model(&cfg.0, "nan", "glm5.3", false).expect("unhide"),
+            "the pair was hidden, so the file changes"
+        );
+        assert_eq!(
+            load(&cfg.0).expect("load").hidden_models,
+            vec!["nan/qwen3.6".to_string()]
+        );
+
+        assert!(
+            !set_hidden_model(&cfg.0, "nan", "glm5.3", false).expect("unhide again"),
+            "unhiding a visible model changes nothing"
+        );
+        assert_eq!(
+            load(&cfg.0).expect("load").hidden_models,
+            vec!["nan/qwen3.6".to_string()]
+        );
+    }
+
+    // S3: a pair without both halves is not a model, so it never reaches the file.
+    #[test]
+    fn set_model_hidden_rejects_a_blank_provider_or_model_id() {
+        let cfg = TempCfg::new("hidden_blank");
+        for (provider, model_id) in [("", "glm5.3"), ("nan", ""), ("  ", "  "), ("", "")] {
+            match set_hidden_model(&cfg.0, provider, model_id, true) {
+                Err(SettingsError::InvalidHiddenModel(_)) => {}
+                other => panic!(
+                    "expected InvalidHiddenModel for ({provider:?}, {model_id:?}), got: {other:?}"
+                ),
+            }
+        }
+        assert!(
+            !cfg.0.exists(),
+            "a rejected request writes no settings file"
+        );
     }
 
     #[test]
