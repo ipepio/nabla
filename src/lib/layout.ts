@@ -40,15 +40,18 @@ export const COMPOSER_MIN_WIDTH = COMPOSER_MAX_WIDTH / 2;
  * Width of the centred transcript column in the conversation state. A maximum,
  * not a minimum: below it the column simply fills the panel (down to
  * `CHAT_MIN_WIDTH`), which is why this value never reaches `APP_MIN_WIDTH`.
+ *
+ * Same as the composer by request: the transcript and the prompt box share one
+ * optical width instead of the composer looking wider than the conversation.
  */
-export const CONVERSATION_TRANSCRIPT_MAX_WIDTH = 760;
+export const CONVERSATION_TRANSCRIPT_MAX_WIDTH = 1035;
 
 /**
- * Widest the conversation composer may get. Wider than `COMPOSER_MAX_WIDTH`
- * because nothing sits beside it there, and a maximum only: its floor stays
- * `COMPOSER_MIN_WIDTH`, so the chat floor and the window minimum are untouched.
+ * Widest the conversation composer may get: 15% more than the 900 it had, and a
+ * maximum only — its floor stays `COMPOSER_MIN_WIDTH`, so the chat floor and the
+ * window minimum are untouched.
  */
-export const CONVERSATION_COMPOSER_MAX_WIDTH = 900;
+export const CONVERSATION_COMPOSER_MAX_WIDTH = 1035;
 
 /** Horizontal padding of the chat column that hosts the composer (`px-4`). */
 const CHAT_COLUMN_PADDING = 32;

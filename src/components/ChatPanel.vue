@@ -849,8 +849,10 @@ onUnmounted(() => {
             </div>
           </ScrollArea>
 
-          <!-- Composer, pinned under the transcript, plus the turns/steps meta. -->
-          <div class="border-t border-border px-4 py-3">
+          <!-- Composer, pinned under the transcript, plus the turns/steps meta.
+               No rule above it: the conversation and its input read as one
+               surface instead of two panes. -->
+          <div class="px-4 py-3">
             <Composer
               v-model="prompt"
               :max-width="CONVERSATION_COMPOSER_MAX_WIDTH"
