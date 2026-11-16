@@ -18,7 +18,7 @@ use crate::providers::{
 };
 use crate::rpc::{AgentEvent, RuntimeStatus};
 use crate::settings::{self, Settings};
-use crate::store::{SessionNew, SessionRow, Store, StoreResult, Workspace};
+use crate::store::{ProviderStatusRow, SessionNew, SessionRow, Store, StoreResult, Workspace};
 
 /// State shared with every command: the SQLite store (app-owned state), the
 /// config directory where settings.json lives (human-owned preferences, S2), the
@@ -1282,17 +1282,76 @@ pub fn pi_auth_check(state: State<'_, AppState>, provider: String) -> Result<PiA
 ///
 /// It never fails per provider: an entry that times out, answers garbage or
 /// cannot be spawned is `unknown`, so one broken provider never blanks the pane.
+///
+/// **Side effect (S5):** every answer is also written to the store as the last
+/// known state of its provider, best effort. Writing is a cache warm-up, never a
+/// precondition: a failed write is dropped and the probe still answers with what
+/// it observed. The return shape is unchanged on purpose, so the UI keeps reading
+/// one contract.
 #[tauri::command]
 pub fn pi_auth_check_many(
     state: State<'_, AppState>,
     providers: Vec<String>,
 ) -> Result<Vec<PiAuthStatus>, String> {
     let settings = settings::load(&settings_path(&state)).map_err(display_err)?;
-    Ok(cli::auth_check_many(
+    let statuses = cli::auth_check_many(
         &providers,
         Duration::from_millis(cli::DEFAULT_TIMEOUT_MS),
         &settings.pi_binary,
-    ))
+    );
+    // After the probe, never before: the pane gets its answer even if the store
+    // is busy or broken.
+    persist_provider_statuses(&state.store, &statuses);
+    Ok(statuses)
+}
+
+/// S5: the account state the last probe left behind, read straight from
+/// `nabla.db`. Pure read: it spawns nothing, so painting the pane costs one
+/// query instead of ~1.15 s per provider. The UI paints these first and lets
+/// `pi_auth_check_many` correct them in the background.
+#[tauri::command]
+pub fn cached_provider_statuses(
+    state: State<'_, AppState>,
+) -> Result<Vec<ProviderStatusRow>, String> {
+    cached_provider_statuses_for(&state.store)
+}
+
+/// The store read behind `cached_provider_statuses`, split out so it is testable
+/// without a Tauri `State` — the same shape `session_transcript` uses.
+fn cached_provider_statuses_for(store: &Store) -> Result<Vec<ProviderStatusRow>, String> {
+    store.list_provider_status().map_err(display_err)
+}
+
+/// S5: stores every probe answer as the last known state of its provider.
+///
+/// Best effort by design: the probe answer is the product and this is a cache,
+/// so a write that fails is dropped instead of failing the call. It is not
+/// silent inside the store — `cached_provider_statuses` reports a broken cache to
+/// whoever reads it.
+fn persist_provider_statuses(store: &Store, statuses: &[PiAuthStatus]) {
+    // One timestamp for the batch: every entry was answered by the same probe.
+    let checked_at = now_iso();
+    for status in statuses {
+        let _ = store.upsert_provider_status(
+            &status.provider,
+            auth_state_label(status.state),
+            status.credential,
+            &checked_at,
+        );
+    }
+}
+
+/// The stored spelling of an account state: the `snake_case` names the
+/// `PiAuthStatus` contract already uses, so the cached row and a live answer
+/// carry the same word. Exhaustive on purpose — a new state must be named here
+/// before it can be cached.
+fn auth_state_label(state: cli::AuthState) -> &'static str {
+    match state {
+        cli::AuthState::Ready => "ready",
+        cli::AuthState::NotReady => "not_ready",
+        cli::AuthState::Invalid => "invalid",
+        cli::AuthState::Unknown => "unknown",
+    }
 }
 
 #[cfg(test)]
@@ -1377,6 +1436,83 @@ mod tests {
         let all = store.list_workspaces().expect("list");
         assert_eq!(all.len(), 1, "the UNIQUE path constraint still holds");
         assert_eq!(all[0].path, fixture.home().to_string_lossy());
+    }
+
+    // ── persisted provider status (S5 of `providers-pane-refinements.md`) ──────
+
+    fn auth_status(provider: &str, state: cli::AuthState, credential: bool) -> PiAuthStatus {
+        PiAuthStatus {
+            provider: provider.to_string(),
+            state,
+            credential,
+        }
+    }
+
+    // S5: every probe answer is stored under the contract's state spelling, with
+    // the credential as a bool, so the next launch paints from the database
+    // instead of booting the CLI first.
+    #[test]
+    fn persist_provider_statuses_records_every_probe_result() {
+        let fixture = TempSeedDir::new("persist_status");
+        let store = fixture.store();
+        let statuses = vec![
+            auth_status("openai-codex", cli::AuthState::Ready, true),
+            auth_status("anthropic", cli::AuthState::NotReady, false),
+            auth_status("google", cli::AuthState::Invalid, false),
+            auth_status("openai", cli::AuthState::Unknown, false),
+        ];
+
+        persist_provider_statuses(&store, &statuses);
+
+        let rows = cached_provider_statuses_for(&store).expect("read the cache");
+        let providers: Vec<&str> = rows.iter().map(|row| row.provider.as_str()).collect();
+        assert_eq!(
+            providers,
+            vec!["anthropic", "google", "openai", "openai-codex"],
+            "one row per probed provider, ordered by provider id"
+        );
+        let row = |provider: &str| {
+            rows.iter()
+                .find(|row| row.provider == provider)
+                .expect("a row for every probed provider")
+        };
+        assert_eq!(row("openai-codex").state, "ready");
+        assert!(row("openai-codex").credential);
+        assert_eq!(row("anthropic").state, "not_ready");
+        assert!(!row("anthropic").credential);
+        assert_eq!(row("google").state, "invalid");
+        assert_eq!(row("openai").state, "unknown");
+        for row in &rows {
+            assert!(
+                row.checked_at.contains('T') && row.checked_at.ends_with('Z'),
+                "checked_at is the store's ISO-8601 shape, got {:?}",
+                row.checked_at
+            );
+        }
+    }
+
+    // S5: persistence is a side effect of the probe, so a write that fails must
+    // never turn a good probe answer into an error the pane has to handle.
+    #[test]
+    fn persist_provider_statuses_ignores_a_failed_write() {
+        let fixture = TempSeedDir::new("persist_status_failure");
+        let store = fixture.store();
+        // Break the cache table behind the store's back: the only possible
+        // outcome of the write is an error, which is exactly the best-effort path.
+        {
+            let conn = rusqlite::Connection::open(fixture.0.join("nabla.db")).expect("raw conn");
+            conn.execute_batch("DROP TABLE provider_status;")
+                .expect("drop the cache table");
+        }
+
+        persist_provider_statuses(&store, &[auth_status("openai", cli::AuthState::Ready, true)]);
+
+        // No panic: the answer still reaches the UI, the cache just misses. The
+        // read is the caller that asks for the cache and hears about it.
+        assert!(
+            cached_provider_statuses_for(&store).is_err(),
+            "a broken cache is reported to the read, never to the probe"
+        );
     }
 
     #[test]

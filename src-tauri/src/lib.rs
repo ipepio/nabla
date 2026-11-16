@@ -127,6 +127,9 @@ pub fn run() {
             // S2 of `providers-pane-refinements.md`: the account state of many
             // providers in one call, probed with a bounded pool.
             commands::pi_auth_check_many,
+            // S5: the same state as the last probe left it, read from nabla.db
+            // so the pane paints its badges without spawning the CLI.
+            commands::cached_provider_statuses,
             commands::pi_auth_check
         ])
         .run(tauri::generate_context!())

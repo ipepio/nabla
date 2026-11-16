@@ -54,6 +54,21 @@ pub struct SessionRow {
     pub updated_at: String,
 }
 
+/// S5: one persisted account badge — what the last probe said about a provider
+/// and when it said it. `credential` is presence only: the credential itself
+/// stays in pi's `auth.json` and never reaches this database.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderStatusRow {
+    pub provider: String,
+    /// The account state as the contract spells it (`ready`, `not_ready`,
+    /// `invalid`, `unknown`). Stored as text, so a state this build does not
+    /// know about can still be read back instead of being dropped.
+    pub state: String,
+    pub credential: bool,
+    pub checked_at: String,
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     Sqlite(String),
@@ -152,7 +167,62 @@ impl Store {
                  COMMIT;",
             )?;
         }
+        if current < 3 {
+            // v3 (S5): the last known account state of each provider, so the
+            // panel paints its badges from the database instead of spending
+            // ~1.15 s per provider booting the CLI before it can show anything.
+            // Additive: no existing table is altered.
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS provider_status (
+                   provider TEXT PRIMARY KEY,
+                   state TEXT NOT NULL,
+                   credential INTEGER NOT NULL,
+                   checked_at TEXT NOT NULL
+                 );
+                 PRAGMA user_version = 3;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
+    }
+
+    /// S5: records what a probe just answered for one provider, replacing the
+    /// previous badge of that same provider and leaving every other row alone.
+    /// One statement, so the row is inserted or rewritten without a second read.
+    pub fn upsert_provider_status(
+        &self,
+        provider: &str,
+        state: &str,
+        credential: bool,
+        checked_at: &str,
+    ) -> StoreResult<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO provider_status (provider, state, credential, checked_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(provider) DO UPDATE SET
+               state = excluded.state,
+               credential = excluded.credential,
+               checked_at = excluded.checked_at",
+            rusqlite::params![provider, state, credential as i64, checked_at],
+        )?;
+        Ok(())
+    }
+
+    /// S5: every persisted badge, ordered by provider id. The UI maps badges by
+    /// provider, so the order is a stable contract and not whatever the planner
+    /// picks.
+    pub fn list_provider_status(&self) -> StoreResult<Vec<ProviderStatusRow>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT provider, state, credential, checked_at FROM provider_status
+             ORDER BY provider",
+        )?;
+        let rows = stmt
+            .query_map([], provider_status_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn add_workspace(&self, path: &str, name: Option<&str>) -> StoreResult<Workspace> {
@@ -361,6 +431,17 @@ fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspace> {
     })
 }
 
+/// Maps one `provider_status` row into its payload. SQLite stores no bool, so
+/// the integer credential flag becomes a bool here, in one place.
+fn provider_status_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderStatusRow> {
+    Ok(ProviderStatusRow {
+        provider: row.get(0)?,
+        state: row.get(1)?,
+        credential: row.get::<_, i64>(2)? != 0,
+        checked_at: row.get(3)?,
+    })
+}
+
 /// Derives a workspace name from its path: the last non-empty segment.
 fn default_name_from_path(path: &str) -> String {
     path.trim_end_matches('/')
@@ -419,12 +500,28 @@ mod tests {
     }
     impl Drop for TempDb {
         fn drop(&mut self) {
+            // WAL leaves `-wal`/`-shm` siblings behind once a connection has
+            // written; removing all three keeps the system temp dir clean.
             let _ = std::fs::remove_file(&self.0);
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar = self.0.clone().into_os_string();
+                sidecar.push(suffix);
+                let _ = std::fs::remove_file(std::path::PathBuf::from(sidecar));
+            }
         }
     }
 
     fn ws_new(store: &Store, path: &str) -> Workspace {
         store.add_workspace(path, None).expect("add workspace")
+    }
+
+    /// The schema version the connection carries right now.
+    fn user_version(store: &Store) -> i64 {
+        store
+            .conn()
+            .expect("conn")
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user_version")
     }
 
     fn session_new(ws_id: i64, pi_path: &str) -> SessionNew {
@@ -503,16 +600,242 @@ mod tests {
             .upsert_session(&session_new(all[0].id, "/sessions/v1.jsonl"))
             .expect("sessions still work after the upgrade");
         assert!(session.id > 0);
-        // Version 2 is the migration contract.
-        let version: i64 = store
-            .conn()
-            .expect("conn")
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .expect("user_version");
-        assert_eq!(version, 2);
+        // The migration chain runs to its head, so a v1 file leaves at v3 and
+        // the cache table is present along the way.
+        assert_eq!(user_version(&store), 3);
+        assert!(store.list_provider_status().expect("list status").is_empty());
         // A second open must not re-run the ALTER statements.
         drop(store);
         Store::open(&db.0).expect("reopen an already-migrated database");
+    }
+
+    // S5: the v3 migration adds the provider-status cache to an existing v2
+    // database and nothing else. Workspaces, sessions and their data must arrive
+    // on the other side untouched.
+    #[test]
+    fn open_upgrades_a_v2_database_to_v3_keeping_workspaces_and_sessions() {
+        let db = TempDb::new("migrate_v2");
+        {
+            // Faithful v2 schema: the v1 tables plus the pin/recency columns.
+            let conn = rusqlite::Connection::open(&db.0).expect("create v2 db");
+            conn.execute_batch(
+                "CREATE TABLE workspaces (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   path TEXT NOT NULL UNIQUE,
+                   name TEXT NOT NULL,
+                   created_at TEXT NOT NULL,
+                   pinned INTEGER NOT NULL DEFAULT 0,
+                   last_used_at TEXT
+                 );
+                 CREATE TABLE sessions (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+                   pi_session_path TEXT NOT NULL UNIQUE,
+                   title TEXT,
+                   model TEXT,
+                   started_at TEXT NOT NULL,
+                   updated_at TEXT NOT NULL
+                 );
+                 CREATE INDEX idx_sessions_workspace_updated
+                   ON sessions(workspace_id, updated_at DESC);
+                 INSERT INTO workspaces (path, name, created_at, pinned, last_used_at)
+                   VALUES ('/tmp/v2-proj', 'v2-proj', '2026-02-02T00:00:00Z', 1, '2026-02-03T00:00:00Z');
+                 INSERT INTO sessions
+                   (workspace_id, pi_session_path, title, model, started_at, updated_at)
+                   VALUES (1, '/sessions/v2.jsonl', 'kept', 'gpt-6.1-sol',
+                           '2026-02-02T00:00:00Z', '2026-02-02T00:10:00Z');
+                 PRAGMA user_version = 2;",
+            )
+            .expect("seed v2 schema");
+        }
+
+        let store = Store::open(&db.0).expect("upgrade v2 -> v3");
+
+        let workspaces = store.list_workspaces().expect("list workspaces");
+        assert_eq!(workspaces.len(), 1, "the v2 workspace must survive");
+        assert!(workspaces[0].pinned, "v2 pin data must survive");
+        assert_eq!(
+            workspaces[0].last_used_at.as_deref(),
+            Some("2026-02-03T00:00:00Z"),
+            "v2 recency data must survive"
+        );
+        let sessions = store
+            .list_sessions(workspaces[0].id)
+            .expect("list sessions");
+        assert_eq!(sessions.len(), 1, "the indexed v2 session must survive");
+        assert_eq!(sessions[0].pi_session_path, "/sessions/v2.jsonl");
+
+        // The new table starts empty, which is what paints "never checked".
+        assert!(
+            store.list_provider_status().expect("list status").is_empty(),
+            "the upgraded cache has no rows until the first probe"
+        );
+        // Usable straight after the upgrade, not merely readable.
+        store
+            .upsert_provider_status("openai", "ready", true, "2026-02-03T00:00:00Z")
+            .expect("the cache accepts a row after the upgrade");
+        assert_eq!(store.list_provider_status().expect("list").len(), 1);
+
+        assert_eq!(user_version(&store), 3, "v3 is the migration contract");
+    }
+
+    // S5: reopening an already-migrated database runs no migration again, so the
+    // cache is a cache and not a table that is quietly rebuilt on every launch.
+    #[test]
+    fn provider_status_cache_is_untouched_when_the_database_is_reopened() {
+        let db = TempDb::new("migrate_v3_idempotent");
+        let store = Store::open(&db.0).expect("open");
+        store
+            .upsert_provider_status("anthropic", "not_ready", false, "2026-03-01T10:00:00Z")
+            .expect("insert");
+        drop(store);
+
+        let reopened = Store::open(&db.0).expect("reopen a v3 database");
+        assert_eq!(
+            user_version(&reopened),
+            3,
+            "reopening must not change the schema version"
+        );
+        let rows = reopened.list_provider_status().expect("list");
+        assert_eq!(
+            rows,
+            vec![ProviderStatusRow {
+                provider: "anthropic".to_string(),
+                state: "not_ready".to_string(),
+                credential: false,
+                checked_at: "2026-03-01T10:00:00Z".to_string(),
+            }],
+            "the persisted rows must be exactly what was written, once"
+        );
+    }
+
+    // S5: one row per provider, rewritten in place by the next probe.
+    #[test]
+    fn upsert_provider_status_inserts_then_updates_without_duplicating() {
+        let db = TempDb::new("status_upsert");
+        let store = Store::open(&db.0).expect("open");
+
+        store
+            .upsert_provider_status("openai", "ready", true, "2026-03-01T10:00:00Z")
+            .expect("insert");
+        store
+            .upsert_provider_status("openai", "invalid", false, "2026-03-01T11:00:00Z")
+            .expect("update");
+
+        let rows = store.list_provider_status().expect("list");
+        assert_eq!(rows.len(), 1, "the same provider must reuse its row");
+        assert_eq!(rows[0].state, "invalid");
+        assert!(!rows[0].credential);
+        assert_eq!(rows[0].checked_at, "2026-03-01T11:00:00Z");
+    }
+
+    // S5: the UI maps badges by provider id, so the list order is stable.
+    #[test]
+    fn list_provider_status_orders_by_provider_id() {
+        let db = TempDb::new("status_order");
+        let store = Store::open(&db.0).expect("open");
+        for provider in ["openai-codex", "anthropic", "google", "openai"] {
+            store
+                .upsert_provider_status(provider, "ready", true, "2026-03-01T10:00:00Z")
+                .expect("insert");
+        }
+
+        let providers: Vec<String> = store
+            .list_provider_status()
+            .expect("list")
+            .into_iter()
+            .map(|row| row.provider)
+            .collect();
+        assert_eq!(
+            providers,
+            vec!["anthropic", "google", "openai", "openai-codex"]
+        );
+    }
+
+    // S5: SQLite has no bool, so the credential flag is a stored integer that
+    // must come back as a bool in both directions.
+    #[test]
+    fn provider_status_round_trips_credential_as_bool() {
+        let db = TempDb::new("status_credential");
+        let store = Store::open(&db.0).expect("open");
+
+        store
+            .upsert_provider_status("openai", "ready", true, "2026-03-01T10:00:00Z")
+            .expect("insert present");
+        store
+            .upsert_provider_status("google", "not_ready", false, "2026-03-01T10:00:00Z")
+            .expect("insert absent");
+
+        let rows = store.list_provider_status().expect("list");
+        let read = |provider: &str| {
+            rows.iter()
+                .find(|row| row.provider == provider)
+                .map(|row| row.credential)
+                .expect("row for provider")
+        };
+        assert!(
+            !read("google"),
+            "an absent credential reads back as false"
+        );
+        assert!(
+            read("openai"),
+            "a present credential reads back as true"
+        );
+
+        store
+            .upsert_provider_status("google", "ready", true, "2026-03-01T11:00:00Z")
+            .expect("flip to present");
+        store
+            .upsert_provider_status("openai", "invalid", false, "2026-03-01T11:00:00Z")
+            .expect("flip to absent");
+        let rows = store.list_provider_status().expect("list");
+        let read = |provider: &str| {
+            rows.iter()
+                .find(|row| row.provider == provider)
+                .map(|row| row.credential)
+                .expect("row for provider")
+        };
+        assert!(!read("openai"), "an absent credential reads back as false");
+        assert!(read("google"));
+    }
+
+    // S5: a probe of one provider never rewrites the badge of another.
+    #[test]
+    fn upsert_provider_status_leaves_other_providers_untouched() {
+        let db = TempDb::new("status_isolation");
+        let store = Store::open(&db.0).expect("open");
+        store
+            .upsert_provider_status("openai", "ready", true, "2026-03-01T10:00:00Z")
+            .expect("insert openai");
+
+        store
+            .upsert_provider_status("anthropic", "not_ready", false, "2026-03-01T12:00:00Z")
+            .expect("insert anthropic");
+        store
+            .upsert_provider_status("anthropic", "unknown", false, "2026-03-01T13:00:00Z")
+            .expect("update anthropic");
+
+        let rows = store.list_provider_status().expect("list");
+        assert_eq!(rows.len(), 2, "one row per provider");
+        assert_eq!(
+            rows[0],
+            ProviderStatusRow {
+                provider: "anthropic".to_string(),
+                state: "unknown".to_string(),
+                credential: false,
+                checked_at: "2026-03-01T13:00:00Z".to_string(),
+            }
+        );
+        assert_eq!(
+            rows[1],
+            ProviderStatusRow {
+                provider: "openai".to_string(),
+                state: "ready".to_string(),
+                credential: true,
+                checked_at: "2026-03-01T10:00:00Z".to_string(),
+            },
+            "the untouched provider keeps every field"
+        );
     }
 
     // S8: pinning is a persisted flag, toggled in both directions.
