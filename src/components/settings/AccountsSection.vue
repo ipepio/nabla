@@ -20,6 +20,12 @@
  * runs `pi auth logout <provider>` behind a confirmation. Credentials stay in
  * pi's `auth.json`: this component never sees a secret, only a state word.
  *
+ * Sign-in URL: pi prints "Open this URL to sign in:" followed by the OAuth URL
+ * whose callback points at `127.0.0.1:1455`. That URL is read out of the streamed
+ * lines, shown on its own block above the paste field and opened in the system
+ * browser exactly once per login session. Nothing is remembered between sessions:
+ * the URL only lives as long as the child that printed it.
+ *
  * Layout: rows carry no rule of their own (no `border-b`), and this section adds
  * no separator at all — the pane's rules only sit between major blocks.
  */
@@ -47,6 +53,7 @@ import { Input } from "@/components/ui/input";
 import { useI18n, type MessageKey } from "@/lib/i18n";
 import {
   commandErrorMessage,
+  openExternalUrl,
   piAuthCheck,
   piCliRun,
   piCliStart,
@@ -108,6 +115,60 @@ const AUTH_STATE_KEYS: Record<PiAuthState, MessageKey> = {
 };
 
 /**
+ * S3: any absolute `http(s)` URL in a streamed line. The device-code flow prints
+ * the OAuth URL on its own line, and terminals/pi may wrap it in punctuation, so
+ * the match stops at whitespace or a quote and the tail is trimmed below.
+ */
+const URL_PATTERN = /https?:\/\/[^\s<>"'`]+/g;
+
+/** `)` `.` `,` and friends close a sentence, not a URL: they never travel to the browser. */
+const TRAILING_PUNCTUATION = /[)\]}.,;:!'"»”]+$/;
+
+/**
+ * S3: what a sign-in link looks like. An OAuth URL names its own purpose in the
+ * path (`/oauth/authorize`, `/login`, device flows) or only in its query, so the
+ * whole URL is searched. It is a preference, not a filter: a line with no such
+ * word still yields its first well-formed URL, because guessing wrong is better
+ * than leaving the human to hunt for a link pi printed.
+ */
+const SIGN_IN_HINT =
+  /(auth|oauth|log-?in|sign-?in|authoriz|device|consent|verify)/i;
+
+/**
+ * S3: the URL a browser can actually receive. Parsing it is also the guard that
+ * a truncated or mangled line never reaches the system opener.
+ */
+function normalizeUrl(raw: string): string | null {
+  const trimmed = raw.replace(TRAILING_PUNCTUATION, "");
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    if (parsed.hostname === "") return null;
+    return trimmed;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * S3: the first sign-in-looking URL of the streamed lines, `null` until pi prints
+ * one. The first match is final for the session: the URL pi generates does not
+ * change while the child waits for the callback.
+ */
+function extractSignInUrl(lines: string[]): string | null {
+  let fallback: string | null = null;
+  for (const line of lines) {
+    for (const match of line.matchAll(URL_PATTERN)) {
+      const url = normalizeUrl(match[0]);
+      if (url === null) continue;
+      if (SIGN_IN_HINT.test(url)) return url;
+      fallback ??= url;
+    }
+  }
+  return fallback;
+}
+
+/**
  * S5: the rows are the configured providers plus the well-known subscription
  * ids, deduplicated in first-seen order so a provider that is both never shows
  * twice.
@@ -145,6 +206,19 @@ const loginRunning = ref(false);
 const loginFinished = ref(false);
 /** Its exit code, `null` when it was killed by a signal (or still running). */
 const loginExitCode = ref<number | null>(null);
+/**
+ * S3: the sign-in URL pi just printed, `null` while it has not printed one. It is
+ * never stored and never restored: it belongs to the live child only.
+ */
+const signInUrl = ref<string | null>(null);
+/**
+ * S3: the session id whose URL was already handed to the browser. Auto-open happens
+ * once per login session even if the same URL shows up on several lines; a manual
+ * "Open in browser" click is a user action and is not counted here.
+ */
+const autoOpenedFor = ref<string | null>(null);
+/** The system opener rejected the URL, so the block says to copy it instead. */
+const openFailed = ref(false);
 
 /** S3: the output block, scrolled to the newest line as it arrives. */
 const outputEl = ref<HTMLElement | null>(null);
@@ -216,6 +290,10 @@ async function stopLiveSession() {
   loginRunning.value = false;
   loginFinished.value = false;
   loginExitCode.value = null;
+  // The URL belonged to the child that just went away: no link outlives it.
+  signInUrl.value = null;
+  autoOpenedFor.value = null;
+  openFailed.value = false;
   if (!live) return;
   try {
     await piCliStop(live.sessionId);
@@ -223,6 +301,29 @@ async function stopLiveSession() {
     // Best effort: the id is already forgotten here, and Rust kills every child
     // with the host anyway.
   }
+}
+
+/**
+ * S3: hands one URL to the system browser. A rejection is not fatal: the block
+ * stays on screen with the URL, which is the manual fallback.
+ */
+async function openInBrowser(url: string) {
+  openFailed.value = false;
+  try {
+    await openExternalUrl(url);
+  } catch {
+    openFailed.value = true;
+  }
+}
+
+/**
+ * S3: the user asked for it again. Only the URL the current child printed can be
+ * opened, so a finished session has nothing left to hand to the browser.
+ */
+function openSignInUrl() {
+  const url = signInUrl.value;
+  if (url === null) return;
+  void openInBrowser(url);
 }
 
 /** S3: the streamed events of the one session this section owns. */
@@ -234,6 +335,10 @@ function handleCliEvent(event: PiCliEvent) {
     loginRunning.value = false;
     loginFinished.value = true;
     loginExitCode.value = event.exitCode ?? null;
+    // The sign-in is over, so the link is spent; the streamed lines stay on
+    // screen as the outcome pi printed last.
+    signInUrl.value = null;
+    openFailed.value = false;
     // Rust keeps a session registered until it is stopped, so reap the finished
     // child here instead of leaving an id in the registry for the whole app run.
     void piCliStop(live.sessionId).catch(() => {});
@@ -260,6 +365,9 @@ async function startLogin(provider: string) {
     loginCode.value = "";
     loginFinished.value = false;
     loginExitCode.value = null;
+    signInUrl.value = null;
+    autoOpenedFor.value = null;
+    openFailed.value = false;
     const sessionId = await piCliStart([
       "auth",
       "login",
@@ -360,6 +468,29 @@ watch(
   },
   { immediate: true },
 );
+
+// S3: the sign-in URL is read out of the stream as it arrives and kept for the
+// rest of the session. Re-reading the whole stream is cheap (pi prints a handful
+// of lines) and keeps the extraction free of parse state.
+watch(
+  () => loginLines.value,
+  (lines) => {
+    if (signInUrl.value !== null) return;
+    const found = extractSignInUrl(lines);
+    if (found !== null) signInUrl.value = found;
+  },
+);
+
+// S3: auto-open, at most once per login session. The guard is the session id, so
+// a re-printed URL, a re-render or a second watcher tick cannot open the browser
+// again; a new login has a new id and therefore earns its own single open.
+watch(signInUrl, (url) => {
+  const live = session.value;
+  if (url === null || live === null) return;
+  if (autoOpenedFor.value === live.sessionId) return;
+  autoOpenedFor.value = live.sessionId;
+  void openInBrowser(url);
+});
 
 onMounted(async () => {
   const unsubscribe = await subscribePiCli(handleCliEvent);
@@ -468,6 +599,41 @@ onBeforeUnmount(() => {
                     code: loginExitCode,
                   })
             }}
+          </p>
+
+          <!-- S3: the URL pi printed, standing on its own so nobody has to hunt
+               for it inside the stream. It was opened once automatically; the
+               button is the manual fallback, and the whole block disappears
+               with the child that printed it. -->
+          <div
+            v-if="signInUrl"
+            class="space-y-1.5 rounded-md border border-primary/40 bg-primary/5 p-2"
+          >
+            <p class="text-xs font-medium">
+              {{ t("settings.accounts.login.urlTitle") }}
+            </p>
+            <p
+              class="select-all truncate font-mono text-xs text-foreground"
+              :title="signInUrl"
+            >
+              {{ signInUrl }}
+            </p>
+            <Button
+              type="button"
+              size="sm"
+              variant="secondary"
+              class="h-7"
+              @click="openSignInUrl"
+            >
+              {{ t("settings.accounts.login.openBrowser") }}
+            </Button>
+            <p v-if="openFailed" class="text-xs text-destructive">
+              {{ t("settings.accounts.login.openFailed") }}
+            </p>
+          </div>
+
+          <p v-if="signInUrl" class="text-xs text-muted-foreground">
+            {{ t("settings.accounts.login.callbackHint") }}
           </p>
 
           <form

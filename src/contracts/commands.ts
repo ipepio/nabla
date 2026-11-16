@@ -3,6 +3,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type { AgentEventEnvelope } from "./agent-events";
 import type {
   AppSettings,
@@ -226,6 +227,29 @@ export async function subscribePiCli(
   return listen<PiCliEvent>("pi-cli", ({ payload }) => {
     handler(payload);
   });
+}
+
+// ── system opener seam (S3 of `odd/tasks/pi-cli-bridge.md`) ──────────────────
+
+/**
+ * S3: hands an absolute `http(s)` URL to the system browser through the opener
+ * plugin the app already installs (`opener:default` capability). The import
+ * stays here because no component imports the Tauri API directly (contract-seam
+ * rule, AGENTS.md 1).
+ *
+ * Only URLs the UI just generated are ever passed through: nothing is stored, so
+ * there is no history to replay. A rejected call means the browser did not open;
+ * the caller keeps the URL on screen as the manual fallback.
+ */
+export function openExternalUrl(url: string): Promise<void> {
+  // Only web links: the opener can also reach local files and handlers, and this
+  // seam exists for the sign-in URL a browser has to load.
+  if (!/^https?:\/\//i.test(url)) {
+    return Promise.reject(
+      new Error("Only absolute http(s) URLs can be opened."),
+    );
+  }
+  return openUrl(url);
 }
 
 // ── pi runtime seam (R3, R4) ─────────────────────────────────────────────────
