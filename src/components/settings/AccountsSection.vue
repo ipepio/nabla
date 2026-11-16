@@ -16,6 +16,13 @@
  * There is only ever one login at a time: starting another stops the previous
  * one, and leaving this pane stops whatever is live.
  *
+ * S1 of `models-by-provider.md`: the real OpenAI login completes by itself on
+ * the local callback (`127.0.0.1:1455`), so the default face of a login is one
+ * short line and a way out. The streamed output, the extracted URL, the
+ * "Open in browser" button and the paste field are backup, and they live behind
+ * a disclosure the human opens on purpose. A finished login collapses to its
+ * outcome: one confirmation on success, the last meaningful line on failure.
+ *
  * S4: the badge is `pi auth check` per provider — never a guess — and "Sign out"
  * runs `pi auth logout <provider>` behind a confirmation. Credentials stay in
  * pi's `auth.json`: this component never sees a secret, only a state word.
@@ -38,6 +45,7 @@ import {
   watch,
   type ComponentPublicInstance,
 } from "vue";
+import { ChevronRightIcon } from "@lucide/vue";
 import { Badge, type BadgeVariants } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -219,6 +227,106 @@ const signInUrl = ref<string | null>(null);
 const autoOpenedFor = ref<string | null>(null);
 /** The system opener rejected the URL, so the block says to copy it instead. */
 const openFailed = ref(false);
+/**
+ * S1: the "Trouble signing in?" disclosure, closed by default. It is per login
+ * session on purpose: once the human opens it, later lines of the same login do
+ * not fold it again, and the next login starts quiet.
+ */
+const detailsOpen = ref(false);
+
+/**
+ * S1: the longest failure line quoted on the status line. The rest is detail and
+ * stays in the disclosure; a wall of text is exactly what this unit removes.
+ */
+const FAILURE_LINE_MAX = 160;
+
+/** S1: the three faces of a login, in the order they supersede each other. */
+type LoginPhase = "running" | "succeeded" | "failed";
+
+/**
+ * S1: exits 0 is success; any other end — a code, a signal, a killed child — is
+ * a failure and keeps its reason. The child is still `running` until it exits.
+ */
+const loginPhase = computed<LoginPhase>(() => {
+  if (!loginFinished.value) return "running";
+  return loginExitCode.value === 0 ? "succeeded" : "failed";
+});
+
+/**
+ * S1: what the running line says. A login whose browser never opened would wait
+ * forever in silence, so that one fallback replaces the message and points at
+ * the disclosure instead of dumping the URL on the row.
+ */
+const runningStatus = computed<string>(() =>
+  openFailed.value
+    ? t("settings.accounts.login.openManually")
+    : t("settings.accounts.login.waitingBrowser"),
+);
+
+/** S1: the last non-blank line pi printed, the only one worth quoting. */
+function lastMeaningfulLine(lines: string[]): string | null {
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = (lines[index] ?? "").trim();
+    if (line !== "") return line;
+  }
+  return null;
+}
+
+/** S1: short enough for one line; the disclosure keeps whatever it cut. */
+function truncateLine(line: string): string {
+  return line.length <= FAILURE_LINE_MAX
+    ? line
+    : `${line.slice(0, FAILURE_LINE_MAX - 1)}…`;
+}
+
+/** S1: the failure line — pi's own last word, or the exit code when it said none. */
+const failureLine = computed<string>(() => {
+  const line = lastMeaningfulLine(loginLines.value);
+  if (line !== null) return line;
+  const code = loginExitCode.value;
+  return code === null
+    ? t("settings.accounts.login.failed")
+    : t("settings.accounts.login.failedWithCode", { code });
+});
+
+/** S1: the single line a login shows, whichever face it is in. */
+const statusText = computed<string>(() => {
+  switch (loginPhase.value) {
+    case "running":
+      return runningStatus.value;
+    case "succeeded":
+      return t("settings.accounts.login.succeeded");
+    case "failed":
+      return truncateLine(failureLine.value);
+  }
+});
+
+/** S1: the untruncated failure stays reachable without widening the row. */
+const statusTitle = computed<string>(() =>
+  loginPhase.value === "failed" ? failureLine.value : statusText.value,
+);
+
+/** S1: semantic tone only — success, failure and the manual fallback explain themselves. */
+const statusClass = computed<string>(() => {
+  switch (loginPhase.value) {
+    case "succeeded":
+      return "text-success";
+    case "failed":
+      return "text-destructive";
+    default:
+      return openFailed.value ? "text-warning" : "text-muted-foreground";
+  }
+});
+
+/** S1: one disclosure per row, so `aria-controls` points at this login's panel. */
+function detailsPanelId(provider: string): string {
+  return `login-details-${provider}`;
+}
+
+/** S1: the human decides when the backup controls appear. */
+function toggleDetails() {
+  detailsOpen.value = !detailsOpen.value;
+}
 
 /** S3: the output block, scrolled to the newest line as it arrives. */
 const outputEl = ref<HTMLElement | null>(null);
@@ -294,6 +402,7 @@ async function stopLiveSession() {
   signInUrl.value = null;
   autoOpenedFor.value = null;
   openFailed.value = false;
+  detailsOpen.value = false;
   if (!live) return;
   try {
     await piCliStop(live.sessionId);
@@ -339,6 +448,10 @@ function handleCliEvent(event: PiCliEvent) {
     // screen as the outcome pi printed last.
     signInUrl.value = null;
     openFailed.value = false;
+    // S1: a login that worked leaves one confirmation and nothing to read, so
+    // the transcript of a successful child is dropped here. A failed one keeps
+    // its lines: they are the detail behind the quoted error.
+    if (event.exitCode === 0) loginLines.value = [];
     // Rust keeps a session registered until it is stopped, so reap the finished
     // child here instead of leaving an id in the registry for the whole app run.
     void piCliStop(live.sessionId).catch(() => {});
@@ -348,7 +461,7 @@ function handleCliEvent(event: PiCliEvent) {
   }
   if (event.line === undefined) return;
   loginLines.value = [...loginLines.value, event.line];
-  void scrollOutputToEnd();
+  if (detailsOpen.value) void scrollOutputToEnd();
 }
 
 /**
@@ -368,6 +481,7 @@ async function startLogin(provider: string) {
     signInUrl.value = null;
     autoOpenedFor.value = null;
     openFailed.value = false;
+    detailsOpen.value = false;
     const sessionId = await piCliStart([
       "auth",
       "login",
@@ -410,6 +524,23 @@ async function cancelLogin() {
   await stopLiveSession();
   loginLines.value = [];
   loginCode.value = "";
+}
+
+/**
+ * S1: drops the outcome of a login that already ended. The child is gone by
+ * then (exit reaps it), so this is a view reset and never a second stop.
+ */
+function dismissLogin() {
+  session.value = null;
+  loginLines.value = [];
+  loginCode.value = "";
+  loginRunning.value = false;
+  loginFinished.value = false;
+  loginExitCode.value = null;
+  signInUrl.value = null;
+  autoOpenedFor.value = null;
+  openFailed.value = false;
+  detailsOpen.value = false;
 }
 
 /** S4: opens the sign-out confirmation for one provider. */
@@ -480,6 +611,12 @@ watch(
     if (found !== null) signInUrl.value = found;
   },
 );
+
+// S1: the stream follows its newest line, but only while the human has the
+// disclosure open; a closed panel does no work and never scrolls.
+watch(detailsOpen, (open) => {
+  if (open) void scrollOutputToEnd();
+});
 
 // S3: auto-open, at most once per login session. The guard is the session id, so
 // a re-printed URL, a re-render or a second watcher tick cannot open the browser
@@ -570,112 +707,155 @@ onBeforeUnmount(() => {
           {{ errors[id] }}
         </p>
 
-        <!-- S3: the live device-code flow. pi prints the URL and the user code;
-             the code the browser shows is pasted back here, to the child's
-             stdin. Only one of these exists at a time. -->
-        <div v-if="session?.provider === id" class="mt-2 space-y-2">
-          <div
-            :ref="bindOutput"
-            role="log"
-            aria-live="polite"
-            class="max-h-40 overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/40 p-2 font-mono text-xs text-foreground"
-          >
-            <p v-for="(line, index) in loginLines" :key="index" class="m-0">
-              {{ line }}
-            </p>
-            <p
-              v-if="!loginLines.length"
-              class="m-0 text-muted-foreground"
-            >
-              {{ t("settings.accounts.login.waiting") }}
-            </p>
-          </div>
-
-          <p v-if="loginFinished" class="text-xs text-muted-foreground">
-            {{
-              loginExitCode === null
-                ? t("settings.accounts.login.finished")
-                : t("settings.accounts.login.finishedCode", {
-                    code: loginExitCode,
-                  })
-            }}
-          </p>
-
-          <!-- S3: the URL pi printed, standing on its own so nobody has to hunt
-               for it inside the stream. It was opened once automatically; the
-               button is the manual fallback, and the whole block disappears
-               with the child that printed it. -->
-          <div
-            v-if="signInUrl"
-            class="space-y-1.5 rounded-md border border-primary/40 bg-primary/5 p-2"
-          >
-            <p class="text-xs font-medium">
-              {{ t("settings.accounts.login.urlTitle") }}
-            </p>
-            <p
-              class="select-all truncate font-mono text-xs text-foreground"
-              :title="signInUrl"
-            >
-              {{ signInUrl }}
-            </p>
-            <Button
-              type="button"
-              size="sm"
-              variant="secondary"
-              class="h-7"
-              @click="openSignInUrl"
-            >
-              {{ t("settings.accounts.login.openBrowser") }}
-            </Button>
-            <p v-if="openFailed" class="text-xs text-destructive">
-              {{ t("settings.accounts.login.openFailed") }}
-            </p>
-          </div>
-
-          <p v-if="signInUrl" class="text-xs text-muted-foreground">
-            {{ t("settings.accounts.login.callbackHint") }}
-          </p>
-
-          <form
-            class="flex flex-wrap items-center gap-2"
-            @submit.prevent="submitCode"
-          >
-            <Input
-              v-model="loginCode"
-              class="h-8 min-w-0 flex-1 font-mono text-sm"
-              autocomplete="off"
-              spellcheck="false"
-              :disabled="!loginRunning || sendingCode"
-              :aria-label="t('settings.accounts.login.codeLabel', { id })"
-              :placeholder="t('settings.accounts.login.codePlaceholder')"
+        <!-- S1: the live sign-in. Its default face is one line — what it waits
+             for, and the way out — because the real flow finishes by itself on
+             the local callback. Only one of these exists at a time. -->
+        <div v-if="session?.provider === id" class="mt-2 space-y-1.5">
+          <div class="flex items-center gap-2">
+            <span
+              v-if="loginPhase === 'running'"
+              class="size-3 shrink-0 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-muted-foreground"
+              aria-hidden="true"
             />
-            <Button
-              type="submit"
-              size="sm"
-              :disabled="
-                loginCode.trim() === '' || sendingCode || !loginRunning
-              "
+            <p
+              role="status"
+              aria-live="polite"
+              class="min-w-0 flex-1 truncate text-xs"
+              :class="statusClass"
+              :title="statusTitle"
             >
-              {{
-                sendingCode
-                  ? t("settings.accounts.login.sending")
-                  : t("settings.accounts.login.continue")
-              }}
-            </Button>
+              {{ statusText }}
+            </p>
             <Button
+              v-if="loginPhase === 'running'"
               type="button"
               variant="ghost"
               size="sm"
-              :disabled="sendingCode"
+              class="h-6 shrink-0 px-2 text-xs"
               @click="cancelLogin"
             >
               {{ t("common.cancel") }}
             </Button>
-          </form>
+            <Button
+              v-else
+              type="button"
+              variant="ghost"
+              size="sm"
+              class="h-6 shrink-0 px-2 text-xs"
+              @click="dismissLogin"
+            >
+              {{ t("common.dismiss") }}
+            </Button>
+          </div>
 
-          <p class="text-xs text-muted-foreground">
-            {{ t("settings.accounts.login.instructions") }}
-          </p>
+          <!-- S1: the backup path — stream, URL, browser button and paste field —
+               is detail. It is closed until the human asks for it, stays open
+               for the rest of this login, and a successful one has nothing left
+               to disclose. -->
+          <div v-if="loginPhase !== 'succeeded'">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              class="h-6 px-1 text-xs font-normal text-muted-foreground"
+              :aria-expanded="detailsOpen"
+              :aria-controls="detailsPanelId(id)"
+              @click="toggleDetails"
+            >
+              <ChevronRightIcon
+                class="size-3 shrink-0 transition-transform"
+                :class="detailsOpen ? 'rotate-90' : ''"
+                aria-hidden="true"
+              />
+              {{ t("settings.accounts.login.disclosure") }}
+            </Button>
+
+            <!-- S1: `v-show` keeps the panel in the document, so the disclosure
+                 button's `aria-controls` always resolves; a hidden node is not a
+                 live region, so nothing is announced until it is opened. -->
+            <div
+              v-show="detailsOpen"
+              :id="detailsPanelId(id)"
+              class="mt-1.5 space-y-2"
+            >
+              <div
+                :ref="bindOutput"
+                role="log"
+                :aria-label="t('settings.accounts.login.output')"
+                class="max-h-40 overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/40 p-2 font-mono text-xs text-foreground"
+              >
+                <p v-for="(line, index) in loginLines" :key="index" class="m-0">
+                  {{ line }}
+                </p>
+                <p v-if="!loginLines.length" class="m-0 text-muted-foreground">
+                  {{ t("settings.accounts.login.waitingBrowser") }}
+                </p>
+              </div>
+
+              <!-- S3: the URL pi printed, standing on its own so nobody has to
+                   hunt for it inside the stream. It was opened once
+                   automatically; the button is the manual fallback, and the
+                   whole block disappears with the child that printed it. -->
+              <div
+                v-if="signInUrl"
+                class="space-y-1.5 rounded-md border border-primary/40 bg-primary/5 p-2"
+              >
+                <p class="text-xs font-medium">
+                  {{ t("settings.accounts.login.urlTitle") }}
+                </p>
+                <p
+                  class="truncate font-mono text-xs text-foreground select-all"
+                  :title="signInUrl"
+                >
+                  {{ signInUrl }}
+                </p>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  class="h-7"
+                  @click="openSignInUrl"
+                >
+                  {{ t("settings.accounts.login.openBrowser") }}
+                </Button>
+                <p v-if="openFailed" class="text-xs text-destructive">
+                  {{ t("settings.accounts.login.openFailed") }}
+                </p>
+              </div>
+
+              <p v-if="signInUrl" class="text-xs text-muted-foreground">
+                {{ t("settings.accounts.login.callbackHint") }}
+              </p>
+
+              <form
+                class="flex flex-wrap items-center gap-2"
+                @submit.prevent="submitCode"
+              >
+                <Input
+                  v-model="loginCode"
+                  class="h-8 min-w-0 flex-1 font-mono text-sm"
+                  autocomplete="off"
+                  spellcheck="false"
+                  :disabled="!loginRunning || sendingCode"
+                  :aria-label="t('settings.accounts.login.codeLabel', { id })"
+                  :placeholder="t('settings.accounts.login.codePlaceholder')"
+                />
+                <Button
+                  type="submit"
+                  size="sm"
+                  :disabled="
+                    loginCode.trim() === '' || sendingCode || !loginRunning
+                  "
+                >
+                  {{
+                    sendingCode
+                      ? t("settings.accounts.login.sending")
+                      : t("settings.accounts.login.continue")
+                  }}
+                </Button>
+              </form>
+            </div>
+          </div>
         </div>
       </li>
     </ul>
