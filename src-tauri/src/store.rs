@@ -276,6 +276,17 @@ impl Store {
         Ok(affected > 0)
     }
 
+    /// Marks a session as used now, which is what the drawer sorts by
+    /// (`updated_at DESC`). Metadata only: the transcript stays in pi's file.
+    pub fn touch_session(&self, id: i64) -> StoreResult<bool> {
+        let conn = self.conn()?;
+        let affected = conn.execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![now_iso(), id],
+        )?;
+        Ok(affected > 0)
+    }
+
     /// Looks one indexed session up by its row id, the runtime key of the pi
     /// process (S1). `None` means the id is not (or no longer) indexed: the
     /// command layer reports that instead of spawning anything for it.
@@ -707,6 +718,32 @@ mod tests {
     // S1/S3: the runtime key is the session row id, so opening a session needs
     // a lookup by that id alone — no workspace in scope, and no row means no
     // process. The answer is metadata only, like every session read.
+    #[test]
+    fn touch_session_moves_it_to_the_top_of_the_list() {
+        let db = TempDb::new("session_touch");
+        let store = Store::open(&db.0).expect("open");
+        let ws = ws_new(&store, "/tmp/proj-touch");
+        let mut older = session_new(ws.id, "/sessions/older.jsonl");
+        older.updated_at = "2026-11-14T09:00:00Z".into();
+        let mut newer = session_new(ws.id, "/sessions/newer.jsonl");
+        newer.updated_at = "2026-11-14T12:00:00Z".into();
+        let old_row = store.upsert_session(&older).expect("insert old");
+        store.upsert_session(&newer).expect("insert new");
+        // Baseline: the later timestamp wins.
+        assert_eq!(
+            store.list_sessions(ws.id).expect("list")[0].pi_session_path,
+            "/sessions/newer.jsonl"
+        );
+        // Touching the old one makes it the most recent activity, which is what
+        // the drawer must show first even when the session predates the others.
+        assert!(store.touch_session(old_row.id).expect("touch"));
+        assert_eq!(
+            store.list_sessions(ws.id).expect("list")[0].pi_session_path,
+            "/sessions/older.jsonl"
+        );
+        assert!(!store.touch_session(9_999).expect("unknown is a no-op"));
+    }
+
     #[test]
     fn set_session_title_persists_the_alias() {
         let db = TempDb::new("session_title");

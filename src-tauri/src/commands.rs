@@ -670,6 +670,9 @@ pub fn send_prompt(
         .send(&session_id.to_string(), "prompt", fields)
         .map_err(display_err)?;
     if response.success {
+        // A sent prompt is activity: the drawer sorts by `updated_at`, so the
+        // session in use must climb to the top instead of sinking by creation.
+        let _ = state.store.touch_session(session_id);
         Ok(())
     } else {
         Err(response
@@ -1006,12 +1009,17 @@ fn open_session_core(
 /// closed, returns the live process untouched when it is already open (S5).
 #[tauri::command]
 pub fn open_session(state: State<'_, AppState>, session_id: String) -> Result<SessionDto, String> {
-    open_session_core(
+    let opened = open_session_core(
         &state.store,
         &state.runtime,
         &state.config_dir,
         &session_id,
-    )
+    )?;
+    // Opening an existing session is activity too: it must show up as recent.
+    if let Ok(row_id) = session_id.parse::<i64>() {
+        let _ = state.store.touch_session(row_id);
+    }
+    Ok(opened)
 }
 
 /// S3: transcript of an existing session, read from the JSONL file pi owns.
