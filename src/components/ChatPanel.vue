@@ -228,6 +228,10 @@ function attachTranscriptViewport(): void {
   viewport.addEventListener("scroll", handleTranscriptScroll, { passive: true });
   transcriptResize ??= new ResizeObserver(handleViewportResize);
   transcriptResize.observe(viewport);
+  // The content element is observed too: collapsing the reasoning block (or a
+  // code block growing) changes its height without touching the viewport, and a
+  // view glued to the bottom must follow that change as well.
+  if (content !== null) transcriptResize.observe(content);
   // A freshly mounted transcript has no position to preserve: open at the end.
   scrollToBottom();
 }

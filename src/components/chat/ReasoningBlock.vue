@@ -56,10 +56,13 @@ function toggle() {
         aria-hidden="true"
       />
     </button>
+    <!-- Bounded height with its own scroll: a long chain of thought must not
+         push the answer off screen, and scrolling inside it must not scroll the
+         transcript (overscroll-contain). -->
     <div
       v-show="expanded"
       :id="contentId"
-      class="mr-2.5 mb-2 ml-2.5 border-l-2 border-border py-0.5 pl-2.5 text-xs leading-relaxed whitespace-pre-wrap text-muted-foreground"
+      class="mr-2.5 mb-2 ml-2.5 max-h-56 overflow-y-auto overscroll-contain border-l-2 border-border py-0.5 pr-1 pl-2.5 text-xs leading-relaxed whitespace-pre-wrap text-muted-foreground"
     >
       {{ text }}
     </div>
