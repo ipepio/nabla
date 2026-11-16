@@ -251,6 +251,25 @@ pub async fn discover_models(
         .map_err(display_err)
 }
 
+/// S2/S4: refreshes the model list of a provider that is already in pi's file.
+///
+/// The editor sends only the id: the base url and the api key are read from
+/// `~/.pi/agent/models.json` inside Rust, so the key never crosses into the
+/// webview just to list models. An unknown id, a non-http url and a remote
+/// provider without a key are errors before any request; a provider on the
+/// machine itself (`localhost`, `127.0.0.1`, `::1`) needs no key, which is the
+/// normal case for llama.cpp, Ollama or a local vLLM. The answer is the same
+/// `[{ id, name }]` the create form's discovery returns.
+#[tauri::command]
+pub async fn discover_provider_models(
+    state: State<'_, AppState>,
+    provider_id: String,
+) -> Result<Vec<ModelOption>, String> {
+    crate::providers::discover_provider_models(&models_path(&state), &provider_id)
+        .await
+        .map_err(display_err)
+}
+
 /// S3: removes one provider from pi's configuration, backup and atomic write
 /// included. `true` means an entry was removed; an id the file does not have is
 /// `false` and not an error, which keeps the delete idempotent (the same stance

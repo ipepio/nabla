@@ -81,6 +81,9 @@ pub fn run() {
             commands::list_providers,
             commands::save_provider,
             commands::discover_models,
+            // S2/S4: refreshing an existing provider's models from pi's file, so
+            // the editor never needs the api key in the webview.
+            commands::discover_provider_models,
             // S3/S4: removing a provider and setting its api key in pi's file,
             // with the same backup and atomic write as `save_provider`.
             commands::delete_provider,

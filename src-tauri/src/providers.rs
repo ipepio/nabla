@@ -112,6 +112,10 @@ pub enum ProvidersError {
     InvalidModelId(String),
     InvalidBaseUrl(String),
     EmptyApiKey,
+    /// S2: a remote provider with nothing to authenticate with. Only discovery
+    /// can hit this, and a provider on the machine itself is exempt (see
+    /// `is_local_endpoint`).
+    MissingApiKey(String),
     /// A provider entry the file does not have. Only `set_provider_key` can hit
     /// this: a key belongs to an entry that exists, and nothing invents providers.
     UnknownProvider(String),
@@ -136,6 +140,9 @@ impl std::fmt::Display for ProvidersError {
                 write!(f, "provider base url must be http(s): {url:?}")
             }
             ProvidersError::EmptyApiKey => write!(f, "provider api key must not be empty"),
+            ProvidersError::MissingApiKey(id) => {
+                write!(f, "provider {id} has no api key configured")
+            }
             ProvidersError::UnknownProvider(id) => write!(f, "unknown provider: {id}"),
             ProvidersError::Http(m) => write!(f, "providers http error: {m}"),
         }
@@ -832,10 +839,12 @@ pub async fn discover_models(
         .timeout(MODELS_TIMEOUT)
         .build()
         .map_err(|e| ProvidersError::Http(e.to_string()))?;
-    let response = client
-        .get(&endpoint)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .header("Accept", "application/json")
+    let mut request = client.get(&endpoint).header("Accept", "application/json");
+    // A keyless local server gets no header at all; see `bearer_header`.
+    if let Some(authorization) = bearer_header(api_key) {
+        request = request.header("Authorization", authorization);
+    }
+    let response = request
         .send()
         .await
         .map_err(|e| ProvidersError::Http(format!("{endpoint}: {e}")))?;
@@ -848,6 +857,112 @@ pub async fn discover_models(
         .await
         .map_err(|e| ProvidersError::Http(format!("{endpoint}: {e}")))?;
     Ok(parse_models_response(&body))
+}
+
+/// S2: the endpoint and the key of a provider that is **already** configured,
+/// read from pi's own file server-side.
+///
+/// This is what lets the settings editor refresh the model list of an existing
+/// provider without ever holding its key (S4): the webview sends an id, the key
+/// goes from `models.json` into the request and nowhere else. It is never logged
+/// and never part of an answer or an error.
+///
+/// The provider must already exist (`UnknownProvider`, nothing is invented), its
+/// id and url are validated before any request (a malformed id or a non-http url
+/// never reaches the network), and the key may only be missing when the server
+/// is local (see `is_local_endpoint`). The answer is `(base_url, api_key)`, with
+/// an empty key for the local case.
+pub fn provider_discovery_credentials(
+    path: &Path,
+    provider_id: &str,
+) -> ProvidersResult<(String, String)> {
+    let id = provider_id.trim();
+    validate_id(id)?;
+
+    let (root, _) = read_root(path)?;
+    let entry = root
+        .get("providers")
+        .and_then(|v| v.as_object())
+        .and_then(|providers| providers.get(id))
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| ProvidersError::UnknownProvider(id.to_string()))?;
+
+    let base_url = entry
+        .get("baseUrl")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or_default();
+    validate_base_url(base_url)?;
+
+    let api_key = entry
+        .get("apiKey")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|key| !key.is_empty());
+    match api_key {
+        Some(key) => Ok((base_url.to_string(), key.to_string())),
+        // A server on this machine is commonly started without a key.
+        None if is_local_endpoint(base_url) => Ok((base_url.to_string(), String::new())),
+        None => Err(ProvidersError::MissingApiKey(id.to_string())),
+    }
+}
+
+/// S2: discovery for a provider the file already has, over the same HTTP path,
+/// parser and timeout as the create form uses.
+pub async fn discover_provider_models(
+    path: &Path,
+    provider_id: &str,
+) -> ProvidersResult<Vec<ModelOption>> {
+    let (base_url, api_key) = provider_discovery_credentials(path, provider_id)?;
+    discover_models(&base_url, &api_key).await
+}
+
+/// The `Authorization` value of a discovery request, or `None` when there is no
+/// key to send.
+///
+/// An empty key is only reachable for a local server, and stripping it there
+/// means the request carries no `Authorization` header instead of the malformed
+/// `Bearer ` (no token) that strict servers reject.
+pub fn bearer_header(api_key: &str) -> Option<String> {
+    let key = api_key.trim();
+    if key.is_empty() {
+        None
+    } else {
+        Some(format!("Bearer {key}"))
+    }
+}
+
+/// S2: whether a base url points at the machine itself, the one case where a
+/// provider may have no api key at all.
+///
+/// Loopback means the host is `localhost`, `127.0.0.1` or IPv6 `::1`, with or
+/// without a port and with any path: llama.cpp, Ollama, LM Studio and a local
+/// vLLM usually start with no auth, and requiring a key there would make a
+/// perfectly working provider impossible to refresh. The comparison is on the
+/// parsed host, never on a substring, so `localhost.evil.test` and
+/// `127.0.0.1.example.com` stay remote and still need their key.
+pub fn is_local_endpoint(base_url: &str) -> bool {
+    matches!(
+        url_host(base_url).as_deref(),
+        Some("localhost") | Some("127.0.0.1") | Some("::1")
+    )
+}
+
+/// Host of an http(s) url, lowercased: userinfo, port, path, query and fragment
+/// are dropped, and an IPv6 literal keeps only what is inside the brackets.
+fn url_host(base_url: &str) -> Option<String> {
+    let lower = base_url.trim().to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // `user:pass@host` — the host is what follows the last `@`.
+    let authority = authority.rsplit('@').next()?;
+    let host = match authority.strip_prefix('[') {
+        Some(after_bracket) => after_bracket.split(']').next()?,
+        None => authority.split(':').next()?,
+    };
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 /// `{base}/models` with trailing slashes removed from the base url.
@@ -2129,6 +2244,237 @@ mod tests {
         assert!(parse_models_response("not json").is_empty());
         assert!(parse_models_response(r#"{"error":{"message":"nope"}}"#).is_empty());
         assert!(parse_models_response(r#"{"data":"nope"}"#).is_empty());
+    }
+
+    // ── discovery of an already-configured provider (S2, S4) ────────────────
+
+    /// A file with one remote provider (key padded with whitespace, as a human
+    /// pasting it may leave it), one provider pointing at a local server with no
+    /// key, one with a whitespace-only key and one with no `apiKey` key at all.
+    const DISCOVERY_FILE: &str = r#"{
+      "providers": {
+        "nan": {
+          "baseUrl": "https://nan.test/v1",
+          "apiKey": "  sk-nan-secret  "
+        },
+        "local": {
+          "baseUrl": "http://127.0.0.1:8080/v1",
+          "apiKey": ""
+        },
+        "blank": {
+          "baseUrl": "https://blank.test/v1",
+          "apiKey": "   "
+        },
+        "nokey": {
+          "baseUrl": "https://nokey.test/v1"
+        }
+      }
+    }"#;
+
+    // S2/S4: the endpoint and the key of an existing provider are read from pi's
+    // own file, server-side, so the editor never has to hold the key to refresh
+    // a model list.
+    #[test]
+    fn discovery_credentials_come_from_pis_file_trimmed() {
+        let dir = TempModelsDir::new("discovery_credentials");
+        dir.write(DISCOVERY_FILE);
+
+        assert_eq!(
+            provider_discovery_credentials(&dir.path(), "nan").expect("credentials"),
+            (
+                "https://nan.test/v1".to_string(),
+                "sk-nan-secret".to_string()
+            ),
+            "the url and the key are read back trimmed"
+        );
+
+        // The id is trimmed exactly like every other reader and writer of the
+        // file, so a stray newline from the UI is not an unknown provider.
+        assert_eq!(
+            provider_discovery_credentials(&dir.path(), " nan\n")
+                .expect("a padded id still finds the provider")
+                .0,
+            "https://nan.test/v1"
+        );
+    }
+
+    // S2: discovering with an id the file does not have is an error that names
+    // it; nothing is invented and nothing is written.
+    #[test]
+    fn discovery_of_an_unknown_provider_is_rejected() {
+        let dir = TempModelsDir::new("discovery_unknown");
+        dir.write(DISCOVERY_FILE);
+        let before = dir.read();
+
+        let err = provider_discovery_credentials(&dir.path(), "absent")
+            .expect_err("an unknown provider cannot be discovered");
+        match &err {
+            ProvidersError::UnknownProvider(id) => assert_eq!(id, "absent"),
+            other => panic!("expected UnknownProvider, got {other:?}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            "unknown provider: absent",
+            "the editor shows this verbatim"
+        );
+        assert_eq!(dir.read(), before, "a failed lookup writes nothing");
+        assert_eq!(dir.entries(), vec!["models.json".to_string()], "no backup");
+
+        // An entry that is not an object is not a provider either.
+        dir.write(r#"{"providers":{"weird":"nope"}}"#);
+        let before = dir.read();
+        match provider_discovery_credentials(&dir.path(), "weird").expect_err("not a provider") {
+            ProvidersError::UnknownProvider(id) => assert_eq!(id, "weird"),
+            other => panic!("expected UnknownProvider, got {other:?}"),
+        }
+        assert_eq!(dir.read(), before, "a failed lookup writes nothing");
+
+        // A file that was never written has no provider, and none is created.
+        let missing = TempModelsDir::new("discovery_missing_file");
+        assert!(matches!(
+            provider_discovery_credentials(&missing.path(), "absent"),
+            Err(ProvidersError::UnknownProvider(_))
+        ));
+        assert_eq!(missing.entries(), Vec::<String>::new(), "nothing is written");
+    }
+
+    // S2/S4: a remote provider without a key cannot be discovered, and the error
+    // names the provider without ever carrying the key it did not have.
+    #[test]
+    fn discovery_without_an_api_key_is_rejected() {
+        let dir = TempModelsDir::new("discovery_no_key");
+        dir.write(DISCOVERY_FILE);
+        let before = dir.read();
+
+        for id in ["blank", "nokey"] {
+            let err = provider_discovery_credentials(&dir.path(), id)
+                .expect_err("a remote provider needs a key");
+            match &err {
+                ProvidersError::MissingApiKey(value) => assert_eq!(value, id),
+                other => panic!("expected MissingApiKey for {id:?}, got {other:?}"),
+            }
+            assert_eq!(
+                err.to_string(),
+                format!("provider {id} has no api key configured")
+            );
+        }
+
+        assert_eq!(dir.read(), before, "a rejected lookup writes nothing");
+        assert_eq!(dir.entries(), vec!["models.json".to_string()]);
+    }
+
+    // S2: a server on this machine commonly runs without a key (llama.cpp,
+    // Ollama, LM Studio, a local vLLM), so an empty key is only an error for a
+    // remote endpoint. The rule is the host, never a substring of the url.
+    #[test]
+    fn a_local_provider_needs_no_api_key() {
+        let dir = TempModelsDir::new("discovery_local");
+        dir.write(DISCOVERY_FILE);
+
+        assert_eq!(
+            provider_discovery_credentials(&dir.path(), "local")
+                .expect("a local server needs no key"),
+            ("http://127.0.0.1:8080/v1".to_string(), String::new()),
+            "discovery proceeds with no key at all, not with a blank one"
+        );
+
+        for url in [
+            "http://localhost:11434/v1",
+            "https://localhost/v1",
+            "http://127.0.0.1:1234/v1",
+            "http://127.0.0.1",
+            "http://[::1]:8080/v1",
+            "HTTP://LOCALHOST:8080/v1",
+        ] {
+            assert!(is_local_endpoint(url), "{url} is loopback");
+        }
+        for url in [
+            "https://api.example.com/v1",
+            "http://192.168.1.10:8080/v1",
+            "http://localhost.evil.test/v1",
+            "http://127.0.0.1.example.com/v1",
+            "http://notlocalhost/v1",
+            "api.example.com/v1",
+        ] {
+            assert!(!is_local_endpoint(url), "{url} is remote");
+        }
+    }
+
+    // S2/S3: both inputs the file supplies are validated before any request, so a
+    // malformed id or a non-http url never reaches the network.
+    #[test]
+    fn discovery_rejects_a_malformed_id_or_a_non_http_base_url() {
+        let dir = TempModelsDir::new("discovery_bad_input");
+        dir.write(DISCOVERY_FILE);
+
+        for id in ["", "NaN", "nan me", "nan/nested", &"n".repeat(33)] {
+            match provider_discovery_credentials(&dir.path(), id)
+                .expect_err("a malformed id is rejected")
+            {
+                ProvidersError::InvalidId(value) => assert_eq!(value, id),
+                other => panic!("expected InvalidId for {id:?}, got {other:?}"),
+            }
+        }
+
+        let urls = TempModelsDir::new("discovery_bad_url");
+        urls.write(
+            r#"{"providers":{
+              "p":{"baseUrl":"ftp://x.test","apiKey":"k"},
+              "q":{"apiKey":"k"},
+              "r":{"baseUrl":"   ","apiKey":"k"},
+              "s":{"baseUrl":"file:///etc/passwd","apiKey":"k"}
+            }}"#,
+        );
+        for id in ["p", "q", "r", "s"] {
+            match provider_discovery_credentials(&urls.path(), id)
+                .expect_err("only http(s) is discoverable")
+            {
+                ProvidersError::InvalidBaseUrl(_) => {}
+                other => panic!("expected InvalidBaseUrl for {id:?}, got {other:?}"),
+            }
+        }
+    }
+
+    // S4: the key stays inside Rust. Every error the editor can show is checked,
+    // including the ones a failed discovery returns.
+    #[test]
+    fn the_api_key_never_appears_in_an_error_or_a_payload() {
+        let dir = TempModelsDir::new("discovery_no_leak");
+        dir.write(DISCOVERY_FILE);
+        let secret = "sk-nan-secret";
+
+        for id in ["absent", "blank", "nokey"] {
+            let message = provider_discovery_credentials(&dir.path(), id)
+                .expect_err("no credentials")
+                .to_string();
+            assert!(!message.contains(secret), "the key leaked: {message}");
+        }
+
+        // A successful lookup hands the key to the HTTP call and nothing else:
+        // the payload the editor receives has no field for it.
+        let (base_url, api_key) =
+            provider_discovery_credentials(&dir.path(), "nan").expect("credentials");
+        assert_eq!(api_key, secret);
+        assert!(!base_url.contains(secret));
+        let json = serde_json::to_string(&vec![ModelOption {
+            id: "m".to_string(),
+            name: "M".to_string(),
+        }])
+        .expect("serialize");
+        assert!(!json.contains(secret));
+        assert!(!json.contains("apiKey"), "no apiKey field: {json}");
+    }
+
+    // S2: a keyless local server must receive no `Authorization` header at all;
+    // `Bearer ` with an empty token is a malformed header some servers reject.
+    #[test]
+    fn the_bearer_header_is_omitted_when_there_is_no_key() {
+        assert_eq!(
+            bearer_header("  sk-abc\n"),
+            Some("Bearer sk-abc".to_string())
+        );
+        assert_eq!(bearer_header(""), None);
+        assert_eq!(bearer_header("   "), None);
     }
 
     // S2: a non-2xx answer must surface the status.
