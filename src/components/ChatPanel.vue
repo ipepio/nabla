@@ -33,7 +33,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   commandErrorMessage,
   getSettings,
-  listModels,
+  listProviderModels,
   saveSettings,
   sendPrompt,
   sessionStatus,
@@ -41,7 +41,7 @@ import {
 } from "@/contracts/commands";
 import type {
   AppSettings,
-  ModelInfo,
+  ProviderModels,
   SessionDto,
   TranscriptRole,
   WorkspaceInfo,
@@ -117,11 +117,25 @@ const transcriptLoading = computed(() =>
   isTranscriptLoading(currentSession.value?.sessionId ?? null),
 );
 
-// S5/S7: the model selector's data. `models` is whatever Rust reports (never a
-// hardcoded list here) and `settings` holds the persisted choice.
-const models = ref<ModelInfo[]>([]);
+// S5/S7: the model selector's data. `providerModels` is whatever Rust reports
+// from pi's own file — grouped by provider, never a hardcoded list here — and
+// `settings` holds the persisted choice (provider *and* model).
+const providerModels = ref<ProviderModels[]>([]);
 const settings = ref<AppSettings | null>(null);
 const savingModel = ref(false);
+
+/**
+ * S2 of `models-by-provider.md`: how many models the grouped selector can offer.
+ * A disabled model (L3) is not one of them, so a provider whose models are all
+ * disabled leaves the selector disabled instead of empty.
+ */
+const enabledModelCount = computed(() =>
+  providerModels.value.reduce(
+    (total, entry) =>
+      total + entry.models.filter((model) => model.enabled).length,
+    0,
+  ),
+);
 
 // S2/S4 of `theme-modes-and-resizable-drawer.md`: the appearance state lives in
 // one module so the sidebar, the empty state and this panel all agree on the
@@ -131,6 +145,9 @@ const { mode: theme, isDark, setMode } = useAppearance();
 
 /** Selected model id, or `""` until settings load. */
 const modelId = computed(() => settings.value?.model ?? "");
+
+/** S2: the provider the persisted model belongs to, `""` until settings load. */
+const providerId = computed(() => settings.value?.provider ?? "");
 
 /** S1: no turn has been rendered yet, so the empty state owns the panel. */
 const isEmptyState = computed(() => {
@@ -311,13 +328,13 @@ async function ensureSession(): Promise<SessionDto | null> {
   }
 }
 
-async function loadModelOptions() {
+async function loadProviderModels() {
   try {
-    models.value = await listModels();
+    providerModels.value = await listProviderModels();
   } catch (cause) {
     // A missing model list must not break the chat: the session still starts
     // with whatever the settings file already names.
-    models.value = [];
+    providerModels.value = [];
     panelError.value = commandErrorMessage(cause);
   }
 }
@@ -362,17 +379,25 @@ async function handleToggleTheme() {
 }
 
 /**
- * S5/S7: persists the chosen model. The whole settings file is re-read first so
- * the write cannot clobber a preference the drawer changed in the meantime
- * (`save_settings` replaces the file). The choice applies to the next spawn.
+ * S2 of `models-by-provider.md`: persists the chosen model together with the
+ * provider it belongs to. Model ids are provider-scoped, so writing only the id
+ * could point the next session at another provider's model (or at nothing).
+ *
+ * The whole settings file is re-read first so the write cannot clobber a
+ * preference the drawer changed in the meantime (`save_settings` replaces the
+ * file). The choice applies to the next spawn.
  */
-async function handleModelChange(value: string) {
-  if (value === "") return;
+async function handleSelectModel(choice: { provider: string; model: string }) {
+  if (choice.model === "" || choice.provider === "") return;
   savingModel.value = true;
   panelError.value = null;
   try {
     const current = await getSettings();
-    settings.value = await saveSettings({ ...current, model: value });
+    settings.value = await saveSettings({
+      ...current,
+      provider: choice.provider,
+      model: choice.model,
+    });
   } catch (cause) {
     panelError.value = commandErrorMessage(cause);
   } finally {
@@ -435,8 +460,8 @@ async function handleStop() {
 
 onMounted(() => {
   // Presentation-only additions (S5): the header needs the active space's name
-  // (already a prop) plus the model options and the persisted choice.
-  void loadModelOptions();
+  // (already a prop) plus the provider-grouped models and the persisted choice.
+  void loadProviderModels();
   void loadSettings();
   // L3/S4: the store owns the single `agent-event` subscription and buffers
   // every session, so this panel only asks for it to be installed. It is never
@@ -474,15 +499,16 @@ onMounted(() => {
       <template #composer>
         <Composer
           v-model="prompt"
+          :provider-id="providerId"
           :model-id="modelId"
-          :models="models"
+          :provider-models="providerModels"
           :workspace-name="workspace?.name ?? t('chat.noWorkspace')"
           :streaming="sending"
           :disabled="workspace === null"
           :can-send="canSend"
-          :model-disabled="savingModel || models.length === 0"
+          :model-disabled="savingModel || enabledModelCount === 0"
           :can-stop="currentSession !== null && !stopping"
-          @update:model-id="handleModelChange"
+          @select-model="handleSelectModel"
           @send="handleSend"
           @stop="handleStop"
         />
@@ -601,15 +627,16 @@ onMounted(() => {
           <div class="border-t border-border px-4 py-3">
             <Composer
               v-model="prompt"
+              :provider-id="providerId"
               :model-id="modelId"
-              :models="models"
+              :provider-models="providerModels"
               :workspace-name="workspace?.name ?? t('chat.noWorkspace')"
               :streaming="sending"
               :disabled="workspace === null"
               :can-send="canSend"
-              :model-disabled="savingModel || models.length === 0"
+              :model-disabled="savingModel || enabledModelCount === 0"
               :can-stop="currentSession !== null && !stopping"
-              @update:model-id="handleModelChange"
+              @select-model="handleSelectModel"
               @send="handleSend"
               @stop="handleStop"
             />

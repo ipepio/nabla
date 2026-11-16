@@ -5,25 +5,63 @@
 // Presentation only: every action is emitted, so ChatPanel keeps the single
 // `sendPrompt` / `stopSession` path and this card never touches the contracts
 // seam. Colours come from semantic tokens only (S4) — no hex here.
+import { computed } from "vue";
 import { ArrowUpIcon, ChevronDownIcon, PlusIcon, SquareIcon } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { t } from "@/lib/i18n";
 import { COMPOSER_MAX_WIDTH, COMPOSER_MIN_WIDTH } from "@/lib/layout";
-import type { ModelInfo } from "@/contracts/types";
+import type { ProviderModels } from "@/contracts/types";
 
-defineProps<{
+/**
+ * A model choice is provider-scoped (S2 of `models-by-provider.md`): the same id
+ * can exist under two providers, so picking one fixes both halves at once.
+ */
+interface ModelChoice {
+  provider: string;
+  model: string;
+}
+
+/**
+ * Separator of one select value. Provider ids are `[a-z0-9-]` (the contract of
+ * `providers.<id>` in pi's file), so the first separator is always the boundary
+ * and a model id may contain anything — `::` included.
+ */
+const MODEL_VALUE_SEPARATOR = "::";
+
+/** The value one item carries: provider, then model. */
+function modelValueOf(provider: string, model: string): string {
+  return `${provider}${MODEL_VALUE_SEPARATOR}${model}`;
+}
+
+/** The inverse of `modelValueOf`; `null` for anything the surface did not build. */
+function modelChoiceOf(value: string): ModelChoice | null {
+  const at = value.indexOf(MODEL_VALUE_SEPARATOR);
+  if (at <= 0) return null;
+  const model = value.slice(at + MODEL_VALUE_SEPARATOR.length);
+  if (model === "") return null;
+  return { provider: value.slice(0, at), model };
+}
+
+const props = defineProps<{
   /** Prompt text (v-model). */
   modelValue: string;
-  /** Options come from `list_models`; the UI never hardcodes them (S7). */
-  models: ModelInfo[];
+  /**
+   * Providers with their models, from `list_provider_models` (S2). The UI never
+   * hardcodes a model id: the grouped list is exactly what pi's file holds.
+   */
+  providerModels: ProviderModels[];
+  /** Persisted provider id from settings.json, `""` until settings load. */
+  providerId: string;
   /** Persisted model id from settings.json, `""` until settings load. */
   modelId: string;
   /** Workspace the turn is written into, for the scope chip. */
@@ -34,7 +72,7 @@ defineProps<{
   disabled: boolean;
   /** The prompt is non-empty and no send is in flight. */
   canSend: boolean;
-  /** Model selection is unavailable (saving, or no options reported). */
+  /** Model selection is unavailable (saving, or no enabled model reported). */
   modelDisabled: boolean;
   /** A session exists, so stop is meaningful. */
   canStop: boolean;
@@ -42,10 +80,72 @@ defineProps<{
 
 const emit = defineEmits<{
   (e: "update:modelValue", value: string): void;
-  (e: "update:modelId", value: string): void;
+  (e: "selectModel", choice: ModelChoice): void;
   (e: "send"): void;
   (e: "stop"): void;
 }>();
+
+/**
+ * S2: one group per provider that has something to offer, one item per enabled
+ * model — `enabled === false` is hidden here, not deleted from the file (L3). A
+ * provider with no usable model is not painted as an empty group.
+ */
+const groups = computed(() =>
+  props.providerModels
+    .map((entry) => ({
+      provider: entry.provider,
+      name: entry.name.trim() === "" ? entry.provider : entry.name,
+      models: entry.models.filter((model) => model.enabled),
+    }))
+    .filter((group) => group.models.length > 0),
+);
+
+/**
+ * The persisted choice resolved against the list that is on screen. The
+ * persisted provider wins, because a model id belongs to it; the search only
+ * falls back to every group while settings have not named one yet. A model the
+ * list does not carry resolves to `null` and is shown as the raw id below.
+ */
+const selected = computed<{
+  provider: string;
+  providerName: string;
+  modelName: string;
+} | null>(() => {
+  const { modelId, providerId } = props;
+  if (modelId === "") return null;
+  const own = groups.value.find((group) => group.provider === providerId);
+  const candidates = own ? [own] : providerId === "" ? groups.value : [];
+  for (const group of candidates) {
+    const hit = group.models.find((model) => model.id === modelId);
+    if (hit) {
+      return {
+        provider: group.provider,
+        providerName: group.name,
+        modelName: hit.name,
+      };
+    }
+  }
+  return null;
+});
+
+/** The select value: the resolved provider and model, empty when unresolved. */
+const selectedValue = computed(() =>
+  selected.value === null
+    ? ""
+    : modelValueOf(selected.value.provider, props.modelId),
+);
+
+/** The muted prefix: the provider of the resolved choice, else the stored id. */
+const selectedProviderName = computed(
+  () => selected.value?.providerName ?? props.providerId,
+);
+
+/** Emits the choice in decoded form, so the panel saves both halves at once. */
+function handleSelect(value: string) {
+  const choice = modelChoiceOf(value);
+  if (choice === null) return;
+  emit("selectModel", choice);
+}
 </script>
 
 <template>
@@ -89,23 +189,48 @@ const emit = defineEmits<{
       </span>
 
       <div class="ms-auto flex min-w-0 shrink items-center gap-1.5">
-        <!-- Model selector (S5/S7): options from `list_models`, value from
-             settings.json. -->
+        <!-- Model selector (S2 of `models-by-provider.md`): grouped by provider,
+             one item per enabled model. The value carries provider + model, and
+             the trigger reads as "provider · model". -->
         <Select
-          :model-value="modelId"
+          :model-value="selectedValue"
           :disabled="modelDisabled"
-          @update:model-value="emit('update:modelId', String($event))"
+          @update:model-value="handleSelect(String($event))"
         >
           <SelectTrigger
-            class="h-8 w-[118px] min-w-0 border-0 bg-transparent text-xs shadow-none hover:bg-muted sm:w-[150px] dark:bg-transparent dark:hover:bg-muted"
+            class="h-8 w-[150px] min-w-0 gap-1 border-0 bg-transparent text-xs shadow-none hover:bg-muted sm:w-[196px] dark:bg-transparent dark:hover:bg-muted"
             :aria-label="t('chat.composer.model')"
           >
-            <SelectValue :placeholder="t('chat.composer.selectModel')" />
+            <span
+              v-if="selectedProviderName"
+              class="shrink-0 truncate text-muted-foreground"
+            >
+              {{ selectedProviderName }}
+            </span>
+            <!-- A model the list does not carry (a file edit, a disabled mark)
+                 is still named instead of being hidden behind the placeholder. -->
+            <SelectValue
+              v-if="selected !== null || modelId === ''"
+              :placeholder="t('chat.composer.selectModel')"
+            />
+            <span v-else class="min-w-0 truncate" :title="modelId">
+              {{ modelId }}
+            </span>
           </SelectTrigger>
           <SelectContent>
-            <SelectItem v-for="model in models" :key="model.id" :value="model.id">
-              {{ model.name }}
-            </SelectItem>
+            <SelectGroup
+              v-for="group in groups"
+              :key="group.provider"
+            >
+              <SelectLabel>{{ group.name }}</SelectLabel>
+              <SelectItem
+                v-for="model in group.models"
+                :key="modelValueOf(group.provider, model.id)"
+                :value="modelValueOf(group.provider, model.id)"
+              >
+                {{ model.name }}
+              </SelectItem>
+            </SelectGroup>
           </SelectContent>
         </Select>
 

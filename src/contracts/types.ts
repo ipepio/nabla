@@ -20,9 +20,10 @@ export interface WorkspaceInfo {
 }
 
 /**
- * One model the runtime offers, as the Rust side knows it (S7). The list is a
- * Rust constant for now; the UI never hardcodes it, it always asks
- * `listModels()`.
+ * One model of the flat `list_models` answer (S7): pi's own list is a Rust
+ * constant. Since S2 of `odd/tasks/models-by-provider.md` the composer no longer
+ * reads it — it groups `list_provider_models()` instead — but the command and its
+ * DTO stay in the seam, so this mirror stays next to them.
  */
 export interface ModelInfo {
   id: string;
@@ -71,6 +72,70 @@ export interface ProviderDraft {
   models: ModelOption[];
 }
 
+// ── models of one provider (S2, S3 of `odd/tasks/models-by-provider.md`) ─────
+
+/**
+ * One model of one provider, as `list_provider_models` reports it (S2/S3). Pi's
+ * own field names (`contextWindow`, `maxTokens`, `cost.input`, `cost.output`,
+ * `input`) are already flattened by Rust, so this is the shape the grouped
+ * selector and the per-model editor read.
+ *
+ * `enabled` is Nabla's mark, not pi's (L3): a disabled model stays in
+ * `models.json` with `"enabled": false` instead of being deleted, and the
+ * selector hides it while the editor keeps showing it. Rust defaults a missing
+ * mark to `true`.
+ *
+ * Mirrors `ModelInfo` in `src-tauri/src/providers.rs`. The TS name is
+ * `ProviderModel` because the flat `list_models` DTO above already owns
+ * `ModelInfo`; every field matches the Rust struct field by field.
+ */
+export interface ProviderModel {
+  id: string;
+  name: string;
+  contextWindow: number | null;
+  maxTokens: number | null;
+  inputCost: number | null;
+  outputCost: number | null;
+  /** Input modalities, pi's `input` array: `"text"` and `"image"`. */
+  modalities: string[];
+  /** L3: the model is offered by the selector and usable by a session. */
+  enabled: boolean;
+}
+
+/**
+ * One provider with the models pi would use, in the order the file declares them
+ * (S2 of `models-by-provider.md`). A provider with no models comes back with an
+ * empty list, never filtered out; the api key has no field here (S4).
+ * Mirrors `ProviderModels` in `src-tauri/src/providers.rs`.
+ */
+export interface ProviderModels {
+  provider: string;
+  name: string;
+  models: ProviderModel[];
+}
+
+/**
+ * What `update_provider_model` writes for one model inside its provider (S3).
+ *
+ * A `null` number, an empty `name` and an empty `modalities` list mean "the form
+ * does not cover this field": Rust merges the draft into the entry the file
+ * already has and keeps what is there, so an edit of the cost never wipes a
+ * context window. `enabled` is always written. Mirrors `ProviderModelDraft` in
+ * `src-tauri/src/providers.rs`.
+ */
+export interface ProviderModelDraft {
+  provider: string;
+  id: string;
+  name: string;
+  contextWindow: number | null;
+  maxTokens: number | null;
+  inputCost: number | null;
+  outputCost: number | null;
+  /** `"text"` and/or `"image"`; the two the editor offers. */
+  modalities: string[];
+  enabled: boolean;
+}
+
 /** Index entry for a pi-owned session file. Content is never copied here. */
 export interface SessionSummary {
   id: number;
@@ -88,7 +153,11 @@ export interface AppSettings {
   piBinary: string;
   /** S7: pi provider id the spawn passes as `--provider`. */
   provider: string;
-  /** S7: model id the spawn passes as `--model`; always one of `listModels()`. */
+  /**
+   * S7: model id the spawn passes as `--model`. S2 of
+   * `models-by-provider.md`: it belongs to `provider` above, because both halves
+   * are chosen together in the grouped selector.
+   */
   model: string;
   /**
    * S2 of `odd/tasks/i18n-and-settings-polish.md`: interface language, mirrored

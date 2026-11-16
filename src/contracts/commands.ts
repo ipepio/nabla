@@ -13,6 +13,9 @@ import type {
   PiCliEvent,
   PiCliResult,
   ProviderDraft,
+  ProviderModel,
+  ProviderModelDraft,
+  ProviderModels,
   ProviderSummary,
   SessionDto,
   SessionStatusDto,
@@ -154,6 +157,48 @@ export function setProviderKey(
   apiKey: string,
 ): Promise<ProviderSummary> {
   return invoke<ProviderSummary>("set_provider_key", { providerId, apiKey });
+}
+
+// ── models of one provider (S2, S3 of `models-by-provider.md`) ──────────────
+
+/**
+ * S2: every provider pi's `models.json` lists, each with its own models in file
+ * order. The grouped selector and the per-model editor are both built on this
+ * one read; a provider with no models comes back with an empty list instead of
+ * disappearing, and the api key never crosses (the DTO has no field for it).
+ */
+export function listProviderModels(): Promise<ProviderModels[]> {
+  return invoke<ProviderModels[]>("list_provider_models");
+}
+
+/**
+ * S3: writes one model inside `providers.<provider>.models` — backup, merge into
+ * the entry the file already has, atomic write — and answers with the entry as
+ * the file now holds it, so the editor refreshes from what was written instead
+ * of from what it sent.
+ *
+ * A `null` number, an empty `name` and an empty `modalities` list mean "keep what
+ * the file has": Rust only writes the fields the draft covers. Disabling a model
+ * is a mark (`enabled: false`), never a delete (L3).
+ */
+export function updateProviderModel(
+  draft: ProviderModelDraft,
+): Promise<ProviderModel> {
+  return invoke<ProviderModel>("update_provider_model", { draft });
+}
+
+/**
+ * S3: removes one model from one provider, backup and atomic write included.
+ *
+ * `true` means an entry was removed; `false` means the file no longer had it, so
+ * the delete is idempotent and a stale row cannot turn into an error. A
+ * malformed id still rejects before anything is written.
+ */
+export function removeProviderModel(
+  provider: string,
+  modelId: string,
+): Promise<boolean> {
+  return invoke<boolean>("remove_provider_model", { provider, modelId });
 }
 
 // ── pi CLI bridge seam (S1-S4 of `odd/tasks/pi-cli-bridge.md`) ───────────────

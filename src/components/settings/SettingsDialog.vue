@@ -86,6 +86,7 @@ import { useI18n, type Locale, type MessageKey } from "@/lib/i18n";
 import type { ThemeMode } from "@/lib/theme";
 import AccountsSection from "./AccountsSection.vue";
 import ProviderForm from "./ProviderForm.vue";
+import ProviderModelsEditor from "./ProviderModelsEditor.vue";
 import {
   commandErrorMessage,
   configFilePath,
@@ -767,6 +768,17 @@ watch(open, (isOpen) => {
                 {{ warning }}
               </p>
             </section>
+
+            <!-- S3 of `models-by-provider.md`: one collapsible block per provider
+                 with its models' context, limits, costs, modalities and enabled
+                 mark. It reads pi's file itself (`list_provider_models`) and is
+                 handed the pane's list for two things: so a provider added or
+                 removed here makes it re-read, and so a model write refreshes
+                 the model count of the row above. -->
+            <template v-if="providers.length">
+              <Separator />
+              <ProviderModelsEditor :providers="providers" @changed="loadProviders" />
+            </template>
 
             <!-- S5: this whole block is ON unless the build sets
                  VITE_ENABLE_CUSTOM_PROVIDERS to `0`/`false`/`off`; with the flag
