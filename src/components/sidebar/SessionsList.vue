@@ -12,7 +12,7 @@
 // the session has a live process — there is nothing to stop otherwise — and
 // delete asks for confirmation before it emits, because a deleted session leaves
 // the list. Both actions are emitted: this component never calls a command.
-import { ref } from "vue";
+import { onMounted, onUnmounted, ref } from "vue";
 import { MessageSquareIcon, MoreHorizontalIcon, PauseIcon, Trash2Icon } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import {
@@ -66,6 +66,16 @@ const emit = defineEmits<{
 const pendingDelete = ref<SessionSummary | null>(null);
 const deleteOpen = ref(false);
 
+/**
+ * How often the relative ages are recomputed. The list itself is refetched by
+ * the parent; this clock only exists so "now" becomes "1m" and "4h" becomes
+ * "5h" without a fetch. One minute is the resolution the labels are written at.
+ */
+const AGE_TICK_MS = 60_000;
+/** Bumped by the clock; reading it in a row is what re-runs that row's label. */
+const ageClock = ref(0);
+let ageTickHandle: number | null = null;
+
 /** Whether this session currently has a pi process behind it. */
 function isRunning(session: SessionSummary, liveSessionIds: string[]): boolean {
   return liveSessionIds.includes(String(session.id));
@@ -94,6 +104,16 @@ function timeLabel(updatedAt: string): string {
   return new Date(then).toLocaleDateString();
 }
 
+/**
+ * The age a row shows. Reading `ageClock` here (annotated, not memorised) makes
+ * the minute tick a render dependency, so the label ages on its own while
+ * `timeLabel` stays a pure function of the stamp.
+ */
+function rowAgeLabel(updatedAt: string): string {
+  void ageClock.value;
+  return timeLabel(updatedAt);
+}
+
 /** Delete is destructive and permanent in the list, so it always asks first. */
 function requestDelete(session: SessionSummary) {
   pendingDelete.value = session;
@@ -107,6 +127,18 @@ function confirmDelete() {
   if (session === null) return;
   emit("delete", session);
 }
+
+onMounted(() => {
+  ageTickHandle = window.setInterval(() => {
+    ageClock.value += 1;
+  }, AGE_TICK_MS);
+});
+
+onUnmounted(() => {
+  if (ageTickHandle === null) return;
+  window.clearInterval(ageTickHandle);
+  ageTickHandle = null;
+});
 </script>
 
 <template>
@@ -150,7 +182,7 @@ function confirmDelete() {
           :datetime="session.updatedAt"
           class="shrink-0 text-[10px] tabular-nums text-muted-foreground"
         >
-          {{ timeLabel(session.updatedAt) }}
+          {{ rowAgeLabel(session.updatedAt) }}
         </time>
       </SidebarMenuSubButton>
 

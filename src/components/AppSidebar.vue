@@ -101,6 +101,16 @@ const workspaceError = ref<string | null>(null);
 const LIVE_POLL_MS = 5000;
 let livePollHandle: number | null = null;
 
+/**
+ * S5: how often the open session lists re-read their index. A session finishing
+ * a turn in another workspace — or one started elsewhere — changes `updated_at`
+ * and therefore the order, and nothing in this drawer is told about it, so the
+ * list has to ask. `list_sessions` is a SQLite read over an indexed table, so
+ * this stays cheap; it is never shorter than the human can perceive.
+ */
+const SESSION_POLL_MS = 15_000;
+let sessionPollHandle: number | null = null;
+
 /** S5: ids of the workspaces whose session list is open. */
 const expandedIds = ref<number[]>([]);
 /** S5: the sessions of each workspace, keyed by workspace id. */
@@ -281,6 +291,23 @@ function isLatestSessionRequest(workspaceId: number, sequence: number): boolean 
 }
 
 /**
+ * S5: whether an incoming index is the one already on screen — same sessions,
+ * in the same order, each with the same `updatedAt`. The poll runs every
+ * `SESSION_POLL_MS`, so an answer that changes nothing must not touch the
+ * reactive state: the rows keep their identity and do not re-render.
+ *
+ * `updatedAt` is part of the comparison because it is both the sort key and the
+ * age label: a turn that completed without reordering the rows still moved it.
+ */
+function sameSessionList(current: SessionSummary[], next: SessionSummary[]): boolean {
+  if (current.length !== next.length) return false;
+  return current.every((session, index) => {
+    const incoming = next[index];
+    return session.id === incoming.id && session.updatedAt === incoming.updatedAt;
+  });
+}
+
+/**
  * S5: reads one workspace's session index. `list_sessions` is the only source;
  * the cache exists so the list keeps rendering while a refresh is in flight.
  *
@@ -301,8 +328,18 @@ async function loadSessions(workspaceId: number) {
     // The cache of a collapsed (or removed) workspace was already dropped; a
     // leftover response must not refill it.
     if (!isExpanded(workspaceId)) return;
-    sessionsByWorkspace.value = { ...sessionsByWorkspace.value, [workspaceId]: list };
-    delete sessionsErrors.value[workspaceId];
+    // The cache is only replaced once the answer is known, and only when it
+    // differs: the list never empties while a fetch is in flight, and a poll
+    // that returns the same index leaves the state (and the rendered rows) as
+    // they were.
+    if (!sameSessionList(sessionsByWorkspace.value[workspaceId] ?? [], list)) {
+      sessionsByWorkspace.value = { ...sessionsByWorkspace.value, [workspaceId]: list };
+    }
+    if (sessionsErrors.value[workspaceId] !== undefined) {
+      const settledErrors = { ...sessionsErrors.value };
+      delete settledErrors[workspaceId];
+      sessionsErrors.value = settledErrors;
+    }
   } catch (cause) {
     if (!isLatestSessionRequest(workspaceId, sequence)) return;
     if (!isExpanded(workspaceId)) return;
@@ -331,6 +368,31 @@ function syncSessions(ids: number[]) {
 }
 
 watch(expandedIds, syncSessions);
+
+/**
+ * S5: keeps every *open* session list current, so the drawer reorders on its
+ * own while it is visible. It goes through `loadSessions`, which owns the
+ * per-workspace sequence guard and the pending counter, so a poll answer is
+ * never newer than the send-triggered refresh it races with and never runs on
+ * top of a fetch already in flight.
+ *
+ * A hidden document is paused: the human cannot see the list, and coming back
+ * refreshes once immediately instead of replaying the missed ticks.
+ */
+function pollExpandedSessions() {
+  if (document.visibilityState !== "visible") return;
+  for (const workspaceId of expandedIds.value) {
+    // Nothing is open for this workspace when a fetch is already running; a
+    // second request would only queue a redundant answer behind the first.
+    if (sessionsLoadingFor(workspaceId)) continue;
+    void loadSessions(workspaceId);
+  }
+}
+
+/** Coming back from a hidden document refreshes once, right away. */
+function handleVisibilityChange() {
+  if (document.visibilityState === "visible") pollExpandedSessions();
+}
 
 // N1: a new session (from the button or from the composer's first send) changes
 // what each open list must show.
@@ -509,12 +571,22 @@ onMounted(() => {
   livePollHandle = window.setInterval(() => {
     void refreshLiveSessions();
   }, LIVE_POLL_MS);
+  // S5: the open session lists follow their index on their own (a turn landing
+  // in another workspace reorders them), paused while the window is hidden.
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+  sessionPollHandle = window.setInterval(pollExpandedSessions, SESSION_POLL_MS);
 });
 
 onUnmounted(() => {
-  if (livePollHandle === null) return;
-  window.clearInterval(livePollHandle);
-  livePollHandle = null;
+  if (livePollHandle !== null) {
+    window.clearInterval(livePollHandle);
+    livePollHandle = null;
+  }
+  if (sessionPollHandle !== null) {
+    window.clearInterval(sessionPollHandle);
+    sessionPollHandle = null;
+  }
+  document.removeEventListener("visibilitychange", handleVisibilityChange);
 });
 </script>
 
