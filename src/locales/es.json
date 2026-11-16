@@ -184,6 +184,8 @@
   "chat.composer.placeholder": "Describe lo que quieres construir, / comandos, @ archivos o sesiones",
   "chat.composer.addContext": "Añadir contexto (sin conectar todavía)",
   "chat.composer.writingIn": "Escribiendo en {workspace}",
+  "chat.composer.provider": "Proveedor",
+  "chat.composer.selectProvider": "Elige proveedor",
   "chat.composer.model": "Modelo",
   "chat.composer.selectModel": "Elige modelo",
   "chat.composer.send": "Enviar mensaje",
