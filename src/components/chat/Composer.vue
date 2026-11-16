@@ -1,20 +1,28 @@
 <script setup lang="ts">
 // Composer card (spec S2): auto-growing prompt, inert "+" and scope chip, the
-// provider → model selectors and the circular send/stop control.
+// provider → model picker and the circular send/stop control.
 //
 // Presentation only: every action is emitted, so ChatPanel keeps the single
 // `sendPrompt` / `stopSession` path and this card never touches the contracts
 // seam. Colours come from semantic tokens only (S4) — no hex here.
 import { computed } from "vue";
-import { ArrowUpIcon, ChevronDownIcon, PlusIcon, SquareIcon } from "@lucide/vue";
+import {
+  ArrowUpIcon,
+  CheckIcon,
+  ChevronDownIcon,
+  PlusIcon,
+  SquareIcon,
+} from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Textarea } from "@/components/ui/textarea";
 import { t } from "@/lib/i18n";
 import { COMPOSER_MAX_WIDTH, COMPOSER_MIN_WIDTH } from "@/lib/layout";
@@ -30,8 +38,8 @@ interface ModelChoice {
 }
 
 /**
- * One row of the provider select: a provider that has something to offer. The
- * label is pi's own provider name and falls back to the id when it is empty.
+ * One row of the picker: a provider and the models it *can* offer. The label is
+ * pi's own provider name and falls back to the id when it is empty.
  */
 interface ProviderOption {
   id: string;
@@ -44,8 +52,8 @@ const props = defineProps<{
   modelValue: string;
   /**
    * Providers with their models, from `list_provider_models` (S1 of
-   * `providers-pane-refinements.md`). The UI never hardcodes a model id: both
-   * selects paint exactly what pi's file holds.
+   * `providers-pane-refinements.md`). The UI never hardcodes a model id: the
+   * picker paints exactly what pi's file holds.
    */
   providerModels: ProviderModels[];
   /** Persisted provider id from settings.json, `""` until settings load. */
@@ -62,7 +70,7 @@ const props = defineProps<{
   canSend: boolean;
   /**
    * Provider/model selection is unavailable (saving, or no enabled model
-   * reported): both selects move together, so both are disabled at once.
+   * reported): the single trigger is disabled, so no half choice is possible.
    */
   modelDisabled: boolean;
   /** A session exists, so stop is meaningful. */
@@ -77,19 +85,24 @@ const emit = defineEmits<{
 }>();
 
 /**
- * S1 of `providers-pane-refinements.md`: the footer carries two selects — the
- * provider on the left, that provider's models on the right — instead of one list
- * grouped by provider. `enabled === false` is hidden here, not deleted from the
- * file (L3), so a provider with no usable model is not painted at all.
+ * One dropdown in the footer: every provider is a row that opens that provider's
+ * models in a lateral submenu, so a pick is still one interaction (and one
+ * settings write) for the provider + model pair. `enabled === false` is hidden
+ * here, not deleted from the file (L3), so a disabled model is never offered.
+ * Providers are all painted — a provider with no enabled model keeps its row and
+ * is disabled instead of silently vanishing.
  */
+const providerRows = computed<ProviderOption[]>(() =>
+  props.providerModels.map((entry) => ({
+    id: entry.provider,
+    name: entry.name.trim() === "" ? entry.provider : entry.name,
+    models: entry.models.filter((model) => model.enabled),
+  })),
+);
+
+/** Rows that can actually be picked from: the trigger's enabled/fallback set. */
 const providerOptions = computed<ProviderOption[]>(() =>
-  props.providerModels
-    .map((entry) => ({
-      id: entry.provider,
-      name: entry.name.trim() === "" ? entry.provider : entry.name,
-      models: entry.models.filter((model) => model.enabled),
-    }))
-    .filter((option) => option.models.length > 0),
+  providerRows.value.filter((option) => option.models.length > 0),
 );
 
 /**
@@ -105,15 +118,14 @@ const activeProvider = computed<ProviderOption | null>(() => {
 });
 
 /**
- * The model on screen: the persisted id while the provider on screen carries it,
- * `""` otherwise, so the select shows its placeholder instead of a value from
+ * The model on screen: the persisted one while the provider on screen carries it,
+ * `null` otherwise, so the trigger shows its placeholder instead of a value from
  * another provider.
  */
-const activeModelId = computed(() => {
+const activeModel = computed(() => {
   const provider = activeProvider.value;
-  if (provider === null || props.modelId === "") return "";
-  const hit = provider.models.find((model) => model.id === props.modelId);
-  return hit === undefined ? "" : props.modelId;
+  if (provider === null || props.modelId === "") return null;
+  return provider.models.find((model) => model.id === props.modelId) ?? null;
 });
 
 /**
@@ -125,34 +137,43 @@ const activeModelId = computed(() => {
 const unresolvedModelId = computed(() => {
   const provider = activeProvider.value;
   if (provider === null || provider.id !== props.providerId) return "";
-  if (props.modelId === "" || activeModelId.value !== "") return "";
+  if (props.modelId === "" || activeModel.value !== null) return "";
   return props.modelId;
 });
 
 /**
- * S1: changing the provider keeps the model when that provider offers it (model
- * ids are provider-scoped, so both halves move together) and takes the first
- * enabled model otherwise. One choice per interaction, so the panel saves the
- * pair with one write; a selection that is already stored writes nothing.
+ * What the trigger's model half reads: the model's display name while the pair
+ * resolves, the raw persisted id while it does not, `""` when there is nothing
+ * to show and the placeholder takes over.
  */
-function handleSelectProvider(value: string) {
-  const option = providerOptions.value.find(
-    (candidate) => candidate.id === value,
-  );
-  if (option === undefined) return;
-  const keep = option.models.some((model) => model.id === props.modelId)
-    ? props.modelId
-    : option.models[0].id;
-  if (option.id === props.providerId && keep === props.modelId) return;
-  emit("selectModel", { provider: option.id, model: keep });
+const activeModelLabel = computed(
+  () => activeModel.value?.name ?? unresolvedModelId.value,
+);
+
+/** Hover/long-press text for the trigger: the full pair, never truncated. */
+const triggerLabel = computed(() => {
+  const provider = activeProvider.value;
+  if (provider === null) return t("chat.composer.selectProvider");
+  const model = activeModelLabel.value;
+  return model === ""
+    ? `${provider.name} · ${t("chat.composer.selectModel")}`
+    : `${provider.name} · ${model}`;
+});
+
+/** The check mark follows the *persisted* pair, not the fallback on screen. */
+function isSelectedPair(provider: string, model: string): boolean {
+  return provider === props.providerId && model === props.modelId;
 }
 
-/** S1: changing the model persists the pair with the provider on screen. */
-function handleSelectModel(value: string) {
-  const provider = activeProvider.value;
-  if (provider === null || value === "") return;
-  if (provider.id === props.providerId && value === props.modelId) return;
-  emit("selectModel", { provider: provider.id, model: value });
+/**
+ * Picking a model fixes both halves at once (model ids are provider-scoped), so
+ * the panel saves the pair with one write; a pick that is already stored writes
+ * nothing.
+ */
+function chooseModel(provider: string, model: string) {
+  if (provider === "" || model === "") return;
+  if (provider === props.providerId && model === props.modelId) return;
+  emit("selectModel", { provider, model });
 }
 </script>
 
@@ -197,63 +218,78 @@ function handleSelectModel(value: string) {
       </span>
 
       <div class="ms-auto flex min-w-0 shrink items-center gap-1.5">
-        <!-- Provider → model (S1 of `providers-pane-refinements.md`): the
-             provider on the left, the enabled models of that provider on the
-             right. Both triggers are compact (h-8, no border) and labelled, so
-             a keyboard user can open and walk either of them. -->
-        <Select
-          :model-value="activeProvider?.id ?? ''"
-          :disabled="modelDisabled || providerOptions.length === 0"
-          @update:model-value="handleSelectProvider(String($event))"
-        >
-          <SelectTrigger
-            size="sm"
-            class="w-[104px] min-w-0 shrink gap-1 border-0 bg-transparent text-xs shadow-none hover:bg-muted sm:w-[124px] dark:bg-transparent dark:hover:bg-muted"
+        <!-- Provider → model: one trigger naming the current pair (provider as
+             a muted prefix), and one menu where each provider row opens its own
+             enabled models laterally. Reka owns the keyboard walk: no custom
+             click handler on the sub trigger, so arrows/hover still open it. -->
+        <DropdownMenu>
+          <DropdownMenuTrigger as-child>
+            <Button
+              variant="ghost"
+              size="sm"
+              class="h-8 max-w-[220px] min-w-0 gap-1 border-0 bg-transparent px-2 text-xs font-normal shadow-none hover:bg-muted aria-expanded:bg-muted sm:max-w-[280px] dark:bg-transparent dark:hover:bg-muted"
+              :disabled="modelDisabled || providerOptions.length === 0"
+              :aria-label="t('chat.composer.model')"
+              :title="triggerLabel"
+            >
+              <template v-if="activeProvider !== null">
+                <span class="shrink-0 text-muted-foreground">
+                  {{ activeProvider.name }}
+                </span>
+                <!-- A model the provider does not carry is still named instead
+                     of being hidden behind the placeholder. -->
+                <span
+                  v-if="activeModelLabel !== ''"
+                  class="min-w-0 truncate"
+                >
+                  {{ activeModelLabel }}
+                </span>
+                <span v-else class="min-w-0 truncate text-muted-foreground">
+                  {{ t("chat.composer.selectModel") }}
+                </span>
+              </template>
+              <span v-else class="min-w-0 truncate text-muted-foreground">
+                {{ t("chat.composer.selectProvider") }}
+              </span>
+              <ChevronDownIcon class="size-3 shrink-0 opacity-60" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent
+            align="end"
+            side="top"
+            class="w-56"
             :aria-label="t('chat.composer.provider')"
           >
-            <SelectValue :placeholder="t('chat.composer.selectProvider')" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem
-              v-for="option in providerOptions"
-              :key="option.id"
-              :value="option.id"
+            <DropdownMenuSub
+              v-for="row in providerRows"
+              :key="row.id"
             >
-              {{ option.name }}
-            </SelectItem>
-          </SelectContent>
-        </Select>
-
-        <Select
-          :model-value="activeModelId"
-          :disabled="modelDisabled || activeProvider === null"
-          @update:model-value="handleSelectModel(String($event))"
-        >
-          <SelectTrigger
-            size="sm"
-            class="w-[124px] min-w-0 shrink gap-1 border-0 bg-transparent text-xs shadow-none hover:bg-muted sm:w-[168px] dark:bg-transparent dark:hover:bg-muted"
-            :aria-label="t('chat.composer.model')"
-          >
-            <!-- A model the provider does not carry is still named instead of
-                 being hidden behind the placeholder. -->
-            <SelectValue
-              v-if="unresolvedModelId === ''"
-              :placeholder="t('chat.composer.selectModel')"
-            />
-            <span v-else class="min-w-0 truncate" :title="unresolvedModelId">
-              {{ unresolvedModelId }}
-            </span>
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem
-              v-for="model in activeProvider?.models ?? []"
-              :key="model.id"
-              :value="model.id"
-            >
-              {{ model.name }}
-            </SelectItem>
-          </SelectContent>
-        </Select>
+              <!-- Disabled, not removed: a provider with no enabled model keeps
+                   its row but cannot be opened. -->
+              <DropdownMenuSubTrigger
+                :disabled="row.models.length === 0"
+                class="text-xs data-[disabled]:opacity-50"
+              >
+                <span class="min-w-0 truncate">{{ row.name }}</span>
+              </DropdownMenuSubTrigger>
+              <DropdownMenuSubContent class="w-56 max-h-[280px] overflow-y-auto">
+                <DropdownMenuItem
+                  v-for="model in row.models"
+                  :key="model.id"
+                  class="text-xs"
+                  @select="chooseModel(row.id, model.id)"
+                >
+                  <CheckIcon
+                    v-if="isSelectedPair(row.id, model.id)"
+                    class="size-3.5 shrink-0"
+                  />
+                  <span v-else class="size-3.5 shrink-0" aria-hidden="true" />
+                  <span class="min-w-0 truncate">{{ model.name }}</span>
+                </DropdownMenuItem>
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+          </DropdownMenuContent>
+        </DropdownMenu>
 
         <Button
           v-if="streaming && canStop"

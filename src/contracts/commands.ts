@@ -201,6 +201,23 @@ export function removeProviderModel(
   return invoke<boolean>("remove_provider_model", { provider, modelId });
 }
 
+/**
+ * S5 of `providers-pane-refinements.md`: the models one CONFIGURED provider
+ * offers, read by Rust from `GET {baseUrl}/models` with the base URL and api key
+ * of that provider in pi's `models.json`. Resolving both server-side is what
+ * keeps the key out of the webview and CORS/CSP out of the way.
+ *
+ * Rejects when the provider is unknown to the file or has no api key yet, with
+ * the reason the editor shows inline. The answer is the endpoint's raw list: the
+ * caller decides which entries are new, so "add" never overwrites a model that is
+ * already configured.
+ */
+export function discoverProviderModels(
+  providerId: string,
+): Promise<ModelOption[]> {
+  return invoke<ModelOption[]>("discover_provider_models", { providerId });
+}
+
 // ── pi CLI bridge seam (S1-S4 of `odd/tasks/pi-cli-bridge.md`) ───────────────
 
 /**

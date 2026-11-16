@@ -5,7 +5,7 @@ Alcance: selector provider→modelo en dos pasos, apertura instantánea de Provi
 
 ## Specs
 
-- **S1** «en el desplegable quiero un dropdown con los providers y al seleccionar cada provider, entonces a la derecha aparecerán los modelos» — dos selects contiguos en el composer: provider y, a su derecha, los modelos de ese provider.
+- **S1** «en el desplegable quiero un dropdown con los providers y al seleccionar cada provider, entonces a la derecha aparecerán los modelos» — **revisado por el usuario**: «no quiero 2 dropdowns, quiero uno y en el de providers que se despliegue un dropdown lateral con los modelos del provider». Implementado como **un solo disparador** con submenús laterales por provider.
 - **S2** «al pulsar Providers, tarda mucho en abrirse, ¿por qué? al final es leer un archivo, no?» — medido: `pi auth check` tarda **1,15 s** (arranca el CLI) y la sección ejecuta **6** (2 configurados + 4 conocidos) → ~7 s. El archivo se lee en milisegundos. La apertura debe ser inmediata y los badges llegar después.
 - **S3** «la subscription accounts, ¿de dónde sacas HelmCode y nan? eso estaría en custom providers, ¿no?» — la sección de cuentas de suscripción debe listar **sólo** providers de suscripción (`openai`, `openai-codex`, `anthropic`, `google`); los configurados (HelmCode, nan, custom) pertenecen a la lista de Providers, no a cuentas.
 - **S4** «en los custom, en lugar de tener models by provider, creo que es mejor tenerlo en un apartado de editar provider» — el editor de modelos deja de ser una sección suelta y pasa a vivir dentro de la edición del provider.

@@ -21,6 +21,17 @@
  * patching a local guess, and the parent refreshes its model count through
  * `changed`.
  *
+ * S5 of `providers-pane-refinements.md` (user feedback): the row's name is an
+ * edited field like every other one — it travels in the same
+ * `update_provider_model` draft — and the dialog can also ADD models a provider
+ * offers but the file does not list yet. "Discover models" asks the endpoint
+ * through `discover_provider_models` (Rust resolves the base URL and api key from
+ * pi's file, so no secret crosses the seam), shows what is NOT configured yet as
+ * a checklist, and adds the ticked ones one `update_provider_model` per model.
+ * Existing entries are filtered out before they are even offered and re-checked
+ * against a fresh read before the write, so this action never overwrites a
+ * configured model.
+ *
  * Errors are one line above the rows: a rejected write leaves every typed value
  * where it is, so fixing one field costs a retry, not a retyped row.
  *
@@ -42,11 +53,16 @@ import {
 import { Input } from "@/components/ui/input";
 import {
   commandErrorMessage,
+  discoverProviderModels,
   listProviderModels,
   removeProviderModel,
   updateProviderModel,
 } from "@/contracts/commands";
-import type { ProviderModel, ProviderSummary } from "@/contracts/types";
+import type {
+  ModelOption,
+  ProviderModel,
+  ProviderSummary,
+} from "@/contracts/types";
 import { useI18n } from "@/lib/i18n";
 
 /** S4: the provider being edited — the only one this editor reads and writes. */
@@ -96,6 +112,20 @@ const busy = ref<string | null>(null);
 const pendingRemoval = ref<string | null>(null);
 const removalOpen = ref(false);
 const removing = ref(false);
+
+/** S5: what the endpoint answered, narrowed to the models the file does not list. */
+const discovered = ref<ModelOption[]>([]);
+/** One tick per discovered model, keyed by id; only the unconfigured ones exist here. */
+const selected = ref<Record<string, boolean>>({});
+const discovering = ref(false);
+const adding = ref(false);
+/** Discovery ran for this provider, so "nothing new" is an answer and not a silence. */
+const discoveryRan = ref(false);
+
+/** S5: the ticked models, in the order the endpoint answered them. */
+const selectedDiscovered = computed(() =>
+  discovered.value.filter((option) => selected.value[option.id] === true),
+);
 
 /** A stable, HTML-safe id: model ids may carry `/` and `.`. */
 function fieldId(modelId: string, field: string): string {
@@ -215,6 +245,102 @@ async function handleSave(row: ModelRow) {
   }
 }
 
+/**
+ * S5: asks the provider's endpoint for its model list. Rust resolves the base URL
+ * and the api key from pi's own file, so the webview never handles the secret.
+ *
+ * Only models the file does not list yet are offered: adding is an additive
+ * action, so an entry that already exists is never a candidate. A failure keeps
+ * the rows and their drafts exactly as they are and reports its reason inline;
+ * the checklist is dropped because it would describe an answer that no longer
+ * stands.
+ */
+async function handleDiscover() {
+  if (
+    discovering.value ||
+    adding.value ||
+    busy.value !== null ||
+    removing.value
+  ) {
+    return;
+  }
+  discovering.value = true;
+  error.value = null;
+  try {
+    const options = await discoverProviderModels(props.provider.id);
+    const configured = new Set(models.value.map((row) => row.id));
+    const fresh = options.filter((option) => !configured.has(option.id));
+    discovered.value = fresh;
+    selected.value = Object.fromEntries(
+      fresh.map((model) => [model.id, true]),
+    );
+    discoveryRan.value = true;
+  } catch (cause) {
+    discovered.value = [];
+    selected.value = {};
+    discoveryRan.value = false;
+    error.value = commandErrorMessage(cause);
+  } finally {
+    discovering.value = false;
+  }
+}
+
+/**
+ * S5: adds the ticked models, one `update_provider_model` per model, with the
+ * name the discovery answer carries. Empty numbers and modalities mean "keep what
+ * the file has" in that draft; for a new entry Rust writes the id, the name and
+ * the enabled mark, which is exactly what a discovered model has.
+ *
+ * Nothing configured is ever overwritten: the ticked ids are checked against a
+ * FRESH read first, so a model added in another window between the discovery and
+ * this click is skipped instead of replaced. A mid-way failure keeps the
+ * checklist, so the retry costs no second discovery and skips what already landed.
+ */
+async function handleAddDiscovered() {
+  const picks = selectedDiscovered.value;
+  if (
+    picks.length === 0 ||
+    adding.value ||
+    discovering.value ||
+    busy.value !== null ||
+    removing.value
+  ) {
+    return;
+  }
+  adding.value = true;
+  error.value = null;
+  try {
+    const list = await listProviderModels();
+    const entry = list.find((item) => item.provider === props.provider.id);
+    const configured = new Set((entry?.models ?? []).map((model) => model.id));
+    for (const model of picks) {
+      if (configured.has(model.id)) continue;
+      await updateProviderModel({
+        provider: props.provider.id,
+        id: model.id,
+        name: model.name,
+        contextWindow: null,
+        maxTokens: null,
+        inputCost: null,
+        outputCost: null,
+        modalities: [],
+        enabled: true,
+      });
+      configured.add(model.id);
+    }
+    await load(null, true);
+    emit("changed");
+    // The checklist was about what the file did not list: it is spent now.
+    discovered.value = [];
+    selected.value = {};
+    discoveryRan.value = false;
+  } catch (cause) {
+    error.value = commandErrorMessage(cause);
+  } finally {
+    adding.value = false;
+  }
+}
+
 /** Opens the confirmation of one model (S3). */
 function askRemove(modelId: string) {
   pendingRemoval.value = modelId;
@@ -256,10 +382,14 @@ const removalText = computed(() => {
 });
 
 // S4: one dialog per provider, so the read follows the provider it was opened
-// for. A different id is a different set of models, never a merge of both.
+// for. A different id is a different set of models, never a merge of both — and
+// the same rule applies to a discovery made for the previous provider.
 watch(
   () => props.provider.id,
   () => {
+    discovered.value = [];
+    selected.value = {};
+    discoveryRan.value = false;
     void load();
   },
   { immediate: true },
@@ -416,6 +546,90 @@ watch(
             {{ t("settings.providers.modelsEditor.remove") }}
           </Button>
         </div>
+      </div>
+    </div>
+
+    <!-- S5: adding models the file does not list yet. The endpoint is asked
+         explicitly (never on open), only the unconfigured models are offered, and
+         the add itself writes one entry per ticked model. Nothing here replaces a
+         configured model. -->
+    <div class="space-y-2">
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        :disabled="discovering || adding || busy !== null || removing"
+        @click="handleDiscover"
+      >
+        {{
+          discovering
+            ? t("settings.providers.modelsEditor.discovery.discovering")
+            : t("settings.providers.modelsEditor.discovery.discover")
+        }}
+      </Button>
+      <p class="text-xs text-muted-foreground">
+        {{ t("settings.providers.modelsEditor.discovery.description") }}
+      </p>
+
+      <!-- The count is what the checklist is about: how many of the endpoint's
+           new models are ticked. -->
+      <p v-if="discovered.length" class="text-xs text-muted-foreground">
+        {{
+          t("settings.providers.modelsEditor.discovery.selected", {
+            count: selectedDiscovered.length,
+            total: discovered.length,
+          })
+        }}
+      </p>
+
+      <div
+        v-if="discovered.length"
+        class="max-h-44 space-y-0.5 overflow-y-auto rounded-md border border-border p-1"
+      >
+        <label
+          v-for="model in discovered"
+          :key="model.id"
+          class="flex items-center gap-2 rounded-sm px-1.5 py-1 text-sm hover:bg-muted"
+        >
+          <input
+            v-model="selected[model.id]"
+            type="checkbox"
+            class="size-4 shrink-0 accent-primary"
+            :aria-label="
+              t('settings.providers.modelsEditor.discovery.include', {
+                model: model.id,
+              })
+            "
+          />
+          <span class="min-w-0 truncate">{{ model.name }}</span>
+          <span
+            v-if="model.name !== model.id"
+            class="ml-auto shrink-0 font-mono text-xs text-muted-foreground"
+          >
+            {{ model.id }}
+          </span>
+        </label>
+      </div>
+
+      <p v-else-if="discoveryRan" class="text-xs text-muted-foreground">
+        {{ t("settings.providers.modelsEditor.discovery.allConfigured") }}
+      </p>
+
+      <div v-if="discovered.length" class="flex justify-end">
+        <Button
+          type="button"
+          size="sm"
+          :disabled="selectedDiscovered.length === 0 || adding"
+          @click="handleAddDiscovered"
+        >
+          {{
+            adding
+              ? t("settings.providers.modelsEditor.discovery.adding")
+              : t("settings.providers.modelsEditor.discovery.add", {
+                  count: selectedDiscovered.length,
+                })
+          }}
+        </Button>
       </div>
     </div>
 

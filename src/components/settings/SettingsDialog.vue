@@ -199,6 +199,16 @@ const editTarget = computed(
 );
 
 /**
+ * S2 of `providers-pane-refinements.md`: the ids pi already has in `models.json`.
+ * The accounts block probes these first, so its first wave asks for the providers
+ * the human can see configured instead of walking the fixed list from the top.
+ * It is the same read the list below renders, so it costs no extra call.
+ */
+const configuredProviderIds = computed(() =>
+  providers.value.map((entry) => entry.id),
+);
+
+/**
  * S5 of `providers-pane.md`: build-time switches, read the same way the palette
  * and the hero copy are. ON BY DEFAULT — only an explicit `0`/`false`/`off`
  * (any case, surrounding spaces ignored) turns a section off, so a build without
@@ -667,7 +677,7 @@ watch(open, (isOpen) => {
                list it adds to. -->
           <div v-else class="space-y-6 py-4">
             <template v-if="providerLoginEnabled">
-              <AccountsSection />
+              <AccountsSection :configured="configuredProviderIds" />
               <Separator />
             </template>
 

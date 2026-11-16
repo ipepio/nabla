@@ -3,15 +3,20 @@
  * S2 of `providers-pane-refinements.md`: the account states are a session cache,
  * so they live at module scope and outlive the pane.
  *
- * One `pi auth check` boots a whole CLI (~1.15 s), so the badges are a
- * background fill and never a prerequisite of anything: the rows paint from the
- * fixed subscription list, the states arrive from ONE batched call
- * (`pi_auth_check_many`, bounded pool in Rust) fired after that first paint, and
- * the answer is kept here. Reopening the pane paints the cached badges at once
+ * One `pi auth check` boots a whole CLI (~1.15 s), so the badges are genuinely
+ * background work and never a prerequisite of anything: the rows paint from the
+ * fixed subscription list, the batch is scheduled a beat after the section is on
+ * screen (and deferred to an idle callback when the webview has one), and only
+ * then does a single `pi_auth_check_many` (bounded pool in Rust) run. Nothing in
+ * the pane awaits it: the badges start as a neutral placeholder and fill in.
+ *
+ * The answer is kept here. Reopening the pane paints the cached badges at once
  * and probes nothing; "Refresh status" is the explicit way to ask pi again.
  *
  * Module scope is the point: this component is unmounted every time the pane is
  * left, and a `ref` inside it would die with the pane and re-probe on every open.
+ * A scheduled probe belongs to the mount that scheduled it, so leaving the pane
+ * cancels it and no batch ever runs behind a hidden section.
  */
 import {
   computed,
@@ -42,42 +47,67 @@ const SUBSCRIPTION_PROVIDERS = [
 /** S2: the states observed this session, by provider id. Empty means "not seen". */
 const statuses = ref<Record<string, PiAuthStatus>>({});
 
-/** S2: a batch is in flight, so a badge with no cached state shows its pending face. */
+/**
+ * S2: how long the section waits after mount before the first probe. The delay
+ * is the whole point of the unit: the rows are readable, the pane is switchable
+ * and the first click lands before a single CLI boots.
+ */
+const PROBE_DELAY_MS = 1_200;
+
+/**
+ * S2: the deadline handed to `requestIdleCallback`. A busy frame would otherwise
+ * defer the batch forever; at the latest the probe runs when this expires.
+ */
+const PROBE_IDLE_TIMEOUT_MS = 2_000;
+
+/** S2: batches queued or running, so a badge with no cached state shows its pending face. */
 const probing = ref(false);
 
-/** The batch in flight, so a second trigger joins it instead of spawning another. */
-let batch: Promise<void> | null = null;
+/**
+ * S2: how many batches are queued or running. The pending face follows this
+ * counter, so the placeholder does not blink between the two waves.
+ */
+let queuedBatches = 0;
+
+/** The tail of the queue: waves run one after another, never in parallel. */
+let queue: Promise<void> = Promise.resolve();
 
 /**
  * S2: one batched probe. A provider that could not be probed lands as `unknown`
  * — the honest word for "nobody observed this account" — never as a guess.
  * Providers that already have a state keep it unless the batch answers again.
  */
-async function probeMany(providers: string[]): Promise<void> {
-  if (providers.length === 0) return;
-  if (batch !== null) {
-    await batch;
-    return;
-  }
-  probing.value = true;
-  batch = (async () => {
-    try {
-      const answer = await piAuthCheckMany(providers);
-      const next = { ...statuses.value };
-      for (const status of answer) next[status.provider] = status;
-      statuses.value = next;
-    } catch {
-      const next = { ...statuses.value };
-      for (const provider of providers) {
-        next[provider] = { provider, state: "unknown", credential: false };
-      }
-      statuses.value = next;
-    } finally {
-      probing.value = false;
-      batch = null;
+async function runBatch(providers: string[]): Promise<void> {
+  try {
+    const answer = await piAuthCheckMany(providers);
+    const next = { ...statuses.value };
+    for (const status of answer) next[status.provider] = status;
+    statuses.value = next;
+  } catch {
+    const next = { ...statuses.value };
+    for (const provider of providers) {
+      next[provider] = { provider, state: "unknown", credential: false };
     }
-  })();
-  await batch;
+    statuses.value = next;
+  }
+}
+
+/**
+ * S2: queues one batch behind whatever is already running, so two waves and an
+ * explicit refresh never spawn two CLI pools at once, and the pending face stays
+ * on screen until the last queued batch has landed.
+ */
+function probeMany(providers: string[]): Promise<void> {
+  if (providers.length === 0) return Promise.resolve();
+  queuedBatches += 1;
+  probing.value = true;
+  const run = queue.then(() => runBatch(providers));
+  const settle = () => {
+    queuedBatches -= 1;
+    probing.value = queuedBatches > 0;
+  };
+  queue = run.then(settle, settle);
+  return run;
 }
 
 /** S2: the single-provider re-read a finished sign-in or sign-out asks for. */
@@ -255,6 +285,13 @@ function extractSignInUrl(lines: string[]): string | null {
 /** S3: the rows are the subscription providers, fixed — the pane's providers are elsewhere. */
 const rows = SUBSCRIPTION_PROVIDERS;
 
+/**
+ * S2: the subscription providers pi already has in `models.json`, handed over by
+ * the pane from the list it renders. They are the first probe wave: an account
+ * the human can already see configured is usually the one they came to check.
+ */
+const props = defineProps<{ configured: string[] }>();
+
 /** Inline failures per provider: a rejected call keeps its reason on its row. */
 const errors = ref<Record<string, string>>({});
 
@@ -408,12 +445,13 @@ function stateOf(provider: string): PiAuthState {
 }
 
 /**
- * S2: this row was never observed and the batch is on its way, so the badge says
- * "checking" instead of claiming the account is unknown. Nothing is blocked
- * while it waits: sign in, sign out and the rest of the pane stay usable.
+ * S2: this row was never observed — the batch is scheduled, on its way, or the
+ * cached states are from an earlier mount. The badge says "checking" instead of
+ * claiming the account is unknown, and nothing in the pane waits for the answer.
+ * Sign in, sign out and the rest of the pane stay usable while it fills in.
  */
-function isPending(provider: string): boolean {
-  return probing.value && statuses.value[provider] === undefined;
+function isUnobserved(provider: string): boolean {
+  return statuses.value[provider] === undefined;
 }
 
 /**
@@ -678,6 +716,72 @@ watch(signInUrl, (url) => {
   void openInBrowser(url);
 });
 
+/**
+ * S2: the two waves of the background fill. Wave 1 is the subscription providers
+ * that already exist in `models.json`; wave 2 is the rest of the fixed list. Both
+ * go through the batched wrapper, so each wave is ONE CLI pool — the useful
+ * accounts land in ~1 s instead of after the whole list.
+ */
+function scheduleProbe() {
+  const configured = new Set(props.configured);
+  const unseen = (ids: readonly string[]) =>
+    ids.filter((id) => statuses.value[id] === undefined);
+  const firstWave = unseen(
+    SUBSCRIPTION_PROVIDERS.filter((id) => configured.has(id)),
+  );
+  const secondWave = unseen(
+    SUBSCRIPTION_PROVIDERS.filter((id) => !configured.has(id)),
+  );
+  if (firstWave.length === 0 && secondWave.length === 0) return;
+  void (async () => {
+    if (firstWave.length > 0) await probeMany(firstWave);
+    if (disposed) return;
+    // Re-filtered: a sign-out or a refresh may have answered while wave 1 ran.
+    const rest = unseen(secondWave);
+    if (rest.length > 0) await probeMany(rest);
+  })();
+}
+
+/** S2: the scheduled fill of this mount, so leaving the pane cancels it. */
+let probeTimer: ReturnType<typeof setTimeout> | null = null;
+let idleHandle: number | null = null;
+
+/** S2: nothing scheduled may outlive the section that scheduled it. */
+function cancelScheduledProbe() {
+  if (probeTimer !== null) {
+    clearTimeout(probeTimer);
+    probeTimer = null;
+  }
+  if (idleHandle !== null) {
+    if (typeof cancelIdleCallback === "function") {
+      cancelIdleCallback(idleHandle);
+    }
+    idleHandle = null;
+  }
+}
+
+/**
+ * S2: the delay expired. The waves run in an idle callback when the webview has
+ * one — so the batch never competes with a paint or an input frame — and fall
+ * back to the timer alone when it does not.
+ */
+function deferProbe() {
+  probeTimer = null;
+  if (disposed) return;
+  if (typeof requestIdleCallback === "function") {
+    idleHandle = requestIdleCallback(
+      () => {
+        idleHandle = null;
+        if (disposed) return;
+        scheduleProbe();
+      },
+      { timeout: PROBE_IDLE_TIMEOUT_MS },
+    );
+    return;
+  }
+  scheduleProbe();
+}
+
 onMounted(async () => {
   const unsubscribe = await subscribePiCli(handleCliEvent);
   if (disposed) {
@@ -687,22 +791,19 @@ onMounted(async () => {
   unsubscribeEvents = unsubscribe;
 });
 
-// S2: the states are a background fill. The rows are already on screen by the
-// time this runs — nothing here is awaited by the first render — and only the
-// providers nothing observed yet are asked for, so reopening the pane paints the
-// cache and spawns no CLI at all.
-onMounted(async () => {
-  await nextTick();
-  setTimeout(() => {
-    if (disposed) return;
-    void probeMany(
-      SUBSCRIPTION_PROVIDERS.filter((id) => statuses.value[id] === undefined),
-    );
-  }, 0);
+/**
+ * S2: mount schedules the badges and awaits nothing else. The section exists only
+ * while it is on screen (the pane renders it with `v-if`), so a hidden section
+ * schedules no probe at all — and one timer, cancelled on unmount, is the whole
+ * cost of a pane the human leaves immediately.
+ */
+onMounted(() => {
+  probeTimer = setTimeout(deferProbe, PROBE_DELAY_MS);
 });
 
 onBeforeUnmount(() => {
   disposed = true;
+  cancelScheduledProbe();
   unsubscribeEvents?.();
   unsubscribeEvents = null;
   // S3: no login flow outlives the pane that started it.
@@ -752,11 +853,13 @@ onBeforeUnmount(() => {
             {{ id }}
           </span>
           <!-- S4: the badge is pi's own answer, never a guess. S2: a row that was
-               never observed while a batch is on its way says so, quietly. -->
+               never observed shows the neutral placeholder — pulsing while the
+               batch is queued or on its way — and never blocks anything. -->
           <Badge
-            v-if="isPending(id)"
+            v-if="isUnobserved(id)"
             variant="outline"
-            class="animate-pulse text-muted-foreground"
+            class="text-muted-foreground"
+            :class="probing ? 'animate-pulse' : ''"
           >
             {{ t("settings.accounts.state.checking") }}
           </Badge>
