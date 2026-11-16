@@ -223,6 +223,16 @@ fn models_path(state: &AppState) -> PathBuf {
     models_file(&state.home_dir)
 }
 
+/// Path of pi's cached provider catalog. Read-only: the union of
+/// `list_provider_models` needs it, and nothing here writes it.
+fn catalog_file(home_dir: &Path) -> PathBuf {
+    crate::providers::models_store_path(home_dir)
+}
+
+fn catalog_path(state: &AppState) -> PathBuf {
+    catalog_file(&state.home_dir)
+}
+
 /// S1: the providers pi knows. The api key is reduced to `has_api_key` (S4).
 #[tauri::command]
 pub fn list_providers(state: State<'_, AppState>) -> Result<Vec<ProviderSummary>, String> {
@@ -299,16 +309,25 @@ pub fn set_provider_key(
 
 // ── models of one provider (S2, S3 of `models-by-provider.md`) ──────────────
 
-/// S2: every provider with its models, read from pi's own `models.json`.
+/// S2: every provider with its models, read from pi's own `models.json` plus the
+/// catalog pi caches in `models-store.json`.
 ///
 /// This is what the grouped selector and the per-model editor are built on: a
-/// provider with no models comes back with an empty list, and the api key never
-/// crosses (the DTO has no field for it).
+/// provider with no models comes back with an empty list, a provider pi signed
+/// in without ever writing `models.json` (openai, openai-codex) comes back from
+/// the catalog, and the api key never crosses (the DTO has no field for it).
+/// Every model says which file it came from (`source`: `configured` or
+/// `catalog`), which is what tells the UI whether it may be edited. A missing or
+/// corrupt catalog is not an error: it only contributes no catalog providers.
 #[tauri::command]
 pub fn list_provider_models(
     state: State<'_, AppState>,
 ) -> Result<Vec<ProviderModels>, String> {
-    crate::providers::read_provider_models(&models_path(&state)).map_err(display_err)
+    crate::providers::read_provider_models_with_catalog(
+        &models_path(&state),
+        &catalog_path(&state),
+    )
+    .map_err(display_err)
 }
 
 /// S3: writes one model inside `providers.<provider>.models` — backup, merge and

@@ -90,7 +90,8 @@ pub fn run() {
             commands::set_provider_key,
             // S2/S3 of `models-by-provider.md`: the models of each provider and
             // the per-model editor, over the same file and the same backup and
-            // atomic write.
+            // atomic write. The listing is the union of `models.json` and the
+            // read-only catalog pi caches in `models-store.json`.
             commands::list_provider_models,
             commands::update_provider_model,
             commands::remove_provider_model,

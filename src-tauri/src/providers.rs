@@ -41,10 +41,23 @@ pub struct ProviderModels {
     pub models: Vec<ModelInfo>,
 }
 
+/// `ModelInfo.source` for an entry of `~/.pi/agent/models.json`: the file the
+/// human edits, so the UI may offer to change it.
+pub const MODEL_SOURCE_CONFIGURED: &str = "configured";
+
+/// `ModelInfo.source` for an entry of `~/.pi/agent/models-store.json`: pi's cached
+/// catalog for an already signed-in provider. Read-only — pi owns that file and
+/// rewrites it on its own schedule, so nothing here edits or deletes it.
+pub const MODEL_SOURCE_CATALOG: &str = "catalog";
+
 /// S3: one model of a provider, as the editor reads it. Pi's own field names
 /// (`contextWindow`, `maxTokens`, `cost.input`, `cost.output`, `input`) are
 /// mapped onto flat camelCase fields; `enabled` is Nabla's mark, not pi's, and
 /// defaults to `true` when the file does not carry it.
+///
+/// `source` says which of pi's two files the entry came from
+/// (`MODEL_SOURCE_CONFIGURED` or `MODEL_SOURCE_CATALOG`), which is what decides
+/// whether the UI may edit it.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelInfo {
@@ -57,6 +70,8 @@ pub struct ModelInfo {
     /// Input modalities: `"text"` and `"image"`, pi's `input` array.
     pub modalities: Vec<String>,
     pub enabled: bool,
+    /// `"configured"` or `"catalog"`; see `MODEL_SOURCE_CONFIGURED`.
+    pub source: String,
 }
 
 /// S3: what the editor writes for one model. An absent number means "keep what
@@ -156,6 +171,18 @@ pub type ProvidersResult<T> = Result<T, ProvidersError>;
 /// Path of pi's provider configuration inside a home directory.
 pub fn models_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".pi").join("agent").join("models.json")
+}
+
+/// Path of pi's cached provider catalog inside a home directory.
+///
+/// pi writes it after a successful sign-in or catalog refresh: it is the only
+/// place the models of a signed-in provider (openai, openai-codex) exist. Nabla
+/// reads it and never writes it.
+pub fn models_store_path(home_dir: &Path) -> PathBuf {
+    home_dir
+        .join(".pi")
+        .join("agent")
+        .join("models-store.json")
 }
 
 /// Reads every provider pi knows, without the api keys.
@@ -293,6 +320,9 @@ pub fn delete_provider(path: &Path, provider_id: &str) -> ProvidersResult<bool> 
 /// S2/S3 of `models-by-provider.md`: every provider with its models, the models
 /// in the order the file declares them.
 ///
+/// This is the configured half only; `read_provider_models_with_catalog` is what
+/// the command layer calls when pi's cached catalog should be listed too.
+///
 /// A provider without a `models` array is listed with an empty vector (the
 /// editor still shows the provider, the selector simply offers nothing) and the
 /// api key stays in the file: `ModelInfo` has no field for it (S4).
@@ -319,6 +349,67 @@ pub fn read_provider_models(path: &Path) -> ProvidersResult<Vec<ProviderModels>>
                 .unwrap_or_default(),
         })
         .collect())
+}
+
+/// The union of what pi has configured and what pi has cached: a provider whose
+/// models only live in the catalog (a signed-in openai or openai-codex) still
+/// lists them, and the models of `models.json` are listed exactly as before.
+///
+/// Merge rules:
+/// - a provider in both files is listed once, with its configured models first
+///   and then the catalog models whose id the configured list does not already
+///   have — an id is never duplicated and the configured entry is the one that
+///   is kept when both files carry the same id;
+/// - a provider only the catalog has is appended with the provider id as its
+///   name (the catalog carries no display name) and every entry marked
+///   `MODEL_SOURCE_CATALOG`;
+/// - only conversation models of the catalog are listed (`type: "chat"`, or no
+///   `type` at all in an older cache); a `type: "classifier"` entry is not a
+///   choice the selector can offer.
+///
+/// The catalog is read-only and never a reason to fail: a missing, unreadable or
+/// corrupt `models-store.json` contributes no catalog entries, while the
+/// configured providers are still listed. A broken `models.json` stays a parse
+/// error, exactly like `read_provider_models` reports it.
+pub fn read_provider_models_with_catalog(
+    models: &Path,
+    store: &Path,
+) -> ProvidersResult<Vec<ProviderModels>> {
+    let mut providers = read_provider_models(models)?;
+    let Some(catalog) = read_catalog(store) else {
+        return Ok(providers);
+    };
+
+    // serde_json's default map is a `BTreeMap`, so the catalog providers are
+    // appended in id order: the listing is deterministic across reads.
+    for (provider_id, entry) in catalog {
+        let catalog_models = catalog_models_of(entry.get("models"));
+        if catalog_models.is_empty() {
+            continue;
+        }
+        match providers
+            .iter_mut()
+            .find(|provider| provider.provider == provider_id)
+        {
+            Some(configured) => {
+                for model in catalog_models {
+                    if configured.models.iter().any(|known| known.id == model.id) {
+                        continue;
+                    }
+                    configured.models.push(model);
+                }
+            }
+            None => providers.push(ProviderModels {
+                provider: provider_id.clone(),
+                // pi's store has no display name for a provider, and inventing
+                // one ("OpenAI Codex") would be a label pi never uses. The id is
+                // the same fallback `models.json` gets for an unnamed entry.
+                name: provider_id,
+                models: catalog_models,
+            }),
+        }
+    }
+    Ok(providers)
 }
 
 /// S3: writes one model inside `providers.<provider>.models` — backup, merge,
@@ -766,6 +857,17 @@ fn model_modalities(model: &serde_json::Value) -> Vec<String> {
 /// One model entry of pi's file as the contract's `ModelInfo`. `None` when the
 /// entry is not an object or carries no id: nothing the UI could select.
 fn model_info_of(model: &serde_json::Value) -> Option<ModelInfo> {
+    model_info_of_source(model, MODEL_SOURCE_CONFIGURED)
+}
+
+/// The same mapping for both files Nabla reads: a configured entry of
+/// `models.json` and a cached entry of `models-store.json` carry the same field
+/// names (`contextWindow`, `maxTokens`, `cost`, `input`), so one mapper serves
+/// both and the only difference is where the entry came from.
+///
+/// A catalog entry is always enabled: pi owns it, so there is nothing on this
+/// side to disable.
+fn model_info_of_source(model: &serde_json::Value, source: &str) -> Option<ModelInfo> {
     if !model.is_object() {
         return None;
     }
@@ -777,6 +879,12 @@ fn model_info_of(model: &serde_json::Value) -> Option<ModelInfo> {
         .filter(|v| !v.is_empty())
         .unwrap_or(&id)
         .to_string();
+    // S3/L3: Nabla's own mark, enabled unless the configured file says otherwise.
+    let enabled = source == MODEL_SOURCE_CATALOG
+        || model
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
     Some(ModelInfo {
         id,
         name,
@@ -785,12 +893,50 @@ fn model_info_of(model: &serde_json::Value) -> Option<ModelInfo> {
         input_cost: model_cost(model, "input"),
         output_cost: model_cost(model, "output"),
         modalities: model_modalities(model),
-        // S3/L3: Nabla's own mark, enabled unless the file says otherwise.
-        enabled: model
-            .get("enabled")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true),
+        enabled,
+        source: source.to_string(),
     })
+}
+
+/// pi's cached catalog as a JSON object, or `None` for every failure a read of it
+/// may hit (missing file, unreadable file, corrupt JSON, a root that is not an
+/// object). The catalog is a cache pi rebuilds by itself, so none of those is an
+/// error here: they only mean there is nothing extra to list.
+fn read_catalog(store: &Path) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let raw = std::fs::read_to_string(store).ok()?;
+    match serde_json::from_str::<serde_json::Value>(&raw).ok()? {
+        serde_json::Value::Object(catalog) => Some(catalog),
+        _ => None,
+    }
+}
+
+/// The conversation models of one cached provider, mapped onto the contract.
+///
+/// `models` is the raw `models` field of the entry: a missing array, an entry
+/// that is not an array and an entry that is not an object all contribute
+/// nothing instead of failing the read.
+fn catalog_models_of(models: Option<&serde_json::Value>) -> Vec<ModelInfo> {
+    models
+        .and_then(serde_json::Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter(|model| is_chat_entry(model))
+                .filter_map(|model| model_info_of_source(model, MODEL_SOURCE_CATALOG))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a cached entry is a conversation model. pi's store also carries
+/// non-chat kinds (`type: "classifier"`), which are not choices the selector can
+/// offer; a cache without a `type` field predates the distinction and is kept.
+fn is_chat_entry(model: &serde_json::Value) -> bool {
+    match model.get("type") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(kind)) => kind.trim() == "chat",
+        Some(_) => false,
+    }
 }
 
 fn summary_of(id: &str, entry: &serde_json::Value) -> ProviderSummary {
@@ -1039,6 +1185,15 @@ mod tests {
 
         fn read(&self) -> String {
             std::fs::read_to_string(self.path()).expect("read models.json")
+        }
+
+        /// pi's cached catalog, next to `models.json` exactly as pi writes it.
+        fn store_path(&self) -> PathBuf {
+            self.0.join("models-store.json")
+        }
+
+        fn write_store(&self, contents: &str) {
+            std::fs::write(self.store_path(), contents).expect("write models-store.json");
         }
 
         /// Every file name in the scratch directory, sorted.
@@ -1762,6 +1917,7 @@ mod tests {
                 output_cost: Some(1.5),
                 modalities: vec!["text".to_string(), "image".to_string()],
                 enabled: true,
+                source: MODEL_SOURCE_CONFIGURED.to_string(),
             }
         );
         assert_eq!(nan.models[1].id, "glm5.3");
@@ -1800,6 +1956,7 @@ mod tests {
                 output_cost: None,
                 modalities: vec!["text".to_string()],
                 enabled: true,
+                source: MODEL_SOURCE_CONFIGURED.to_string(),
             }
         );
         // The Nabla-side flag is read back when the file carries it.
@@ -1811,6 +1968,318 @@ mod tests {
         let dir = TempModelsDir::new("list_missing");
         let providers = read_provider_models(&dir.path()).expect("a missing file is not an error");
         assert!(providers.is_empty());
+    }
+
+    // ── the cached catalog (`models-store.json`) ────────────────────────────
+
+    /// `models.json` with one provider, so every catalog test starts from a
+    /// configured provider that must survive the union untouched.
+    const CONFIGURED_FILE: &str = r#"{
+      "providers": {
+        "keep": {
+          "name": "Keep",
+          "baseUrl": "https://keep.test/v1",
+          "apiKey": "sk-keep-secret",
+          "models": [
+            { "id": "alpha", "name": "Alpha (configured)", "contextWindow": 8192 }
+          ]
+        }
+      }
+    }"#;
+
+    /// The union read: the configured file plus the catalog next to it.
+    fn union(dir: &TempModelsDir) -> Vec<ProviderModels> {
+        read_provider_models_with_catalog(&dir.path(), &dir.store_path())
+            .expect("the union never fails for a broken catalog")
+    }
+
+    /// The model ids of one listed provider, in payload order.
+    fn listed_ids(providers: &[ProviderModels], provider: &str) -> Vec<String> {
+        providers
+            .iter()
+            .find(|p| p.provider == provider)
+            .unwrap_or_else(|| panic!("provider {provider} is not listed"))
+            .models
+            .iter()
+            .map(|m| m.id.clone())
+            .collect()
+    }
+
+    // A provider pi only has in the catalog (a signed-in openai-codex) is listed
+    // with every chat model, marked read-only, and the pane still lists the
+    // configured provider exactly as before.
+    #[test]
+    fn a_catalog_only_provider_is_listed_with_source_catalog() {
+        let dir = TempModelsDir::new("catalog_only");
+        dir.write(CONFIGURED_FILE);
+        dir.write_store(
+            r#"{
+              "openai-codex": {
+                "models": [
+                  { "id": "gpt-5.6-luna", "name": "GPT-5.6 Luna", "type": "chat" },
+                  { "id": "gpt-5.6-sol", "name": "GPT-5.6 Sol", "type": "chat" }
+                ],
+                "lastModified": 1794769407,
+                "etag": "etag-value",
+                "checkedAt": 1794769407
+              }
+            }"#,
+        );
+
+        let providers = union(&dir);
+
+        assert_eq!(
+            providers
+                .iter()
+                .map(|p| p.provider.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep", "openai-codex"],
+            "configured providers come first, catalog-only ones after them"
+        );
+        let codex = providers
+            .iter()
+            .find(|p| p.provider == "openai-codex")
+            .expect("openai-codex is listed");
+        assert_eq!(
+            codex.name, "openai-codex",
+            "pi's store carries no display name, so the id is the label"
+        );
+        assert_eq!(
+            codex
+                .models
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpt-5.6-luna", "gpt-5.6-sol"]
+        );
+        assert!(
+            codex
+                .models
+                .iter()
+                .all(|m| m.source == MODEL_SOURCE_CATALOG),
+            "catalog entries are read-only: pi owns that file"
+        );
+
+        // The configured provider is untouched, with its own source.
+        let keep = providers
+            .iter()
+            .find(|p| p.provider == "keep")
+            .expect("keep");
+        assert_eq!(keep.name, "Keep");
+        assert_eq!(keep.models.len(), 1);
+        assert_eq!(keep.models[0].source, MODEL_SOURCE_CONFIGURED);
+
+        // S4: neither the key nor the base url of either file reaches the payload.
+        let json = serde_json::to_string(&providers).expect("serialize");
+        assert!(!json.contains("sk-keep-secret"), "no api key: {json}");
+        assert!(!json.contains("apiKey"), "no apiKey field: {json}");
+        assert!(!json.contains("baseUrl"), "no baseUrl field: {json}");
+        assert!(!json.contains("keep.test"), "no base url value: {json}");
+    }
+
+    // A provider present in both files is listed once: configured models first,
+    // then the catalog models whose id is not configured. The configured entry
+    // wins for an id both files carry.
+    #[test]
+    fn a_provider_in_both_files_merges_without_duplicating_an_id() {
+        let dir = TempModelsDir::new("catalog_merge");
+        dir.write(CONFIGURED_FILE);
+        dir.write_store(
+            r#"{
+              "keep": {
+                "models": [
+                  { "id": "alpha", "name": "Alpha (catalog)", "contextWindow": 999, "type": "chat" },
+                  { "id": "beta", "name": "Beta", "type": "chat" },
+                  { "id": "gamma", "name": "Gamma", "type": "chat" }
+                ]
+              }
+            }"#,
+        );
+        let store_before = std::fs::read_to_string(dir.store_path()).expect("read store");
+
+        let providers = union(&dir);
+
+        assert_eq!(providers.len(), 1, "the provider is listed exactly once");
+        assert_eq!(
+            listed_ids(&providers, "keep"),
+            vec!["alpha", "beta", "gamma"],
+            "configured models first, then the catalog ones it does not have"
+        );
+        let models = &providers[0].models;
+        // The configured entry is the one kept for the shared id.
+        assert_eq!(models[0].name, "Alpha (configured)");
+        assert_eq!(models[0].source, MODEL_SOURCE_CONFIGURED);
+        assert_eq!(models[0].context_window, Some(8192));
+        assert_eq!(models[1].source, MODEL_SOURCE_CATALOG);
+        assert_eq!(models[2].name, "Gamma");
+
+        // The catalog is read-only: the union never rewrites it.
+        assert_eq!(
+            std::fs::read_to_string(dir.store_path()).expect("read store"),
+            store_before
+        );
+    }
+
+    // Only conversation entries are listed: pi's store also carries non-chat
+    // kinds, which the selector cannot offer.
+    #[test]
+    fn non_chat_catalog_entries_are_skipped() {
+        let dir = TempModelsDir::new("catalog_types");
+        dir.write(CONFIGURED_FILE);
+        dir.write_store(
+            r#"{
+              "openai": {
+                "models": [
+                  { "id": "chat-latest", "name": "Chat Latest", "type": "chat" },
+                  { "id": "omni-moderation", "type": "classifier" },
+                  { "id": "no-type", "name": "No Type" },
+                  { "name": "no id at all", "type": "chat" },
+                  { "id": "", "type": "chat" }
+                ]
+              }
+            }"#,
+        );
+
+        assert_eq!(
+            listed_ids(&union(&dir), "openai"),
+            vec!["chat-latest", "no-type"],
+            "a non-chat kind is skipped, and an entry without an id is not a choice"
+        );
+    }
+
+    // The catalog is mapped by the same mapper as the configured file, so a
+    // signed-in model carries its real window, cost and modalities. It is always
+    // enabled: pi owns the entry.
+    #[test]
+    fn a_catalog_model_maps_pi_fields_onto_the_contract() {
+        let dir = TempModelsDir::new("catalog_mapping");
+        dir.write_store(
+            r#"{
+              "openai": {
+                "models": [
+                  {
+                    "id": "chat-latest",
+                    "name": "Chat Latest",
+                    "api": "openai-responses",
+                    "provider": "openai",
+                    "baseUrl": "https://api.openai.com/v1",
+                    "reasoning": true,
+                    "input": ["text", "image"],
+                    "cost": { "input": 5, "output": 30, "cacheRead": 0.5, "cacheWrite": 0 },
+                    "contextWindow": 400000,
+                    "maxTokens": 128000,
+                    "enabled": false,
+                    "type": "chat"
+                  }
+                ]
+              }
+            }"#,
+        );
+
+        let providers = union(&dir);
+        assert_eq!(providers.len(), 1, "no configured file, only the catalog");
+        assert_eq!(
+            providers[0].models,
+            vec![ModelInfo {
+                id: "chat-latest".to_string(),
+                name: "Chat Latest".to_string(),
+                context_window: Some(400000),
+                max_tokens: Some(128000),
+                input_cost: Some(5.0),
+                output_cost: Some(30.0),
+                modalities: vec!["text".to_string(), "image".to_string()],
+                enabled: true,
+                source: MODEL_SOURCE_CATALOG.to_string(),
+            }]
+        );
+
+        // CamelCase on the wire, and the read-only marker is part of it.
+        let json = serde_json::to_value(&providers).expect("serialize");
+        let model = &json[0]["models"][0];
+        assert_eq!(model["source"], serde_json::json!("catalog"));
+        assert_eq!(model["contextWindow"], serde_json::json!(400000));
+        assert_eq!(model["maxTokens"], serde_json::json!(128000));
+        assert_eq!(model["inputCost"], serde_json::json!(5.0));
+        assert_eq!(model["outputCost"], serde_json::json!(30.0));
+        assert_eq!(model["modalities"], serde_json::json!(["text", "image"]));
+        assert_eq!(model["enabled"], serde_json::json!(true));
+        assert!(model.get("baseUrl").is_none(), "no base url: {model}");
+        assert!(model.get("apiKey").is_none(), "no api key: {model}");
+    }
+
+    // A fresh install has never been signed in: the store does not exist, and
+    // the configured listing still works.
+    #[test]
+    fn a_missing_catalog_file_lists_the_configured_providers_only() {
+        let dir = TempModelsDir::new("catalog_missing");
+        dir.write(CONFIGURED_FILE);
+
+        let providers = union(&dir);
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].provider, "keep");
+        assert_eq!(listed_ids(&providers, "keep"), vec!["alpha"]);
+        assert!(!dir.store_path().exists(), "nothing is created");
+    }
+
+    // A corrupt cache is a cache pi rebuilds by itself: it contributes no
+    // catalog entries and never fails the command.
+    #[test]
+    fn a_corrupt_catalog_file_lists_the_configured_providers_only() {
+        let dir = TempModelsDir::new("catalog_corrupt");
+        dir.write(CONFIGURED_FILE);
+        let configured_before = dir.read();
+
+        for contents in [
+            "{ not json",
+            "",
+            "[]",
+            r#""just a string""#,
+            r#"{"keep":{"models":"not an array"}}"#,
+            r#"{"keep":[1,2,3]}"#,
+            r#"{"openai":{"models":[42,"nope",null]}}"#,
+        ] {
+            dir.write_store(contents);
+            let providers = union(&dir);
+            assert_eq!(
+                providers
+                    .iter()
+                    .map(|p| p.provider.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["keep"],
+                "only the configured provider is listed for {contents:?}"
+            );
+            assert_eq!(listed_ids(&providers, "keep"), vec!["alpha"]);
+            assert_eq!(dir.read(), configured_before, "models.json is not rewritten");
+            assert_eq!(
+                std::fs::read_to_string(dir.store_path()).expect("read store"),
+                contents,
+                "the catalog is never rewritten"
+            );
+        }
+    }
+
+    // The tolerance is for the catalog only: a broken configured file is still a
+    // parse error, exactly like the configured-only read reports it.
+    #[test]
+    fn a_corrupt_configured_file_is_still_a_parse_error() {
+        let dir = TempModelsDir::new("catalog_corrupt_models");
+        dir.write("{ not json");
+        dir.write_store(r#"{"openai":{"models":[{"id":"chat-latest"}]}}"#);
+
+        assert!(matches!(
+            read_provider_models_with_catalog(&dir.path(), &dir.store_path()),
+            Err(ProvidersError::Parse(_))
+        ));
+    }
+
+    // The path resolver targets pi's own cache, next to models.json.
+    #[test]
+    fn models_store_path_is_pis_agent_models_store_json() {
+        assert_eq!(
+            models_store_path(Path::new("/home/u")),
+            PathBuf::from("/home/u/.pi/agent/models-store.json")
+        );
     }
 
     // S3: a new model is appended to its provider and everything else — the other
@@ -1841,6 +2310,7 @@ mod tests {
                 output_cost: Some(0.75),
                 modalities: vec!["text".to_string(), "image".to_string()],
                 enabled: true,
+                source: MODEL_SOURCE_CONFIGURED.to_string(),
             }
         );
 
@@ -2132,6 +2602,7 @@ mod tests {
                 output_cost: Some(1.5),
                 modalities: vec!["text".to_string()],
                 enabled: false,
+                source: MODEL_SOURCE_CONFIGURED.to_string(),
             }],
         };
         let json = serde_json::to_value(&provider).expect("serialize");
@@ -2139,6 +2610,11 @@ mod tests {
         assert_eq!(json["name"], serde_json::json!("NaN"));
         let model = &json["models"][0];
         assert_eq!(model["id"], serde_json::json!("qwen3.6"));
+        assert_eq!(
+            model["source"],
+            serde_json::json!("configured"),
+            "every model says which file it came from"
+        );
         assert_eq!(model["contextWindow"], serde_json::json!(131072));
         assert_eq!(model["maxTokens"], serde_json::json!(8192));
         assert_eq!(model["inputCost"], serde_json::json!(0.5));
