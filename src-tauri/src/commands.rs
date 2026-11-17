@@ -19,6 +19,7 @@ use crate::providers::{
 };
 use crate::rpc::{AgentEvent, RuntimeStatus};
 use crate::settings::{self, Settings};
+use crate::shell::{self, ShellSession, ShellSessions, ShellSink};
 use crate::store::{ProviderStatusRow, SessionNew, SessionRow, Store, StoreResult, Workspace};
 use crate::workspace::{FsEntry, FsPreview, GitEntry};
 
@@ -40,6 +41,10 @@ pub struct AppState {
     /// Emitter of the `pi-cli` event. The registry receives the sink per call,
     /// so nothing below this layer decides how an event reaches the webview.
     pub cli_sink: CliSink,
+    /// S2 of `tool-drawer-and-mcp.md` (F2): the workspace terminals, one pty per
+    /// tab, and the sink their `shell-output` events leave through.
+    pub shells: ShellSessions,
+    pub shell_sink: ShellSink,
 }
 
 // Errors cross the bridge as plain strings for now: StoreError and SettingsError
@@ -1573,6 +1578,76 @@ pub fn git_diff(workspace: String, path: String) -> Result<String, String> {
     crate::workspace::git_diff(&workspace, &path)
 }
 
+// ── F2 of `tool-drawer-and-mcp.md`: the workspace terminal ──────────────────
+//
+// One pty per tab, on the human's own shell, with the workspace as its working
+// directory. The terminal is opt-in through `enabledTools` and is never exposed
+// to the agent: pi already has its own shell tool, and a second one here would
+// only widen the surface. Everything that knows how a pty lives is in `shell`;
+// these commands only unfreeze the arguments.
+
+/// The directory a terminal starts in. The workspace goes through `resolve`, the
+/// same containment check the Files tab uses, so a workspace that was deleted or
+/// renamed answers a readable error instead of opening a shell in `/`.
+fn terminal_cwd(workspace: &str) -> Result<PathBuf, String> {
+    crate::workspace::resolve(workspace, "")
+}
+
+/// S2: opens one terminal in the workspace and answers the session its
+/// `shell-output` events carry.
+#[tauri::command]
+pub fn shell_open(state: State<'_, AppState>, workspace: String) -> Result<ShellSession, String> {
+    let cwd = terminal_cwd(&workspace)?;
+    // S2: the human's own shell — `$SHELL`, then zsh, then bash. Resolved here so
+    // the tab can show what it actually runs.
+    let shell = shell::resolve_shell();
+    state
+        .shells
+        .open_with(
+            &shell,
+            &[],
+            &cwd,
+            shell::DEFAULT_COLS,
+            shell::DEFAULT_ROWS,
+            Arc::clone(&state.shell_sink),
+        )
+        .map_err(display_err)
+}
+
+/// S2: what the human typed, byte for byte. No newline is added here; xterm
+/// sends the carriage return itself. `false` means the session is unknown or
+/// already finished, which is not an error.
+#[tauri::command]
+pub fn shell_write(
+    state: State<'_, AppState>,
+    session_id: String,
+    data: String,
+) -> Result<bool, String> {
+    state.shells.write(&session_id, &data).map_err(display_err)
+}
+
+/// S2: the panel's new size, so the shell reflows and full-screen programs get
+/// their resize signal.
+#[tauri::command]
+pub fn shell_resize(
+    state: State<'_, AppState>,
+    session_id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<bool, String> {
+    state
+        .shells
+        .resize(&session_id, cols, rows)
+        .map_err(display_err)
+}
+
+/// S2: kills the shell and forgets the session. Idempotent, like `stop`: a tab
+/// that closes twice is not an error.
+#[tauri::command]
+pub fn shell_close(state: State<'_, AppState>, session_id: String) -> Result<bool, String> {
+    Ok(state.shells.close(&session_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2500,5 +2575,29 @@ done
 
         // A relative root would display a path the app cannot open.
         assert!(mcp_file_path_for(Path::new("home"), project, McpScope::Global).is_err());
+    }
+
+    // ── F2 of `tool-drawer-and-mcp.md`: the workspace terminal ─────────────
+
+    // S2: a terminal starts in the workspace it was opened for. A workspace the
+    // app cannot read is refused before any pty exists, so no shell is ever
+    // opened in a directory nobody asked for.
+    #[test]
+    fn terminal_cwd_is_the_workspace_and_must_exist() {
+        let fixture = TempSeedDir::new("terminal_cwd");
+        let workspace = fixture.home();
+
+        let cwd = terminal_cwd(&workspace.to_string_lossy()).expect("an existing workspace");
+        assert_eq!(cwd, workspace.canonicalize().expect("canonical home"));
+        assert!(cwd.is_dir(), "a terminal needs a directory to start in");
+
+        let gone = workspace.join("gone");
+        let err = terminal_cwd(&gone.to_string_lossy())
+            .expect_err("a workspace that no longer exists is refused");
+        assert!(err.contains("not readable"), "got: {err}");
+
+        // A relative path would silently open the shell in the app's own cwd.
+        let err = terminal_cwd("relative/workspace").expect_err("a relative path is refused");
+        assert!(err.contains("absolute"), "got: {err}");
     }
 }

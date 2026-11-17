@@ -42,7 +42,7 @@ Objetivo: convertir el panel derecho vacío en el área de herramientas.
 - **Fuera**: editar/guardar archivos, staging, commit, agregación multi-worktree (queda como F4).
 - **Verificación**: tests Rust de confinamiento (intentos `..`, symlink externo, archivo enorme, binario) y de parseo de `git status --porcelain`; build del frontend.
 
-### F2 — Terminal  · riesgo alto (opt-in)
+### F2 — Terminal  · riesgo alto (opt-in) · ✅ HECHO
 Objetivo: una terminal real en el workspace.
 
 - **Rust**: sesión PTY (ya disponible) con `cwd = workspace`, ciclo de vida por pestaña, kill al cerrar; eventos por canal propio.

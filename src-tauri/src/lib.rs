@@ -5,6 +5,7 @@ mod process;
 mod providers;
 mod rpc;
 mod settings;
+mod shell;
 mod store;
 mod workspace;
 
@@ -66,6 +67,17 @@ pub fn run() {
                 runtime,
                 cli: cli::CliSessions::new(),
                 cli_sink,
+                // S2 of `tool-drawer-and-mcp.md` (F2): the workspace terminals
+                // emit their `{ sessionId, stream, data?, exitCode? }` payload
+                // on `shell-output`, a channel of their own so a terminal's
+                // bytes never interleave with the agent's events.
+                shells: shell::ShellSessions::new(),
+                shell_sink: {
+                    let shell_handle = app.handle().clone();
+                    Arc::new(move |event: &shell::ShellOutputEvent| {
+                        let _ = shell_handle.emit("shell-output", event.clone());
+                    })
+                },
             });
             Ok(())
         })
@@ -150,7 +162,14 @@ pub fn run() {
             // Raw bytes, so an image preview never pays for base64.
             commands::fs_read_image_bytes,
             commands::git_status,
-            commands::git_diff
+            commands::git_diff,
+            // F2 of `tool-drawer-and-mcp.md`: the workspace terminal, one pty per
+            // tab, streaming on the `shell-output` channel. Opt-in through
+            // `enabledTools` and never exposed to the agent.
+            commands::shell_open,
+            commands::shell_write,
+            commands::shell_resize,
+            commands::shell_close
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -44,6 +44,13 @@ pub struct Settings {
     /// instead of being rejected. An absent field means `true`.
     #[serde(default = "default_true")]
     pub queue_messages: bool,
+    /// S5 of `tool-drawer-and-mcp.md`: which drawer tools are active, by tool id
+    /// (`files`, `changes`, `terminal`, `browser`). Files and Changes ship on; the
+    /// two tools that reach outside the app (a real shell, a driven browser) are
+    /// opt-in. An absent field takes `default_tools`, and an unknown id is kept
+    /// verbatim — a tool this build does not know is not erased from the file.
+    #[serde(default = "default_tools")]
+    pub enabled_tools: Vec<String>,
 }
 
 /// S2/S3 of `chat-preferences-and-queue.md`: both chat toggles ship enabled, so
@@ -71,6 +78,13 @@ fn default_language() -> String {
     "en".to_string()
 }
 
+/// S5 of `tool-drawer-and-mcp.md`: the tools a fresh install shows. Terminal and
+/// Browser stay out on purpose — they run arbitrary commands and drive a real
+/// browser, so the human turns them on explicitly in Settings.
+pub fn default_tools() -> Vec<String> {
+    vec!["files".to_string(), "changes".to_string()]
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -83,6 +97,7 @@ impl Default for Settings {
             hidden_models: Vec::new(),
             show_reasoning: default_true(),
             queue_messages: default_true(),
+            enabled_tools: default_tools(),
         }
     }
 }
@@ -379,6 +394,83 @@ mod tests {
         assert_eq!(s.theme, "light");
         assert_eq!(s.model, "glm5.3");
         assert_eq!(s.language, "en");
+    }
+
+    // ── enabled drawer tools (S5 of `tool-drawer-and-mcp.md`) ───────────────
+
+    // S5: a fresh install opens with Files and Changes on and the two opt-in
+    // tools (Terminal, Browser) off, which is exactly this list.
+    #[test]
+    fn default_enabled_tools_are_files_and_changes() {
+        let s = Settings::default();
+        assert_eq!(
+            s.enabled_tools,
+            vec!["files".to_string(), "changes".to_string()],
+            "S5: Files and Changes ship on; Terminal and Browser are opt-in"
+        );
+
+        // camelCase on the wire, so `preferences.ts` mirrors this key.
+        let json = serde_json::to_value(&s).expect("serialize");
+        assert_eq!(
+            json["enabledTools"],
+            serde_json::json!(["files", "changes"])
+        );
+    }
+
+    // S5: the switches are a preference like the others — the list is written
+    // verbatim and read back unchanged, including the opt-in tools.
+    #[test]
+    fn enabled_tools_round_trip() {
+        let cfg = TempCfg::new("enabled_tools_roundtrip");
+        let s = Settings {
+            enabled_tools: vec![
+                "files".to_string(),
+                "terminal".to_string(),
+                "browser".to_string(),
+            ],
+            ..Settings::default()
+        };
+        save(&cfg.0, &s).expect("save");
+
+        let loaded = load(&cfg.0).expect("load");
+        assert_eq!(
+            loaded.enabled_tools,
+            vec![
+                "files".to_string(),
+                "terminal".to_string(),
+                "browser".to_string()
+            ],
+            "S5: a tool turned on stays on across relaunches"
+        );
+        // An empty list is a real choice too: every tool turned off.
+        save(
+            &cfg.0,
+            &Settings {
+                enabled_tools: Vec::new(),
+                ..Settings::default()
+            },
+        )
+        .expect("save");
+        assert!(!load(&cfg.0).expect("load").enabled_tools.contains(&"files".to_string()));
+    }
+
+    // S5 + settings header rule: a file written before the switches existed must
+    // still load, showing the same tools a fresh install shows.
+    #[test]
+    fn settings_file_without_enabled_tools_uses_the_default_tools() {
+        let cfg = TempCfg::new("pre_enabled_tools");
+        std::fs::write(
+            &cfg.0,
+            r#"{"theme":"light","piBinary":"pi","provider":"nan","model":"glm5.3","language":"es"}"#,
+        )
+        .expect("write fixture");
+        let s = load(&cfg.0).expect("an older settings file must load");
+        assert_eq!(s.theme, "light");
+        assert_eq!(
+            s.enabled_tools,
+            vec!["files".to_string(), "changes".to_string()],
+            "an absent key means the shipped set, never an empty drawer"
+        );
     }
 
     // ── hidden models (S2 of `model-visibility.md`) ─────────────────────────
