@@ -11,6 +11,7 @@ use tauri::State;
 use tauri_plugin_opener::OpenerExt;
 
 use crate::cli::{self, CliSessions, CliSink, PiAuthStatus, PiCliResult};
+use crate::mcp::{self, McpAddDraft, McpScope, McpServerSummary};
 use crate::process::{ProcessManager, StartupOutcome};
 use crate::providers::{
     ModelInfo as ProviderModelInfo, ModelOption, ProviderDraft, ProviderModelDraft, ProviderModels,
@@ -1354,6 +1355,175 @@ fn auth_state_label(state: cli::AuthState) -> &'static str {
     }
 }
 
+// ── MCP configuration (F0 of `tool-drawer-and-mcp.md`) ──────────────────────
+
+/// S1: every MCP read and every MCP write is a `pi mcp` call run through the
+/// allowlisted bridge. Nabla never opens `mcp.json` or `~/.pi/agent/mcp-auth.json`:
+/// pi owns the schema, the merge of global and project files and the OAuth
+/// tokens, so nothing here can drift from what a session sees.
+///
+/// The exit code is never evidence of state (L of the feature doc: `pi mcp login`
+/// of an unknown server exits 0): the badges are read from `list --json`.
+fn mcp_call(state: &AppState, args: &[String], timeout_ms: u64) -> Result<PiCliResult, String> {
+    let settings = settings::load(&settings_path(state)).map_err(display_err)?;
+    cli::run(
+        args,
+        Duration::from_millis(timeout_ms),
+        &settings.pi_binary,
+    )
+    .map_err(display_err)
+}
+
+/// S1: one reading of a finished `pi mcp list --json`.
+///
+/// The JSON is the only evidence. A list call exits 1 when any server is
+/// unhealthy — which is exactly the case the pane must paint — so a non-zero code
+/// is folded into the answer instead of failing the call. A timeout is the one
+/// outcome with nothing to read, and it reports an error instead of an empty list
+/// that would look like "no MCP servers configured".
+fn mcp_list_from(result: &PiCliResult) -> Result<Vec<McpServerSummary>, String> {
+    if result.timed_out {
+        return Err(format!(
+            "pi mcp list did not finish within {}s",
+            mcp::LIST_TIMEOUT_MS / 1000
+        ));
+    }
+    Ok(mcp::parse_list(&result.stdout))
+}
+
+/// S1: what a mutating `pi mcp` call means. 0 is success; anything else carries
+/// pi's own diagnostic on stderr, which is more useful than "it failed".
+fn check_mcp_mutation(result: &PiCliResult, action: &str) -> Result<(), String> {
+    match result.exit_code {
+        Some(0) => Ok(()),
+        Some(code) => Err(format!(
+            "pi mcp {action} failed (exit {code}): {}",
+            stderr_or_none(&result.stderr)
+        )),
+        None => Err(format!(
+            "pi mcp {action} ended without an exit code: {}",
+            stderr_or_none(&result.stderr)
+        )),
+    }
+}
+
+/// pi's diagnostic, or an explicit "none" so a failure is never reported as an
+/// empty message.
+fn stderr_or_none(stderr: &str) -> String {
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        "no diagnostic".to_string()
+    } else {
+        stderr.to_string()
+    }
+}
+
+/// S1: the MCP pane's listing, read from pi.
+#[tauri::command]
+pub fn mcp_list(state: State<'_, AppState>) -> Result<Vec<McpServerSummary>, String> {
+    let result = mcp_call(&state, &mcp::list_args(), mcp::LIST_TIMEOUT_MS)?;
+    mcp_list_from(&result)
+}
+
+/// S1: adds or replaces a server with the argv `mcp::add_args` builds, then
+/// answers the refreshed listing so the pane never paints a stale row.
+#[tauri::command]
+pub fn mcp_add(
+    state: State<'_, AppState>,
+    draft: McpAddDraft,
+) -> Result<Vec<McpServerSummary>, String> {
+    let args = mcp::add_args(&draft).map_err(display_err)?;
+    // Adding writes a config file, so the generic deadline is right here: it is
+    // not the listing, which connects to every server.
+    let result = mcp_call(&state, &args, cli::DEFAULT_TIMEOUT_MS)?;
+    check_mcp_mutation(&result, "add")?;
+    let listed = mcp_call(&state, &mcp::list_args(), mcp::LIST_TIMEOUT_MS)?;
+    mcp_list_from(&listed)
+}
+
+/// S1: removes a server from the file named by its scope.
+#[tauri::command]
+pub fn mcp_remove(
+    state: State<'_, AppState>,
+    name: String,
+    scope: McpScope,
+) -> Result<Vec<McpServerSummary>, String> {
+    let args = mcp::remove_args(&name, scope).map_err(display_err)?;
+    let result = mcp_call(&state, &args, cli::DEFAULT_TIMEOUT_MS)?;
+    check_mcp_mutation(&result, "remove")?;
+    let listed = mcp_call(&state, &mcp::list_args(), mcp::LIST_TIMEOUT_MS)?;
+    mcp_list_from(&listed)
+}
+
+/// S1: deletes the stored OAuth credential of one server. pi keeps the server in
+/// `mcp.json`; only its sign-in is gone, so the refreshed list paints the entry
+/// as needing a sign-in again.
+#[tauri::command]
+pub fn mcp_logout(
+    state: State<'_, AppState>,
+    name: String,
+    scope: McpScope,
+) -> Result<Vec<McpServerSummary>, String> {
+    let args = mcp::logout_args(&name, scope).map_err(display_err)?;
+    let result = mcp_call(&state, &args, cli::DEFAULT_TIMEOUT_MS)?;
+    check_mcp_mutation(&result, "logout")?;
+    let listed = mcp_call(&state, &mcp::list_args(), mcp::LIST_TIMEOUT_MS)?;
+    mcp_list_from(&listed)
+}
+
+/// S1: the file a scope addresses, as an absolute path. Nothing is created: pi
+/// writes the file on the first `add`, and this path only feeds the "open the
+/// file" and "show me the JSON" actions.
+#[tauri::command]
+pub fn mcp_file_path(state: State<'_, AppState>, scope: McpScope) -> Result<String, String> {
+    let project = project_root()?;
+    mcp_file_path_for(&state.home_dir, &project, scope)
+}
+
+/// The project root `pi` itself resolves for `-l`: the working directory of the
+/// host process. The bridge inherits it and has no cwd parameter, so this is the
+/// only project a `pi mcp ... -l` call can address.
+fn project_root() -> Result<PathBuf, String> {
+    std::env::current_dir()
+        .map_err(|err| format!("cannot resolve the project directory: {err}"))
+}
+
+/// The path resolution behind `mcp_file_path`, split out so it is testable
+/// without a Tauri `State` — the same shape the settings path helpers use.
+fn mcp_file_path_for(home: &Path, project: &Path, scope: McpScope) -> Result<String, String> {
+    let path = mcp::file_path(home, project, scope);
+    // A relative path would name a file the app cannot open from any directory.
+    if !path.is_absolute() {
+        return Err(format!("mcp file path is not absolute: {}", path.display()));
+    }
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// S1: starts the OAuth sign-in of one server as an INTERACTIVE `pi mcp login`.
+///
+/// It deliberately reuses the bridge's interactive session (S3 of
+/// `pi-cli-bridge.md`) instead of a batch call: `pi mcp login` waits at a prompt
+/// for the returned redirect URL, which only exists on a terminal. The returned
+/// id is the `cliSessionId` of the `pi-cli` events, so the pane consumes the same
+/// stream the provider login already consumes, and `pi_cli_write` is what pastes
+/// the redirect URL into the child's stdin. No timeout: the human decides when
+/// the flow ends, and `pi_cli_stop` kills it.
+#[tauri::command]
+pub fn mcp_login_start(
+    state: State<'_, AppState>,
+    name: String,
+    scope: McpScope,
+) -> Result<String, String> {
+    let settings = settings::load(&settings_path(&state)).map_err(display_err)?;
+    // No `--timeout`: pi's own default (300 s) applies, so the UI never has to
+    // guess how long a human needs in a browser.
+    let args = mcp::login_args(&name, scope, None).map_err(display_err)?;
+    state
+        .cli
+        .start(&args, &settings.pi_binary, Arc::clone(&state.cli_sink))
+        .map_err(display_err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2191,5 +2361,95 @@ done
         assert_eq!(json["role"], serde_json::json!("user"));
         assert_eq!(json["text"], serde_json::json!("hola"));
         assert_eq!(json["at"], serde_json::Value::Null);
+    }
+
+    // ── MCP configuration (F0 of `tool-drawer-and-mcp.md`) ─────────────────
+
+    /// One finished `pi mcp list --json` call, as the bridge would report it.
+    fn cli_result(stdout: &str, exit_code: Option<i32>, timed_out: bool) -> PiCliResult {
+        PiCliResult {
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            exit_code,
+            timed_out,
+            truncated: false,
+        }
+    }
+
+    const MCP_LIST_PAYLOAD: &str = r#"{
+      "servers": [
+        { "name": "engram", "scope": "global", "enabled": true,
+          "transport": "/opt/homebrew/bin/engram mcp --tools=agent",
+          "state": "connected", "tools": ["mem_save"] }
+      ],
+      "errors": []
+    }"#;
+
+    // S1: `pi mcp list` exits 1 whenever a server is unhealthy, and that answer is
+    // exactly what the pane must paint: the exit code never discards the JSON.
+    #[test]
+    fn mcp_list_from_reads_the_json_even_when_the_call_exits_non_zero() {
+        for exit_code in [Some(0), Some(1), None] {
+            let servers = mcp_list_from(&cli_result(MCP_LIST_PAYLOAD, exit_code, false))
+                .expect("the JSON is the answer, whatever the exit code");
+            assert_eq!(servers.len(), 1, "exit: {exit_code:?}");
+            assert_eq!(servers[0].name, "engram");
+            assert_eq!(servers[0].state, mcp::McpState::Ready);
+        }
+    }
+
+    // S1: a listing that timed out has nothing to parse, so it is reported as an
+    // error instead of an empty list that would read as "no MCP servers".
+    #[test]
+    fn mcp_list_from_reports_a_timeout_as_an_error() {
+        let err = mcp_list_from(&cli_result("", None, true)).expect_err("a timeout is an error");
+        assert!(err.contains("did not finish"), "got: {err}");
+    }
+
+    // S1: garbage in the payload is "no servers", never a panic and never a
+    // failed call.
+    #[test]
+    fn mcp_list_from_answers_an_empty_list_for_garbage() {
+        assert!(
+            mcp_list_from(&cli_result("not json", Some(1), false))
+                .expect("garbage is not a failure")
+                .is_empty()
+        );
+    }
+
+    // S1: a mutating call reports pi's own diagnostic, not a bare failure.
+    #[test]
+    fn check_mcp_mutation_reports_the_exit_code_and_stderr() {
+        let ok = cli_result("added\n", Some(0), false);
+        assert_eq!(check_mcp_mutation(&ok, "add"), Ok(()));
+
+        let mut failed = cli_result("", Some(1), false);
+        failed.stderr = "No global MCP server named \"x\".\n".to_string();
+        let err = check_mcp_mutation(&failed, "remove").expect_err("a non-zero exit fails");
+        assert!(err.contains("exit 1"), "got: {err}");
+        assert!(err.contains("No global MCP server named"), "got: {err}");
+
+        // A child terminated by a signal has no code: still a failure, and never
+        // an empty diagnostic.
+        let killed = cli_result("", None, false);
+        let err = check_mcp_mutation(&killed, "logout").expect_err("no code is not success");
+        assert!(err.contains("no diagnostic"), "got: {err}");
+    }
+
+    // S1: the file path is absolute and names pi's own file for each scope.
+    #[test]
+    fn mcp_file_path_names_the_global_and_project_files() {
+        let home = Path::new("/home/somebody");
+        let project = Path::new("/work/project");
+
+        let global = mcp_file_path_for(home, project, McpScope::Global).expect("absolute home");
+        assert!(Path::new(&global).is_absolute(), "got: {global}");
+        assert!(global.ends_with(".pi/agent/mcp.json"), "got: {global}");
+
+        let local = mcp_file_path_for(home, project, McpScope::Project).expect("absolute project");
+        assert_eq!(local, "/work/project/.pi/mcp.json");
+
+        // A relative root would display a path the app cannot open.
+        assert!(mcp_file_path_for(Path::new("home"), project, McpScope::Global).is_err());
     }
 }

@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod mcp;
 mod process;
 mod providers;
 mod rpc;
@@ -130,7 +131,17 @@ pub fn run() {
             // S5: the same state as the last probe left it, read from nabla.db
             // so the pane paints its badges without spawning the CLI.
             commands::cached_provider_statuses,
-            commands::pi_auth_check
+            commands::pi_auth_check,
+            // S1 of `tool-drawer-and-mcp.md` (F0): MCP servers configured through
+            // pi's own CLI — listing, add, remove, sign-in and sign-out. The
+            // listing is `pi mcp list --json`, never a file read, and the
+            // sign-in reuses the interactive `pi-cli` session above.
+            commands::mcp_list,
+            commands::mcp_add,
+            commands::mcp_remove,
+            commands::mcp_logout,
+            commands::mcp_file_path,
+            commands::mcp_login_start
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

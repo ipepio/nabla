@@ -22,7 +22,7 @@ Alcance: convertir el panel derecho en un área de herramientas con pestañas, e
 
 ## Fases (alcance cerrado)
 
-### F0 — Configuración de MCP en Ajustes  · riesgo medio
+### F0 — Configuración de MCP en Ajustes  · riesgo medio · ✅ HECHO
 Objetivo: que pi pueda usar MCPs configurados desde Nabla, sin editar archivos a mano.
 
 - **Bridge**: allowlist += `mcp`; reutiliza la sesión PTY para `mcp login`.

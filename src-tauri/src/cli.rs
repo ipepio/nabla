@@ -5,11 +5,12 @@
 // Design notes:
 // - argv only: `std::process::Command` with a typed argument vector, never a
 //   shell, so there is no interpolation surface at all (S1, S2).
-// - the allowlist is enforced in Rust before anything is spawned: the FIRST
-//   argument must be one of `ALLOWED_SUBCOMMANDS` (S2). `install`/`update` are
-//   outside it because they run third-party code, and `auth print-api-key` /
-//   `auth print-bearer-token` are never called from here because they would hand
-//   secrets to the webview.
+//! - the allowlist is enforced in Rust before anything is spawned: the FIRST
+//!   argument must be one of `ALLOWED_SUBCOMMANDS` (S2). `install`/`update` are
+//!   outside it because they run third-party code, `auth print-api-key` /
+//!   `auth print-bearer-token` are never called from here because they would hand
+//!   secrets to the webview, and `mcp` is inside it because F0 of
+//!   `tool-drawer-and-mcp.md` configures MCP servers through pi's own CLI.
 // - the child inherits the same environment allowlist the pi runtime forwards
 //   (`process::forwarded_env`): this bridge can never leak the host environment.
 // - output is bounded: each non-interactive stream is capped at `STREAM_CAP`
@@ -80,7 +81,7 @@ pub const PTY_COLS: u16 = 200;
 /// every call must be exactly one of these: nothing is matched by prefix, so
 /// `auth print-api-key` can only ever run if `auth` is allowed — and Nabla never
 /// asks for it.
-pub const ALLOWED_SUBCOMMANDS: &[&str] = &["auth", "models", "config", "--version", "--help"];
+pub const ALLOWED_SUBCOMMANDS: &[&str] = &["auth", "models", "config", "mcp", "--version", "--help"];
 
 /// Answer of one non-interactive call. Mirrors the frozen contract:
 /// `{ stdout, stderr, exitCode, timedOut, truncated }` (S1, S2).
@@ -1168,12 +1169,53 @@ exit 0
 
     // ── non-interactive bridge (S1, S2) ─────────────────────────────────────
 
-    // S2: the allowlist is the frozen contract's set, exactly.
+    // S2: the allowlist is the frozen contract's set, exactly. `mcp` joined it in
+    // F0 of `tool-drawer-and-mcp.md`, because every MCP read and write is a
+    // `pi mcp` call and nothing here edits `mcp.json`.
     #[test]
     fn allowlist_matches_the_frozen_contract() {
         assert_eq!(
             ALLOWED_SUBCOMMANDS,
-            &["auth", "models", "config", "--version", "--help"]
+            &["auth", "models", "config", "mcp", "--version", "--help"]
+        );
+    }
+
+    // S1 of `tool-drawer-and-mcp.md`: `mcp` is reachable through the bridge, and
+    // widening the allowlist did not let `install` (arbitrary third-party code)
+    // or a prefix match through.
+    #[cfg(unix)]
+    #[test]
+    fn allowlist_accepts_mcp_and_still_rejects_install() {
+        let scratch = Scratch::new("run_mcp");
+        let script = write_script(&scratch, "pi-ok.sh", FAKE_OK);
+
+        let result = run(
+            &args(&["mcp", "list", "--json"]),
+            Duration::from_secs(10),
+            binary(&script),
+        )
+        .expect("mcp is in the allowlist");
+        assert_eq!(result.exit_code, Some(0));
+
+        assert_eq!(
+            run(
+                &args(&["install", "some-package"]),
+                Duration::from_secs(10),
+                binary(&script),
+            )
+            .expect_err("install stays outside the allowlist"),
+            CliError::NotAllowed("install".to_string())
+        );
+        // Nothing is matched by prefix: a longer word starting with an allowed
+        // one is still refused.
+        assert_eq!(
+            run(
+                &args(&["mcpx", "list"]),
+                Duration::from_secs(10),
+                binary(&script),
+            )
+            .expect_err("the allowlist is exact"),
+            CliError::NotAllowed("mcpx".to_string())
         );
     }
 
