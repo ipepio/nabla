@@ -271,6 +271,8 @@ export async function refreshLiveSessions(): Promise<string[]> {
 
 let eventsInstalled = false;
 let eventsInstalling: Promise<void> | null = null;
+/** The live unsubscribe, kept so a module reload can hand the old one back. */
+let eventsUnsubscribe: (() => void) | null = null;
 
 /**
  * Installs the one `agent-event` subscription this app has. Called on first use
@@ -289,14 +291,32 @@ export function ensureSessionEvents(): Promise<void> {
       // screen, so a background session keeps its transcript (S4).
       applyEvent(envelope.sessionId, envelope.event);
     })
-      .then(() => {
+      .then((unsubscribe) => {
         eventsInstalled = true;
+        eventsUnsubscribe = unsubscribe;
       })
       .catch(() => {
         eventsInstalling = null;
       });
   }
   return eventsInstalling;
+}
+
+/**
+ * Vite replaces this module on every edit, and the module flag that guards the
+ * subscription dies with it. Without this, each reload stacked another listener
+ * while the previous one stayed attached: every pi event was then processed N
+ * times and each stale copy could hand the same prompt to pi again — which looks
+ * exactly like the agent repeating a turn. Disposing keeps the invariant "one
+ * subscription per app", including in development.
+ */
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    eventsUnsubscribe?.();
+    eventsUnsubscribe = null;
+    eventsInstalled = false;
+    eventsInstalling = null;
+  });
 }
 
 /**
@@ -430,6 +450,13 @@ function settleQueuedMessage(
 const draining = new Map<string, Promise<void>>();
 
 /**
+ * Queue entries that were already handed to pi, per session. Belt to the
+ * `draining` guard: duplicate frames (or a stale listener from a hot reload)
+ * must never send the same prompt twice, which is what looked like a loop.
+ */
+const settledQueueIds = new Map<string, Set<string>>();
+
+/**
  * S3: adds one prompt to the session's queue. ChatPanel calls this instead of
  * `sendPrompt` when the composer's submit arrives while the agent is working, so
  * the prompt is kept rather than rejected or sent into a busy session.
@@ -523,6 +550,13 @@ function drainQueue(sessionId: string, buffer: SessionBuffer): void {
   if (workspaceId === null) return;
   const next = buffer.queue.shift();
   if (next === undefined) return;
+  // Belt to the guard above: an entry that was already handed to pi is never
+  // sent again, whatever the event stream does. Duplicate turn_end frames (or a
+  // stale listener from a hot reload) used to look like the agent looping.
+  const sent = settledQueueIds.get(sessionId) ?? new Set<string>();
+  settledQueueIds.set(sessionId, sent);
+  if (sent.has(next.id)) return;
+  sent.add(next.id);
   const send = sendQueuedTurn(sessionId, buffer, workspaceId, next).finally(() => {
     draining.delete(sessionId);
   });
@@ -665,8 +699,14 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
       liveIds.value = liveIds.value.filter((id) => id !== sessionId);
       return;
     default:
-      // agent_start/turn_start and unmodelled pi events add nothing here; the
-      // stream keeps flowing past them.
+      // A fresh turn starts with no tool chips: the list describes the turn in
+      // progress, not a running log, or a long session becomes a wall of badges.
+      if (
+        event.type === "other" &&
+        (event.kind === "turn_start" || event.kind === "agent_start")
+      ) {
+        buffer.tools = [];
+      }
       return;
   }
 }
