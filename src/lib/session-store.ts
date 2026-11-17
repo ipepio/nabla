@@ -17,7 +17,9 @@ import { computed, reactive, ref } from "vue";
 import {
   commandErrorMessage,
   liveSessionIds,
+  loadSessionPreview,
   openSession,
+  saveSessionPreview,
   sendPrompt,
   sessionTranscript,
   startSession,
@@ -25,6 +27,7 @@ import {
 } from "../contracts/commands";
 import type { AgentEvent, RuntimeStatus } from "../contracts/agent-events";
 import type {
+  PreviewMessage,
   SessionDto,
   SessionSummary,
   TranscriptMessage,
@@ -211,6 +214,15 @@ const transcriptLoading = reactive(new Set<string>());
  * refresh of the same session does not re-read the file.
  */
 const transcriptSeeded = new Set<string>();
+
+/**
+ * Sessions whose first paint came from their stored preview rather than from
+ * pi's JSONL file. It is the precedence mark: a preview is only painted when Rust
+ * has confirmed pi's file has not outgrown it (see `loadSessionPreview`), so the
+ * file read must never overwrite what the preview already showed — including the
+ * reasoning the file never stored.
+ */
+const previewPainted = new Set<string>();
 
 /**
  * Bumped whenever a session is created. The drawer watches it to refresh the
@@ -672,6 +684,10 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
       // Belt to the `done` slice above: a stream that ends without one still
       // lands in the transcript instead of vanishing.
       flushStreaming(sessionId, buffer);
+      // The finished turn is exactly what an open will paint next time, so the
+      // snapshot is taken here and nowhere else: after the flush, the buffer is
+      // the whole conversation including this turn's reasoning.
+      snapshotPreview(sessionId, buffer);
       // A finished turn is activity the drawer must see: bump the generation so
       // the session list re-reads and the row moves up now, instead of waiting
       // for the next poll tick.
@@ -721,12 +737,23 @@ function dtoFromSummary(
   };
 }
 
-/** Seeds a buffer with the history pi already has on disk (S3). */
+/**
+ * Seeds a buffer with the history pi already has on disk (S3).
+ *
+ * This is also where the preview-vs-file precedence is enforced, at the only place
+ * that could overwrite one with the other: a session that painted from its preview
+ * keeps it. Rust only hands a preview back when pi's file has not outgrown that
+ * snapshot (`load_session_preview`), so the file has nothing newer to add — and it
+ * never carried the turn's reasoning, which is the whole reason the preview exists.
+ * When no preview was painted, this behaves exactly as it did before previews
+ * existed.
+ */
 function seedTranscript(
   sessionId: string,
   buffer: SessionBuffer,
   history: TranscriptMessage[],
 ): void {
+  if (previewPainted.has(sessionId)) return;
   if (history.length === 0) return;
   // pi's lines carry no id and no reasoning (it never stored them for us), so
   // each one gets a handle here: the panel needs a stable key per message.
@@ -741,6 +768,90 @@ function seedTranscript(
   buffer.transcript = [...seeded, ...buffer.transcript];
 }
 
+// ── the session preview: first paint before pi boots ─────────────────────────
+
+/**
+ * How many trailing messages a snapshot keeps. Enough to paint the conversation
+ * the human was looking at, few enough that the snapshot stays one small row;
+ * Rust enforces the same bound on its side.
+ */
+const PREVIEW_MESSAGE_LIMIT = 30;
+
+/**
+ * Paints the session's stored preview into its buffer, if Rust has one worth
+ * painting.
+ *
+ * The precedence rule starts here and is decided by Rust: a preview comes back
+ * only when pi's JSONL file has not outgrown the snapshot (`load_session_preview`),
+ * so a painted preview is *at least as fresh as the file* and, unlike the file, it
+ * carries each turn's reasoning. `seedTranscript` then leaves it alone. When the
+ * preview is absent, unusable or stale, nothing is painted and the file fills the
+ * buffer exactly as it did before previews existed.
+ */
+async function paintPreview(
+  sessionId: string,
+  buffer: SessionBuffer,
+): Promise<void> {
+  let preview: PreviewMessage[] | null;
+  try {
+    preview = await loadSessionPreview(Number(sessionId));
+  } catch {
+    // A preview is an optimization, never the transcript: a failed read leaves
+    // the file read to paint the conversation.
+    return;
+  }
+  if (preview === null || preview.length === 0) return;
+  const seeded: ChatMessage[] = preview.map((message) => {
+    const entry: ChatMessage = {
+      id: nextMessageId(sessionId),
+      role: message.role,
+      text: message.text,
+      at: message.at,
+    };
+    // `reasoning` is only present when it is real: an empty string would render
+    // an empty block the human could open.
+    if (message.reasoning !== null && message.reasoning !== "") {
+      entry.reasoning = message.reasoning;
+    }
+    return entry;
+  });
+  // Painted in front, like the file's history: anything already in the buffer
+  // arrived live and is newer than any snapshot.
+  buffer.transcript = [...seeded, ...buffer.transcript];
+  previewPainted.add(sessionId);
+}
+
+/**
+ * Snapshots the newest turns of a session so its next open paints instantly
+ * (`mostrar los últimos mensajes y por detrás, abrir la sesión`).
+ *
+ * Called after every finished turn (`turn_end`/`agent_end`, once the streaming
+ * tail has been flushed into the transcript), because that is the only moment the
+ * buffer is a complete conversation. The buffer is the source and not pi's file:
+ * it still holds the reasoning pi streamed, which the file never stored.
+ *
+ * Best-effort and fire-and-forget: a failed save resolves to silence and is never
+ * surfaced, because a preview must never break the turn that produced it. Two
+ * events can snapshot the same turn (`turn_end` then `agent_end`); both send the
+ * same tail, so the later write cannot lose anything.
+ */
+function snapshotPreview(sessionId: string, buffer: SessionBuffer): void {
+  if (buffer.transcript.length === 0) return;
+  const messages: PreviewMessage[] = buffer.transcript
+    .slice(-PREVIEW_MESSAGE_LIMIT)
+    // The UI-only id is stripped: it means nothing outside this app run, and the
+    // contract carries role, text, reasoning and time.
+    .map((message) => ({
+      role: message.role,
+      text: message.text,
+      reasoning: message.reasoning ?? null,
+      at: message.at,
+    }));
+  void saveSessionPreview(Number(sessionId), messages).catch(() => {
+    /* best effort: pi's file is the transcript, this is only a head start */
+  });
+}
+
 /**
  * S3/S5: makes a session the one the chat shows.
  *
@@ -748,7 +859,8 @@ function seedTranscript(
  * panel binds to this session's existing buffer, nothing is stopped (S4). The
  * process is opened only when the runtime says there is none, and an already
  * live session is reused through the idempotent `open_session` (S5). The first
- * time a session is selected its transcript is read from pi's file (S3).
+ * time a session is selected its transcript is painted from the stored preview,
+ * or — when there is none worth painting — read from pi's file (S3).
  */
 export async function selectSession(session: SessionSummary): Promise<void> {
   const sessionId = String(session.id);
@@ -758,16 +870,25 @@ export async function selectSession(session: SessionSummary): Promise<void> {
   activeSession.value = dtoFromSummary(session, buffer.status);
   void ensureSessionEvents();
 
-  // The transcript is a disk read of pi's own JSONL and does NOT need pi to be
-  // running. Seeding it first means the conversation paints in milliseconds; the
-  // (slow) process spawn then happens in the background instead of holding the
-  // view hostage for ~2 s before anything reacts. This is the fix for "click a
-  // session and nothing happens for seconds".
+  // The conversation is painted before anything slow runs: the preview is a
+  // few rows of SQLite, while pi's file is a disk read and the spawn is seconds.
+  // This is the fix for "click a session and nothing happens for seconds".
   const loadTranscript = (async () => {
     if (transcriptSeeded.has(sessionId)) return;
+    // One paint per session even when two selections race: the first one is
+    // already reading, and a second would seed the same turns twice.
+    if (transcriptLoading.has(sessionId)) return;
+    // Marked before the first await, so the panel shows the conversation shell
+    // instead of flashing the brand empty state while the preview is read.
     transcriptLoading.add(sessionId);
     try {
+      // Paint first and immediately: the preview is a few rows of SQLite, while
+      // pi's file is a disk read. Whichever lands, the conversation is on screen
+      // before the (slow) spawn below even starts.
+      await paintPreview(sessionId, buffer);
       const history = await sessionTranscript(sessionId);
+      // `seedTranscript` owns the precedence rule: it leaves a painted preview
+      // alone, and fills the gap when there was none.
       seedTranscript(sessionId, buffer, history);
       transcriptSeeded.add(sessionId);
     } catch (cause) {
@@ -847,6 +968,7 @@ export function removeSession(sessionId: string | number): void {
     if (messageId.startsWith(`${key}:`)) reasoningExpanded.delete(messageId);
   }
   transcriptSeeded.delete(key);
+  previewPainted.delete(key);
   transcriptLoading.delete(key);
   // A send that was still on its way for a session that no longer exists must not
   // keep a later session with the same id from draining its own queue.

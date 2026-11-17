@@ -254,6 +254,22 @@ export interface TranscriptMessage {
 export type TranscriptRole = "user" | "assistant" | "tool";
 
 /**
+ * One message of the preview the app keeps for a session: the newest turns as it
+ * last streamed them, so opening a session paints before pi boots. Mirrors
+ * `PreviewMessage` in `src-tauri/src/commands.rs`.
+ *
+ * `reasoning` is the part that makes this preview worth keeping: pi's own JSONL
+ * file never stored it, so the file read alone cannot reproduce it. `reasoning`
+ * and `at` are `null` when the turn carried none.
+ */
+export interface PreviewMessage {
+  role: TranscriptRole;
+  text: string;
+  reasoning: string | null;
+  at: string | null;
+}
+
+/**
  * What `session_status` returns. A session that is not running reports
  * `stopped` with no pid. Mirrors `SessionStatusDto` in
  * `src-tauri/src/commands.rs`.

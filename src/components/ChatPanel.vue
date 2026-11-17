@@ -144,6 +144,24 @@ const transcriptLoading = computed(() =>
 );
 
 /**
+ * The muted "loading conversation" note, and the only condition under which it
+ * belongs on screen: there is genuinely nothing to show yet.
+ *
+ * A session that painted its preview (or pi's file) already has a conversation, and
+ * one whose turn is already streaming has live text — a loading note above either
+ * of them would be a second status that contradicts what the human is reading.
+ * Those sessions wait silently instead, which is what makes opening one feel
+ * instant: the messages appear first and the engine finishes booting behind them.
+ */
+const showsLoadingPlaceholder = computed(
+  () =>
+    transcriptLoading.value &&
+    transcript.value.length === 0 &&
+    streamingText.value === "" &&
+    streamingReasoning.value === "",
+);
+
+/**
  * Scroll behaviour of the transcript: the view follows the bottom only while the
  * human is already there. Reading the middle of a conversation must survive the
  * tokens that keep streaming in (and any other growth of the transcript), which
@@ -953,9 +971,11 @@ onUnmounted(() => {
             </Button>
           </div>
 
-          <!-- S3: the session's own history is being read from pi's file. -->
+          <!-- S3: nothing to show yet, so the only honest status is that the
+               conversation is being read. A session that already painted its
+               preview never gets here. -->
           <p
-            v-if="transcriptLoading && transcript.length === 0"
+            v-if="showsLoadingPlaceholder"
             class="text-sm text-muted-foreground"
           >
             {{ t("chat.loadingConversation") }}

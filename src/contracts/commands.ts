@@ -20,6 +20,7 @@ import type {
   PiAuthStatus,
   PiCliEvent,
   PiCliResult,
+  PreviewMessage,
   ProviderDraft,
   ProviderModel,
   ProviderModelDraft,
@@ -625,6 +626,34 @@ export function sessionTranscript(
   sessionId: string,
 ): Promise<TranscriptMessage[]> {
   return invoke<TranscriptMessage[]>("session_transcript", { sessionId });
+}
+
+/**
+ * The preview of a session: its newest turns, with the reasoning pi's JSONL file
+ * never stored, so an open paints before the engine boots.
+ *
+ * `null` means there is nothing worth painting yet and the caller reads pi's file
+ * instead — no snapshot, a snapshot that no longer parses, or one pi's own file
+ * has outgrown. Rust decides that freshness; it is never an error.
+ */
+export function loadSessionPreview(
+  sessionId: number,
+): Promise<PreviewMessage[] | null> {
+  return invoke<PreviewMessage[] | null>("load_session_preview", { sessionId });
+}
+
+/**
+ * Snapshots the tail of a session's conversation so the next open paints from it.
+ *
+ * Best-effort by contract: `false` means nothing was stored (the session is not
+ * indexed, or the write failed) and the caller carries on — pi's file stays the
+ * transcript, this is only a head start on painting it.
+ */
+export function saveSessionPreview(
+  sessionId: number,
+  messages: PreviewMessage[],
+): Promise<boolean> {
+  return invoke<boolean>("save_session_preview", { sessionId, messages });
 }
 
 /**
