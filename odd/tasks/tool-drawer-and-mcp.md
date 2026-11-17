@@ -51,7 +51,7 @@ Objetivo: una terminal real en el workspace.
 - **Fuera**: allowlist de comandos (teatro de seguridad), multiplexores, perfiles de shell.
 - **Verificación**: test Rust de arranque/cierre del PTY con un comando falso; smoke manual con `pwd`/`ls`.
 
-### F3 — Browser  · riesgo medio (opt-in)
+### F3 — Browser  · riesgo medio (opt-in) · ✅ HECHO
 Objetivo: que el agente navegue y el humano vea qué pasa.
 
 - **Decisión**: **lanzar** una instancia Chromium dedicada (perfil propio, `--remote-debugging-port`) en vez de adjuntar a la del usuario.

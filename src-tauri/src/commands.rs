@@ -10,6 +10,7 @@ use std::time::Duration;
 use tauri::State;
 use tauri_plugin_opener::OpenerExt;
 
+use crate::browser::{self, BrowserCandidate, BrowserStarted, BrowserTarget};
 use crate::cli::{self, CliSessions, CliSink, PiAuthStatus, PiCliResult};
 use crate::mcp::{self, McpAddDraft, McpScope, McpServerSummary};
 use crate::process::{ProcessManager, StartupOutcome};
@@ -45,6 +46,11 @@ pub struct AppState {
     /// tab, and the sink their `shell-output` events leave through.
     pub shells: ShellSessions,
     pub shell_sink: ShellSink,
+    /// S4/S6 of `tool-drawer-and-mcp.md` (F3): the Chromium instances this app
+    /// launched itself, addressed by session id. Cloneable because the launch,
+    /// the target list and the close all run off the IPC thread: the readiness
+    /// poll waits up to 15 s and must never freeze the webview.
+    pub browsers: browser::BrowserSessions,
 }
 
 // Errors cross the bridge as plain strings for now: StoreError and SettingsError
@@ -1646,6 +1652,86 @@ pub fn shell_resize(
 #[tauri::command]
 pub fn shell_close(state: State<'_, AppState>, session_id: String) -> Result<bool, String> {
     Ok(state.shells.close(&session_id))
+}
+
+// ── F3 of `tool-drawer-and-mcp.md`: the browser the agent drives ────────────
+//
+// Chromium + CDP only (S6). Nabla launches its own instance with a dedicated
+// profile, so nothing here reads the human's profile and no command attaches to
+// a browser that is already running. The webview addresses a session by id; the
+// port stays a field of that session and is never how a tab names it.
+//
+// Every command that touches the process or the DevTools endpoint is async and
+// moves its blocking work to the blocking pool: the readiness poll is bounded by
+// 15 s, and a sync command would hold the IPC thread for that long.
+
+/// S6: what this machine can drive. Empty means no Chromium-family browser was
+/// found; the drawer tab then stays disabled with its own reason, and the
+/// recorded alternative is the `chrome-devtools-mcp` server from F0.
+#[tauri::command]
+pub fn browser_detect() -> Vec<BrowserCandidate> {
+    browser::detect_browsers()
+}
+
+/// S4: starts a dedicated Chromium in the workspace and answers the session id
+/// the other browser commands take.
+#[tauri::command]
+pub async fn browser_launch(
+    state: State<'_, AppState>,
+    workspace: String,
+) -> Result<BrowserStarted, String> {
+    // Same containment check the terminal and the Files tab use: a workspace
+    // that was deleted or renamed answers a readable error instead of launching
+    // a browser in `/`.
+    let cwd = terminal_cwd(&workspace)?;
+    let browsers = state.browsers.clone();
+    let app_data_dir = state.data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || browsers.launch(&cwd, &app_data_dir))
+        .await
+        .map_err(display_err)?
+        .map_err(display_err)
+}
+
+/// S4: what the browser has open. An unreachable endpoint is an empty list, not
+/// an error: the human may have closed the browser window.
+#[tauri::command]
+pub async fn browser_targets(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<BrowserTarget>, String> {
+    let browsers = state.browsers.clone();
+    tauri::async_runtime::spawn_blocking(move || browsers.targets(&session_id))
+        .await
+        .map_err(display_err)?
+        .map_err(display_err)
+}
+
+/// S4: navigates the session's browser to `url`. Only http(s) urls are accepted;
+/// `None` means the endpoint refused, which the tab shows as "could not open".
+#[tauri::command]
+pub async fn browser_open_url(
+    state: State<'_, AppState>,
+    session_id: String,
+    url: String,
+) -> Result<Option<BrowserTarget>, String> {
+    let browsers = state.browsers.clone();
+    tauri::async_runtime::spawn_blocking(move || browsers.open_url(&session_id, &url))
+        .await
+        .map_err(display_err)?
+        .map_err(display_err)
+}
+
+/// S4: stops one browser by pid and forgets its session. Idempotent: an unknown
+/// id answers `false` rather than an error.
+#[tauri::command]
+pub async fn browser_close(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<bool, String> {
+    let browsers = state.browsers.clone();
+    tauri::async_runtime::spawn_blocking(move || browsers.close(&session_id))
+        .await
+        .map_err(display_err)
 }
 
 #[cfg(test)]
