@@ -20,6 +20,7 @@ use crate::providers::{
 use crate::rpc::{AgentEvent, RuntimeStatus};
 use crate::settings::{self, Settings};
 use crate::store::{ProviderStatusRow, SessionNew, SessionRow, Store, StoreResult, Workspace};
+use crate::workspace::{FsEntry, FsPreview, GitEntry};
 
 /// State shared with every command: the SQLite store (app-owned state), the
 /// config directory where settings.json lives (human-owned preferences, S2), the
@@ -1522,6 +1523,54 @@ pub fn mcp_login_start(
         .cli
         .start(&args, &settings.pi_binary, Arc::clone(&state.cli_sink))
         .map_err(display_err)
+}
+
+// ── F1 of `tool-drawer-and-mcp.md`: Files and Changes ───────────────────────
+//
+// Every one of these is read-only and every path is confined to the workspace
+// it names. The logic lives in `workspace.rs`; the commands only unfreeze the
+// arguments, so what the tests cover is what the webview gets.
+
+/// S2/S3: one directory of the workspace, for the Files tree to expand.
+#[tauri::command]
+pub fn fs_list_dir(workspace: String, rel_path: String) -> Result<Vec<FsEntry>, String> {
+    crate::workspace::list_dir(&workspace, &rel_path)
+}
+
+/// S3: how to preview one file — decoded text, or a kind the UI renders some
+/// other way. Reading here never follows a symlink out of the workspace.
+#[tauri::command]
+pub fn fs_read_preview(workspace: String, rel_path: String) -> Result<FsPreview, String> {
+    crate::workspace::preview(&workspace, &rel_path)
+}
+
+/// S3: the bytes of one image, returned raw.
+///
+/// Raw bytes, not base64: `tauri::ipc::Response` carries a binary body, so the
+/// webview turns it into a `Blob`/object URL without a 33 % inflation, a base64
+/// dependency and a second decode. Base64 would only be simpler if the answer
+/// had to travel inside JSON, and it does not.
+#[tauri::command]
+pub fn fs_read_image_bytes(
+    workspace: String,
+    rel_path: String,
+) -> Result<tauri::ipc::Response, String> {
+    let bytes = crate::workspace::image_bytes(&workspace, &rel_path)?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// F1: the Changes tab's list, from `git status --porcelain=v1 -z`. A folder
+/// that is not a repository answers an empty list.
+#[tauri::command]
+pub fn git_status(workspace: String) -> Result<Vec<GitEntry>, String> {
+    crate::workspace::git_status(&workspace)
+}
+
+/// F1: one file against `HEAD`, with untracked files shown as an added block and
+/// the answer capped at 512 KiB.
+#[tauri::command]
+pub fn git_diff(workspace: String, path: String) -> Result<String, String> {
+    crate::workspace::git_diff(&workspace, &path)
 }
 
 #[cfg(test)]

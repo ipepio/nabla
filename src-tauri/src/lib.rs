@@ -6,6 +6,7 @@ mod providers;
 mod rpc;
 mod settings;
 mod store;
+mod workspace;
 
 use std::sync::Arc;
 
@@ -141,7 +142,15 @@ pub fn run() {
             commands::mcp_remove,
             commands::mcp_logout,
             commands::mcp_file_path,
-            commands::mcp_login_start
+            commands::mcp_login_start,
+            // F1 of `tool-drawer-and-mcp.md`: the Files and Changes tabs. Every
+            // call is read-only and confined to the workspace it names.
+            commands::fs_list_dir,
+            commands::fs_read_preview,
+            // Raw bytes, so an image preview never pays for base64.
+            commands::fs_read_image_bytes,
+            commands::git_status,
+            commands::git_diff
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

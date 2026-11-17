@@ -32,7 +32,7 @@ Objetivo: que pi pueda usar MCPs configurados desde Nabla, sin editar archivos a
 - **Verificación**: tests de parseo con fixtures de `list --json` (incluye el caso "necesita login" y el error); smoke con el MCP local ya configurado (`engram`) y con un HTTP público.
 - **Depende de**: nada. **Habilita**: navegador vía MCP sin escribir extensión.
 
-### F1 — Host de pestañas + Files + Changes  · riesgo bajo
+### F1 — Host de pestañas + Files + Changes  · riesgo bajo · ✅ HECHO
 Objetivo: convertir el panel derecho vacío en el área de herramientas.
 
 - **Host**: registro de herramientas `{id, label, icon, flag, component}`; pestañas; estado vacío; recordar la pestaña activa en la sesión.
