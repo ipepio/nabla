@@ -1098,13 +1098,21 @@ mod tests {
 
     #[test]
     fn the_free_port_picker_returns_a_bindable_port() {
-        let port = pick_free_port().expect("a free port");
-
-        assert_ne!(port, 0);
-        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+        // The picker binds :0, reads the port and closes the listener, so another
+        // process can steal it between the two steps. A bounded retry keeps the
+        // test honest without pretending the race does not exist.
+        let mut picked = None;
+        for _ in 0..5 {
+            let port = pick_free_port().expect("a free port");
+            assert_ne!(port, 0);
+            if TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).is_ok() {
+                picked = Some(port);
+                break;
+            }
+        }
         assert!(
-            listener.is_ok(),
-            "the picked port must still be bindable, got {port}"
+            picked.is_some(),
+            "five freshly picked ports were all taken right after being freed"
         );
     }
 

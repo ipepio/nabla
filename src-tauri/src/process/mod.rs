@@ -1170,6 +1170,8 @@ sleep 30
             ("PATH", "/usr/bin:/bin"),
             ("HOME", "/home/user"),
             ("NODE_PATH", "/node/modules"),
+            ("PI_CODING_AGENT_DIR", "/home/user/.omp/agent"),
+            ("PI_SESSION_FILE", "must-not-leak"),
             ("ANTHROPIC_API_KEY", "anthropic-token"),
             ("GOOGLE_CLOUD_PROJECT", "project"),
             ("OPENAI_API_KEY", "openai-token"),
