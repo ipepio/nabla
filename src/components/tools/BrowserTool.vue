@@ -32,10 +32,16 @@
 // reach this webview yet; that arrives with a local MCP. The pane says so in the
 // footer rather than implying a capability that does not exist.
 //
-// TEARDOWN — a view lives exactly as long as this component: unmount closes it
-// (collapsing the drawer, closing the pane, quitting), a workspace switch closes
-// it and rebuilds it, and a create that answers after teardown closes the view it
-// just made instead of leaking it. Remounting creates a fresh one.
+// TEARDOWN — a view lives exactly as long as this pane is DRAWN, not as long as
+// its component is mounted. The drawer keeps every tab's body mounted and only
+// shows the active one (`v-show` in `ToolTabs.vue`) so a terminal keeps its shell;
+// a child webview cannot be hidden that way, because it floats above the HTML and
+// would keep painting over whatever tab is on screen. So the pane receives `active`
+// and (a) closes its view when its tab stops being drawn, (b) builds a fresh one
+// when the tab is drawn again. Everything else follows the component: unmount
+// closes the view (collapsing the drawer, closing the pane, quitting), a workspace
+// switch closes it and rebuilds it, and a create that answers after teardown closes
+// the view it just made instead of leaking it.
 //
 // URL POLICY — `http`, `https` and `about:blank`, nothing else, and the check is
 // LOCAL: a rejected address shows the message and never reaches Rust. A bare host
@@ -65,7 +71,16 @@ import { t } from "@/lib/i18n";
 
 const props = defineProps<{
   workspace: WorkspaceInfo | null;
+  /**
+   * This pane's tab is the drawn one. `false` closes the child webview (it cannot
+   * be hidden) and `true` builds it again; absent means "drawn", so a pane that
+   * does not know about tabs still works.
+   */
+  active?: boolean;
 }>();
+
+/** Whether this pane should have a live view right now (see the teardown note). */
+const drawn = computed(() => props.active !== false);
 
 /** What a fresh view shows. The pane offers no generated start page: only the
  *  http(s) addresses Rust accepts, and a blank document until the human types. */
@@ -377,7 +392,7 @@ function handleNav(event: EmbedNavEvent): void {
  * behind; a create that answers after teardown closes what it built.
  */
 async function createView(): Promise<void> {
-  if (viewId.value !== null || creating.value || disposed) return;
+  if (viewId.value !== null || creating.value || disposed || !drawn.value) return;
   creating.value = true;
   status.value = null;
   try {
@@ -397,7 +412,9 @@ async function createView(): Promise<void> {
       rect.height,
       START_URL,
     );
-    if (disposed) {
+    // Torn down, or its tab was hidden while the platform was building it: close
+    // it, because a hidden pane must not leave a webview painting over the app.
+    if (disposed || !drawn.value) {
       void embedClose(id).catch(() => {});
       return;
     }
@@ -523,6 +540,25 @@ watch(
     if (next === previous) return;
     void reset();
   },
+);
+
+/**
+ * A hidden tab closes its view and a drawn one builds a fresh view. `post` so the
+ * parent has already applied `v-show` and the body has a measurable rect.
+ */
+watch(
+  drawn,
+  (visible) => {
+    if (disposed) return;
+    if (!visible) {
+      void closeView();
+      return;
+    }
+    // A timer left over from the hidden period would measure nothing useful.
+    appliedRect = null;
+    void createView();
+  },
+  { flush: "post" },
 );
 
 onMounted(() => {

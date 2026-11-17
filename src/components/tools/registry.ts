@@ -1,9 +1,9 @@
 // The drawer's tool registry (F1/F2 of `odd/tasks/tool-drawer-and-mcp.md`, and
 // the dock of `src/components/tools/dock.ts`).
 //
-// One entry per tool is the whole integration point: the dock's "+ Add tool"
-// menu is this list, and a pane mounts the `component` of the instance it holds.
-// Adding a tool is one entry here, never an edit to the dock.
+// One entry per tool is the whole integration point: the tool chooser of an empty
+// tab is this list, and a pane mounts the `component` of the instance it holds.
+// Adding a tool is one entry here, never an edit to the drawer.
 //
 // Two rules keep this list honest:
 //
@@ -75,10 +75,10 @@ export interface ToolDefinition {
   /** Mounted as-is by `DockPane.vue` with the props of its own context. */
   component: Component;
   /**
-   * At most one pane may hold this tool. Adding it again FOCUSES the pane that
-   * already has it instead of opening a second one, and a singleton pane cannot
-   * be split: two views of the same working tree would only be two ways to look
-   * at one answer.
+   * At most one pane of a TAB may hold this tool, and a singleton pane cannot be
+   * split: two views of the same working tree would only be two ways to look at
+   * one answer. Tabs stay independent — a second tab is a second area, which is
+   * the whole point of the tab strip.
    */
   singleton?: boolean;
   /** The context a fresh pane starts with, normally derived from the workspace. */
@@ -142,8 +142,8 @@ export function toolById(id: string): ToolDefinition | undefined {
 /**
  * S5: the tools the human enabled, in registry order. An id in `enabled` that no
  * entry declares is ignored, so a settings file from a newer build never breaks
- * this one, and an empty answer is an empty menu (the dock then shows its empty
- * face) instead of a pane nobody asked for.
+ * this one, and an empty answer is an empty chooser (the tab then says where the
+ * switches are) instead of a pane nobody asked for.
  */
 export function visibleTools(enabled: readonly string[]): ToolDefinition[] {
   return TOOLS.filter((tool) => enabled.includes(tool.id));

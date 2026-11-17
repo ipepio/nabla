@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// One pane of the dock: the header that identifies it, and the tool inside.
+// One pane of a tab: the header that identifies it, and the tool inside.
 //
 // The header is the whole pane contract, in four parts:
 //   - the tool icon and label, from the registry (never hardcoded here);
@@ -9,18 +9,27 @@
 //     "change folder" affordance, and it is the only place that writes a context,
 //     so a pane can be re-pointed but never half-re-pointed;
 //   - split right / split down, hidden at the depth cap, on a singleton tool and
-//     when the dock is already full (the dock's own cap, `dock.ts`);
-//   - close, hidden when this is the only pane: a drawer with nothing in it is a
-//     dead end (the empty face is reached by disabling the tool in Settings).
+//     when THIS TAB already holds `MAX_PANES` panes (`dock.ts`). The cap is per
+//     tab: another tab's panes never disable these buttons;
+//   - close, hidden when this is the tab's only pane: a tab with nothing in it
+//     would be a second way to reach the chooser, and closing the tab is the way
+//     to get rid of its last pane.
 //
 // MOUNTING — the tool is keyed by instance id AND by its folder. That is the rule
 // that makes the model work: a pane re-pointed at another folder remounts, so the
 // tree re-reads and the shell reopens there instead of showing the previous
-// folder's answer. Two panes never share state because their ids differ.
+// folder's answer. Two panes never share state because their ids differ, and two
+// TABS never share it either: switching tabs only hides a body (the host uses
+// `v-show`), it does not unmount it, so a terminal keeps its pty.
+//
+// THE ONE EXCEPTION — a Browser pane owns a CHILD WEBVIEW, which floats above the
+// HTML and cannot be hidden by CSS. `active` says whether this pane's tab is the
+// drawn one; `BrowserTool.vue` closes its view when it is not and rebuilds it when
+// it is again.
 //
 // The component receives its own props from `binding`, one shape per tool: Files
-// takes `rootPath` and emits `browse`, Terminal takes `cwd`, and the two
-// read-only views take the active workspace.
+// takes `rootPath` and emits `browse`, Terminal takes `cwd`, and the two read-only
+// views take the active workspace.
 import { computed } from "vue";
 import { Columns2Icon, FolderIcon, Rows2Icon, XIcon } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
@@ -30,22 +39,26 @@ import { t } from "@/lib/i18n";
 import {
   closePane,
   contextPath,
-  dockTree,
   focusPane,
   focusedId,
-  instances,
   MAX_DEPTH,
   MAX_PANES,
   setContextPath,
   splitPane,
+  tabById,
+  tabPanes,
   type SplitDirection,
 } from "./dock";
 import { TOOLS, toolById, type ToolInstance } from "./registry";
 
 const props = defineProps<{
+  /** The tab this pane belongs to: every mutation below is scoped to it. */
+  tabId: string;
   instance: ToolInstance;
-  /** Splits above this pane; 0 is the root pane. */
+  /** Splits above this pane inside its tab; 0 is the tab's root pane. */
   depth: number;
+  /** This pane's tab is the drawn one. */
+  active: boolean;
   workspace: WorkspaceInfo | null;
 }>();
 
@@ -59,9 +72,12 @@ const definition = computed(() => toolById(props.instance.toolId) ?? TOOLS[0]);
 /** The folder this pane shows, or `null` when the tool has no folder of its own. */
 const path = computed(() => contextPath(props.instance));
 
-const paneCount = computed(() => instances(dockTree.value).length);
+/** How many panes this pane's TAB holds — the only count the cap is about. */
+const paneCount = computed(() => tabPanes(tabById(props.tabId)).length);
 
-const focused = computed(() => focusedId.value === props.instance.id);
+const focused = computed(
+  () => props.active && focusedId.value === props.instance.id,
+);
 
 /** The cap, in the three places the header must respect it. */
 const canSplit = computed(
@@ -76,11 +92,9 @@ const canClose = computed(() => paneCount.value > 1);
 /**
  * What a remount is triggered by: the instance, and the folder it points at.
  * Changing folders therefore re-reads a tree and reopens a shell — the same
- * answer "switch workspace" already gave before the dock existed.
+ * answer "switch workspace" already gave before the drawer had tabs.
  */
-const mountKey = computed(
-  () => `${props.instance.id}:${path.value ?? ""}`,
-);
+const mountKey = computed(() => `${props.instance.id}:${path.value ?? ""}`);
 
 /** The props of the tool inside, one shape per tool (see the module note). */
 const binding = computed(() => {
@@ -91,8 +105,10 @@ const binding = computed(() => {
     case "terminal":
       return { cwd: instance.context.cwd };
     case "changes":
-    case "browser":
       return { workspace: props.workspace };
+    case "browser":
+      // `active`: the pane's tab is drawn, so the child webview may exist.
+      return { workspace: props.workspace, active: props.active };
   }
 });
 
@@ -101,14 +117,14 @@ async function browse(): Promise<void> {
     const selected = await pickDirectory(t("tools.dock.chooseFolder"));
     // A dismissed dialog answers `null`; a rejected one is left as it is: there
     // is no toast layer here, and the pane still points where it did.
-    if (selected !== null) setContextPath(props.instance.id, selected);
+    if (selected !== null) setContextPath(props.tabId, props.instance.id, selected);
   } catch {
     // Same as a dismissal: the pane keeps its folder.
   }
 }
 
 function split(direction: SplitDirection): void {
-  splitPane(props.instance.id, direction);
+  splitPane(props.tabId, props.instance.id, direction);
 }
 </script>
 
@@ -171,7 +187,7 @@ function split(direction: SplitDirection): void {
           size="icon-xs"
           :aria-label="t('tools.dock.close')"
           :title="t('tools.dock.close')"
-          @click="closePane(instance.id)"
+          @click="closePane(tabId, instance.id)"
         >
           <XIcon />
         </Button>
