@@ -426,3 +426,80 @@ export interface McpAddDraft {
   /** http only: the variable pi reads for `Authorization: Bearer`. */
   bearerTokenEnvVar?: string | null;
 }
+
+// ── workspace files (F1 of `odd/tasks/tool-drawer-and-mcp.md`) ───────────────
+
+/**
+ * What one entry of `fs_list_dir` is. A symlink is its own kind on purpose: Rust
+ * confines every read to the workspace, so the UI shows the link as a link and
+ * never pretends it is the target it may point outside.
+ */
+export type FsEntryKind = "dir" | "file" | "symlink";
+
+/**
+ * One row of a directory listing: the name shown, the path the next call takes
+ * back (workspace-relative, `/`-separated) and the size of a file in bytes.
+ * Directories carry `0`. Mirrors `FsEntry` in `src-tauri/src/fs.rs`.
+ */
+export interface FsEntry {
+  name: string;
+  /** Workspace-relative path; hand it back to `fsListDir`/`fsReadPreview`. */
+  path: string;
+  kind: FsEntryKind;
+  sizeBytes: number;
+}
+
+/**
+ * How Rust classifies a preview before any content is sent.
+ *
+ * - `text` — decoded UTF-8 in `content`;
+ * - `image` — a supported image; the bytes come from `fsReadImageBytes`;
+ * - `binary` — no textual rendering, and no preview is attempted;
+ * - `too_large` — above Rust's preview cap, so `content` stays `null` and the
+ *   size is still reported.
+ *
+ * Mirrors `FsPreview` in `src-tauri/src/fs.rs`.
+ */
+export type FsPreviewKind = "text" | "image" | "binary" | "too_large";
+
+/**
+ * What `fs_read_preview` answers (S3 of `tool-drawer-and-mcp.md`): the kind, the
+ * size of the file and, for `text` only, its content. `mime` is the image type
+ * when Rust recognized one and `null` for everything else. There is no bytes
+ * field on purpose: an image is fetched by `fsReadImageBytes`, which answers the
+ * raw binary body instead of a base64 string.
+ */
+export interface FsPreview {
+  kind: FsPreviewKind;
+  sizeBytes: number;
+  mime: string | null;
+  /** UTF-8 text for `kind: "text"`; `null` for every other kind. */
+  content: string | null;
+}
+
+// ── workspace changes (F1 of `odd/tasks/tool-drawer-and-mcp.md`) ────────────
+
+/**
+ * The change one path carries, reduced to the words the Changes tab paints:
+ * a file staged for commit and then edited again appears as two entries, one
+ * `staged: true` and one `staged: false`, exactly as `git status` reports it.
+ * Mirrors `GitEntryStatus` in `src-tauri/src/git.rs`.
+ */
+export type GitEntryStatus =
+  | "modified"
+  | "added"
+  | "deleted"
+  | "renamed"
+  | "untracked"
+  | "conflicted";
+
+/**
+ * One row of `git_status`: the workspace-relative path, its change and whether
+ * the change lives in the index (`staged`) or in the working tree.
+ * Mirrors `GitEntry` in `src-tauri/src/git.rs`.
+ */
+export interface GitEntry {
+  path: string;
+  status: GitEntryStatus;
+  staged: boolean;
+}

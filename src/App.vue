@@ -9,9 +9,11 @@ import { PanelRightCloseIcon } from "@lucide/vue";
 import AppSidebar from "./components/AppSidebar.vue";
 import ChatPanel from "./components/ChatPanel.vue";
 import ResizableAside from "./components/ResizableAside.vue";
+import ToolTabs from "./components/tools/ToolTabs.vue";
 import { Button } from "./components/ui/button";
 import { SidebarInset, SidebarProvider } from "./components/ui/sidebar";
 import type { WorkspaceInfo } from "./contracts/types";
+import { t } from "./lib/i18n";
 
 const activeWorkspace = ref<WorkspaceInfo | null>(null);
 // Right tools drawer (S6): collapsed by default; the chat header and the empty
@@ -41,43 +43,37 @@ const toolsOpen = ref(false);
         </div>
 
         <!--
-          RIGHT VIEWPORT (S6, resizable since S3) — still a placeholder, but no
-          longer inert: `ResizableAside` owns the drag handle, the pointer and
-          keyboard resizing, and the panel width itself (S4: one owner). This
-          component keeps only `toolsOpen`, and the panel therefore resets to
+          RIGHT VIEWPORT (S6, resizable since S3) — the tools drawer (S2 of
+          `tool-drawer-and-mcp.md`). `ResizableAside` owns the drag handle, the
+          pointer and keyboard resizing, and the panel width itself (S4: one
+          owner); this component keeps only `toolsOpen`, so the panel resets to
           its default width when reopened.
 
-          The user asked for an empty right viewport to be left for future tools;
-          nothing inside it is interactive yet. It stays a plain flex sibling, so
-          a real tool panel replaces its content without moving the chat: the
-          chat owns its own scroll and only loses the width this rail takes.
-
-          When it grows controls, promote it to
-          `<Sidebar side="right" collapsible="offcanvas">` inside the provider
-          below — that needs no restructuring either.
+          The body is `ToolTabs`, which renders one tab per entry of
+          `components/tools/registry.ts` and mounts the active tool. That is the
+          whole integration: a new tool (terminal, browser) is a registry entry,
+          never an edit here. The tool receives the active workspace, so a
+          workspace switch re-reads what it shows.
         -->
         <ResizableAside
           v-if="toolsOpen"
-          aria-label="Tools"
+          :aria-label="t('tools.title')"
           class="hidden md:flex"
         >
           <div class="flex items-center gap-2 border-b px-3 py-2">
-            <h2 class="text-sm font-semibold">Tools</h2>
+            <h2 class="text-sm font-semibold">{{ t("tools.title") }}</h2>
             <Button
               variant="ghost"
               size="icon-sm"
               class="ms-auto"
-              aria-label="Collapse tools panel"
+              :aria-label="t('tools.collapse')"
               @click="toolsOpen = false"
             >
               <PanelRightCloseIcon />
             </Button>
           </div>
-          <div class="flex flex-1 items-center justify-center p-4">
-            <p class="text-center text-xs text-muted-foreground">
-              No tools yet. This viewport is reserved.
-            </p>
-          </div>
+
+          <ToolTabs :workspace="activeWorkspace" />
         </ResizableAside>
       </div>
     </SidebarInset>

@@ -7,6 +7,9 @@ import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { AgentEventEnvelope } from "./agent-events";
 import type {
   AppSettings,
+  FsEntry,
+  FsPreview,
+  GitEntry,
   McpAddDraft,
   McpScope,
   McpServerSummary,
@@ -559,4 +562,75 @@ export async function subscribeAgentEvents(
   return listen<AgentEventEnvelope>("agent-event", ({ payload }) => {
     handler(payload);
   });
+}
+
+// ── workspace files and changes (F1 of `odd/tasks/tool-drawer-and-mcp.md`) ──
+
+/**
+ * S3: one directory of the workspace, one level deep. `relPath` is relative to
+ * `workspace` and `""` is the workspace root; the answer never includes parent
+ * entries, so the Files tab can expand lazily — one call per expanded folder,
+ * never a recursive walk. Rust confines every read to the workspace, so a `..`
+ * or a symlink that escapes is a rejection, not an answer.
+ */
+export function fsListDir(
+  workspace: string,
+  relPath: string,
+): Promise<FsEntry[]> {
+  return invoke<FsEntry[]>("fs_list_dir", { workspace, relPath });
+}
+
+/**
+ * S3: what a file is and, for text, its content — decided by Rust so the webview
+ * never guesses at a binary and never streams a file it should not render. The
+ * size cap lives in Rust: a file above it answers `kind: "too_large"` with its
+ * size instead of its bytes.
+ */
+export function fsReadPreview(
+  workspace: string,
+  relPath: string,
+): Promise<FsPreview> {
+  return invoke<FsPreview>("fs_read_preview", { workspace, relPath });
+}
+
+/**
+ * S3: the bytes of an image preview, RAW.
+ *
+ * `fs_read_image_bytes` answers `tauri::ipc::Response`, so the payload is a
+ * binary body the bridge hands over as an `ArrayBuffer` — not JSON, not base64:
+ * no 33 % inflation and no dependency on either side. The caller puts the bytes
+ * in a `Blob` with the `mime` `fsReadPreview` reported and revokes the object URL
+ * it builds.
+ */
+export async function fsReadImageBytes(
+  workspace: string,
+  relPath: string,
+): Promise<ArrayBuffer> {
+  const answer = await invoke<ArrayBuffer | Uint8Array | number[]>(
+    "fs_read_image_bytes",
+    { workspace, relPath },
+  );
+  if (answer instanceof ArrayBuffer) return answer;
+  // A bridge that hands over a view or a plain array lands here; normalizing to
+  // one `ArrayBuffer` keeps the caller free of `BlobPart` type gymnastics.
+  return new Uint8Array(answer).buffer;
+}
+
+/**
+ * S3: every change of the working tree, staged and unstaged, untracked files
+ * included. A folder that is not a git repository answers an EMPTY LIST rather
+ * than an error (`src-tauri/src/workspace.rs`), so the two empty faces of the
+ * Changes tab share this one answer.
+ */
+export function gitStatus(workspace: string): Promise<GitEntry[]> {
+  return invoke<GitEntry[]>("git_status", { workspace });
+}
+
+/**
+ * S3: the unified diff of one path against `HEAD` (an untracked file diffs
+ * against the empty tree), as git prints it. Loaded per click, never for the
+ * whole list, so the Changes tab stays cheap on a large working tree.
+ */
+export function gitDiff(workspace: string, path: string): Promise<string> {
+  return invoke<string>("git_diff", { workspace, path });
 }
