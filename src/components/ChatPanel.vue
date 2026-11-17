@@ -63,7 +63,9 @@ import {
   isTranscriptLoading,
   newSession,
   queuedCount,
+  queuedPrompts,
   recordSessionStatus,
+  removeQueuedPrompt,
   sessionBuffer,
   sessionGeneration,
   type SessionBuffer,
@@ -340,6 +342,24 @@ const canQueue = computed(
 /** Prompts of the session on screen that are waiting for a turn to end (S3). */
 const queuedForSession = computed(() =>
   queuedCount(currentSession.value?.sessionId ?? null),
+);
+
+/**
+ * The queued prompts themselves, for the list above the composer. The store
+ * hands back a copy of the reactive queue, so adding, sending or removing one
+ * re-runs this computed and the panel never owns the list.
+ */
+const queuedList = computed(() =>
+  queuedPrompts(currentSession.value?.sessionId ?? null),
+);
+
+/**
+ * The queue stack shares the composer's ceiling, so it lines up with the box
+ * under it: the empty state's narrow one, the conversation's wide one.
+ */
+const queueMaxWidth = computed(
+  () =>
+    `${isEmptyState.value ? COMPOSER_MAX_WIDTH : CONVERSATION_COMPOSER_MAX_WIDTH}px`,
 );
 
 /** Provider reported by settings, used by the empty-state chip (S1). */
@@ -682,8 +702,20 @@ function handleQueue() {
   const current = currentSession.value;
   const text = prompt.value.trim();
   if (current === null || text === "" || !queueMessages.value) return;
-  enqueuePrompt(current.sessionId, text);
+  // The panel knows the workspace of the session it renders, so the queued
+  // prompt is addressable the moment the turn ends — even if the human has
+  // moved to another workspace by then.
+  enqueuePrompt(current.sessionId, text, current.workspaceId);
   prompt.value = "";
+}
+
+/**
+ * S3: drops one waiting prompt of the session on screen. Index-based because the
+ * list is rendered in queue order; the store ignores an index that has since
+ * drained, so a click racing a turn end cannot throw.
+ */
+function handleRemoveQueued(index: number) {
+  removeQueuedPrompt(currentSession.value?.sessionId ?? null, index);
 }
 
 /**
@@ -760,25 +792,68 @@ onUnmounted(() => {
       :hint="workspace === null ? t('chat.noWorkspaceHint') : null"
     >
       <template #composer>
-        <Composer
-          v-model="prompt"
-          :max-width="COMPOSER_MAX_WIDTH"
-          :provider-id="providerId"
-          :model-id="modelId"
-          :provider-models="providerModels"
-          :workspace-name="workspace?.name ?? t('chat.noWorkspace')"
-          :streaming="agentWorking"
-          :disabled="workspace === null"
-          :can-send="canSend"
-          :can-queue="canQueue"
-          :queued-count="queuedForSession"
-          :model-disabled="savingModel || enabledModelCount === 0"
-          :can-stop="currentSession !== null && !stopping"
-          @select-model="handleSelectModel"
-          @send="handleSend"
-          @queue="handleQueue"
-          @stop="handleStop"
-        />
+        <div class="flex w-full flex-col gap-1.5">
+          <!-- S3: this session's waiting prompts, directly above the composer
+               (see the conversation branch below for the same stack). -->
+          <div
+            v-if="queuedList.length > 0"
+            class="mx-auto flex w-full flex-col gap-1"
+            :style="{ maxWidth: queueMaxWidth }"
+          >
+            <p class="px-1 text-xs text-muted-foreground">
+              {{ t("chat.queue.heading", { count: queuedList.length }) }}
+            </p>
+            <ul
+              class="max-h-[5rem] overflow-y-auto rounded-md bg-muted/40 p-1"
+              :aria-label="t('chat.queue.list')"
+            >
+              <li
+                v-for="(item, index) in queuedList"
+                :key="`${index}-${item}`"
+                class="flex items-center gap-1.5"
+              >
+                <span
+                  class="w-4 shrink-0 text-right text-[10px] tabular-nums text-muted-foreground"
+                  aria-hidden="true"
+                >
+                  {{ index + 1 }}
+                </span>
+                <span class="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+                  {{ item }}
+                </span>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  class="shrink-0"
+                  :aria-label="t('chat.queue.remove', { index: index + 1 })"
+                  @click="handleRemoveQueued(index)"
+                >
+                  <XIcon />
+                </Button>
+              </li>
+            </ul>
+          </div>
+
+          <Composer
+            v-model="prompt"
+            :max-width="COMPOSER_MAX_WIDTH"
+            :provider-id="providerId"
+            :model-id="modelId"
+            :provider-models="providerModels"
+            :workspace-name="workspace?.name ?? t('chat.noWorkspace')"
+            :streaming="agentWorking"
+            :disabled="workspace === null"
+            :can-send="canSend"
+            :can-queue="canQueue"
+            :queued-count="queuedForSession"
+            :model-disabled="savingModel || enabledModelCount === 0"
+            :can-stop="currentSession !== null && !stopping"
+            @select-model="handleSelectModel"
+            @send="handleSend"
+            @queue="handleQueue"
+            @stop="handleStop"
+          />
+        </div>
       </template>
     </ChatEmptyState>
 
@@ -910,6 +985,48 @@ onUnmounted(() => {
            No rule above it: the conversation and its input read as one
            surface instead of two panes. -->
       <div class="px-4 py-3">
+        <!-- S3: this session's waiting prompts, directly above the composer and
+             capped to three visible rows so the input never leaves the screen.
+             Same stack as the empty state above. -->
+        <div
+          v-if="queuedList.length > 0"
+          class="mx-auto mb-1.5 flex w-full flex-col gap-1"
+          :style="{ maxWidth: queueMaxWidth }"
+        >
+          <p class="px-1 text-xs text-muted-foreground">
+            {{ t("chat.queue.heading", { count: queuedList.length }) }}
+          </p>
+          <ul
+            class="max-h-[5rem] overflow-y-auto rounded-md bg-muted/40 p-1"
+            :aria-label="t('chat.queue.list')"
+          >
+            <li
+              v-for="(item, index) in queuedList"
+              :key="`${index}-${item}`"
+              class="flex items-center gap-1.5"
+            >
+              <span
+                class="w-4 shrink-0 text-right text-[10px] tabular-nums text-muted-foreground"
+                aria-hidden="true"
+              >
+                {{ index + 1 }}
+              </span>
+              <span class="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+                {{ item }}
+              </span>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                class="shrink-0"
+                :aria-label="t('chat.queue.remove', { index: index + 1 })"
+                @click="handleRemoveQueued(index)"
+              >
+                <XIcon />
+              </Button>
+            </li>
+          </ul>
+        </div>
+
         <Composer
           v-model="prompt"
           :max-width="CONVERSATION_COMPOSER_MAX_WIDTH"

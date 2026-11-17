@@ -219,6 +219,9 @@
   "chat.composer.queue": "Queue message",
   "chat.composer.queued": "Queued: {count}",
   "chat.composer.stop": "Stop session",
+  "chat.queue.heading": "Queued ({count})",
+  "chat.queue.list": "Queued prompts",
+  "chat.queue.remove": "Remove queued prompt {index}",
 
   "message.copy": "Copy message",
 

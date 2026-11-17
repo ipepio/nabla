@@ -107,9 +107,10 @@ export interface SessionBuffer {
    */
   busy: boolean;
   /**
-   * Owning workspace, remembered when the session is created, opened or seeded.
-   * `send_prompt` takes the pair, so a queued prompt cannot be resent without
-   * it; `null` for a session the store only learned about from an event.
+   * Owning workspace, remembered when the session is created, opened, seeded or
+   * enqueued into. `send_prompt` takes the pair, so a queued prompt cannot be
+   * sent without it; `null` for a session the store only learned about from an
+   * event. While it is `null` the queue waits instead of being dropped.
    */
   workspaceId: number | null;
   /**
@@ -118,7 +119,8 @@ export interface SessionBuffer {
    * queue belongs to the conversation it was typed into. One entry is shifted
    * and sent each time a turn ends, so it drains in order. A queue left over
    * after the toggle is turned off simply waits and drains on the next finished
-   * turn once it is back on.
+   * turn once it is back on, and so does one whose session cannot be addressed
+   * yet: an entry leaves this list only when it is really sent.
    */
   queue: string[];
 }
@@ -334,13 +336,22 @@ function flushStreaming(sessionId: string, buffer: SessionBuffer): void {
  * `sendPrompt` when the composer's submit arrives while the agent is working, so
  * the prompt is kept rather than rejected or sent into a busy session.
  *
+ * `workspaceId` is the workspace the caller already knows (the panel always
+ * does: it renders a session that belongs to one). Recording it here is what
+ * makes the queued prompt addressable later, when the panel may have moved to
+ * another workspace or session entirely.
+ *
  * Nothing is echoed into the transcript here: the turn appears when it is really
  * sent (see `sendQueuedTurn`), so a dropped item never leaves a phantom message.
  */
-export function enqueuePrompt(sessionId: string, text: string): void {
+export function enqueuePrompt(
+  sessionId: string,
+  text: string,
+  workspaceId: number | null = null,
+): void {
   const prompt = text.trim();
   if (prompt === "") return;
-  ensureBuffer(sessionId).queue.push(prompt);
+  ensureBuffer(sessionId, workspaceId).queue.push(prompt);
 }
 
 /** How many prompts of one session are waiting; `0` when there are none. */
@@ -350,20 +361,55 @@ export function queuedCount(sessionId: string | null): number {
 }
 
 /**
+ * S3: the prompts of one session that are still waiting, oldest first.
+ *
+ * A copy, not the buffer's own array: the panel renders the list but only
+ * `removeQueuedPrompt` may change it. Reading the reactive queue here is what
+ * keeps the panel up to date — a computed over this function re-evaluates
+ * whenever an entry is added, sent or removed.
+ */
+export function queuedPrompts(sessionId: string | null): string[] {
+  const buffer = sessionBuffer(sessionId);
+  if (buffer === null) return [];
+  return [...buffer.queue];
+}
+
+/**
+ * S3: drops one waiting prompt of a session by position. The human's own undo
+ * for a queued item; out-of-range indices are ignored instead of throwing, since
+ * the list can shrink on its own when a turn ends and drains it.
+ */
+export function removeQueuedPrompt(
+  sessionId: string | null,
+  index: number,
+): void {
+  const buffer = sessionBuffer(sessionId);
+  if (buffer === null) return;
+  if (!Number.isInteger(index) || index < 0 || index >= buffer.queue.length) return;
+  // `splice` on the reactive array: the queue is mutated in place so every
+  // computed watching it (the counter, the list) updates.
+  buffer.queue.splice(index, 1);
+}
+
+/**
  * S3: hands the next queued prompt of a session to pi, after the turn that just
  * ended. Exactly one per turn end, so a queue of three takes three turns — same
  * order the human typed them.
  *
- * A session the store never learned the workspace of cannot address
- * `send_prompt`, which takes the pair: that item is dropped instead of being
- * retried forever or sent to a guessed workspace.
+ * Addressability comes first. `send_prompt` takes the (workspace, session) pair,
+ * so a session whose workspace is unknown cannot be sent to; the queue is left
+ * exactly as it is then, and its first entry goes out on a later turn, once a
+ * path that knows the workspace has recorded it. Shifting before that check
+ * destroyed the prompt instead — it was reported as sent and never processed.
+ * Nothing is written to `buffer.error` either: a workspace that is merely not
+ * known yet is not a failure to show the human.
  */
 function drainQueue(sessionId: string, buffer: SessionBuffer): void {
   if (!queueMessages.value) return;
-  const next = buffer.queue.shift();
-  if (next === undefined) return;
   const workspaceId = buffer.workspaceId;
   if (workspaceId === null) return;
+  const next = buffer.queue.shift();
+  if (next === undefined) return;
   void sendQueuedTurn(sessionId, buffer, workspaceId, next);
 }
 
@@ -552,6 +598,10 @@ export async function selectSession(session: SessionSummary): Promise<void> {
   if (!live.includes(sessionId)) {
     try {
       const opened = await openSession(sessionId);
+      // The runtime's answer carries the workspace too; recording it here keeps
+      // the open path addressable even for a session the caller described
+      // without one.
+      ensureBuffer(sessionId, opened.workspaceId);
       buffer.status = opened.status;
       buffer.error = null;
       markLive(sessionId, opened.status);
