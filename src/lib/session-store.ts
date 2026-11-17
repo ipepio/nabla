@@ -758,8 +758,32 @@ export async function selectSession(session: SessionSummary): Promise<void> {
   activeSession.value = dtoFromSummary(session, buffer.status);
   void ensureSessionEvents();
 
-  const live = await refreshLiveSessions();
-  if (!live.includes(sessionId)) {
+  // The transcript is a disk read of pi's own JSONL and does NOT need pi to be
+  // running. Seeding it first means the conversation paints in milliseconds; the
+  // (slow) process spawn then happens in the background instead of holding the
+  // view hostage for ~2 s before anything reacts. This is the fix for "click a
+  // session and nothing happens for seconds".
+  const loadTranscript = (async () => {
+    if (transcriptSeeded.has(sessionId)) return;
+    transcriptLoading.add(sessionId);
+    try {
+      const history = await sessionTranscript(sessionId);
+      seedTranscript(sessionId, buffer, history);
+      transcriptSeeded.add(sessionId);
+    } catch (cause) {
+      // Not fatal: the session still streams, and the next selection retries.
+      buffer.error = buffer.error ?? commandErrorMessage(cause);
+    } finally {
+      transcriptLoading.delete(sessionId);
+    }
+  })();
+
+  // Opening pi boots the engine (~2 s). It must not block the first paint: run
+  // it in parallel and let the runtime's status arrive through agent-events and
+  // the snapshot we replace here once it resolves.
+  const open = (async () => {
+    const live = await refreshLiveSessions();
+    if (live.includes(sessionId)) return;
     try {
       const opened = await openSession(sessionId);
       // The runtime's answer carries the workspace too; recording it here keeps
@@ -775,20 +799,9 @@ export async function selectSession(session: SessionSummary): Promise<void> {
     } catch (cause) {
       buffer.error = commandErrorMessage(cause);
     }
-  }
+  })();
 
-  if (transcriptSeeded.has(sessionId)) return;
-  transcriptLoading.add(sessionId);
-  try {
-    const history = await sessionTranscript(sessionId);
-    seedTranscript(sessionId, buffer, history);
-    transcriptSeeded.add(sessionId);
-  } catch (cause) {
-    // Not fatal: the session still streams, and the next selection retries.
-    buffer.error = buffer.error ?? commandErrorMessage(cause);
-  } finally {
-    transcriptLoading.delete(sessionId);
-  }
+  await Promise.all([loadTranscript, open]);
 }
 
 /**
