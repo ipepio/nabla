@@ -51,6 +51,10 @@ pub struct AppState {
     /// the target list and the close all run off the IPC thread: the readiness
     /// poll waits up to 15 s and must never freeze the webview.
     pub browsers: browser::BrowserSessions,
+    /// The embedded browser: one child webview per view, added to the main
+    /// window, plus the last url each one reported. Tauri owns the webviews;
+    /// this registry is the handle the commands address.
+    pub embeds: crate::embed::EmbedSessions,
 }
 
 // Errors cross the bridge as plain strings for now: StoreError and SettingsError
@@ -1732,6 +1736,115 @@ pub async fn browser_close(
     tauri::async_runtime::spawn_blocking(move || browsers.close(&session_id))
         .await
         .map_err(display_err)
+}
+
+// ── embedded browser: a child webview the app controls ─────────────────────
+//
+// A real webview, never an iframe: X-Frame-Options and CSP `frame-ancestors`
+// make an iframe unusable for arbitrary sites, and an external browser is a
+// different product. Each view is a child webview of the main window with its
+// own id, position, size and lifetime, and `embed-nav` reports every navigation
+// so the UI always knows what the pane shows. `embed.rs` documents the platform
+// story: macOS first, the Webview2 caveat on Windows, and no multiwebview API at
+// all on mobile.
+
+/// Creates a child webview in the main window at a logical position and size and
+/// answers its id (`embed-<n>`). `url` defaults to `about:blank`.
+///
+/// `async` on purpose: `Window::add_child` waits on the main thread to build the
+/// webview, so calling it from the main thread would stall the app, and on Windows
+/// it deadlocks. The blocking build runs on a worker thread instead.
+#[tauri::command]
+pub async fn embed_create(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    url: Option<String>,
+) -> Result<String, String> {
+    let embeds = state.embeds.clone();
+    tauri::async_runtime::spawn_blocking(move || embeds.create(&app, x, y, width, height, url))
+        .await
+        .map_err(display_err)?
+        .map_err(display_err)
+}
+
+/// Moves and resizes one view, in logical units. The UI calls this with the panel
+/// rect and on every resize, so the child webview covers exactly that rect.
+#[tauri::command]
+pub fn embed_set_bounds(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    view_id: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    state
+        .embeds
+        .set_bounds(&app, &view_id, x, y, width, height)
+        .map_err(display_err)
+}
+
+/// Navigates one view. Only `http`, `https` and `about:blank` are accepted; a
+/// `file:` or `javascript:` url is refused before the webview ever sees it.
+#[tauri::command]
+pub fn embed_navigate(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    view_id: String,
+    url: String,
+) -> Result<(), String> {
+    state
+        .embeds
+        .navigate(&app, &view_id, &url)
+        .map_err(display_err)
+}
+
+/// Evaluates a script in one view and answers the result as the JSON string the
+/// platform serializes it into.
+///
+/// `async` plus a worker thread because the answer comes back on the main thread
+/// through a callback: waiting for it there would deadlock the app.
+#[tauri::command]
+pub async fn embed_eval(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    view_id: String,
+    script: String,
+) -> Result<String, String> {
+    let embeds = state.embeds.clone();
+    tauri::async_runtime::spawn_blocking(move || embeds.eval(&app, &view_id, &script))
+        .await
+        .map_err(display_err)?
+        .map_err(display_err)
+}
+
+/// Closes one view and forgets it. Idempotent: an unknown id answers `false`.
+#[tauri::command]
+pub fn embed_close(state: State<'_, AppState>, app: tauri::AppHandle, view_id: String) -> bool {
+    state.embeds.close(&app, &view_id)
+}
+
+/// The last url the navigation handler of one view reported: the page the human
+/// is looking at.
+#[tauri::command]
+pub fn embed_url(state: State<'_, AppState>, view_id: String) -> Result<String, String> {
+    state
+        .embeds
+        .get(&view_id)
+        .map(|view| view.url)
+        .ok_or_else(|| display_err(crate::embed::EmbedError::UnknownView(view_id)))
+}
+
+/// Closes every view and answers how many were closed. The app also does this on
+/// exit, so no child webview outlives the window that hosts it.
+#[tauri::command]
+pub fn embed_close_all(state: State<'_, AppState>, app: tauri::AppHandle) -> usize {
+    state.embeds.close_all(&app)
 }
 
 #[cfg(test)]

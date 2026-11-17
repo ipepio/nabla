@@ -1,6 +1,8 @@
 mod browser;
 mod cli;
 mod commands;
+// The embedded browser: one child webview per view, added to the main window.
+mod embed;
 mod mcp;
 mod process;
 mod providers;
@@ -84,6 +86,11 @@ pub fn run() {
                 // uses, and it kills every child it still owns on drop, so no
                 // browser outlives the app.
                 browsers: browser::BrowserSessions::new(),
+                // The embedded browser's registry: ids and the last url each
+                // child webview reported. Tauri owns the webviews themselves —
+                // here the app only keeps the metadata it can test without a
+                // window.
+                embeds: embed::EmbedSessions::new(),
             });
             Ok(())
         })
@@ -184,8 +191,28 @@ pub fn run() {
             commands::browser_launch,
             commands::browser_targets,
             commands::browser_open_url,
-            commands::browser_close
+            commands::browser_close,
+            // The embedded browser: a child webview of the main window, moved
+            // and sized by the UI, with its own lifetime per view. A real
+            // webview, not an iframe (X-Frame-Options forbids that).
+            commands::embed_create,
+            commands::embed_set_bounds,
+            commands::embed_navigate,
+            commands::embed_eval,
+            commands::embed_close,
+            commands::embed_url,
+            commands::embed_close_all
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Every child webview is closed when the app exits, so nothing of
+            // the embedded browser outlives the window that hosts it. This is
+            // the `close_all` of the registry: a `Drop` cannot do it, because a
+            // dropping registry has no app handle to close a webview with.
+            if matches!(event, tauri::RunEvent::Exit) {
+                let embeds = app.state::<AppState>().embeds.clone();
+                embeds.close_all(app);
+            }
+        });
 }
