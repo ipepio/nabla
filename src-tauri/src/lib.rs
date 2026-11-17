@@ -1,4 +1,3 @@
-mod browser;
 mod cli;
 mod commands;
 // The embedded browser: one child webview per view, added to the main window.
@@ -81,11 +80,6 @@ pub fn run() {
                         let _ = shell_handle.emit("shell-output", event.clone());
                     })
                 },
-                // S4/S6 of `tool-drawer-and-mcp.md` (F3): the Chromium instances
-                // Nabla starts itself. The registry is the handle the webview
-                // uses, and it kills every child it still owns on drop, so no
-                // browser outlives the app.
-                browsers: browser::BrowserSessions::new(),
                 // The embedded browser's registry: ids and the last url each
                 // child webview reported. Tauri owns the webviews themselves —
                 // here the app only keeps the metadata it can test without a
@@ -183,15 +177,6 @@ pub fn run() {
             commands::shell_write,
             commands::shell_resize,
             commands::shell_close,
-            // F3 of `tool-drawer-and-mcp.md`: the browser the agent drives. One
-            // dedicated Chromium launched by Nabla, addressed by session id;
-            // no Chromium on the machine means detection answers empty and the
-            // tab stays disabled with its reason (S6).
-            commands::browser_detect,
-            commands::browser_launch,
-            commands::browser_targets,
-            commands::browser_open_url,
-            commands::browser_close,
             // The embedded browser: a child webview of the main window, moved
             // and sized by the UI, with its own lifetime per view. A real
             // webview, not an iframe (X-Frame-Options forbids that).
