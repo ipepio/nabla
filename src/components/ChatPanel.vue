@@ -33,7 +33,6 @@ import {
   commandErrorMessage,
   getSettings,
   saveSettings,
-  sendPrompt,
   sessionStatus,
   stopSession,
 } from "@/contracts/commands";
@@ -57,7 +56,6 @@ import {
 } from "@/lib/provider-models";
 import {
   activeSession,
-  appendUserTurn,
   ensureSessionEvents,
   enqueuePrompt,
   isTranscriptLoading,
@@ -66,8 +64,8 @@ import {
   queuedPrompts,
   recordSessionStatus,
   removeQueuedPrompt,
+  sendUserTurn,
   sessionBuffer,
-  sessionGeneration,
   type SessionBuffer,
   type ToolEntry,
 } from "@/lib/session-store";
@@ -90,8 +88,17 @@ interface StatusAlert {
 
 const prompt = ref("");
 
-const starting = ref(false);
+/**
+ * The click has been taken but pi has not accepted it yet: session creation plus
+ * the first RPC round-trip. It is a synchronous latch (set before the first
+ * `await`, so a second Enter cannot start a second session) and nothing more —
+ * the moment a send is accepted, the store's `busy` takes over. Both are read
+ * through the single `agentWorking` below, which is what the composer's stop,
+ * send/queue decision and disabled state all derive from.
+ */
 const sending = ref(false);
+/** Same latch for the "there is no session yet" half of the first send. */
+const starting = ref(false);
 const stopping = ref(false);
 /** Last command failure of this panel; the session's own diagnosis lives in
  * its buffer, so switching sessions cannot carry one over the other. */
@@ -309,25 +316,42 @@ const isEmptyState = computed(() => {
   );
 });
 
-const canSend = computed(
-  () => props.workspace !== null && prompt.value.trim() !== "" && !sending.value && !starting.value,
-);
-
 /**
- * Is the agent doing work right now? The buffer's `busy` flag is raised by
- * streaming and tool events and lowered when a turn ends, so it covers the whole
- * turn; `sending`/`starting` cover the milliseconds before the first event. This
- * is what the composer receives as `streaming`, which is therefore also when Stop
- * is offered and when a submit turns into a queued prompt (S3).
+ * Is the agent doing work right now?
+ *
+ * The store's `busy` is the authority: it goes up the instant a prompt is handed
+ * to pi (direct send *and* queue drain) and comes down on `turn_end`,
+ * `agent_end`, `process_exit`, a stop or a crash, so it also covers the silence
+ * between acceptance and pi's first delta. `sending`/`starting` only extend it
+ * over the milliseconds before a send exists to accept.
+ *
+ * The composer receives exactly this as `streaming`, and Stop, the send/queue
+ * decision and `canSend` are all derived from it — the same field the drawer's
+ * spinner reads through `busyIds`, so the two surfaces cannot disagree.
  */
 const agentWorking = computed(
   () => sending.value || starting.value || (buffer.value?.busy ?? false),
 );
 
 /**
+ * The prompt can be sent right now: there is a workspace, something to say, and
+ * the agent is not working. "Not working" reads `agentWorking`, not a private
+ * copy of it, so a submit and the stop control can never disagree about whether
+ * the turn is over.
+ */
+const canSend = computed(
+  () => props.workspace !== null && prompt.value.trim() !== "" && !agentWorking.value,
+);
+
+/**
  * S3: the prompt can be queued instead of sent — the agent is working, the
- * preference is on and there is something to queue. The store keeps the queue per
- * session; the panel only decides which event the composer emits.
+ * preference is on, there is a session to queue it against and there is
+ * something to queue. The store keeps the queue per session; the panel only
+ * decides which event the composer emits.
+ *
+ * `sending`/`starting` keep it off while a click is being accepted: the text is
+ * still in the composer then, and it belongs to that send — queueing it as well
+ * would show the same prompt twice.
  */
 const canQueue = computed(
   () =>
@@ -335,6 +359,7 @@ const canQueue = computed(
     agentWorking.value &&
     !sending.value &&
     !starting.value &&
+    currentSession.value !== null &&
     props.workspace !== null &&
     prompt.value.trim() !== "",
 );
@@ -666,25 +691,28 @@ async function handleSelectModel(choice: { provider: string; model: string }) {
   }
 }
 
+/**
+ * Send and Queue share this guard.
+ *
+ * A send goes through `sendUserTurn`, which writes the human's turn to the
+ * transcript and marks the session working before the bridge is asked, and rolls
+ * both back if the send does not land. That is why nothing here appends a turn
+ * itself: the store owns the conversation, and a failed send must not leave a
+ * question pi never received in it.
+ */
 async function handleSend() {
   const text = prompt.value.trim();
-  if (text === "" || sending.value || starting.value) return;
+  if (text === "" || agentWorking.value) return;
   sending.value = true;
   panelError.value = null;
   try {
     const current = await ensureSession();
     if (current === null) return;
-    await sendPrompt(current.workspaceId, Number(current.sessionId), text);
-    // Echo the turn so the transcript reads as a conversation: pi answers with
-    // deltas on `agent-event`, it does not echo the prompt back. The turn lands
-    // in that session's buffer, not in whatever is on screen.
-    appendUserTurn(current.sessionId, text);
+    await sendUserTurn(current.sessionId, current.workspaceId, text);
     prompt.value = "";
-    // The drawer sorts by activity and caches each workspace's list, so every
-    // successful send has to invalidate it — not just the first turn, which was
-    // only there to pick up the derived alias.
-    sessionGeneration.value += 1;
   } catch (cause) {
+    // The composer keeps the text: a prompt that never left is still the
+    // human's to resend.
     panelError.value = commandErrorMessage(cause);
   } finally {
     sending.value = false;
@@ -695,12 +723,18 @@ async function handleSend() {
  * S3 of `chat-preferences-and-queue.md`: the human submitted while the agent is
  * working and the queue is on. The prompt is kept in this session's queue and
  * pi is not called at all — `session-store` sends it once the current turn ends.
- * The composer is cleared so the next prompt starts empty, exactly as a send
- * does.
+ *
+ * The store also puts the turn in the transcript right now, muted and marked
+ * pending, so the question the human typed is visible and in order while it
+ * waits; sending it later only clears that mark. The composer is cleared so the
+ * next prompt starts empty, exactly as a send does.
  */
 function handleQueue() {
   const current = currentSession.value;
   const text = prompt.value.trim();
+  // The latch check matters: while a send is being accepted the text belongs to
+  // that send, and queueing it too would show one prompt twice.
+  if (sending.value || starting.value) return;
   if (current === null || text === "" || !queueMessages.value) return;
   // The panel knows the workspace of the session it renders, so the queued
   // prompt is addressable the moment the turn ends — even if the human has
@@ -936,6 +970,24 @@ onUnmounted(() => {
             >
               <WrenchIcon class="mt-0.5 size-3 shrink-0" aria-hidden="true" />
               <span class="min-w-0 whitespace-pre-wrap">{{ message.text }}</span>
+            </div>
+            <!-- S3: a prompt waiting in the queue is already here, muted, and in
+                 the order it was typed — waiting must never mean invisible. It is
+                 the message the human typed, not a placeholder: sending it only
+                 clears the mark (`pending`), never appends a second copy. -->
+            <div v-else-if="message.pending" class="flex flex-col gap-1">
+              <div class="opacity-60">
+                <MessageBubble
+                  :role="bubbleRole(message.role)"
+                  :text="message.text"
+                  :at="timeLabel(message.at)"
+                  :reasoning="showReasoning ? message.reasoning : undefined"
+                  :message-id="message.id"
+                />
+              </div>
+              <p class="px-1 text-right text-xs text-muted-foreground">
+                {{ t("chat.queue.pending") }}
+              </p>
             </div>
             <MessageBubble
               v-else

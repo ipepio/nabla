@@ -222,6 +222,7 @@
   "chat.queue.heading": "En cola ({count})",
   "chat.queue.list": "Mensajes en cola",
   "chat.queue.remove": "Quitar el mensaje en cola {index}",
+  "chat.queue.pending": "En cola · se envía al terminar este turno",
 
   "message.copy": "Copiar mensaje",
 

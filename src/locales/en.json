@@ -222,6 +222,7 @@
   "chat.queue.heading": "Queued ({count})",
   "chat.queue.list": "Queued prompts",
   "chat.queue.remove": "Remove queued prompt {index}",
+  "chat.queue.pending": "Queued · sent when this turn ends",
 
   "message.copy": "Copy message",
 

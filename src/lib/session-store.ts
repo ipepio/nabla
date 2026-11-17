@@ -55,12 +55,35 @@ export interface ChatMessage {
   at: string | null;
   /** The turn's reasoning, absent when pi streamed none. */
   reasoning?: string;
+  /**
+   * The human typed this turn while the agent was working and it is still
+   * waiting in the queue (S3). It is already in the transcript — a prompt the
+   * human typed is never invisible — and the panel renders it muted. Sending it
+   * only clears this mark; the message is never appended a second time.
+   */
+  pending?: boolean;
+}
+
+/**
+ * One prompt waiting in a session's queue (S3), with the handle of the pending
+ * transcript entry it already owns. The id is minted once, at enqueue time, so
+ * the entry that waits and the entry that is finally sent are the same message.
+ */
+export interface QueuedPrompt {
+  /** Id of the transcript entry the human already sees, muted. */
+  id: string;
+  /** What pi will receive when the queue drains. */
+  text: string;
 }
 
 /**
  * Id of the next message. Prefixed with the session id so a deleted session's
  * bookkeeping (the reasoning toggle state) can be pruned by prefix, and
- * monotonic so an id is never reused inside one app run.
+ * monotonic — one counter for the whole app run, never reset — so no id is ever
+ * reused, inside one session or across sessions. A reused id would make Vue
+ * patch the wrong node (or skip one), which is exactly how a message goes
+ * missing from a transcript. Everything that needs a message mints it here and
+ * nowhere else.
  */
 let messageSequence = 0;
 function nextMessageId(sessionId: string): string {
@@ -100,10 +123,20 @@ export interface SessionBuffer {
    */
   exitCode: number | null;
   /**
-   * The agent is doing work for this session right now (streaming a reply or
-   * running a tool). `turn_end`/`agent_end` clear it, so the drawer can show a
-   * spinner on the row that is actually busy — independent of whether the
-   * process merely exists.
+   * The agent is doing work for this session right now.
+   *
+   * This flag is the single authority for "working": the drawer's spinner reads
+   * it through `busyIds`, and the chat panel's composer (its stop control, its
+   * send/queue decision and its disabled state) derives from the same field, so
+   * the two surfaces cannot disagree.
+   *
+   * It goes up the moment a prompt is handed to pi — `sendUserTurn` and the
+   * queue drain raise it *before* the bridge is asked — not on the first delta,
+   * because pi working on an accepted prompt produces no event for a while
+   * (model latency, a tool's own startup) and the panel used to read that silence
+   * as "finished". Streaming and tool events raise it again for the rest of the
+   * turn; `turn_end`, `agent_end`, `process_exit`, a stop or a crash lower it, and
+   * so does a failed send, so a session is never left stuck working.
    */
   busy: boolean;
   /**
@@ -121,8 +154,12 @@ export interface SessionBuffer {
    * after the toggle is turned off simply waits and drains on the next finished
    * turn once it is back on, and so does one whose session cannot be addressed
    * yet: an entry leaves this list only when it is really sent.
+   *
+   * Each entry already owns its transcript message (see `QueuedPrompt`): the
+   * queue only says what is still waiting, it never holds the only copy of a
+   * prompt the human typed.
    */
-  queue: string[];
+  queue: QueuedPrompt[];
 }
 
 /** Per-session state, keyed by the session index id in decimal form (S1). */
@@ -326,10 +363,71 @@ function flushStreaming(sessionId: string, buffer: SessionBuffer): void {
     at: new Date().toISOString(),
   };
   if (reasoning !== "") message.reasoning = reasoning;
+  // A finished answer belongs *above* the prompts still waiting: those were
+  // typed after the turn this answers, so appending blindly would render a later
+  // question above its own predecessor's answer as soon as the queue drains.
+  const waiting = buffer.transcript.findIndex((entry) => entry.pending === true);
+  if (waiting === -1) buffer.transcript.push(message);
+  else buffer.transcript.splice(waiting, 0, message);
+}
+
+/**
+ * Pushes one human turn into the transcript and returns its id. `pending` marks a
+ * prompt that is still waiting in the queue; the id is the only handle the queue
+ * needs to clear that mark instead of appending a second copy later.
+ */
+function pushUserTurn(
+  sessionId: string,
+  buffer: SessionBuffer,
+  text: string,
+  pending: boolean,
+): string {
+  const id = nextMessageId(sessionId);
+  const message: ChatMessage = {
+    id,
+    role: "user",
+    text,
+    at: new Date().toISOString(),
+  };
+  if (pending) message.pending = true;
   buffer.transcript.push(message);
+  return id;
+}
+
+/** Removes one transcript entry by id; a no-op once it is gone. */
+function dropTranscriptMessage(buffer: SessionBuffer, id: string): void {
+  const index = buffer.transcript.findIndex((message) => message.id === id);
+  if (index !== -1) buffer.transcript.splice(index, 1);
+}
+
+/**
+ * Clears the pending mark of a prompt that really went out. This is the whole of
+ * the "it was sent" bookkeeping: the message is already in the transcript, in the
+ * position the human typed it, so sending it must never add another one.
+ *
+ * The one exception is a prompt withdrawn while its send was already in flight: pi
+ * has it, so it is recorded once here instead of vanishing from the conversation.
+ */
+function settleQueuedMessage(
+  sessionId: string,
+  buffer: SessionBuffer,
+  entry: QueuedPrompt,
+): void {
+  const message = buffer.transcript.find((candidate) => candidate.id === entry.id);
+  if (message === undefined) {
+    pushUserTurn(sessionId, buffer, entry.text, false);
+    return;
+  }
+  message.pending = false;
 }
 
 // ── per-session prompt queue (S3) ────────────────────────────────────────────
+
+/**
+ * The queued send in flight for each session, keyed by session id. Only the drain
+ * reads it: it keeps one prompt on its way at a time (see `drainQueue`).
+ */
+const draining = new Map<string, Promise<void>>();
 
 /**
  * S3: adds one prompt to the session's queue. ChatPanel calls this instead of
@@ -341,8 +439,11 @@ function flushStreaming(sessionId: string, buffer: SessionBuffer): void {
  * makes the queued prompt addressable later, when the panel may have moved to
  * another workspace or session entirely.
  *
- * Nothing is echoed into the transcript here: the turn appears when it is really
- * sent (see `sendQueuedTurn`), so a dropped item never leaves a phantom message.
+ * The turn is echoed into the transcript **now**, in the order the human typed
+ * it, marked pending — waiting in a queue must never mean invisible. The queue
+ * entry carries that message's id, so the send that finally happens only clears
+ * the mark (`settleQueuedMessage`) while withdrawing one (`removeQueuedPrompt`)
+ * takes the message with it: a prompt is neither duplicated nor orphaned.
  */
 export function enqueuePrompt(
   sessionId: string,
@@ -351,7 +452,9 @@ export function enqueuePrompt(
 ): void {
   const prompt = text.trim();
   if (prompt === "") return;
-  ensureBuffer(sessionId, workspaceId).queue.push(prompt);
+  const buffer = ensureBuffer(sessionId, workspaceId);
+  const id = pushUserTurn(sessionId, buffer, prompt, true);
+  buffer.queue.push({ id, text: prompt });
 }
 
 /** How many prompts of one session are waiting; `0` when there are none. */
@@ -371,7 +474,7 @@ export function queuedCount(sessionId: string | null): number {
 export function queuedPrompts(sessionId: string | null): string[] {
   const buffer = sessionBuffer(sessionId);
   if (buffer === null) return [];
-  return [...buffer.queue];
+  return buffer.queue.map((entry) => entry.text);
 }
 
 /**
@@ -388,7 +491,10 @@ export function removeQueuedPrompt(
   if (!Number.isInteger(index) || index < 0 || index >= buffer.queue.length) return;
   // `splice` on the reactive array: the queue is mutated in place so every
   // computed watching it (the counter, the list) updates.
-  buffer.queue.splice(index, 1);
+  const [removed] = buffer.queue.splice(index, 1);
+  // Withdrawing a queued prompt withdraws the muted turn it rendered, so the
+  // transcript never keeps a question the human took back.
+  if (removed !== undefined) dropTranscriptMessage(buffer, removed.id);
 }
 
 /**
@@ -403,36 +509,55 @@ export function removeQueuedPrompt(
  * destroyed the prompt instead — it was reported as sent and never processed.
  * Nothing is written to `buffer.error` either: a workspace that is merely not
  * known yet is not a failure to show the human.
+ *
+ * At most one prompt per session is on its way at a time. pi closes a turn with
+ * `turn_end` *and* `agent_end`, and both land here, so without this guard the
+ * second event would drain the next entry while the first is still in flight —
+ * two prompts into one process turn. A second entry then waits for the turn its
+ * predecessor really starts, which is the "one per turn end" this owns.
  */
 function drainQueue(sessionId: string, buffer: SessionBuffer): void {
   if (!queueMessages.value) return;
+  if (draining.has(sessionId)) return;
   const workspaceId = buffer.workspaceId;
   if (workspaceId === null) return;
   const next = buffer.queue.shift();
   if (next === undefined) return;
-  void sendQueuedTurn(sessionId, buffer, workspaceId, next);
+  const send = sendQueuedTurn(sessionId, buffer, workspaceId, next).finally(() => {
+    draining.delete(sessionId);
+  });
+  draining.set(sessionId, send);
 }
 
 /**
- * Sends one dequeued prompt and records it as a human turn, exactly as the
- * composer's own send path does (pi answers with deltas, it never echoes the
- * prompt back). A failure lands on the session's error field, which the panel
- * already renders, instead of being swallowed or thrown into the event loop.
+ * Sends one dequeued prompt. Its transcript entry is already there (minted at
+ * enqueue time), so this only clears the pending mark once pi has accepted it —
+ * never appending the turn a second time.
+ *
+ * The session is marked working before the bridge is asked: an accepted prompt is
+ * work even while pi produces no event at all. A failure clears the flag again,
+ * puts the prompt back at the front of the queue (transcript entry and pending
+ * mark intact, so nothing the human typed is lost) and records the reason on the
+ * session's error field, which the panel already renders.
  */
 async function sendQueuedTurn(
   sessionId: string,
   buffer: SessionBuffer,
   workspaceId: number,
-  text: string,
+  entry: QueuedPrompt,
 ): Promise<void> {
+  buffer.busy = true;
   try {
-    await sendPrompt(workspaceId, Number(sessionId), text);
-    appendUserTurn(sessionId, text);
-    // The drawer sorts by activity, so a queued turn is activity too.
-    sessionGeneration.value += 1;
+    await sendPrompt(workspaceId, Number(sessionId), entry.text);
   } catch (cause) {
+    buffer.busy = false;
+    buffer.queue.unshift(entry);
     buffer.error = commandErrorMessage(cause);
+    return;
   }
+  settleQueuedMessage(sessionId, buffer, entry);
+  // The drawer sorts by activity, so a queued turn is activity too.
+  sessionGeneration.value += 1;
 }
 
 function findTool(buffer: SessionBuffer, toolCallId: string) {
@@ -456,6 +581,13 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
     event.type === "agent_end" ||
     event.type === "process_exit"
   ) {
+    buffer.busy = false;
+  } else if (
+    event.type === "process_status" &&
+    (event.status === "stopped" || event.status === "crashed")
+  ) {
+    // A dead process is not working, even when pi never got to close the turn:
+    // the spinner and the composer must not outlive the thing they describe.
     buffer.busy = false;
   }
   switch (event.type) {
@@ -671,28 +803,50 @@ export function removeSession(sessionId: string | number): void {
   }
   transcriptSeeded.delete(key);
   transcriptLoading.delete(key);
+  // A send that was still on its way for a session that no longer exists must not
+  // keep a later session with the same id from draining its own queue.
+  draining.delete(key);
   liveIds.value = liveIds.value.filter((id) => id !== key);
   if (activeSession.value?.sessionId === key) activeSession.value = null;
 }
 
 /**
- * Records a turn the human just sent. pi answers with deltas, it does not echo
- * the prompt back, so the store is what makes the transcript read as a
- * conversation.
+ * Sends one prompt the human typed *now*, and is the only path the panel has to
+ * pi — the single place a human turn is recorded, so a prompt can be appended
+ * once and once only. The turn is written to the transcript before the bridge is
+ * asked (the question is always above its answer, whichever of the two channels
+ * arrives first) and the session is marked working at the same moment.
+ *
+ * Both are rolled back when the send does not land — the entry is removed so no
+ * phantom question is left behind, and the flag is lowered so the composer offers
+ * send again — and the caller surfaces the reason. The text stays in the
+ * composer, so nothing the human typed is lost.
  */
-export function appendUserTurn(sessionId: string, text: string): void {
-  const buffer = ensureBuffer(sessionId);
-  buffer.transcript.push({
-    id: nextMessageId(sessionId),
-    role: "user",
-    text,
-    at: new Date().toISOString(),
-  });
+export async function sendUserTurn(
+  sessionId: string,
+  workspaceId: number,
+  text: string,
+): Promise<void> {
+  const prompt = text.trim();
+  if (prompt === "") return;
+  const buffer = ensureBuffer(sessionId, workspaceId);
+  const id = pushUserTurn(sessionId, buffer, prompt, false);
+  buffer.busy = true;
+  try {
+    await sendPrompt(workspaceId, Number(sessionId), prompt);
+  } catch (cause) {
+    buffer.busy = false;
+    dropTranscriptMessage(buffer, id);
+    throw cause;
+  }
+  sessionGeneration.value += 1;
 }
 
 /**
  * Confirms a lifecycle transition the user asked for (an explicit stop) with the
- * runtime's own answer instead of assuming the transition landed.
+ * runtime's own answer instead of assuming the transition landed. A process that
+ * is stopped or crashed is not working, so the busy flag follows it: an explicit
+ * stop must clear the spinner even when no turn ever ends.
  */
 export function recordSessionStatus(
   sessionId: string,
@@ -702,5 +856,6 @@ export function recordSessionStatus(
   const buffer = ensureBuffer(sessionId);
   buffer.status = status;
   buffer.error = error;
+  if (status === "stopped" || status === "crashed") buffer.busy = false;
   markLive(sessionId, status);
 }
