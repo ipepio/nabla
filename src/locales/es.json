@@ -7,7 +7,6 @@
   "common.moreActions": "Más acciones para {name}",
   "common.name": "Nombre",
   "common.path": "Ruta",
-
   "settings.title": "Ajustes",
   "settings.close": "Cerrar ajustes",
   "settings.sections": "Secciones de ajustes",
@@ -151,7 +150,6 @@
   "settings.accounts.login.continue": "Continuar",
   "settings.accounts.login.sending": "Enviando…",
   "settings.accounts.login.notAccepted": "pi ya no espera ningún código; vuelve a iniciar sesión.",
-
   "sidebar.expand": "Desplegar la barra lateral",
   "sidebar.newSession": "Nueva sesión",
   "sidebar.workspaces": "Espacios",
@@ -164,13 +162,11 @@
   "sidebar.emptySearch": "Ningún espacio coincide con esta búsqueda.",
   "sidebar.settings": "Ajustes",
   "sidebar.duplicatePath": "Esa ruta ya está en la lista de espacios.",
-
   "workspace.pin": "Fijar {name}",
   "workspace.unpin": "Soltar {name}",
   "workspace.edit": "Editar espacio",
   "workspace.editDescription": "Renombrar y eliminar un espacio llega en la próxima unidad. Esto es lo que guarda el almacén hoy.",
   "workspace.remove": "Quitar espacio",
-
   "session.untitled": "Sesión",
   "session.working": "El agente está trabajando",
   "session.running": "en marcha",
@@ -183,7 +179,6 @@
   "session.age.minutes": "{count}m",
   "session.age.hours": "{count}h",
   "session.age.days": "{count}d",
-
   "chat.status.spawning": "pi está arrancando…",
   "chat.status.ready": "pi está listo.",
   "chat.status.working": "pi está trabajando…",
@@ -222,10 +217,7 @@
   "chat.queue.heading": "En cola ({count})",
   "chat.queue.list": "Mensajes en cola",
   "chat.queue.remove": "Quitar el mensaje en cola {index}",
-  "chat.queue.pending": "En cola · se envía al terminar este turno",
-
   "message.copy": "Copiar mensaje",
-
   "theme.switchToLight": "Cambiar al tema claro",
   "theme.switchToDark": "Cambiar al tema oscuro"
 }

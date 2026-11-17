@@ -7,7 +7,6 @@
   "common.moreActions": "More actions for {name}",
   "common.name": "Name",
   "common.path": "Path",
-
   "settings.title": "Settings",
   "settings.close": "Close settings",
   "settings.sections": "Settings sections",
@@ -151,7 +150,6 @@
   "settings.accounts.login.continue": "Continue",
   "settings.accounts.login.sending": "Sending…",
   "settings.accounts.login.notAccepted": "pi is no longer waiting for a code; start the sign-in again.",
-
   "sidebar.expand": "Expand sidebar",
   "sidebar.newSession": "New session",
   "sidebar.workspaces": "Workspaces",
@@ -164,13 +162,11 @@
   "sidebar.emptySearch": "No workspaces match this search.",
   "sidebar.settings": "Settings",
   "sidebar.duplicatePath": "That workspace path is already in the list.",
-
   "workspace.pin": "Pin {name}",
   "workspace.unpin": "Unpin {name}",
   "workspace.edit": "Edit workspace",
   "workspace.editDescription": "Renaming and deleting a workspace land in the next unit. This is what the store holds today.",
   "workspace.remove": "Remove workspace",
-
   "session.untitled": "Session",
   "session.working": "Agent is working",
   "session.running": "running",
@@ -183,7 +179,6 @@
   "session.age.minutes": "{count}m",
   "session.age.hours": "{count}h",
   "session.age.days": "{count}d",
-
   "chat.status.spawning": "pi is starting…",
   "chat.status.ready": "pi is ready.",
   "chat.status.working": "pi is working…",
@@ -222,10 +217,7 @@
   "chat.queue.heading": "Queued ({count})",
   "chat.queue.list": "Queued prompts",
   "chat.queue.remove": "Remove queued prompt {index}",
-  "chat.queue.pending": "Queued · sent when this turn ends",
-
   "message.copy": "Copy message",
-
   "theme.switchToLight": "Switch to light theme",
   "theme.switchToDark": "Switch to dark theme"
 }

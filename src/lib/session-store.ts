@@ -55,13 +55,6 @@ export interface ChatMessage {
   at: string | null;
   /** The turn's reasoning, absent when pi streamed none. */
   reasoning?: string;
-  /**
-   * The human typed this turn while the agent was working and it is still
-   * waiting in the queue (S3). It is already in the transcript — a prompt the
-   * human typed is never invisible — and the panel renders it muted. Sending it
-   * only clears this mark; the message is never appended a second time.
-   */
-  pending?: boolean;
 }
 
 /**
@@ -383,34 +376,25 @@ function flushStreaming(sessionId: string, buffer: SessionBuffer): void {
     at: new Date().toISOString(),
   };
   if (reasoning !== "") message.reasoning = reasoning;
-  // A finished answer belongs *above* the prompts still waiting: those were
-  // typed after the turn this answers, so appending blindly would render a later
-  // question above its own predecessor's answer as soon as the queue drains.
-  const waiting = buffer.transcript.findIndex((entry) => entry.pending === true);
-  if (waiting === -1) buffer.transcript.push(message);
-  else buffer.transcript.splice(waiting, 0, message);
+  buffer.transcript.push(message);
 }
 
 /**
- * Pushes one human turn into the transcript and returns its id. `pending` marks a
- * prompt that is still waiting in the queue; the id is the only handle the queue
- * needs to clear that mark instead of appending a second copy later.
+ * Pushes one human turn into the transcript and returns its id. Called from the
+ * direct send path and from the queue once a prompt is actually handed to pi.
  */
 function pushUserTurn(
   sessionId: string,
   buffer: SessionBuffer,
   text: string,
-  pending: boolean,
 ): string {
   const id = nextMessageId(sessionId);
-  const message: ChatMessage = {
+  buffer.transcript.push({
     id,
     role: "user",
     text,
     at: new Date().toISOString(),
-  };
-  if (pending) message.pending = true;
-  buffer.transcript.push(message);
+  });
   return id;
 }
 
@@ -428,17 +412,24 @@ function dropTranscriptMessage(buffer: SessionBuffer, id: string): void {
  * The one exception is a prompt withdrawn while its send was already in flight: pi
  * has it, so it is recorded once here instead of vanishing from the conversation.
  */
+/**
+ * S3: a queued prompt enters the conversation at the moment it is handed to pi —
+ * not before, when it was only waiting in the queue strip above the composer.
+ * The queue's id becomes the message id, so the entry and the turn are the same
+ * thing and nothing can be duplicated.
+ */
 function settleQueuedMessage(
   sessionId: string,
   buffer: SessionBuffer,
   entry: QueuedPrompt,
 ): void {
-  const message = buffer.transcript.find((candidate) => candidate.id === entry.id);
-  if (message === undefined) {
-    pushUserTurn(sessionId, buffer, entry.text, false);
-    return;
-  }
-  message.pending = false;
+  void sessionId;
+  buffer.transcript.push({
+    id: entry.id,
+    role: "user",
+    text: entry.text,
+    at: new Date().toISOString(),
+  });
 }
 
 // ── per-session prompt queue (S3) ────────────────────────────────────────────
@@ -480,8 +471,10 @@ export function enqueuePrompt(
   const prompt = text.trim();
   if (prompt === "") return;
   const buffer = ensureBuffer(sessionId, workspaceId);
-  const id = pushUserTurn(sessionId, buffer, prompt, true);
-  buffer.queue.push({ id, text: prompt });
+  // Queueing does not enter the conversation: the prompt lives in the queue
+  // strip above the composer until it is actually handed to pi, which is the
+  // moment it becomes a turn in the transcript.
+  buffer.queue.push({ id: nextMessageId(sessionId), text: prompt });
 }
 
 /** How many prompts of one session are waiting; `0` when there are none. */
@@ -589,8 +582,7 @@ async function sendQueuedTurn(
     buffer.error = commandErrorMessage(cause);
     return;
   }
-  settleQueuedMessage(sessionId, buffer, entry);
-  // The drawer sorts by activity, so a queued turn is activity too.
+  settleQueuedMessage(sessionId, buffer, entry);  // The drawer sorts by activity, so a queued turn is activity too.
   sessionGeneration.value += 1;
 }
 
@@ -870,7 +862,7 @@ export async function sendUserTurn(
   const prompt = text.trim();
   if (prompt === "") return;
   const buffer = ensureBuffer(sessionId, workspaceId);
-  const id = pushUserTurn(sessionId, buffer, prompt, false);
+  const id = pushUserTurn(sessionId, buffer, prompt);
   buffer.busy = true;
   try {
     await sendPrompt(workspaceId, Number(sessionId), prompt);

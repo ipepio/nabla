@@ -971,24 +971,9 @@ onUnmounted(() => {
               <WrenchIcon class="mt-0.5 size-3 shrink-0" aria-hidden="true" />
               <span class="min-w-0 whitespace-pre-wrap">{{ message.text }}</span>
             </div>
-            <!-- S3: a prompt waiting in the queue is already here, muted, and in
-                 the order it was typed — waiting must never mean invisible. It is
-                 the message the human typed, not a placeholder: sending it only
-                 clears the mark (`pending`), never appends a second copy. -->
-            <div v-else-if="message.pending" class="flex flex-col gap-1">
-              <div class="opacity-60">
-                <MessageBubble
-                  :role="bubbleRole(message.role)"
-                  :text="message.text"
-                  :at="timeLabel(message.at)"
-                  :reasoning="showReasoning ? message.reasoning : undefined"
-                  :message-id="message.id"
-                />
-              </div>
-              <p class="px-1 text-right text-xs text-muted-foreground">
-                {{ t("chat.queue.pending") }}
-              </p>
-            </div>
+            <!-- A queued prompt is not here yet: it lives in the queue strip
+                 above the composer until it is handed to pi, and only then
+                 becomes a turn in the conversation. -->
             <MessageBubble
               v-else
               :role="bubbleRole(message.role)"
