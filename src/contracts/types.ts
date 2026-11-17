@@ -328,3 +328,101 @@ export interface PiCliEvent {
   line?: string;
   exitCode?: number;
 }
+
+// ── MCP servers (F0 of `odd/tasks/tool-drawer-and-mcp.md`) ───────────────────
+
+/**
+ * Which `mcp.json` file defines a server: `global` is
+ * `~/.pi/agent/mcp.json` (shared by every workspace) and `project` is
+ * `.pi/mcp.json` in the workspace (read only in a trusted project). Mirrors
+ * `McpScope` in `src-tauri/src/mcp.rs`.
+ */
+export type McpScope = "global" | "project";
+
+/**
+ * How pi reaches a server. `stdio` spawns a process (`command` + `args`);
+ * `http` connects to a streamable HTTP endpoint (`url`). The legacy SSE
+ * transport pi rejects is deliberately not representable here.
+ */
+export type McpTransport = "stdio" | "http";
+
+/**
+ * The state of one server as `pi mcp list --json` reports it, reduced to the
+ * five words the pane can paint (S1):
+ *
+ * - `ready` — connected, so its tools are usable;
+ * - `needs_sign_in` — the server rejected the connection and wants OAuth;
+ * - `error` — the connection failed, and `error` carries pi's reason;
+ * - `disabled` — the entry is present with `enabled: false`, or Rust could not
+ *   connect it because the human turned it off;
+ * - `unknown` — pi said something this build does not model (a newer state
+ *   word), so the badge never claims a state nobody observed.
+ *
+ * Mirrors `McpState` in `src-tauri/src/mcp.rs` (snake_case, as serde writes it).
+ */
+export type McpState =
+  | "ready"
+  | "needs_sign_in"
+  | "error"
+  | "disabled"
+  | "unknown";
+
+/**
+ * One server of `mcp_list()` (S1). It is a read-only summary of what pi's
+ * configuration plus one connection test answered: `target` is the command line
+ * of a stdio server or the URL of an HTTP one, and `tools` are the tool names
+ * the server published (`[]` when it never connected). No credential has a
+ * field here: OAuth tokens stay in pi's `mcp-auth.json`, and `headers`/`env`
+ * values are never read back. Mirrors `McpServerSummary` in
+ * `src-tauri/src/mcp.rs`.
+ */
+export interface McpServerSummary {
+  name: string;
+  scope: McpScope;
+  transport: McpTransport;
+  /** `command args` for stdio, the URL for http; never a secret. */
+  target: string;
+  /** `false` when the entry exists with `enabled: false`. */
+  enabled: boolean;
+  state: McpState;
+  /** Tool names the server published; empty when it never connected. */
+  tools: string[];
+  /** pi's own reason when the server did not connect, `null` otherwise. */
+  error: string | null;
+}
+
+/**
+ * One `key=value` pair of the add form: an environment variable of a stdio
+ * server or an HTTP header. Both are written as pi's `env`/`headers` objects,
+ * so a value may be `${NAME}` or `!command` exactly as `mcp.json` allows.
+ */
+export interface McpKeyValue {
+  key: string;
+  value: string;
+}
+
+/**
+ * What `mcp_add` writes into one `mcp.json` (S1). The two halves are exclusive:
+ * a stdio draft carries `command` + `args` + `env`, an http draft carries `url` +
+ * `headers` + an optional `bearerTokenEnvVar` (pi sends
+ * `Authorization: Bearer ${NAME}`). Rust validates the shape and writes the file;
+ * the caller never builds the argv itself. Mirrors `McpAddDraft` in
+ * `src-tauri/src/mcp.rs`.
+ */
+export interface McpAddDraft {
+  name: string;
+  scope: McpScope;
+  transport: McpTransport;
+  /** stdio only: one executable, never a shell string. */
+  command?: string | null;
+  /** stdio only: the arguments of `command`, in order. */
+  args?: string[];
+  /** stdio only: the process environment. */
+  env?: McpKeyValue[];
+  /** http only: the streamable HTTP endpoint. */
+  url?: string | null;
+  /** http only: headers sent with every request. */
+  headers?: McpKeyValue[];
+  /** http only: the variable pi reads for `Authorization: Bearer`. */
+  bearerTokenEnvVar?: string | null;
+}

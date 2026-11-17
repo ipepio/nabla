@@ -3,10 +3,13 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { AgentEventEnvelope } from "./agent-events";
 import type {
   AppSettings,
+  McpAddDraft,
+  McpScope,
+  McpServerSummary,
   ModelInfo,
   ModelOption,
   PiAuthStatus,
@@ -370,6 +373,109 @@ export function openExternalUrl(url: string): Promise<void> {
     );
   }
   return openUrl(url);
+}
+
+/**
+ * S1 of `tool-drawer-and-mcp.md`: shows one absolute path in the system file
+ * manager, with the file already selected.
+ *
+ * Why revealing and not "open with the default app": the opener plugin grants
+ * `open-path` only to a capability that lists `opener:allow-open-path`, and this
+ * app's capability (`opener:default`) does not, so a webview call to it would be
+ * denied at runtime. `reveal_item_in_dir` IS part of `opener:default`, so this is
+ * the file action that works today without widening the Tauri capability (a
+ * `src-tauri/` change, outside this task). The import stays here because no
+ * component imports the Tauri API directly (contract-seam rule, AGENTS.md 1).
+ *
+ * Only an absolute path is accepted: the value comes from `mcpFilePath`, and a
+ * relative or empty one would be revealed somewhere nobody asked for.
+ */
+export function revealFileInFileManager(path: string): Promise<void> {
+  const absolute = /^\//.test(path) || /^[A-Za-z]:[\\/]/.test(path);
+  if (path.trim() === "" || !absolute) {
+    return Promise.reject(new Error("Only absolute paths can be revealed."));
+  }
+  return revealItemInDir(path);
+}
+
+// ── MCP servers (F0 of `odd/tasks/tool-drawer-and-mcp.md`) ───────────────────
+
+/**
+ * S1: every server pi's MCP configuration defines, global and project, as pi
+ * itself reports it. Rust runs `pi mcp list --json` and maps its answer; a server
+ * that cannot connect is a row with `state: "error"` and pi's reason, never a
+ * rejection, so one broken entry never hides the others.
+ *
+ * It is a full connect-and-probe of every enabled server, so the pane treats it
+ * as background work with a visible "refreshing" face instead of a synchronous
+ * read.
+ */
+export function mcpList(): Promise<McpServerSummary[]> {
+  return invoke<McpServerSummary[]>("mcp_list");
+}
+
+/**
+ * S1: writes one server into the `mcp.json` of its scope through
+ * `pi mcp add … -- <command> [args]` / `--url <url>` (env, headers and
+ * `--bearer-token-env-var` included) and answers with the refreshed list, so the
+ * pane renders what the file now holds instead of patching its own copy of a row
+ * it did not write. A rejected draft reports Rust's reason (an invalid name, an
+ * unparsable URL), and the form keeps what was typed.
+ */
+export function mcpAdd(draft: McpAddDraft): Promise<McpServerSummary[]> {
+  return invoke<McpServerSummary[]>("mcp_add", { draft });
+}
+
+/**
+ * S1: removes one server from the file of its scope (`pi mcp remove`, `-l` for a
+ * project entry) and answers with the refreshed list. pi keeps the stored OAuth
+ * credentials of a removed entry, so this never signs anything out.
+ */
+export function mcpRemove(
+  name: string,
+  scope: McpScope,
+): Promise<McpServerSummary[]> {
+  return invoke<McpServerSummary[]>("mcp_remove", { name, scope });
+}
+
+/**
+ * S1: starts the OAuth sign-in of one server (`pi mcp login <name>`, `-l` for a
+ * project entry) and answers with the id of its interactive session. There is no
+ * timeout: the human decides when the flow ends, and `mcpLogout`, `piCliStop` or
+ * the child's own exit is how it ends.
+ *
+ * The child's output arrives on the existing `pi-cli` event (subscribe with
+ * `subscribePiCli`), and the pasted redirect URL goes back through
+ * `piCliWrite` — the same path the provider device-code login already uses, so
+ * there is one interactive-CLI seam and not two.
+ */
+export function mcpLoginStart(
+  name: string,
+  scope: McpScope,
+): Promise<string> {
+  return invoke<string>("mcp_login_start", { name, scope });
+}
+
+/**
+ * S1: deletes the OAuth credentials pi stored for one server (`pi mcp logout`) and
+ * answers with the refreshed list, so the badge turns `needs_sign_in` because pi
+ * said so. The entry itself stays in `mcp.json`.
+ */
+export function mcpLogout(
+  name: string,
+  scope: McpScope,
+): Promise<McpServerSummary[]> {
+  return invoke<McpServerSummary[]>("mcp_logout", { name, scope });
+}
+
+/**
+ * S1: the absolute path of the `mcp.json` of one scope, resolved by Rust so the
+ * dialog never guesses a directory (`~/.pi/agent/mcp.json` or the workspace's
+ * `.pi/mcp.json`). Hand it to `revealFileInFileManager` for the "show file"
+ * action; nothing of the file's content crosses the seam.
+ */
+export function mcpFilePath(scope: McpScope): Promise<string> {
+  return invoke<string>("mcp_file_path", { scope });
 }
 
 // ── pi runtime seam (R3, R4) ─────────────────────────────────────────────────

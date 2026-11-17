@@ -65,9 +65,17 @@
  * S4: the configuration-file action exists exactly once, at the end of the
  * General pane; the header no longer repeats it.
  *
- * S5 of `settings-dialog.md`: the nav has exactly two entries — permissions,
- * font size, work details, code view and shortcuts have no backend yet, so they
- * are not painted as if they worked.
+ * S5 of `settings-dialog.md`: the nav lists only the sections the app can drive
+ * — permissions, font size, work details, code view and shortcuts have no
+ * backend yet, so they are not painted as if they worked. S1 of
+ * `tool-drawer-and-mcp.md` added the third one: MCP, a pane of its own rather
+ * than a block inside Providers, because servers and providers are two different
+ * things pi reads from two different files.
+ *
+ * The MCP pane mounts only while it is selected (the content is a `v-if`/`v-else`
+ * chain), so opening the dialog costs nothing for it: `McpSection.vue` reads
+ * pi's MCP configuration on its own mount, and this component knows nothing about
+ * that file.
  *
  * Preferences live in `settings.json`; this component owns the get/save flow
  * (`getSettings`/`saveSettings`) and applies the theme through the shared
@@ -76,6 +84,7 @@
  */
 import { computed, ref, watch } from "vue";
 import {
+  BlocksIcon,
   CheckIcon,
   ExternalLinkIcon,
   MonitorIcon,
@@ -123,6 +132,7 @@ import {
 } from "@/lib/provider-models";
 import type { ThemeMode } from "@/lib/theme";
 import AccountsSection from "./AccountsSection.vue";
+import McpSection from "./McpSection.vue";
 import ProviderForm from "./ProviderForm.vue";
 import ProviderModelsEditor from "./ProviderModelsEditor.vue";
 import {
@@ -140,8 +150,8 @@ import type { AppSettings, ProviderSummary } from "@/contracts/types";
 /** The dialog is open when the drawer's gear button says so. */
 const open = defineModel<boolean>("open", { default: false });
 
-/** S1 of `settings-dialog.md`: the two sections the app can drive right now. */
-type Section = "general" | "providers";
+/** S1 of `settings-dialog.md`: the sections the app can drive right now. */
+type Section = "general" | "providers" | "mcp";
 const section = ref<Section>("general");
 
 /** S2: every row renders through the catalogue, so a locale switch re-renders. */
@@ -729,6 +739,20 @@ watch(open, (isOpen) => {
             <PlugIcon class="size-4 shrink-0" aria-hidden="true" />
             {{ t("settings.section.providers") }}
           </button>
+          <button
+            type="button"
+            :aria-current="section === 'mcp' ? 'page' : undefined"
+            :class="[
+              'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+              section === 'mcp'
+                ? 'bg-sidebar-accent font-medium text-sidebar-accent-foreground'
+                : 'text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground',
+            ]"
+            @click="section = 'mcp'"
+          >
+            <BlocksIcon class="size-4 shrink-0" aria-hidden="true" />
+            {{ t("settings.section.mcp") }}
+          </button>
         </nav>
 
         <!-- S1: the scrolling pane. One row per setting: label and description
@@ -913,7 +937,7 @@ watch(open, (isOpen) => {
                the pane — the accounts block and the provider list are the two
                major blocks here, and the custom-provider form belongs to the
                list it adds to. -->
-          <div v-else class="space-y-6 py-4">
+          <div v-else-if="section === 'providers'" class="space-y-6 py-4">
             <template v-if="providerLoginEnabled">
               <AccountsSection
                 :configured="configuredProviderIds"
@@ -1285,6 +1309,13 @@ watch(open, (isOpen) => {
               </DialogContent>
             </Dialog>
           </div>
+
+          <!-- S1 of `tool-drawer-and-mcp.md`: the MCP pane, a sibling of
+               Providers because servers and providers are two different things
+               pi reads from two different files. It owns its own read/write
+               cycle (list, add, remove, login/logout) and its own error line, so
+               this component only decides that it is on screen. -->
+          <McpSection v-else />
 
           <Alert v-if="error" variant="destructive" class="mb-4">
             <AlertDescription>{{ error }}</AlertDescription>
