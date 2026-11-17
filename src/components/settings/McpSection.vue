@@ -27,6 +27,18 @@
  * The two `mcp.json` files this pane describes are shown by path, and "show file"
  * reveals one in the system file manager. Nothing of their content is read into
  * the dialog: `pi mcp list` is the summary, and the files stay pi's.
+ *
+ * Mounting never waits for that read. `pi mcp list --json` boots the CLI and
+ * connects every enabled server (~0.7 s measured), and awaiting it on mount left
+ * the pane saying "No MCP servers configured yet" for most of a second — the one
+ * sentence that is wrong on a machine that has servers. So the list lives in
+ * `src/lib/mcp-servers.ts`: this pane paints whatever that store already holds in
+ * the first frame, schedules the read a beat later (an idle callback, the same
+ * spirit as the accounts block) and asks for a newer answer only when the human
+ * presses Refresh, a sign-in ends or a write lands. The store keeps the previous
+ * rows on a failed read, and the `settled` flag is what tells an empty answer
+ * apart from no answer at all: the empty state is claimed only by a settled read
+ * that genuinely found nothing.
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ChevronRightIcon, ExternalLinkIcon, PlusIcon } from "@lucide/vue";
@@ -46,9 +58,17 @@ import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
 import { useI18n, type MessageKey } from "@/lib/i18n";
 import {
+  applyMcpServers,
+  error as serversError,
+  invalidateMcpServers,
+  loadMcpServers,
+  loading as serversLoading,
+  servers,
+  settled as serversSettled,
+} from "@/lib/mcp-servers";
+import {
   commandErrorMessage,
   mcpFilePath,
-  mcpList,
   mcpLoginStart,
   mcpLogout,
   mcpRemove,
@@ -168,13 +188,13 @@ function extractSignInUrl(lines: string[]): string | null {
   return fallback;
 }
 
-/** The list pi's configuration answers with, `[]` until the first read lands. */
-const servers = ref<McpServerSummary[]>([]);
-/** The first read is still on its way: the list has never answered. */
-const loading = ref(false);
-/** A re-read is on its way and the rows on screen are the previous answer. */
+/**
+ * A re-read this pane asked for is on its way and the rows on screen are the
+ * previous answer. The shared store owns `loading`; this flag is only "the human
+ * (or a finished sign-in) asked again", so the Refresh action can say so.
+ */
 const refreshing = ref(false);
-/** The pane's one error line: a read or a write that could not run at all. */
+/** The pane's one write error line: an add, remove or sign-out that could not run. */
 const error = ref<string | null>(null);
 /**
  * Inline failures per row, keyed by `scope:name`. A sign-in that could not start
@@ -349,21 +369,17 @@ async function scrollOutputToEnd() {
 }
 
 /**
- * S1: reads the list. `initial` distinguishes the first answer (the pane has
- * nothing to paint, so it says it is loading) from a refresh (`refreshing`, with
- * the previous rows still on screen): `pi mcp list` connects every enabled
- * server, so an answer can take a while and the rows must not blink out.
+ * S1: asks the shared store for a newer listing. `pi mcp list` connects every
+ * enabled server, so an answer can take a while: the previous rows stay on
+ * screen for all of it, and the store paints the new ones when it lands. A
+ * failed read is reported by the store (see `serversError`), never by blanking
+ * the list.
  */
-async function load(options: { initial?: boolean } = {}) {
-  if (options.initial) loading.value = true;
-  else refreshing.value = true;
-  error.value = null;
+async function refresh() {
+  refreshing.value = true;
   try {
-    servers.value = await mcpList();
-  } catch (cause) {
-    error.value = commandErrorMessage(cause);
+    await loadMcpServers({ force: true });
   } finally {
-    loading.value = false;
     refreshing.value = false;
   }
 }
@@ -534,7 +550,7 @@ function requestSignOut(server: McpServerSummary) {
   error.value = null;
 }
 
-/** S1: signs out of one server behind a confirmation, then re-reads the list. */
+/** S1: signs out of one server behind a confirmation and adopts the refreshed list. */
 async function confirmSignOut() {
   const server = signOutTarget.value;
   if (!server || signingOut.value !== null) return;
@@ -545,7 +561,9 @@ async function confirmSignOut() {
   error.value = null;
   clearRowError(key);
   try {
-    servers.value = await mcpLogout(server.name, server.scope);
+    // The command answers with the listing taken after the write, so the store
+    // adopts it instead of booting `pi mcp list` a second time for the same rows.
+    applyMcpServers(await mcpLogout(server.name, server.scope));
   } catch (cause) {
     setRowError(key, commandErrorMessage(cause));
   } finally {
@@ -577,7 +595,7 @@ async function confirmRemove() {
     if (session.value?.name === target.name && session.value.scope === target.scope) {
       await stopLiveSession();
     }
-    servers.value = await mcpRemove(target.name, target.scope);
+    applyMcpServers(await mcpRemove(target.name, target.scope));
   } catch (cause) {
     error.value = commandErrorMessage(cause);
   } finally {
@@ -587,7 +605,7 @@ async function confirmRemove() {
 
 /** S1: a saved server landed in the file, so the answer is the new list. */
 function handleSaved(list: McpServerSummary[]) {
-  servers.value = list;
+  applyMcpServers(list);
   showForm.value = false;
 }
 
@@ -609,8 +627,9 @@ function handleCliEvent(event: PiCliEvent) {
     // child here instead of leaving an id in the registry for the whole app run.
     void piCliStop(live.sessionId).catch(() => {});
     // The exit is what changed pi's stored credential: ask the file again rather
-    // than guessing a badge from the exit code.
-    void load();
+    // than guessing a badge from the exit code. The rows on screen stay for the
+    // whole read.
+    void refresh();
     return;
   }
   if (event.line === undefined) return;
@@ -653,16 +672,77 @@ onMounted(async () => {
   unsubscribeEvents = unsubscribe;
 });
 
+/**
+ * How long the pane waits after mount before reading. Short: the cached rows are
+ * already on screen, so this only decides when the background read starts. The
+ * idle callback behind it is the accounts block's rule — never compete with a
+ * paint or an input frame — with a deadline so a busy webview cannot starve it.
+ */
+const BACKGROUND_READ_DELAY_MS = 150;
+const BACKGROUND_READ_IDLE_TIMEOUT_MS = 600;
+
+/** The scheduled read of this mount, so leaving the pane cancels it. */
+let readTimer: ReturnType<typeof setTimeout> | null = null;
+let idleHandle: number | null = null;
+
+/** Nothing scheduled may outlive the section that scheduled it. */
+function cancelScheduledRead() {
+  if (readTimer !== null) {
+    clearTimeout(readTimer);
+    readTimer = null;
+  }
+  if (idleHandle !== null) {
+    if (typeof cancelIdleCallback === "function") {
+      cancelIdleCallback(idleHandle);
+    }
+    idleHandle = null;
+  }
+}
+
+/**
+ * The background read: an unforced load, so a list the store already holds for
+ * this session answers without booting the CLI and a stale one re-reads behind the
+ * rows on screen.
+ */
+function scheduleBackgroundRead() {
+  const read = () => {
+    readTimer = null;
+    if (disposed) return;
+    void loadMcpServers();
+  };
+  readTimer = setTimeout(() => {
+    readTimer = null;
+    if (disposed) return;
+    if (typeof requestIdleCallback === "function") {
+      idleHandle = requestIdleCallback(
+        () => {
+          idleHandle = null;
+          if (disposed) return;
+          void loadMcpServers();
+        },
+        { timeout: BACKGROUND_READ_IDLE_TIMEOUT_MS },
+      );
+      return;
+    }
+    read();
+  }, BACKGROUND_READ_DELAY_MS);
+}
+
 // The pane exists only while it is on screen (the dialog renders it with a
-// `v-if` chain), so mounting it is exactly "the section was opened": one read of
-// the list and one resolve of both paths, neither awaited by a row.
+// `v-if` chain), so mounting it is exactly "the section was opened". Nothing here
+// is awaited: `servers` is painted from whatever the store holds in this frame,
+// the read is scheduled behind it, and the two file paths resolve on their own.
 onMounted(() => {
-  void load({ initial: true });
+  scheduleBackgroundRead();
   void loadFilePaths();
 });
 
 onBeforeUnmount(() => {
   disposed = true;
+  cancelScheduledRead();
+  // pi's `mcp.json` can be edited outside the app, so the next mount reads again
+  // instead of trusting rows that may predate the edit.
+  invalidateMcpServers();
   unsubscribeEvents?.();
   unsubscribeEvents = null;
   // No sign-in flow outlives the pane that started it.
@@ -685,8 +765,8 @@ onBeforeUnmount(() => {
           variant="ghost"
           size="sm"
           class="shrink-0"
-          :disabled="loading || refreshing"
-          @click="load()"
+          :disabled="serversLoading || refreshing"
+          @click="refresh"
         >
           {{
             refreshing
@@ -696,12 +776,31 @@ onBeforeUnmount(() => {
         </Button>
       </div>
 
-      <p v-if="loading" class="text-xs text-muted-foreground">
+      <!-- A read that failed says so instead of claiming the list is empty: the
+           store kept the previous rows, and an unreadable configuration is not
+           "nothing configured". It sits here, right under the title, because it
+           is the one line that explains why the list below is what it is. -->
+      <Alert v-if="serversError" variant="destructive">
+        <AlertDescription>{{ serversError }}</AlertDescription>
+      </Alert>
+
+      <!-- Two lines, never a row: "still reading" while nobody has answered (the
+           store is not settled, holds nothing and nothing failed), and "nothing
+           configured" only when an answer genuinely found no server. The rows are
+           painted in every other case, including a refresh whose new answer has
+           not landed yet. -->
+      <p
+        v-if="!serversSettled && !servers.length && !serversError"
+        class="text-xs text-muted-foreground"
+      >
         {{ t("settings.mcp.loading") }}
       </p>
 
       <template v-else>
-        <p v-if="!servers.length" class="text-xs text-muted-foreground">
+        <p
+          v-if="!servers.length && !serversError"
+          class="text-xs text-muted-foreground"
+        >
           {{ t("settings.mcp.empty") }}
         </p>
 
@@ -1091,8 +1190,9 @@ onBeforeUnmount(() => {
       </DialogContent>
     </Dialog>
 
-    <!-- The pane's one error line: a read or a write that could not run at all.
-         A server's own failure is pi's, and stays on its row. -->
+    <!-- The pane's write error line: an add, remove, sign-in or sign-out that
+         could not run at all. A failed read is the store's (`serversError`, under
+         the title above) and a server's own failure is pi's, on its row. -->
     <Alert v-if="error" variant="destructive">
       <AlertDescription>{{ error }}</AlertDescription>
     </Alert>
