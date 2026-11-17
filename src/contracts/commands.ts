@@ -7,6 +7,9 @@ import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { AgentEventEnvelope } from "./agent-events";
 import type {
   AppSettings,
+  BrowserCandidate,
+  BrowserSession,
+  BrowserTarget,
   FsEntry,
   FsPreview,
   GitEntry,
@@ -698,4 +701,60 @@ export function gitStatus(workspace: string): Promise<GitEntry[]> {
  */
 export function gitDiff(workspace: string, path: string): Promise<string> {
   return invoke<string>("git_diff", { workspace, path });
+}
+
+// ── browser sessions (F3 of `odd/tasks/tool-drawer-and-mcp.md`) ─────────────
+
+/**
+ * F3/S6: the Chromium candidates this machine has. An EMPTY list is a valid
+ * answer and the one the tab turns into its disabled face: only Chromium speaks
+ * CDP, so Safari and Firefox never appear here and the pane must not pretend they
+ * can be driven.
+ */
+export function browserDetect(): Promise<BrowserCandidate[]> {
+  return invoke<BrowserCandidate[]>("browser_detect");
+}
+
+/**
+ * F3: launches a DEDICATED Chromium for the workspace — its own profile and its
+ * own `--remote-debugging-port` — instead of attaching to the human's browser.
+ * `workspace` is the absolute path the store handed the drawer; Rust owns the
+ * argv, the port and the profile directory.
+ */
+export function browserLaunch(workspace: string): Promise<BrowserSession> {
+  return invoke<BrowserSession>("browser_launch", { workspace });
+}
+
+/**
+ * F3/S4: what the session has open right now — the read-only status the tab
+ * polls while it is visible. The pane expects a closed session to answer an empty
+ * list and treats a rejection as a real failure (it renders the message in place
+ * instead of blanking the status row above it).
+ */
+export function browserTargets(sessionId: string): Promise<BrowserTarget[]> {
+  return invoke<BrowserTarget[]>("browser_targets", { sessionId });
+}
+
+/**
+ * F3/S4: navigates the session to `url`. The tab only ever passes an `http(s)`
+ * URL (it validates before enabling the button), and Rust is expected to reject
+ * any other scheme as a second line. Resolves with the new target, or `null` when
+ * the browser accepted the navigation but published no target for it — which the
+ * tab answers by re-reading `browser_targets` rather than trusting this answer.
+ */
+export function browserOpenUrl(
+  sessionId: string,
+  url: string,
+): Promise<BrowserTarget | null> {
+  return invoke<BrowserTarget | null>("browser_open_url", { sessionId, url });
+}
+
+/**
+ * F3: kills the browser this app launched and forgets the session. Idempotent:
+ * `false` means there was nothing left to close, so unmount never has to guess
+ * whether teardown already ran. Never attaches to, or closes, a browser the human
+ * started.
+ */
+export function browserClose(sessionId: string): Promise<boolean> {
+  return invoke<boolean>("browser_close", { sessionId });
 }

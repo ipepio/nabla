@@ -7,10 +7,9 @@
 // Two rules keep this list honest:
 //
 // 1. A tool is listed only when it has a component. A tab that does nothing is
-//    worse than no tab, and `browser` (F3) therefore has no entry yet: its
-//    component does not exist, so declaring it here would be a dead tab. The
-//    `enabledTools` switch already exists in Settings (`src/lib/preferences.ts`),
-//    so the flag is ready before the tab is.
+//    worse than no tab, so an id reaches this list together with its component
+//    and never before it. The `enabledTools` switch already exists in Settings
+//    (`src/lib/preferences.ts`), so the flag may be ready before the tab is.
 // 2. Whether a listed tool is SHOWN is `enabledTools` (S5), which the host reads
 //    through `visibleTools` below — never a build flag. A tool that is off simply
 //    does not reach the strip.
@@ -18,17 +17,20 @@
 // Nothing else lives in this file: the registry is data, and every tool keeps its
 // own state and its own requests.
 import type { Component } from "vue";
-import { FilesIcon, GitBranchIcon, TerminalIcon } from "@lucide/vue";
+import {
+  FilesIcon,
+  GitBranchIcon,
+  GlobeIcon,
+  TerminalIcon,
+} from "@lucide/vue";
 import type { MessageKey } from "@/lib/i18n";
+import BrowserTool from "./BrowserTool.vue";
 import ChangesTool from "./ChangesTool.vue";
 import FilesTool from "./FilesTool.vue";
 import TerminalTool from "./TerminalTool.vue";
 
-/**
- * The tools this build ships. `browser` is deliberately absent: F3 adds it here
- * together with its component (see rule 1 above).
- */
-export type ToolId = "files" | "changes" | "terminal";
+/** The tools this build ships; each id matches an `enabledTools` switch (S5). */
+export type ToolId = "files" | "changes" | "terminal" | "browser";
 
 /** One tool the drawer can show. */
 export interface ToolDefinition {
@@ -44,7 +46,9 @@ export interface ToolDefinition {
 
 /**
  * The tools in tab order. `files` first because it is the one the user reaches
- * for while a session runs; `terminal` last because it is opt-in and runs code.
+ * for while a session runs; the two opt-in tools — the terminal and the browser —
+ * last, because both are off by default and the registry order is the strip order
+ * once Settings turns them on.
  */
 export const TOOLS: readonly ToolDefinition[] = [
   {
@@ -64,6 +68,12 @@ export const TOOLS: readonly ToolDefinition[] = [
     labelKey: "tools.terminal.label",
     icon: TerminalIcon,
     component: TerminalTool,
+  },
+  {
+    id: "browser",
+    labelKey: "tools.browser.label",
+    icon: GlobeIcon,
+    component: BrowserTool,
   },
 ];
 

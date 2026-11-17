@@ -549,3 +549,66 @@ export interface GitEntry {
   status: GitEntryStatus;
   staged: boolean;
 }
+
+// ── browser sessions (F3 of `odd/tasks/tool-drawer-and-mcp.md`) ──────────────
+
+/**
+ * The only family this feature supports (S6): a Chromium that speaks CDP. Safari
+ * and Firefox are not candidates at all, which is why the tab has a disabled face
+ * instead of a half-working one.
+ *
+ * A plain `string`, mirroring `BrowserCandidate.family` in
+ * `src-tauri/src/browser.rs`: it is always `"chromium"` today, and the field
+ * exists so a future engine never has to guess what it is looking at. Narrowing it
+ * to the one literal here would make that future a compile error in a file that
+ * does not even branch on it.
+ */
+export type BrowserFamily = string;
+
+/**
+ * One browser `browser_detect` found on this machine: the display name the tab
+ * shows on the Launch button, the executable it would spawn, and the family
+ * (always `chromium` today). Mirrors `BrowserCandidate` in
+ * `src-tauri/src/browser.rs`.
+ */
+export interface BrowserCandidate {
+  name: string;
+  path: string;
+  family: BrowserFamily;
+}
+
+/**
+ * What `browser_launch` answers: the id every other browser command takes, the
+ * CDP port the dedicated instance listens on, the pid of the process Nabla owns,
+ * the browser it actually spawned and the profile directory it keeps for itself
+ * (a dedicated profile, never the human's — F3 decision).
+ *
+ * The flat shape is Rust's: `browser_launch` answers `BrowserStarted`, which is
+ * the session id plus a flattened `BrowserSession`, so the wire object is one
+ * camelCase record. Mirrors both in `src-tauri/src/browser.rs`.
+ */
+export interface BrowserSession {
+  sessionId: string;
+  port: number;
+  pid: number;
+  browserName: string;
+  /** Absolute path of the throwaway profile; informational, shown as a hint. */
+  profileDir: string;
+}
+
+/**
+ * One open target of a session: its DevTools id (handed back to Rust, never
+ * rendered), its kind, and the url and title the tab shows truncated.
+ *
+ * `kind` is the DevTools `type` lowercased (`page`, `iframe`, `service_worker`, …)
+ * or the sentinel `"other"`, and `url`/`title` are EMPTY STRINGS when the endpoint
+ * did not report them — never `null`. Both are mirrored as Rust declares them in
+ * `src-tauri/src/browser.rs`, so the pane reads them defensively instead of
+ * trusting a nullability the wire never promised.
+ */
+export interface BrowserTarget {
+  id: string;
+  kind: string;
+  url: string;
+  title: string;
+}
