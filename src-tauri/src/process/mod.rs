@@ -288,10 +288,15 @@ fn force_stop(pid: u32, exit: &ExitSignal, timeouts: &Timeouts) {
 }
 
 /// Supervisor of all per-session pi children.
+///
+/// Cheap to clone: every handle shares the same registry behind the `Arc`, so a
+/// command can move one onto a worker thread and still address the children the
+/// host already registered.
+#[derive(Clone)]
 pub struct ProcessManager {
     sink: EventSink,
     timeouts: Timeouts,
-    sessions: Mutex<HashMap<String, Arc<SessionProcess>>>,
+    sessions: Arc<Mutex<HashMap<String, Arc<SessionProcess>>>>,
 }
 
 impl ProcessManager {
@@ -303,7 +308,7 @@ impl ProcessManager {
         ProcessManager {
             sink,
             timeouts,
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -712,8 +717,12 @@ impl ProcessManager {
 
 impl Drop for ProcessManager {
     fn drop(&mut self) {
-        // S1: no pi outlives the host that owns it.
-        self.stop_all();
+        // S1: no pi outlives the host that owns it. Handles share the registry
+        // through an `Arc`, so only the last one owns the children: dropping a
+        // clone (a command's worker thread handle) must never kill a live pi.
+        if Arc::strong_count(&self.sessions) == 1 {
+            self.stop_all();
+        }
     }
 }
 
@@ -1449,6 +1458,61 @@ sleep 30
 
         manager.stop_all();
         assert!(!manager.contains("s1") && !manager.contains("s2"));
+    }
+
+    // Handles are cheap to clone so a Tauri command can move one onto a worker
+    // thread instead of blocking the IPC thread on a spawn. Every handle shares
+    // the one registry, and only the last one owns the children (S1): dropping a
+    // clone must never kill a live pi.
+    #[cfg(unix)]
+    #[test]
+    fn cloning_the_manager_shares_the_registry_and_never_stops_the_children() {
+        let scratch = Scratch::new("clone");
+        let attempts = scratch.path("attempts");
+        let marker = scratch.path("marker");
+        let script = write_script(&scratch, "fake-pi.sh", &attempts, &marker, FAKE_PI);
+        let collected = Arc::new(Collected::default());
+        let manager = ProcessManager::with_timeouts(collected.sink(), test_timeouts());
+
+        let report = manager
+            .spawn(
+                "s1",
+                script.to_str().unwrap(),
+                &scratch.path("s1.jsonl"),
+                TEST_PROVIDER,
+                TEST_MODEL,
+                &scratch.dir,
+            )
+            .expect("spawn");
+        assert_eq!(report.outcome, StartupOutcome::Ready, "stderr: {:?}", report.stderr_tail);
+        let pid = report.pid.expect("a ready child has a pid");
+
+        let worker = manager.clone();
+        assert_eq!(
+            worker.live_ids(),
+            vec!["s1".to_string()],
+            "a clone addresses the same registry, not a second one"
+        );
+        assert_eq!(
+            worker.status("s1"),
+            manager.status("s1"),
+            "both handles report the same live child"
+        );
+
+        drop(worker);
+        assert_eq!(
+            manager.status("s1").map(|snapshot| snapshot.pid),
+            Some(pid),
+            "dropping a clone must not stop the child it did not start"
+        );
+        assert_eq!(
+            manager.status("s1").map(|snapshot| snapshot.status),
+            Some(RuntimeStatus::Ready),
+            "the registry entry survives the clone's drop"
+        );
+
+        manager.stop_and_wait("s1").expect("stop");
+        assert!(manager.live_ids().is_empty());
     }
 
     // S5: the live-id list is read from the registry, so it reflects a spawned

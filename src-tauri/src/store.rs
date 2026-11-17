@@ -6,7 +6,7 @@
 //   live in settings.json (T5).
 
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 // Payloads cross the Tauri bridge as camelCase JSON: the same convention
 // settings.json uses (see L3). The TS contracts mirror these shapes (S4).
@@ -92,12 +92,17 @@ impl From<rusqlite::Error> for StoreError {
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
+/// Cheap to clone: every handle shares the one connection behind the `Arc`.
+/// Commands that hand blocking work to a worker thread clone the store instead
+/// of borrowing it, and the handle they move is the same database, not a second
+/// one.
+#[derive(Clone)]
 pub struct Store {
     /// rusqlite's Connection is `Send` but not `Sync`; the store is shared by
     /// every Tauri command (which run on worker threads), so access is
     /// serialized through a mutex exactly like a single-threaded connection
     /// would be.
-    conn: Mutex<rusqlite::Connection>,
+    conn: Arc<Mutex<rusqlite::Connection>>,
 }
 
 impl Store {
@@ -108,7 +113,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         let store = Store {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         };
         store.migrate()?;
         Ok(store)

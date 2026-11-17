@@ -590,8 +590,16 @@ fn ensure_session_in_workspace(
 /// Spawns one headless pi for this workspace and registers it in the session
 /// index (S1, S3, S7). The returned `sessionId` is the index row id in decimal
 /// form — the key every later session command uses.
+///
+/// `async` on purpose: creating the process costs seconds of readiness wait, and
+/// a synchronous command would hold Tauri's IPC thread for all of it. The
+/// directory, the index row and the settings stay on the caller's thread; only
+/// the spawn runs on a worker.
 #[tauri::command]
-pub fn start_session(state: State<'_, AppState>, workspace_id: i64) -> Result<SessionDto, String> {
+pub async fn start_session(
+    state: State<'_, AppState>,
+    workspace_id: i64,
+) -> Result<SessionDto, String> {
     // A workspace is a directory on disk: spawning pi somewhere else would
     // produce a session the user never asked for.
     let workspace = workspace_by_id(&state.store, workspace_id)?;
@@ -624,17 +632,25 @@ pub fn start_session(state: State<'_, AppState>, workspace_id: i64) -> Result<Se
         .map_err(display_err)?;
     let session_id = row.id.to_string();
 
-    let report = state
-        .runtime
-        .spawn(
-            &session_id,
+    // The spawn waits for pi's readiness probe; the handle and the paths are
+    // owned before the move so the closure is `'static`. `settings` is only
+    // needed by the spawn, so it moves with them.
+    let runtime = state.runtime.clone();
+    let key = session_id.clone();
+    let workspace_path = workspace.path.clone();
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        runtime.spawn(
+            &key,
             &settings.pi_binary,
             &pi_session_path,
             &settings.provider,
             &settings.model,
-            Path::new(&workspace.path),
+            Path::new(&workspace_path),
         )
-        .map_err(display_err)?;
+    })
+    .await
+    .map_err(display_err)?
+    .map_err(display_err)?;
 
     if report.outcome != StartupOutcome::Ready {
         let detail = report.stderr_tail.join("\n");
@@ -965,7 +981,11 @@ fn session_dto(row: &SessionRow, pid: u32, status: RuntimeStatus) -> SessionDto 
 /// instead of starting a new one. A file pi has not created yet is not an error:
 /// pi creates it at exactly that path, which keeps the index and the file in
 /// agreement.
-fn open_session_core(
+///
+/// `async` on purpose: the spawn waits for pi's readiness probe, which costs
+/// seconds. Everything before it (the index row, the workspace, the settings)
+/// is fast and stays on the caller's thread; only the spawn moves to a worker.
+async fn open_session_core(
     store: &Store,
     runtime: &ProcessManager,
     config_dir: &Path,
@@ -976,7 +996,8 @@ fn open_session_core(
     let row = session_row_by_id(store, session_id)?;
 
     // S5: a live process for this key is reused untouched — its pid comes from
-    // the registry, never from a second spawn.
+    // the registry, never from a second spawn. This branch never waits, so it
+    // stays on the caller's thread.
     if let Some(snapshot) = runtime.status(session_id) {
         return Ok(session_dto(&row, snapshot.pid, snapshot.status));
     }
@@ -985,17 +1006,33 @@ fn open_session_core(
     // The engine path, provider and model are user-configured, so they are read
     // per open, not cached (S7).
     let settings = settings::load(&settings_file(config_dir)).map_err(display_err)?;
-    let report = match runtime.spawn(
-        session_id,
-        &settings.pi_binary,
-        // S3: the SAME file the index points at, so pi resumes that transcript
-        // instead of creating another one. A file pi has not written yet is not
-        // an error: pi creates it exactly there, keeping index and file equal.
-        Path::new(&row.pi_session_path),
-        &settings.provider,
-        &settings.model,
-        Path::new(&workspace.path),
-    ) {
+
+    // The readiness wait is the only slow step, so it is the only one handed to
+    // a worker thread: a synchronous command would hold Tauri's IPC thread for
+    // the whole spawn and stall every other command meanwhile. The handle and
+    // the paths are owned before the move so the closure is `'static`.
+    let spawned_runtime = runtime.clone();
+    let key = session_id.to_string();
+    let pi_session_path = row.pi_session_path.clone();
+    let workspace_path = workspace.path.clone();
+    let spawned = tauri::async_runtime::spawn_blocking(move || {
+        spawned_runtime.spawn(
+            &key,
+            &settings.pi_binary,
+            // S3: the SAME file the index points at, so pi resumes that
+            // transcript instead of creating another one. A file pi has not
+            // written yet is not an error: pi creates it exactly there, keeping
+            // index and file equal.
+            Path::new(&pi_session_path),
+            &settings.provider,
+            &settings.model,
+            Path::new(&workspace_path),
+        )
+    })
+    .await
+    .map_err(display_err)?;
+
+    let report = match spawned {
         Ok(report) => report,
         // A concurrent open registered the process between the status read and
         // this spawn: reuse it, exactly like the live branch above.
@@ -1018,17 +1055,22 @@ fn open_session_core(
 
 /// S3: opens an existing session — spawns pi on its indexed file when it is
 /// closed, returns the live process untouched when it is already open (S5).
+///
+/// `async` so the spawn's readiness wait cannot block the IPC thread; the
+/// handles are cloned first, because they are what makes the shared state
+/// reachable from the worker thread.
 #[tauri::command]
-pub fn open_session(state: State<'_, AppState>, session_id: String) -> Result<SessionDto, String> {
-    let opened = open_session_core(
-        &state.store,
-        &state.runtime,
-        &state.config_dir,
-        &session_id,
-    )?;
+pub async fn open_session(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<SessionDto, String> {
+    let store = state.store.clone();
+    let runtime = state.runtime.clone();
+    let config_dir = state.config_dir.clone();
+    let opened = open_session_core(&store, &runtime, &config_dir, &session_id).await?;
     // Opening an existing session is activity too: it must show up as recent.
     if let Ok(row_id) = session_id.parse::<i64>() {
-        let _ = state.store.touch_session(row_id);
+        let _ = store.touch_session(row_id);
     }
     Ok(opened)
 }
@@ -2197,6 +2239,13 @@ done
         }
     }
 
+    /// Runs one async core helper to completion. `open_session_core` is `async`
+    /// so a spawn cannot block the IPC thread; what the tests assert about it is
+    /// unchanged, so they only need a way to wait for it.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tauri::async_runtime::block_on(future)
+    }
+
     /// Short timeouts so lifecycle tests never wait out real minutes.
     fn lifecycle_timeouts() -> crate::process::Timeouts {
         crate::process::Timeouts {
@@ -2255,12 +2304,12 @@ done
         let runtime = lifecycle_runtime();
         let key = row.id.to_string();
 
-        let first = open_session_core(
+        let first = block_on(open_session_core(
             &fixture.store,
             &runtime,
             &fixture.config_dir(),
             &key,
-        )
+        ))
         .expect("first open");
         assert_eq!(first.status, RuntimeStatus::Ready);
         assert!(first.pid > 0);
@@ -2274,12 +2323,12 @@ done
             "the id is the live runtime key"
         );
 
-        let second = open_session_core(
+        let second = block_on(open_session_core(
             &fixture.store,
             &runtime,
             &fixture.config_dir(),
             &key,
-        )
+        ))
         .expect("second open");
         assert_eq!(second.pid, first.pid, "S5: no second process per session");
         assert_eq!(second.status, first.status);
@@ -2303,12 +2352,12 @@ done
         let row = fixture.add_session("s7.jsonl", true, "");
         let runtime = lifecycle_runtime();
 
-        let dto = open_session_core(
+        let dto = block_on(open_session_core(
             &fixture.store,
             &runtime,
             &fixture.config_dir(),
             &row.id.to_string(),
-        )
+        ))
         .expect("open session");
         assert_eq!(dto.status, RuntimeStatus::Ready);
         assert_eq!(dto.session_id, row.id.to_string());
@@ -2341,24 +2390,24 @@ done
         fixture.write_settings(&script);
         let runtime = lifecycle_runtime();
 
-        let err = open_session_core(
+        let err = block_on(open_session_core(
             &fixture.store,
             &runtime,
             &fixture.config_dir(),
             "424242",
-        )
+        ))
         .expect_err("an unindexed id cannot be opened");
         assert!(
             err.contains("unknown session") && err.contains("424242"),
             "the error names the id, got {err:?}"
         );
         // A non-numeric id is rejected before anything is spawned too.
-        let non_numeric = open_session_core(
+        let non_numeric = block_on(open_session_core(
             &fixture.store,
             &runtime,
             &fixture.config_dir(),
             "not-a-number",
-        )
+        ))
         .expect_err("a non-numeric id cannot be opened");
         assert!(non_numeric.contains("not-a-number"), "got {non_numeric:?}");
 
