@@ -30,10 +30,11 @@
 // missed ticks. Requests are serialized (`targetsInFlight`) and answered only if
 // the session that asked is still the one mounted.
 //
-// TEARDOWN — one session per mounting. Unmount closes it (workspace changes
-// remount the tab, see `ToolTabs`), a workspace change while mounted closes it
-// too, and a launch that answers after teardown closes the browser it just
-// created instead of leaking it. Nothing keeps polling afterwards.
+// TEARDOWN — one session per mounting. Unmount closes it (closing the pane or
+// switching workspace, both of which remount it through `DockPane`), a workspace
+// change while mounted closes it too, and a launch that answers after teardown
+// closes the browser it just created instead of leaking it. Nothing keeps polling
+// afterwards.
 import { computed, onBeforeUnmount, onMounted, ref, watch, type Component } from "vue";
 import {
   CircleIcon,
@@ -324,9 +325,9 @@ async function openUrl(): Promise<void> {
   }
 }
 
-// A workspace switch remounts this tab (`ToolTabs` keys it by workspace); the
-// watch is the explicit second path, so the browser never outlives the folder it
-// was launched for even if the host ever stops remounting.
+// A workspace switch remounts this pane (`DockPane` keys it by instance and
+// context); the watch is the explicit second path, so the browser never outlives
+// the folder it was launched for even if the host ever stops remounting.
 watch(
   () => props.workspace?.path ?? null,
   (next, previous) => {

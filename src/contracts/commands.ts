@@ -3,6 +3,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { AgentEventEnvelope } from "./agent-events";
 import type {
@@ -381,6 +382,25 @@ export function openExternalUrl(url: string): Promise<void> {
     );
   }
   return openUrl(url);
+}
+
+// ── native folder picker seam (dock, F1 of `tool-drawer-and-mcp.md`) ────────
+
+/**
+ * Shows the system's folder picker and answers the chosen absolute path, or
+ * `null` when the human dismissed it (which is not an error).
+ *
+ * Why here: a dock pane is pointed at a folder, and the drawer needs that picker
+ * for a path the workspace list does not hold — a second Files pane on another
+ * tree, or a shell in another directory. The call lives in the contracts seam for
+ * the same reason every other one does (AGENTS.md 1): no component imports the
+ * Tauri API directly. It is the `directory: true, multiple: false` shape the
+ * sidebar already uses, with the title passed in so both locales apply.
+ */
+export async function pickDirectory(title: string): Promise<string | null> {
+  const selected = await openDialog({ directory: true, multiple: false, title });
+  if (selected === null) return null;
+  return Array.isArray(selected) ? (selected[0] ?? null) : selected;
 }
 
 /**

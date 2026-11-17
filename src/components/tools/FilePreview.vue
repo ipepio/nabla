@@ -1,7 +1,11 @@
 <script setup lang="ts">
-// The preview of one file, rendered inside the Files tab (S3 of
+// The preview of one file, rendered inside a Files pane (S3 of
 // `odd/tasks/tool-drawer-and-mcp.md`: "cuando lo selecciones, te lo abre en la
 // misma pestaña").
+//
+// The folder is the PANE's root (`rootPath`), not the active workspace: a Files
+// pane can be pointed at another directory, and the preview must read the file it
+// was opened from. `relPath` stays relative to that root, exactly as before.
 //
 // What it renders is decided by Rust, not guessed here: `fsReadPreview` answers
 // `text` (with its content), `image` (bytes fetched separately), `binary` or
@@ -25,18 +29,19 @@ import {
   fsReadImageBytes,
   fsReadPreview,
 } from "@/contracts/commands";
-import type { FsPreview, WorkspaceInfo } from "@/contracts/types";
+import type { FsPreview } from "@/contracts/types";
 import { t } from "@/lib/i18n";
 import { formatBytes } from "./format";
 
 const props = defineProps<{
-  workspace: WorkspaceInfo;
-  /** Workspace-relative path of the file to preview. */
+  /** The absolute folder this pane browses; `relPath` is relative to it. */
+  rootPath: string;
+  /** Root-relative path of the file to preview. */
   relPath: string;
 }>();
 
 const emit = defineEmits<{
-  /** The X: the Files tab goes back to a full-height tree. */
+  /** The X: the Files pane goes back to a full-height tree. */
   (e: "close"): void;
 }>();
 
@@ -69,11 +74,11 @@ async function load(): Promise<void> {
   preview.value = null;
   releaseImage();
   try {
-    const answer = await fsReadPreview(props.workspace.path, props.relPath);
+    const answer = await fsReadPreview(props.rootPath, props.relPath);
     if (disposed || id !== requestId) return;
     preview.value = answer;
     if (answer.kind === "image") {
-      const bytes = await fsReadImageBytes(props.workspace.path, props.relPath);
+      const bytes = await fsReadImageBytes(props.rootPath, props.relPath);
       if (disposed || id !== requestId) return;
       // The mime comes from the preview; a name whose type Rust did not model
       // still renders, as an opaque binary body the <img> can sniff.
@@ -98,7 +103,7 @@ const textBody = computed(() => {
   };
 });
 
-watch(() => [props.workspace.path, props.relPath], load);
+watch(() => [props.rootPath, props.relPath], load);
 onMounted(load);
 onBeforeUnmount(() => {
   disposed = true;
@@ -108,7 +113,7 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="flex min-h-0 flex-1 flex-col border-t" aria-live="polite">
-    <!-- Header: the workspace-relative path is the identity of what is shown,
+    <!-- Header: the root-relative path is the identity of what is shown,
          plus the size and the close control. -->
     <div class="flex shrink-0 items-center gap-2 px-2 py-1.5">
       <span class="min-w-0 flex-1 truncate text-xs font-medium" :title="relPath">

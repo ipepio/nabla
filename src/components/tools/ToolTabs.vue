@@ -1,112 +1,153 @@
 <script lang="ts">
-// Module state, on purpose: the drawer unmounts when it is collapsed, so a
-// component-local `ref` would forget the tab. This module keeps the last active
-// tool for the whole app session (S2: no persistence across launches — that is a
-// settings key, out of scope here).
-import { ref } from "vue";
-import { DEFAULT_TOOL_ID, type ToolId } from "./registry";
-
-const rememberedToolId = ref<ToolId>(DEFAULT_TOOL_ID);
+// The dock's layout lives at MODULE scope, not in this component.
+//
+// Why: the drawer unmounts whenever it is collapsed (the parent keeps only
+// `toolsOpen`), so a component-local `ref` would throw the panes away every time
+// the human hides the panel. The tree itself — and the rules around it — live in
+// `./dock.ts`; this file is only the host that renders it and offers the way to
+// add a tool.
 </script>
 
 <script setup lang="ts">
-// The drawer's tab host (F1 of `odd/tasks/tool-drawer-and-mcp.md`).
+// The drawer's tool host: a DOCK of tool instances with splits, not a tab strip.
 //
-// It owns exactly three things: which tool is active, the tab strip, and mounting
-// the active tool. The tools themselves come from `registry.ts`, so a new tool is
-// one entry there and never an edit to this file.
+// The request this replaces a tab strip for is literal: "un selector de tools y
+// que tú puedas abrir las que quieras en el drawer… ¿y si quiero abrir otro path
+// porque quiero abrir otro archivo? ¿y si quiero dividir la pestaña del drawer
+// porque quiero 2 o n files? Lo mismo con la consola."
 //
-// S5 of the same document: the strip is the tools the human enabled in Settings
-// (`enabledTools`), never the whole registry. The filter lives in `registry.ts`
-// (`visibleTools`) and is applied here on every render of the shared ref, so a
-// flip in the dialog removes or adds a tab of an already-open drawer without a
-// reload. A tool that is off is not mounted, which is also what keeps the
-// terminal from opening a shell nobody asked for.
+// So this component owns exactly three things:
 //
-// The tool is remounted with `key` = (tool, workspace), which is what makes
-// switching workspaces RE-READ the folder or the working tree instead of showing
-// the previous workspace's data — and what closes a shell when the workspace
-// changes, because unmounting the terminal is what ends its session.
-import { computed } from "vue";
+//  1. the "+ Add tool" menu — the selector, built from `visibleTools`, i.e. the
+//     tools the human enabled in Settings (S5), never a hardcoded list;
+//  2. reconciling the module-scope dock with reality (`applyDock`): a new active
+//     workspace resets the layout, a disabled tool closes its panes;
+//  3. the empty face, which is the same "no tools" state the tab strip had, plus
+//     the "nothing open yet" one the dock can reach.
+//
+// Adding a tool is one registry entry (`./registry.ts`), never an edit here. Each
+// pane's header, splits and folder chip belong to `DockPane.vue`; the layout tree
+// is `DockNode.vue`.
+import { computed, watch } from "vue";
+import { PlusIcon } from "@lucide/vue";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import type { WorkspaceInfo } from "@/contracts/types";
 import { t } from "@/lib/i18n";
 import { enabledTools } from "@/lib/preferences";
+import DockNode from "./DockNode.vue";
+import {
+  addPreview,
+  addTool,
+  applyDock,
+  dockTree,
+  instances,
+  MAX_PANES,
+} from "./dock";
 import { visibleTools, type ToolDefinition } from "./registry";
 
-defineProps<{ workspace: WorkspaceInfo | null }>();
+const props = defineProps<{ workspace: WorkspaceInfo | null }>();
 
-const activeId = rememberedToolId;
-
-/** S5: the enabled tools, in registry order. */
-const tools = computed<ToolDefinition[]>(() =>
+/** S5: the enabled tools, in registry order — the whole "+ Add tool" menu. */
+const available = computed<ToolDefinition[]>(() =>
   visibleTools(enabledTools.value),
 );
 
-/**
- * The active entry, or the first enabled one when the remembered id is gone —
- * because the human disabled it, or because a release dropped it.
- */
-const activeTool = computed<ToolDefinition | null>(
-  () => tools.value.find((tool) => tool.id === activeId.value) ?? tools.value[0] ?? null,
+const panes = computed(() => instances(dockTree.value));
+
+/** At least one entry can still be opened (or focused), so the menu is worth a click. */
+const canAddAny = computed(() =>
+  available.value.some((tool) => addPreview(tool.id) !== "full"),
 );
 
-function selectTool(tool: ToolDefinition): void {
-  activeId.value = tool.id;
+/**
+ * The dock is reconciled here because this is the only place that knows both
+ * inputs: the active workspace and the enabled tools. `immediate` covers the
+ * drawer being reopened after the human flipped a switch while it was collapsed.
+ */
+watch(
+  [() => props.workspace?.path ?? null, () => enabledTools.value.join(",")],
+  () => applyDock(props.workspace, enabledTools.value),
+  { immediate: true },
+);
+
+/** What a click on one menu entry would do, without doing it (`dock.ts`). */
+function preview(toolId: ToolDefinition["id"]) {
+  return addPreview(toolId);
+}
+
+function open(toolId: ToolDefinition["id"]): void {
+  addTool(toolId, props.workspace);
 }
 </script>
 
 <template>
   <div class="flex min-h-0 flex-1 flex-col">
     <!--
-      Tab strip: one equal-width button per tool. Labels truncate on a narrow
-      drawer instead of wrapping, so the strip keeps a single compact row.
+      Dock bar: the selector. Compact on purpose — the drawer is 240px wide at its
+      narrowest, and the panes need the height. The counter states the cap so
+      "Add tool" being unavailable is explained instead of surprising.
     -->
     <div
-      v-if="tools.length > 0"
-      role="tablist"
-      :aria-label="t('tools.tabs')"
-      class="flex shrink-0 items-center gap-1 border-b px-1.5 py-1.5"
+      v-if="available.length > 0"
+      class="flex shrink-0 items-center gap-1.5 border-b px-1.5 py-1.5"
     >
-      <button
-        v-for="tool in tools"
-        :key="tool.id"
-        type="button"
-        role="tab"
-        :aria-selected="tool.id === activeTool?.id"
-        class="flex min-w-0 flex-1 items-center justify-center gap-1.5 rounded-[min(var(--radius-md),8px)] px-2 py-1 text-xs outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring"
-        :class="
-          tool.id === activeTool?.id
-            ? 'bg-muted text-foreground'
-            : 'text-muted-foreground hover:bg-muted/60 hover:text-foreground'
-        "
-        @click="selectTool(tool)"
-      >
-        <component :is="tool.icon" class="size-3.5 shrink-0" aria-hidden="true" />
-        <span class="truncate">{{ t(tool.labelKey) }}</span>
-      </button>
+      <DropdownMenu>
+        <DropdownMenuTrigger as-child>
+          <Button
+            variant="ghost"
+            size="xs"
+            :disabled="!canAddAny"
+            :title="canAddAny ? t('tools.dock.add') : t('tools.dock.full', { count: MAX_PANES })"
+          >
+            <PlusIcon />
+            {{ t("tools.dock.add") }}
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" class="w-52">
+          <DropdownMenuLabel v-if="!canAddAny">
+            {{ t("tools.dock.full", { count: MAX_PANES }) }}
+          </DropdownMenuLabel>
+          <DropdownMenuItem
+            v-for="tool in available"
+            :key="tool.id"
+            :disabled="preview(tool.id) === 'full'"
+            @select="open(tool.id)"
+          >
+            <component :is="tool.icon" />
+            {{ t(tool.labelKey) }}
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+
+      <span class="ms-auto shrink-0 text-[11px] text-muted-foreground">
+        {{
+          t("tools.dock.panes", {
+            count: panes.length,
+            max: MAX_PANES,
+          })
+        }}
+      </span>
     </div>
 
-    <!--
-      The active tool. `key` includes the workspace so a switch remounts it: the
-      tree and the change list belong to one workspace and must never be reused
-      for another.
-    -->
-    <div
-      v-if="activeTool"
-      role="tabpanel"
-      :aria-label="t(activeTool.labelKey)"
-      class="flex min-h-0 flex-1 flex-col"
-    >
-      <component
-        :is="activeTool.component"
-        :key="`${activeTool.id}:${workspace?.id ?? 'none'}`"
-        :workspace="workspace"
-      />
-    </div>
+    <!-- The layout: a split tree whose leaves are the open panes. -->
+    <DockNode
+      v-if="dockTree"
+      :node="dockTree"
+      :depth="0"
+      :workspace="workspace"
+    />
 
+    <!-- Nothing open: either nothing to open, or an empty dock. -->
     <div v-else class="flex flex-1 items-center justify-center p-4">
       <p class="text-center text-xs text-muted-foreground">
-        {{ t("tools.empty") }}
+        {{ available.length === 0 ? t("tools.empty") : t("tools.dock.empty") }}
       </p>
     </div>
   </div>

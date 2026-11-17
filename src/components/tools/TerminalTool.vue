@@ -1,14 +1,20 @@
 <script setup lang="ts">
-// Terminal tab (F2 of `odd/tasks/tool-drawer-and-mcp.md`): a real shell in the
-// active workspace, rendered by xterm.js.
+// Terminal pane (F2 of `odd/tasks/tool-drawer-and-mcp.md`): a real shell in ONE
+// folder, rendered by xterm.js.
 //
-// LIFECYCLE — one shell per mounting, and mounting IS activation. `ToolTabs`
-// mounts only the active tool and keys it by (tool, workspace), so this component
-// is created when the human opens the Terminal tab and destroyed when they leave
-// it or switch workspace. That gives the whole rule for free:
+// The folder is `cwd`, not the active workspace: a dock can hold several Terminal
+// panes and each opens its own shell where its own context says. The pane starts
+// on the workspace, and the pane header's folder chip re-points it at any other
+// directory through the same native dialog the Files pane uses (`DockPane.vue`);
+// the dock owns that value, so this component never changes it itself.
 //
-//   mount      → open the session (`createShell` with the workspace path)
-//   unmount    → `closeShell` (the PTY child dies with the tab)
+// LIFECYCLE — one shell per mounting, and mounting IS opening. `DockPane` keys
+// this component by its instance id and its cwd, so the shell is created when the
+// pane is born, destroyed when the pane is closed, and replaced when the pane is
+// re-pointed at another folder. That gives the whole rule for free:
+//
+//   mount      → open the session (`createShell` with `cwd`)
+//   unmount    → `closeShell` (the PTY child dies with the pane)
 //   resubscribe→ the `shell-output` listener is created once and dropped on
 //                unmount, so nothing keeps firing after teardown
 //
@@ -36,7 +42,7 @@ import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
-import type { WorkspaceInfo, ShellOutputEvent } from "@/contracts/types";
+import type { ShellOutputEvent } from "@/contracts/types";
 import {
   closeShell,
   commandErrorMessage,
@@ -50,7 +56,11 @@ import { t } from "@/lib/i18n";
 import { Button } from "@/components/ui/button";
 
 const props = defineProps<{
-  workspace: WorkspaceInfo | null;
+  /**
+   * The absolute folder this pane's shell opens in. Empty means "no workspace
+   * yet", the same face this pane had before the dock existed.
+   */
+  cwd: string;
 }>();
 
 /** Rows kept above the viewport. Generous, but bounded: a chatty build log ends. */
@@ -223,10 +233,10 @@ function mountTerminal(): void {
   term.focus();
 }
 
-/** Opens the PTY for this workspace and adopts its id. */
+/** Opens the PTY for this pane's folder and adopts its id. */
 async function startSession(): Promise<void> {
-  const workspace = props.workspace;
-  if (workspace === null) return;
+  const cwd = props.cwd;
+  if (cwd === "") return;
   error.value = null;
   ended.value = false;
   exitCode.value = null;
@@ -234,7 +244,7 @@ async function startSession(): Promise<void> {
   awaitingSession = true;
   earlyOutput = [];
   try {
-    const session = await createShell({ workspace: workspace.path });
+    const session = await createShell({ workspace: cwd });
     if (disposed) {
       // The tab closed while the shell was spawning: do not leak the child.
       void closeShell(session.sessionId).catch(() => {});
@@ -276,7 +286,7 @@ async function restart(): Promise<void> {
 }
 
 onMounted(async () => {
-  if (props.workspace === null) return;
+  if (props.cwd === "") return;
   mountTerminal();
   // Subscribe before spawning: the first prompt is output too.
   try {
@@ -332,7 +342,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="flex min-h-0 flex-1 flex-col">
     <div
-      v-if="workspace === null"
+      v-if="cwd === ''"
       class="flex flex-1 items-center justify-center p-4"
     >
       <p class="text-center text-xs text-muted-foreground">

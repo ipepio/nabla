@@ -49,11 +49,12 @@ const toolsOpen = ref(false);
           owner); this component keeps only `toolsOpen`, so the panel resets to
           its default width when reopened.
 
-          The body is `ToolTabs`, which renders one tab per entry of
-          `components/tools/registry.ts` and mounts the active tool. That is the
-          whole integration: a new tool (terminal, browser) is a registry entry,
-          never an edit here. The tool receives the active workspace, so a
-          workspace switch re-reads what it shows.
+          The body is `ToolTabs`, which hosts the DOCK: a split tree of tool
+          instances (`components/tools/dock.ts`) whose "+ Add tool" menu is the
+          registry. That is the whole integration: a new tool is a registry
+          entry, never an edit here. The dock receives the active workspace,
+          which is the default context of a new pane and the reset rule of the
+          layout, so a workspace switch never shows the previous folder's panes.
         -->
         <ResizableAside
           v-if="toolsOpen"

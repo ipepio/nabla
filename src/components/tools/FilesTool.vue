@@ -1,16 +1,28 @@
 <script setup lang="ts">
-// Files tab (S3 of `odd/tasks/tool-drawer-and-mcp.md`): a lazy tree of the active
-// workspace, and the preview of the selected file in the SAME tab.
+// Files pane (S3 of `odd/tasks/tool-drawer-and-mcp.md`): a lazy tree of ONE
+// folder, and the preview of the selected file in the SAME pane.
+//
+// The folder is `rootPath`, not the active workspace: a pane is an instance
+// pointed at a directory, and the drawer shows as many Files panes as the dock has
+// room for, each with its own root ("¿y si quiero abrir otro path porque quiero
+// abrir otro archivo?"). The pane starts on the workspace and the path bar below
+// re-points it at any other directory through the native folder dialog; the dock
+// owns that value, so `browse` is an event and never a local state.
+//
+// REMOUNT, NOT WATCH: re-pointing a pane changes its dock context, and `DockPane`
+// keys this component by it. The tree, the open folders and the selection are
+// therefore dropped and re-read for the new root, which is exactly what a
+// different folder means.
 //
 // Laziness: one `fsListDir` call reads the root, and every expansion reads
-// exactly that one folder. Nothing recurses, so opening a workspace costs one
+// exactly that one folder. Nothing recurses, so opening a folder costs one
 // request whatever its depth, and a directory the user never opens is never read.
 //
 // Ownership: this component owns the tree state (children per relative path,
 // which folders are open, which failed) and the selected path. The preview itself
 // is `FilePreview`, which owns its request and its blob URL.
 //
-// Layout: the tree fills the tab; selecting a file gives it 60% of the height
+// Layout: the tree fills the pane; selecting a file gives it 60% of the height
 // (`flex-[3]` against the tree's `flex-[2]`) and the X in the preview header
 // restores the tree to full height.
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
@@ -19,20 +31,30 @@ import {
   FileIcon,
   FolderIcon,
   FolderOpenIcon,
+  FolderSearchIcon,
   LinkIcon,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { commandErrorMessage, fsListDir } from "@/contracts/commands";
-import type { FsEntry, WorkspaceInfo } from "@/contracts/types";
+import type { FsEntry } from "@/contracts/types";
 import { t } from "@/lib/i18n";
 import FilePreview from "./FilePreview.vue";
 import { formatBytes } from "./format";
 
 const props = defineProps<{
-  workspace: WorkspaceInfo | null;
+  /**
+   * The absolute folder this pane browses. Empty means "no workspace yet", the
+   * same face this pane had before the dock existed.
+   */
+  rootPath: string;
 }>();
 
-/** The workspace root as `fs_list_dir` takes it: an empty relative path. */
+const emit = defineEmits<{
+  /** The path bar's Browse button: the dock opens the dialog and writes the root. */
+  (e: "browse"): void;
+}>();
+
+/** The pane's root as `fs_list_dir` takes it: an empty relative path. */
 const ROOT = "";
 
 /** Directories first, then names: the order a file manager uses. */
@@ -55,13 +77,13 @@ const selectedPath = ref<string | null>(null);
 let disposed = false;
 
 async function loadDir(relPath: string): Promise<void> {
-  const workspace = props.workspace;
-  if (workspace === null) return;
+  const root = props.rootPath;
+  if (root === "") return;
   if (pendingPaths.value.has(relPath)) return;
   pendingPaths.value.add(relPath);
   delete errorsByPath.value[relPath];
   try {
-    const entries = await fsListDir(workspace.path, relPath);
+    const entries = await fsListDir(root, relPath);
     if (disposed) return;
     childrenByPath.value[relPath] = sortEntries(entries);
   } catch (error) {
@@ -110,7 +132,7 @@ function walk(relPath: string, depth: number, out: Row[]): void {
 }
 
 const rows = computed<Row[]>(() => {
-  if (props.workspace === null) return [];
+  if (props.rootPath === "") return [];
   const out: Row[] = [];
   const rootError = errorsByPath.value[ROOT];
   if (rootError !== undefined) {
@@ -128,7 +150,7 @@ const rows = computed<Row[]>(() => {
 /** Whether the root itself is still being read, for the empty face. */
 const rootPending = computed(
   () =>
-    props.workspace !== null &&
+    props.rootPath !== "" &&
     pendingPaths.value.has(ROOT) &&
     childrenByPath.value[ROOT] === undefined,
 );
@@ -176,7 +198,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="flex min-h-0 flex-1 flex-col">
     <div
-      v-if="workspace === null"
+      v-if="rootPath === ''"
       class="flex flex-1 items-center justify-center p-4"
     >
       <p class="text-center text-xs text-muted-foreground">
@@ -185,6 +207,26 @@ onBeforeUnmount(() => {
     </div>
 
     <template v-else>
+      <!--
+        Path bar: which folder this pane is showing, and the one action that
+        makes a second Files pane useful — point it somewhere else.
+      -->
+      <div
+        class="flex shrink-0 items-center gap-1.5 border-b px-2 py-1"
+        :title="t('tools.files.root', { path: rootPath })"
+      >
+        <FolderOpenIcon
+          class="size-3.5 shrink-0 text-muted-foreground"
+          aria-hidden="true"
+        />
+        <span class="min-w-0 flex-1 truncate text-[11px] text-muted-foreground">
+          {{ rootPath }}
+        </span>
+        <Button variant="ghost" size="xs" class="shrink-0" @click="emit('browse')">
+          <FolderSearchIcon />
+          {{ t("tools.files.browse") }}
+        </Button>
+      </div>
       <!-- Tree: the whole tab, or the top 40% while a preview is open. -->
       <div
         class="min-h-0 overflow-auto py-1"
@@ -291,7 +333,7 @@ onBeforeUnmount(() => {
       <!-- Preview, in the same tab, at ~60% of the height. -->
       <div v-if="selectedPath !== null" class="flex min-h-0 flex-[3] flex-col">
         <FilePreview
-          :workspace="workspace"
+          :root-path="rootPath"
           :rel-path="selectedPath"
           @close="selectedPath = null"
         />
