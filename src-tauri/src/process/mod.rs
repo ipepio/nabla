@@ -757,6 +757,12 @@ const FORWARDED_ENV_EXACT: &[&str] = &[
     "SYSTEMROOT",
     "NODE_PATH",
     "COLORTERM",
+    // pi's agent directory. Without it the child falls back to ~/.pi/agent, which
+    // may not be where the user's pi keeps mcp.json, auth.json or models.json —
+    // the symptom is an MCP list that answers "no servers configured" while the
+    // user's own terminal sees them. Forwarding it also makes sessions and CLI
+    // commands read the same configuration the user's pi reads.
+    "PI_CODING_AGENT_DIR",
     "OPENAI_API_KEY",
     "CLAUDE_CODE_USE_VERTEX",
     "CLOUD_ML_REGION",
@@ -1180,6 +1186,11 @@ sleep 30
         assert!(names.contains(&"PATH"));
         assert!(names.contains(&"HOME"));
         assert!(names.contains(&"NODE_PATH"));
+        // The user's agent dir must travel with the child, or it reads another
+        // pi's configuration (the MCP list came back empty without it).
+        assert!(names.contains(&"PI_CODING_AGENT_DIR"));
+        // But never our own session identity: the child must not inherit it.
+        assert!(!names.contains(&"PI_SESSION_FILE"));
         assert!(names.contains(&"ANTHROPIC_API_KEY"));
         assert!(names.contains(&"GOOGLE_CLOUD_PROJECT"));
         assert!(names.contains(&"OPENAI_API_KEY"));
