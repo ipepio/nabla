@@ -16,24 +16,38 @@ const rememberedToolId = ref<ToolId>(DEFAULT_TOOL_ID);
 // the active tool. The tools themselves come from `registry.ts`, so a new tool is
 // one entry there and never an edit to this file.
 //
+// S5 of the same document: the strip is the tools the human enabled in Settings
+// (`enabledTools`), never the whole registry. The filter lives in `registry.ts`
+// (`visibleTools`) and is applied here on every render of the shared ref, so a
+// flip in the dialog removes or adds a tab of an already-open drawer without a
+// reload. A tool that is off is not mounted, which is also what keeps the
+// terminal from opening a shell nobody asked for.
+//
 // The tool is remounted with `key` = (tool, workspace), which is what makes
 // switching workspaces RE-READ the folder or the working tree instead of showing
-// the previous workspace's data.
+// the previous workspace's data — and what closes a shell when the workspace
+// changes, because unmounting the terminal is what ends its session.
 import { computed } from "vue";
 import type { WorkspaceInfo } from "@/contracts/types";
 import { t } from "@/lib/i18n";
-import { TOOLS, type ToolDefinition } from "./registry";
+import { enabledTools } from "@/lib/preferences";
+import { visibleTools, type ToolDefinition } from "./registry";
 
 defineProps<{ workspace: WorkspaceInfo | null }>();
 
 const activeId = rememberedToolId;
 
+/** S5: the enabled tools, in registry order. */
+const tools = computed<ToolDefinition[]>(() =>
+  visibleTools(enabledTools.value),
+);
+
 /**
- * The active entry, or the first one when the remembered id is no longer in the
- * registry (a tool can disappear between releases).
+ * The active entry, or the first enabled one when the remembered id is gone —
+ * because the human disabled it, or because a release dropped it.
  */
 const activeTool = computed<ToolDefinition | null>(
-  () => TOOLS.find((tool) => tool.id === activeId.value) ?? TOOLS[0] ?? null,
+  () => tools.value.find((tool) => tool.id === activeId.value) ?? tools.value[0] ?? null,
 );
 
 function selectTool(tool: ToolDefinition): void {
@@ -48,13 +62,13 @@ function selectTool(tool: ToolDefinition): void {
       drawer instead of wrapping, so the strip keeps a single compact row.
     -->
     <div
-      v-if="TOOLS.length > 0"
+      v-if="tools.length > 0"
       role="tablist"
       :aria-label="t('tools.tabs')"
       class="flex shrink-0 items-center gap-1 border-b px-1.5 py-1.5"
     >
       <button
-        v-for="tool in TOOLS"
+        v-for="tool in tools"
         :key="tool.id"
         type="button"
         role="tab"

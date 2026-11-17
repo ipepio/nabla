@@ -212,6 +212,14 @@ export interface AppSettings {
    * preference existed behaves like a fresh install.
    */
   queueMessages: boolean;
+  /**
+   * S5 of `odd/tasks/tool-drawer-and-mcp.md`: which drawer tools are offered,
+   * by id (`files`, `changes`, `terminal`, `browser`). Rust defaults the field to
+   * `["files", "changes"]`, so the two read-only tools are on and the two that
+   * run code are opt-in. An id this build does not know is simply never matched
+   * by the registry, so enabling a future tool early changes nothing.
+   */
+  enabledTools: string[];
 }
 
 /**
@@ -425,6 +433,44 @@ export interface McpAddDraft {
   headers?: McpKeyValue[];
   /** http only: the variable pi reads for `Authorization: Bearer`. */
   bearerTokenEnvVar?: string | null;
+}
+
+// ── shell sessions (F2 of `odd/tasks/tool-drawer-and-mcp.md`) ───────────────
+
+/**
+ * What `shell_open` returns: the id the other shell commands take, the pid of the
+ * child the PTY owns, and the executable that was spawned (the human's login
+ * shell, or `$SHELL`). Mirrors `ShellSession` in `src-tauri/src/shell.rs`.
+ */
+export interface ShellSession {
+  sessionId: string;
+  /**
+   * Session leader of the PTY, when the platform reports one: `null` when it does
+   * not. Informational only — the tab never needs it to drive the shell.
+   */
+  pid: number | null;
+  /** Path or name of the shell the PTY runs; informational only. */
+  shell: string;
+}
+
+/**
+ * The two things a shell session reports: `data` is a chunk of the child's output
+ * exactly as it came off the PTY (no line splitting — the emulator needs the raw
+ * bytes to render carriage returns and colours), `exit` is the child leaving.
+ */
+export type ShellOutputStream = "data" | "exit";
+
+/**
+ * Payload of the Tauri event `shell-output` (F2). `data` is present only on
+ * `data`, and `exitCode` only on `exit`, and only when the child left on its own
+ * (a killed child has no code). Mirrors `ShellOutputEvent` in
+ * `src-tauri/src/shell.rs`.
+ */
+export interface ShellOutputEvent {
+  sessionId: string;
+  stream: ShellOutputStream;
+  data?: string;
+  exitCode?: number;
 }
 
 // ── workspace files (F1 of `odd/tasks/tool-drawer-and-mcp.md`) ───────────────

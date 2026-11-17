@@ -27,6 +27,8 @@ import type {
   SessionDto,
   SessionStatusDto,
   SessionSummary,
+  ShellOutputEvent,
+  ShellSession,
   TranscriptMessage,
   WorkspaceInfo,
 } from "./types";
@@ -479,6 +481,69 @@ export function mcpLogout(
  */
 export function mcpFilePath(scope: McpScope): Promise<string> {
   return invoke<string>("mcp_file_path", { scope });
+}
+
+// ── shell sessions (F2 of `odd/tasks/tool-drawer-and-mcp.md`) ───────────────
+
+/**
+ * F2/S5: starts a real shell inside one workspace. Rust spawns it on a PTY with
+ * `cwd = workspace` and answers the session id every other shell call takes; the
+ * child's output arrives on the `shell-output` event, never in this answer.
+ *
+ * `workspace` is the absolute path the drawer received from the store, so the
+ * shell opens where the active workspace is, with no directory guessing here.
+ */
+export function createShell(payload: {
+  workspace: string;
+}): Promise<ShellSession> {
+  return invoke<ShellSession>("shell_open", { workspace: payload.workspace });
+}
+
+/**
+ * F2: writes raw keystrokes to the shell's stdin. `data` is exactly what the
+ * emulator produced (a printable run, a control byte, a pasted block), so no
+ * newline is appended and nothing is escaped. `false` means the session is gone
+ * or already finished, which is not an error.
+ */
+export function writeShell(sessionId: string, data: string): Promise<boolean> {
+  return invoke<boolean>("shell_write", { sessionId, data });
+}
+
+/**
+ * F2: tells the PTY its new size, in character cells, so full-screen programs
+ * (`vim`, `top`) draw at the size the drawer is showing. `false` means the
+ * session is gone, which is not an error.
+ */
+export function resizeShell(
+  sessionId: string,
+  cols: number,
+  rows: number,
+): Promise<boolean> {
+  return invoke<boolean>("shell_resize", { sessionId, cols, rows });
+}
+
+/**
+ * F2: kills the shell and forgets the session. Idempotent: `false` means there
+ * was nothing left to close, so teardown never has to guess whether it already
+ * ran.
+ */
+export function closeShell(sessionId: string): Promise<boolean> {
+  return invoke<boolean>("shell_close", { sessionId });
+}
+
+/**
+ * F2: subscribes to the `shell-output` stream. One listener serves every session,
+ * so the caller filters by its own `sessionId`; the listener lives here because
+ * no component imports the Tauri API directly (contract-seam rule, AGENTS.md 1).
+ * Resolves with an unsubscribe function: call it on unmount or it keeps receiving
+ * events after teardown.
+ */
+export async function subscribeShellOutput(
+  handler: (event: ShellOutputEvent) => void,
+): Promise<() => void> {
+  return listen<ShellOutputEvent>("shell-output", ({ payload }) => {
+    handler(payload);
+  });
 }
 
 // ── pi runtime seam (R3, R4) ─────────────────────────────────────────────────

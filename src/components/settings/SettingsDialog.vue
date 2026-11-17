@@ -118,10 +118,13 @@ import { Separator } from "@/components/ui/separator";
 import { useAppearance } from "@/lib/appearance";
 import {
   applyPreferences,
+  isToolEnabled,
   queueMessages,
   setQueueMessages,
   setShowReasoning,
+  setToolEnabled,
   showReasoning,
+  type ToolPreferenceId,
 } from "@/lib/preferences";
 import { useI18n, type Locale, type MessageKey } from "@/lib/i18n";
 import {
@@ -464,6 +467,52 @@ function handleShowReasoning(next: boolean) {
 /** S3: the "Queue messages" switch, same pattern as the reasoning one. */
 function handleQueueMessages(next: boolean) {
   void setQueueMessages(next);
+}
+
+/**
+ * S5 of `tool-drawer-and-mcp.md`: the drawer switches, in the order the pane
+ * lists them. Files and Changes are read-only views; Terminal and Browser run
+ * code, so each of those two carries the warning shown while it is on. Browser
+ * has no tab yet (F3), and the switch is still offered because the preference is
+ * what F3 will read — the description says so instead of pretending otherwise.
+ */
+const TOOL_SWITCHES: {
+  id: ToolPreferenceId;
+  labelKey: MessageKey;
+  descriptionKey: MessageKey;
+  warningKey?: MessageKey;
+}[] = [
+  {
+    id: "files",
+    labelKey: "settings.general.tools.files",
+    descriptionKey: "settings.general.tools.files.description",
+  },
+  {
+    id: "changes",
+    labelKey: "settings.general.tools.changes",
+    descriptionKey: "settings.general.tools.changes.description",
+  },
+  {
+    id: "terminal",
+    labelKey: "settings.general.tools.terminal",
+    descriptionKey: "settings.general.tools.terminal.description",
+    warningKey: "settings.general.tools.terminal.warning",
+  },
+  {
+    id: "browser",
+    labelKey: "settings.general.tools.browser",
+    descriptionKey: "settings.general.tools.browser.description",
+    warningKey: "settings.general.tools.browser.warning",
+  },
+];
+
+/**
+ * S5: one switch, one write. The shared setter updates the live list first — the
+ * open drawer gains or drops the tab immediately — and persists the normalized
+ * list through the same read-merge-save path as every other preference.
+ */
+function handleToolToggle(id: ToolPreferenceId, next: boolean) {
+  void setToolEnabled(id, next);
 }
 
 /**
@@ -875,8 +924,67 @@ watch(open, (isOpen) => {
               </div>
             </section>
 
-            <!-- One separator only: the two appearance-flavoured blocks above |
-                 Language. The configuration block that used to sit here was
+            <!-- S5 of `tool-drawer-and-mcp.md`: the drawer's tools. One row per
+                 tool: label, description and — for the two that execute code —
+                 a warning that only appears while the tool is ON, so the risk is
+                 stated exactly when it is being accepted. Each switch reads the
+                 shared `enabledTools` ref, so the drawer follows without a
+                 reload. -->
+            <section class="space-y-3">
+              <div class="min-w-0">
+                <h3 class="text-sm font-medium">
+                  {{ t("settings.general.tools") }}
+                </h3>
+                <p class="mt-0.5 text-xs text-muted-foreground">
+                  {{ t("settings.general.tools.description") }}
+                </p>
+              </div>
+
+              <div
+                v-for="tool in TOOL_SWITCHES"
+                :key="tool.id"
+                class="flex items-start justify-between gap-4"
+              >
+                <div class="min-w-0">
+                  <p class="text-sm">
+                    {{ t(tool.labelKey) }}
+                  </p>
+                  <p class="mt-0.5 text-xs text-muted-foreground">
+                    {{ t(tool.descriptionKey) }}
+                  </p>
+                  <p
+                    v-if="tool.warningKey && isToolEnabled(tool.id)"
+                    class="mt-0.5 text-xs text-warning"
+                  >
+                    {{ t(tool.warningKey) }}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  :aria-checked="isToolEnabled(tool.id)"
+                  :aria-label="t(tool.labelKey)"
+                  :class="[
+                    'relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                    isToolEnabled(tool.id) ? 'bg-primary' : 'bg-input',
+                  ]"
+                  @click="handleToolToggle(tool.id, !isToolEnabled(tool.id))"
+                >
+                  <span
+                    :class="[
+                      'size-4 rounded-full bg-background shadow-sm transition-transform',
+                      isToolEnabled(tool.id)
+                        ? 'translate-x-4.5'
+                        : 'translate-x-0.5',
+                    ]"
+                    aria-hidden="true"
+                  />
+                </button>
+              </div>
+            </section>
+
+            <!-- One separator only: the blocks above | Language. The
+                 configuration block that used to sit here was
                  redundant with the single "open configuration file" action at
                  the end of the pane. -->
             <Separator />
