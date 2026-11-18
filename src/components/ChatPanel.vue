@@ -728,7 +728,16 @@ async function handleSelectModel(choice: { provider: string; model: string }) {
  */
 async function handleSend() {
   const text = prompt.value.trim();
-  if (text === "" || agentWorking.value) return;
+  if (text === "") return;
+  // S3: with the queue preference on, a prompt typed while the agent works is
+  // queued instead of dropped. The guard used to return here for both cases,
+  // which silently discarded what the human had just typed — the toggle said
+  // "Encolar mensajes" and this path ignored it. The queue is the same one the
+  // explicit action fills, so a queued prompt looks and drains the same way.
+  if (agentWorking.value) {
+    if (queueMessages.value) handleQueue();
+    return;
+  }
   sending.value = true;
   panelError.value = null;
   try {
