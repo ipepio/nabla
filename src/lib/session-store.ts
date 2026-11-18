@@ -70,6 +70,14 @@ export interface QueuedPrompt {
   id: string;
   /** What pi will receive when the queue drains. */
   text: string;
+  /**
+   * The prompt was typed before its pi process existed (`spawning`), so it waits
+   * for the process, not for a turn. It is the one entry a drain may send with
+   * the queue preference off: waiting for a process that does not exist yet is
+   * never optional, while waiting for a working agent is the preference's own
+   * decision.
+   */
+  awaitingProcess: boolean;
 }
 
 /**
@@ -244,8 +252,18 @@ export function isTranscriptLoading(sessionId: string | null): boolean {
 
 // ── live-process bookkeeping (L4) ────────────────────────────────────────────
 
+/**
+ * Whether a status has an addressable process behind it: pi exists and its stdin
+ * is there, so a prompt can be handed to it (S1).
+ *
+ * `spawning` is deliberately *not* live. Creating a session now answers
+ * `spawning` immediately and the process is not registered yet, so the row must
+ * not wear the live dot before something live exists — the dot arrives with
+ * `ready`, from the same event stream it has always read. A prompt typed in the
+ * meantime waits in the session's queue (see `drainQueue`).
+ */
 function isLive(status: RuntimeStatus): boolean {
-  return status === "spawning" || status === "ready" || status === "running";
+  return status === "ready" || status === "running";
 }
 
 function markLive(sessionId: string, status: RuntimeStatus): void {
@@ -486,13 +504,32 @@ export function enqueuePrompt(
   // Queueing does not enter the conversation: the prompt lives in the queue
   // strip above the composer until it is actually handed to pi, which is the
   // moment it becomes a turn in the transcript.
-  buffer.queue.push({ id: nextMessageId(sessionId), text: prompt });
+  buffer.queue.push({
+    id: nextMessageId(sessionId),
+    text: prompt,
+    // Why it waits decides what may drain it: a session that is still spawning
+    // has no stdin yet, which is not something the preference can switch off.
+    awaitingProcess: buffer.status === "spawning",
+  });
 }
 
 /** How many prompts of one session are waiting; `0` when there are none. */
 export function queuedCount(sessionId: string | null): number {
   if (sessionId === null) return 0;
   return sessions.get(sessionId)?.queue.length ?? 0;
+}
+
+/**
+ * The session exists but its pi is not addressable yet: `start_session` answered
+ * `spawning` and the process has not reported `ready` (S1, S4).
+ *
+ * A prompt typed now cannot be sent — pi's stdin does not exist — so it goes to
+ * the session's own queue instead, which drains the moment the process is live.
+ * The panel asks this to make that decision in one place, next to the state it
+ * reads.
+ */
+export function isSessionSpawning(sessionId: string | null): boolean {
+  return sessionBuffer(sessionId)?.status === "spawning";
 }
 
 /**
@@ -547,12 +584,20 @@ export function removeQueuedPrompt(
  * second event would drain the next entry while the first is still in flight —
  * two prompts into one process turn. A second entry then waits for the turn its
  * predecessor really starts, which is the "one per turn end" this owns.
+ *
+ * Two events drain: a finished turn (the usual one) and the process becoming
+ * live, which is what releases a prompt typed while pi was still spawning.
+ * Which of the two releases an entry is decided by why it was queued: the queue
+ * preference governs prompts waiting for a turn, never prompts waiting for the
+ * process itself (see `QueuedPrompt.awaitingProcess`).
  */
 function drainQueue(sessionId: string, buffer: SessionBuffer): void {
-  if (!queueMessages.value) return;
   if (draining.has(sessionId)) return;
   const workspaceId = buffer.workspaceId;
   if (workspaceId === null) return;
+  const head = buffer.queue[0];
+  if (head === undefined) return;
+  if (!queueMessages.value && !head.awaitingProcess) return;
   const next = buffer.queue.shift();
   if (next === undefined) return;
   // Belt to the guard above: an entry that was already handed to pi is never
@@ -692,16 +737,26 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
       // the session list re-reads and the row moves up now, instead of waiting
       // for the next poll tick.
       sessionGeneration.value += 1;
-      // S3: the finished turn is the only moment a queued prompt is sent, so
-      // nothing ever talks to pi while it is working. Flushing first keeps the
-      // conversation in order: the answer lands above the next question.
+      // S3: a finished turn releases the next queued prompt, so nothing ever
+      // talks to pi while it is working. Flushing first keeps the conversation
+      // in order: the answer lands above the next question. This is one of the
+      // two drains; the other is the process becoming live (see `drainQueue`).
       drainQueue(sessionId, buffer);
       return;
-    case "process_status":
+    case "process_status": {
+      const previous = buffer.status;
       buffer.status = event.status;
       buffer.error = event.error ?? null;
       markLive(sessionId, event.status);
+      // A prompt typed while pi was still booting waits in the queue (its stdin
+      // does not exist yet). The transition into a live process is what drains
+      // it, so the prompt the human typed into a session that was still starting
+      // goes out on its own instead of waiting for a turn that never began.
+      if (previous !== event.status && isLive(event.status)) {
+        drainQueue(sessionId, buffer);
+      }
       return;
+    }
     case "process_exit":
       buffer.exitCode = event.code ?? null;
       liveIds.value = liveIds.value.filter((id) => id !== sessionId);
@@ -905,6 +960,11 @@ export async function selectSession(session: SessionSummary): Promise<void> {
   const open = (async () => {
     const live = await refreshLiveSessions();
     if (live.includes(sessionId)) return;
+    // A session this app has only just created is still booting: its spawn is
+    // already on its way, so opening it again would start a second pi for one
+    // session. The runtime registers the process before it reports `ready`, so
+    // anything it reports as live is caught by the check above.
+    if (isSessionSpawning(sessionId)) return;
     try {
       const opened = await openSession(sessionId);
       // The runtime's answer carries the workspace too; recording it here keeps
@@ -930,6 +990,13 @@ export async function selectSession(session: SessionSummary): Promise<void> {
  * drawer's button and the composer's first send both land here, so pi is never
  * spawned twice for one intent.
  *
+ * It returns as soon as the index row exists: `start_session` answers `spawning`
+ * and boots pi behind that answer (`mostrar el chat y que arranque por detrás`),
+ * so the composer is usable immediately instead of after the readiness probe. No
+ * process is live yet, so the buffer is not marked live and no green dot is
+ * claimed; the runtime's `ready` event arrives through the one subscription and
+ * drains whatever the human typed in the meantime.
+ *
  * Failures propagate to the caller: each caller owns the surface it renders the
  * message on, and this module never invents UI state.
  */
@@ -938,7 +1005,12 @@ export async function newSession(workspaceId: number): Promise<SessionDto> {
   const buffer = ensureBuffer(started.sessionId, workspaceId);
   buffer.status = started.status;
   buffer.error = null;
+  // `spawning` is not live: nothing is registered under this key yet, so the
+  // drawer keeps its dot off until the process really exists.
   markLive(started.sessionId, started.status);
+  // The event stream must be up before the process is: the `ready` transition
+  // that drains a prompt typed right now arrives through it.
+  void ensureSessionEvents();
   // A session created here has no earlier conversation to read back.
   transcriptSeeded.add(started.sessionId);
   activeSession.value = started;

@@ -58,6 +58,7 @@ import {
   activeSession,
   ensureSessionEvents,
   enqueuePrompt,
+  isSessionSpawning,
   isTranscriptLoading,
   newSession,
   queuedCount,
@@ -717,6 +718,13 @@ async function handleSelectModel(choice: { provider: string; model: string }) {
  * both back if the send does not land. That is why nothing here appends a turn
  * itself: the store owns the conversation, and a failed send must not leave a
  * question pi never received in it.
+ *
+ * The one exception is a session whose pi is still starting. Creating one now
+ * answers `spawning` at once, but pi's stdin does not exist until its process is
+ * ready, so sending would only be refused. The prompt takes the queue path
+ * instead — the same queue a working agent uses, never a second one — and the
+ * store sends it the moment the process reports live. That is what makes the
+ * composer usable in the same instant the session appears.
  */
 async function handleSend() {
   const text = prompt.value.trim();
@@ -726,6 +734,11 @@ async function handleSend() {
   try {
     const current = await ensureSession();
     if (current === null) return;
+    if (isSessionSpawning(current.sessionId)) {
+      enqueuePrompt(current.sessionId, text, current.workspaceId);
+      prompt.value = "";
+      return;
+    }
     await sendUserTurn(current.sessionId, current.workspaceId, text);
     prompt.value = "";
   } catch (cause) {
