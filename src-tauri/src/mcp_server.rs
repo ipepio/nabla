@@ -6,9 +6,9 @@
 //! view the human is looking at (`odd/tasks/webview-control.md`, S1-S2).
 //!
 //! The shape is deliberately boring. A local HTTP endpoint speaks MCP's
-//! *streamable HTTP* binding over JSON-RPC 2.0, exposes two tools for now, and
-//! each tool calls the same driver the UI's commands call. No new protocol, no
-//! second browser: the agent drives the page the human already sees.
+//! *streamable HTTP* binding over JSON-RPC 2.0, exposes the tools a browser agent
+//! needs, and each tool calls the same driver the UI's commands call. No new
+//! protocol, no second browser: the agent drives the page the human already sees.
 //!
 //! ```text
 //! pi ──POST /mcp (JSON-RPC)──▶ this module ──WebviewDriver──▶ embed::EmbedSessions
@@ -124,15 +124,24 @@ pub fn dispatch(driver: &dyn WebviewDriver, request: &Value) -> Option<Value> {
 
 /// `tools/call`: resolve the view, run the tool, and turn its outcome into
 /// content the model reads — including failures.
+///
+/// Every tool but `list_targets` acts on one view, so resolution happens once,
+/// before the tool runs. `list_targets` is the tool whose *answer* is the
+/// registry: an empty list is a valid reply, not a failure, so it never
+/// resolves a view.
 fn call_tool(driver: &dyn WebviewDriver, id: &Value, params: &Value) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    if !matches!(name, "navigate" | "eval") {
+    if !TOOL_NAMES.contains(&name) {
         return error(id, -32602, &format!("unknown tool `{name}`"));
     }
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
     let asked_view = arguments.get("viewId").and_then(Value::as_str);
 
     let views = driver.views();
+    if name == "list_targets" {
+        return tool_result(id, &targets_text(&views), false);
+    }
+
     let view = match resolve_view(&views, asked_view) {
         Ok(view) => view,
         Err(message) => return tool_result(id, &message, true),
@@ -140,27 +149,164 @@ fn call_tool(driver: &dyn WebviewDriver, id: &Value, params: &Value) -> Value {
 
     let outcome = match name {
         "navigate" => {
-            let url = arguments.get("url").and_then(Value::as_str).unwrap_or("");
-            if url.is_empty() {
+            let Some(url) = argument(&arguments, "url") else {
                 return error(id, -32602, "navigate needs a `url` argument");
-            }
+            };
             driver
                 .navigate(&view.id, url)
                 .map(|()| format!("navigated `{}` to {url}", view.id))
         }
-        _ => {
-            let script = arguments.get("script").and_then(Value::as_str).unwrap_or("");
-            if script.is_empty() {
+        "eval" => {
+            let Some(script) = argument(&arguments, "script") else {
                 return error(id, -32602, "eval needs a `script` argument");
-            }
+            };
             driver.eval(&view.id, script)
         }
+        // The url the registry holds for this view: the agent's own navigation
+        // is not the only way it changes, so the page is never asked.
+        "get_url" => Ok(view.url.clone()),
+        "get_title" => driver.eval(&view.id, TITLE_SCRIPT),
+        "click" => {
+            let Some(selector) = argument(&arguments, "selector") else {
+                return error(id, -32602, "click needs a `selector` argument");
+            };
+            run_script(driver, view, &click_script(selector))
+        }
+        "type" => {
+            let Some(selector) = argument(&arguments, "selector") else {
+                return error(id, -32602, "type needs a `selector` argument");
+            };
+            // An empty text is a request to clear the field, which is a real
+            // thing to do, so only a missing or non-string one is refused.
+            let Some(text) = arguments.get("text").and_then(Value::as_str) else {
+                return error(id, -32602, "type needs a `text` argument");
+            };
+            run_script(driver, view, &type_script(selector, text))
+        }
+        "back" => history(driver, view, "history.back()", "went back one history entry"),
+        "forward" => history(
+            driver,
+            view,
+            "history.forward()",
+            "went forward one history entry",
+        ),
+        "reload" => history(driver, view, "location.reload()", "reloaded the page"),
+        other => unreachable!("`{other}` is in TOOL_NAMES and has no arm"),
     };
 
     match outcome {
         Ok(text) => tool_result(id, &text, false),
         Err(message) => tool_result(id, &message, true),
     }
+}
+
+/// A non-empty string argument, or `None`. An empty one is treated as absent:
+/// it would reach the page as a selector that matches nothing.
+fn argument<'a>(arguments: &'a Value, key: &str) -> Option<&'a str> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+/// Runs one generated script and keeps its answer.
+///
+/// A page that cannot satisfy the request says so *inside* the script, as
+/// `{"error": "..."}`, instead of throwing: `eval_with_callback` ignores an
+/// exception (Tauri documents the limitation), so a throw would cost the whole
+/// timeout and deliver no message. The failure is unpacked here, where it becomes
+/// an `isError` result the model can read and retry.
+fn run_script(
+    driver: &dyn WebviewDriver,
+    view: &LiveView,
+    script: &str,
+) -> Result<String, String> {
+    let answer = driver.eval(&view.id, script)?;
+    match serde_json::from_str::<Value>(&answer) {
+        Ok(value) => match value.get("error").and_then(Value::as_str) {
+            Some(message) => Err(message.to_string()),
+            None => Ok(answer),
+        },
+        Err(_) => Ok(answer),
+    }
+}
+
+/// One of the three history moves, which answer their own confirmation: the
+/// platform serializes `history.back()` as `null`, which tells the model nothing.
+fn history(
+    driver: &dyn WebviewDriver,
+    view: &LiveView,
+    script: &str,
+    done: &str,
+) -> Result<String, String> {
+    driver.eval(&view.id, script).map(|_| done.to_string())
+}
+
+/// The page's own title, read where the page is.
+const TITLE_SCRIPT: &str = "document.title";
+
+/// A model-supplied string as a JavaScript string literal.
+///
+/// `serde_json`'s string syntax is a subset of JavaScript's, so its output is a
+/// literal that cannot be closed early: a selector or a text holding `"`, `\\` or
+/// a newline is escaped, never spliced in raw. This is the one place where the
+/// model's text becomes code, so it is the one place that must not concatenate.
+fn json_literal(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// Clicks the first element matching `selector`, after bringing it into view.
+///
+/// Scrolling first is not politeness: a programmatic click on an element nobody
+/// can see is where a "it worked" answer hides a page that never moved.
+fn click_script(selector: &str) -> String {
+    format!(
+        r#"(() => {{
+  const selector = {literal};
+  const element = document.querySelector(selector);
+  if (!element) {{
+    return {{ error: "nothing matches the selector " + selector }};
+  }}
+  element.scrollIntoView({{ block: "center", inline: "center" }});
+  element.click();
+  return {{ clicked: true }};
+}})()"#,
+        literal = json_literal(selector)
+    )
+}
+
+/// Types `text` into the first element matching `selector`.
+///
+/// The value goes through the **native setter**: assigning `element.value`
+/// updates the DOM and leaves React's and Vue's own state behind, so the next
+/// render puts the old value back. Dispatching `input` and `change`, both
+/// bubbling, is what makes the framework's listener see the edit. Focus comes
+/// first because a field that is not focused does not look typed in either.
+fn type_script(selector: &str, text: &str) -> String {
+    format!(
+        r#"(() => {{
+  const selector = {selector};
+  const text = {text};
+  const element = document.querySelector(selector);
+  if (!element) {{
+    return {{ error: "nothing matches the selector " + selector }};
+  }}
+  const prototype = element instanceof HTMLTextAreaElement
+    ? HTMLTextAreaElement.prototype
+    : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+  if (!setter) {{
+    return {{ error: "not a text field: " + selector }};
+  }}
+  element.focus();
+  setter.call(element, text);
+  element.dispatchEvent(new Event("input", {{ bubbles: true }}));
+  element.dispatchEvent(new Event("change", {{ bubbles: true }}));
+  return {{ typed: true }};
+}})()"#,
+        selector = json_literal(selector),
+        text = json_literal(text)
+    )
 }
 
 /// Which view a tool acts on: the named one, or the only one open.
@@ -192,13 +338,48 @@ fn open_views(views: &[LiveView]) -> String {
     }
     views
         .iter()
-        .map(|view| format!("{} ({})", view.id, view.url))
+        .map(describe)
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-/// The two tools of T1. The schemas are what the model sees, so every field is
+/// One line per view, the shape `list_targets` and every "open now" message
+/// share, so the agent reads the same thing wherever it looks.
+fn describe(view: &LiveView) -> String {
+    format!("{} ({})", view.id, view.url)
+}
+
+/// The registry as a tool answer: `id (url)` per line. An empty registry is an
+/// answer, not an error — the tool's whole job is to report it.
+fn targets_text(views: &[LiveView]) -> String {
+    if views.is_empty() {
+        return "no browser view is open; ask the human to open the browser pane first".to_string();
+    }
+    views.iter().map(describe).collect::<Vec<_>>().join("\n")
+}
+
+/// Every tool this server offers, in catalog order. Kept as data so a name that
+/// is listed but not dispatched (or the reverse) fails a test instead of the
+/// model's next call.
+const TOOL_NAMES: [&str; 10] = [
+    "navigate",
+    "eval",
+    "get_url",
+    "get_title",
+    "click",
+    "type",
+    "back",
+    "forward",
+    "reload",
+    "list_targets",
+];
+
+/// The catalog. The schemas are what the model sees, so every field is
 /// described: a bare `{"type":"object"}` makes the model guess.
+///
+/// `required` is declared on all ten and empty on the six tools that genuinely
+/// demand nothing (`viewId` is the common case omitted), because a schema that
+/// lies about its inputs is worse than one with an empty list.
 fn tool_catalog() -> Vec<Value> {
     vec![
         json!({
@@ -234,6 +415,132 @@ fn tool_catalog() -> Vec<Value> {
                     }
                 },
                 "required": ["script"]
+            }
+        }),
+        json!({
+            "name": "get_url",
+            "description": "The url the browser view is showing, as the app's own registry knows it. \
+                            Costs no script in the page.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "viewId": {
+                        "type": "string",
+                        "description": "Which view, when more than one is open. Omit for the only one."
+                    }
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "get_title",
+            "description": "The page's own title (`document.title`) of the browser view.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "viewId": {
+                        "type": "string",
+                        "description": "Which view, when more than one is open. Omit for the only one."
+                    }
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "click",
+            "description": "Click the first element matching a CSS selector, scrolling it into view first. \
+                            Fails with a message naming the selector when nothing matches — the page \
+                            may still be loading, so retrying after a moment is reasonable.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector of the element to click."
+                    },
+                    "viewId": {
+                        "type": "string",
+                        "description": "Which view, when more than one is open. Omit for the only one."
+                    }
+                },
+                "required": ["selector"]
+            }
+        }),
+        json!({
+            "name": "type",
+            "description": "Type text into the first element matching a CSS selector, the way a human \
+                            would: the value goes through the native setter and `input` and `change` \
+                            fire, so controlled React and Vue inputs update. Use `eval` for anything else.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector of the field to type into."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "What to type. An empty string clears the field."
+                    },
+                    "viewId": {
+                        "type": "string",
+                        "description": "Which view, when more than one is open. Omit for the only one."
+                    }
+                },
+                "required": ["selector", "text"]
+            }
+        }),
+        json!({
+            "name": "back",
+            "description": "Go back one entry in the history of the browser view.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "viewId": {
+                        "type": "string",
+                        "description": "Which view, when more than one is open. Omit for the only one."
+                    }
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "forward",
+            "description": "Go forward one entry in the history of the browser view.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "viewId": {
+                        "type": "string",
+                        "description": "Which view, when more than one is open. Omit for the only one."
+                    }
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "reload",
+            "description": "Reload the page in the browser view.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "viewId": {
+                        "type": "string",
+                        "description": "Which view, when more than one is open. Omit for the only one."
+                    }
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "list_targets",
+            "description": "List the open browser views, one `id (url)` per line. Use it when a call \
+                            needs a `viewId`. An empty list is a normal answer: it means no view is \
+                            open, and the human has to open the browser pane.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": []
             }
         }),
     ]
@@ -399,24 +706,44 @@ mod tests {
         assert_eq!(dispatch(&driver, &notification), None);
     }
 
-    // S1: the model discovers what it can do, with a schema it can fill.
+    // S1: the model discovers everything it can drive, with a schema it can fill.
+    // Every tool declares `required`; it is empty exactly where the design gives
+    // the tool no mandatory argument (the registry and the view's own history are
+    // the whole input), and that emptiness is asserted, not skipped.
     #[test]
-    fn tools_list_exposes_navigate_and_eval_with_schemas() {
+    fn tools_list_exposes_the_whole_catalog_with_schemas() {
         let driver = FakeDriver::one();
         let answer = dispatch(&driver, &request("tools/list", json!({}))).expect("answer");
         let tools = answer["result"]["tools"].as_array().expect("tools array");
 
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-        assert_eq!(names, vec!["navigate", "eval"]);
+        assert_eq!(names, TOOL_NAMES.to_vec());
         for tool in tools {
-            assert_eq!(tool["inputSchema"]["type"], "object");
+            assert_eq!(tool["inputSchema"]["type"], "object", "{}", tool["name"]);
             assert!(
-                tool["inputSchema"]["required"].as_array().is_some_and(|r| !r.is_empty()),
-                "a tool without a required argument makes the model guess"
+                tool["inputSchema"]["required"].as_array().is_some(),
+                "{} must declare required, even when it is empty",
+                tool["name"]
             );
         }
-        assert_eq!(tools[0]["inputSchema"]["required"], json!(["url"]));
-        assert_eq!(tools[1]["inputSchema"]["required"], json!(["script"]));
+
+        let required = |name: &str| -> Value {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is not in the catalog"));
+            tool["inputSchema"]["required"].clone()
+        };
+        assert_eq!(required("navigate"), json!(["url"]));
+        assert_eq!(required("eval"), json!(["script"]));
+        assert_eq!(required("click"), json!(["selector"]));
+        assert_eq!(required("type"), json!(["selector", "text"]));
+
+        // No mandatory argument, deliberately: `viewId` is the common case
+        // omitted, and list_targets answers *with* the registry.
+        for name in ["get_url", "get_title", "back", "forward", "reload", "list_targets"] {
+            assert_eq!(required(name), json!([]), "{name} takes no mandatory argument");
+        }
     }
 
     // S5: the tool reaches the view the human is looking at without the model
@@ -564,6 +891,305 @@ mod tests {
         .expect("answer");
         assert_eq!(answer["error"]["code"], -32602);
         assert!(driver.navigated.lock().unwrap().is_empty());
+
+        // The DOM tools refuse the same way, before the page is touched.
+        for (name, arguments) in [
+            ("click", json!({})),
+            ("type", json!({ "selector": "#email" })),
+        ] {
+            let answer = dispatch(
+                &driver,
+                &request("tools/call", json!({ "name": name, "arguments": arguments })),
+            )
+            .expect("answer");
+            assert_eq!(answer["error"]["code"], -32602, "{name}");
+        }
+        assert!(
+            driver.evaluated.lock().unwrap().is_empty(),
+            "no page was touched"
+        );
+    }
+
+    // S1: a selector and a text are the model's strings, and they reach an
+    // evaluator. Embedded as a JSON string literal they cannot close the literal
+    // early — quotes and backslashes are escaped, so a selector that looks like
+    // the tail of a statement stays data.
+    #[test]
+    fn a_selector_and_a_text_are_embedded_as_json_string_literals() {
+        let driver = FakeDriver::one();
+        let selector = "li[data-note=\"a\"] .body\\x";
+        let text = "say \"hi\" \\ bye";
+
+        dispatch(
+            &driver,
+            &request(
+                "tools/call",
+                json!({ "name": "click", "arguments": { "selector": selector } }),
+            ),
+        )
+        .expect("answer");
+        dispatch(
+            &driver,
+            &request(
+                "tools/call",
+                json!({ "name": "type", "arguments": { "selector": selector, "text": text } }),
+            ),
+        )
+        .expect("answer");
+
+        let evaluated = driver.evaluated.lock().unwrap().clone();
+        assert_eq!(evaluated.len(), 2);
+        let (click_view, click_script) = &evaluated[0];
+        let (type_view, type_script) = &evaluated[1];
+        assert_eq!(click_view, "embed-1");
+        assert_eq!(type_view, "embed-1");
+
+        // The escaped form the evaluator receives, decoded again, is the string
+        // the model sent — and the naive splice is not in the script.
+        let escaped = serde_json::to_string(selector).expect("a JSON literal");
+        for script in [click_script, type_script] {
+            assert!(script.contains(&escaped), "escaped literal missing: {script}");
+            assert_eq!(literal_after(script, "selector = "), selector, "{script}");
+        }
+        assert_eq!(literal_after(type_script, "text = "), text, "{type_script}");
+    }
+
+    /// The string literal a script embeds after `marker`, decoded.
+    fn literal_after(script: &str, marker: &str) -> String {
+        let tail = script
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("no `{marker}` in {script}"))
+            .1;
+        let literal = tail
+            .lines()
+            .next()
+            .expect("a line")
+            .trim_end()
+            .trim_end_matches(';');
+        serde_json::from_str::<String>(literal)
+            .unwrap_or_else(|error| panic!("`{literal}` is not one JSON string literal: {error}"))
+    }
+
+    // S1: click finds the element, brings it into view (a click on an offscreen
+    // element is what fails silently) and clicks it.
+    #[test]
+    fn click_scrolls_the_element_into_view_then_clicks_it() {
+        let mut driver = FakeDriver::one();
+        driver.eval_answer = Ok("{\"clicked\":true}".to_string());
+        let answer = dispatch(
+            &driver,
+            &request(
+                "tools/call",
+                json!({ "name": "click", "arguments": { "selector": "#go" } }),
+            ),
+        )
+        .expect("answer");
+
+        assert_eq!(answer["result"]["isError"], false);
+        assert_eq!(answer["result"]["content"][0]["text"], "{\"clicked\":true}");
+        let script = driver.evaluated.lock().unwrap()[0].1.clone();
+        for step in [
+            "document.querySelector(selector)",
+            "scrollIntoView",
+            "element.click()",
+        ] {
+            assert!(script.contains(step), "{step} missing: {script}");
+        }
+    }
+
+    // S1: a controlled input (React, Vue) only updates when the value goes
+    // through the native setter and the events its framework listens for arrive.
+    // Assigning `element.value` updates the DOM and leaves the framework behind.
+    #[test]
+    fn type_sets_the_value_through_the_native_setter_and_fires_the_events() {
+        let mut driver = FakeDriver::one();
+        driver.eval_answer = Ok("{\"typed\":true}".to_string());
+        let answer = dispatch(
+            &driver,
+            &request(
+                "tools/call",
+                json!({
+                    "name": "type",
+                    "arguments": { "selector": "#email", "text": "a@b.example" }
+                }),
+            ),
+        )
+        .expect("answer");
+
+        assert_eq!(answer["result"]["isError"], false);
+        assert_eq!(answer["result"]["content"][0]["text"], "{\"typed\":true}");
+        let script = driver.evaluated.lock().unwrap()[0].1.clone();
+        for step in [
+            "Object.getOwnPropertyDescriptor",
+            "setter.call(element, text)",
+            "new Event(\"input\", { bubbles: true })",
+            "new Event(\"change\", { bubbles: true })",
+        ] {
+            assert!(script.contains(step), "{step} missing: {script}");
+        }
+    }
+
+    // A selector nobody matches is a normal outcome the model retries: the page
+    // answers it inside the script (an exception never reaches us — Tauri ignores
+    // it) and the tool reports a failure with the message intact.
+    #[test]
+    fn a_click_the_page_cannot_satisfy_is_a_tool_error_naming_the_selector() {
+        let mut driver = FakeDriver::one();
+        driver.eval_answer = Ok("{\"error\":\"nothing matches the selector #nope\"}".to_string());
+        let page = dispatch(
+            &driver,
+            &request(
+                "tools/call",
+                json!({ "name": "click", "arguments": { "selector": "#nope" } }),
+            ),
+        )
+        .expect("answer");
+        assert!(page["error"].is_null(), "a failed tool keeps the protocol clean");
+        assert_eq!(page["result"]["isError"], true);
+        assert_eq!(
+            page["result"]["content"][0]["text"],
+            "nothing matches the selector #nope"
+        );
+
+        // A driver failure of its own is preserved verbatim.
+        let mut broken = FakeDriver::one();
+        broken.eval_answer = Err("embed-1 did not answer within 10s".to_string());
+        let answer = dispatch(
+            &broken,
+            &request(
+                "tools/call",
+                json!({ "name": "click", "arguments": { "selector": "#go" } }),
+            ),
+        )
+        .expect("answer");
+        assert_eq!(answer["result"]["isError"], true);
+        assert_eq!(
+            answer["result"]["content"][0]["text"],
+            "embed-1 did not answer within 10s"
+        );
+    }
+
+    // S5: two tools read the registry itself. A url or the list of targets costs
+    // no round trip into the page — and must not run one.
+    #[test]
+    fn get_url_and_list_targets_answer_from_the_registry_without_a_script() {
+        let driver = FakeDriver::with_views(vec![
+            LiveView { id: "embed-1".to_string(), url: "https://a.example/".to_string() },
+            LiveView {
+                id: "embed-2".to_string(),
+                url: "https://b.example/page".to_string(),
+            },
+        ]);
+
+        let url = dispatch(
+            &driver,
+            &request(
+                "tools/call",
+                json!({ "name": "get_url", "arguments": { "viewId": "embed-2" } }),
+            ),
+        )
+        .expect("answer");
+        assert_eq!(url["result"]["isError"], false);
+        assert_eq!(url["result"]["content"][0]["text"], "https://b.example/page");
+
+        let targets = dispatch(
+            &driver,
+            &request("tools/call", json!({ "name": "list_targets", "arguments": {} })),
+        )
+        .expect("answer");
+        assert_eq!(targets["result"]["isError"], false);
+        assert_eq!(
+            targets["result"]["content"][0]["text"],
+            "embed-1 (https://a.example/)\nembed-2 (https://b.example/page)"
+        );
+
+        assert!(
+            driver.evaluated.lock().unwrap().is_empty(),
+            "the registry answers, not the page"
+        );
+    }
+
+    // No view is the human's step, not a bug: the message says whose move it is.
+    // And the server does not invent a view — only the UI knows where one goes,
+    // so the honest answer is the existing one.
+    #[test]
+    fn get_url_on_an_empty_registry_asks_the_human_to_open_the_pane() {
+        let driver = FakeDriver::with_views(Vec::new());
+        let answer = dispatch(
+            &driver,
+            &request("tools/call", json!({ "name": "get_url", "arguments": {} })),
+        )
+        .expect("answer");
+
+        assert_eq!(answer["result"]["isError"], true);
+        let text = answer["result"]["content"][0]["text"].as_str().expect("text");
+        assert!(text.contains("open the browser pane"), "{text}");
+        assert!(driver.evaluated.lock().unwrap().is_empty());
+
+        // An empty list of targets is an answer, not a failure.
+        let targets = dispatch(
+            &driver,
+            &request("tools/call", json!({ "name": "list_targets", "arguments": {} })),
+        )
+        .expect("answer");
+        assert_eq!(targets["result"]["isError"], false);
+        assert!(
+            targets["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("open the browser pane")
+        );
+    }
+
+    // S1: the title is the page's own, read where the page is.
+    #[test]
+    fn get_title_reads_the_pages_own_title() {
+        let mut driver = FakeDriver::one();
+        driver.eval_answer = Ok("\"Example Domain\"".to_string());
+        let answer = dispatch(
+            &driver,
+            &request("tools/call", json!({ "name": "get_title", "arguments": {} })),
+        )
+        .expect("answer");
+
+        assert_eq!(answer["result"]["isError"], false);
+        assert_eq!(
+            answer["result"]["content"][0]["text"],
+            "\"Example Domain\""
+        );
+        assert_eq!(
+            driver.evaluated.lock().unwrap().as_slice(),
+            [("embed-1".to_string(), "document.title".to_string())]
+        );
+    }
+
+    // S1: moving through the view's own history runs in the view the human is
+    // looking at, and answers a confirmation flat enough to read.
+    #[test]
+    fn the_history_moves_and_reload_reach_the_only_open_view() {
+        let driver = FakeDriver::one();
+        for (name, message) in [
+            ("back", "went back one history entry"),
+            ("forward", "went forward one history entry"),
+            ("reload", "reloaded the page"),
+        ] {
+            let answer = dispatch(
+                &driver,
+                &request("tools/call", json!({ "name": name, "arguments": {} })),
+            )
+            .expect("answer");
+            assert_eq!(answer["result"]["isError"], false, "{name}");
+            assert_eq!(answer["result"]["content"][0]["text"], message, "{name}");
+        }
+
+        assert_eq!(
+            driver.evaluated.lock().unwrap().as_slice(),
+            [
+                ("embed-1".to_string(), "history.back()".to_string()),
+                ("embed-1".to_string(), "history.forward()".to_string()),
+                ("embed-1".to_string(), "location.reload()".to_string()),
+            ]
+        );
     }
 
     #[test]
