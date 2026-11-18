@@ -166,6 +166,14 @@ pub struct McpAddDraft {
     /// (`--bearer-token-env-var NAME`).
     #[serde(default)]
     pub bearer_token_env_var: Option<String>,
+    /// How the model reaches this server's tools (`--exposure`).
+    ///
+    /// Absent leaves pi's default, `codemode`, which declares **nothing** to the
+    /// model: those tools only exist inside codemode scripts, and the agent sees
+    /// no `mcp__<server>__<tool>` at all. A caller that wants callable tools has
+    /// to say `direct`, which is what the app's own server needs.
+    #[serde(default)]
+    pub exposure: Option<String>,
 }
 
 /// Why a draft or a call was refused. Typed and testable inside Rust; the
@@ -186,6 +194,8 @@ pub enum McpError {
     InvalidHeaderKey(String),
     /// `pi mcp login --timeout 0`: pi would give up before opening a browser.
     InvalidTimeout(u64),
+    /// An `--exposure` value outside the modes pi accepts.
+    InvalidExposure(String),
 }
 
 impl std::fmt::Display for McpError {
@@ -216,6 +226,16 @@ impl std::fmt::Display for McpError {
                 f,
                 "mcp: the login timeout must be at least 1 second, got {seconds}"
             ),
+            McpError::InvalidExposure(mode) => {
+                write!(f, "mcp: unknown exposure {mode:?}: use one of ")?;
+                for (index, expected) in EXPOSURE_MODES.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{expected}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -392,6 +412,17 @@ pub fn add_args(draft: &McpAddDraft) -> Result<Vec<String>, McpError> {
     if let Some(flag) = draft.scope.flag() {
         args.push(flag.to_string());
     }
+    // Before the transport: `--exposure` is a flag of `pi mcp add`, not of the
+    // server, so it must precede the `--` separator a stdio server uses.
+    if let Some(mode) = draft
+        .exposure
+        .as_deref()
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+    {
+        args.push("--exposure".to_string());
+        args.push(validate_exposure(mode)?.to_string());
+    }
     match draft.transport {
         McpTransport::Stdio => {
             let command = draft
@@ -521,6 +552,27 @@ pub fn file_path(home: &Path, project: &Path, scope: McpScope) -> PathBuf {
     }
 }
 
+/// The modes `pi mcp add --exposure` accepts.
+///
+/// `codemode` is pi's default and declares **nothing** to the model: the tools
+/// only exist inside codemode scripts, so an agent that was promised
+/// `mcp__<server>__<tool>` finds no such tool. `direct` is the one that makes them
+/// ordinary tools, and the reason this list is not passed through blindly.
+pub const EXPOSURE_MODES: [&str; 5] = [
+    "direct",
+    "codemode",
+    "codemode-deferred",
+    "deferred",
+    "hidden",
+];
+
+fn validate_exposure(mode: &str) -> Result<&str, McpError> {
+    match EXPOSURE_MODES.iter().find(|known| **known == mode) {
+        Some(_) => Ok(mode),
+        None => Err(McpError::InvalidExposure(mode.to_string())),
+    }
+}
+
 /// Rejects a server name that is empty, longer than `NAME_MAX_LEN` or outside
 /// `[A-Za-z0-9._-]`. The argv builders never interpolate a shell, so this is not
 /// an escaping rule: it keeps a name addressable in `pi mcp remove <name>` and
@@ -632,6 +684,7 @@ mod tests {
             url: None,
             headers: Vec::new(),
             bearer_token_env_var: None,
+            exposure: None,
         }
     }
 
@@ -897,6 +950,42 @@ mod tests {
         assert_eq!(
             add_args(&http).expect("a valid http draft"),
             strings(&["mcp", "add", "engram", "--url", "https://mcp.example.test/mcp"])
+        );
+    }
+
+    // S6 of `webview-control.md`: the mode pi uses to decide whether a tool is
+    // declared to the model at all. It goes before the `--` separator, because it
+    // is a flag of `pi mcp add` and not of the server's own argv, and a mode pi
+    // does not know is refused here instead of writing a broken registration.
+    #[test]
+    fn add_args_places_a_known_exposure_before_the_command_separator() {
+        let mut stdio = draft(McpTransport::Stdio, McpScope::Global);
+        stdio.command = Some("npx".to_string());
+        stdio.args = vec!["-y".to_string(), "some-mcp".to_string()];
+        stdio.exposure = Some("direct".to_string());
+        assert_eq!(
+            add_args(&stdio).expect("a valid stdio draft"),
+            strings(&[
+                "mcp", "add", "engram", "--exposure", "direct", "--", "npx", "-y", "some-mcp",
+            ])
+        );
+
+        // A blank mode means "say nothing", which leaves pi's default in place.
+        let mut blank = draft(McpTransport::Http, McpScope::Global);
+        blank.url = Some("https://mcp.example.test/mcp".to_string());
+        blank.exposure = Some("  ".to_string());
+        assert_eq!(
+            add_args(&blank).expect("a blank exposure is not an error"),
+            strings(&["mcp", "add", "engram", "--url", "https://mcp.example.test/mcp"])
+        );
+
+        // A mode pi does not accept never reaches its command line.
+        let mut unknown = draft(McpTransport::Http, McpScope::Global);
+        unknown.url = Some("https://mcp.example.test/mcp".to_string());
+        unknown.exposure = Some("everywhere".to_string());
+        assert_eq!(
+            add_args(&unknown),
+            Err(McpError::InvalidExposure("everywhere".to_string()))
         );
     }
 

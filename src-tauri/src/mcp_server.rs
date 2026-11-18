@@ -617,6 +617,11 @@ pub fn registration_draft(endpoint: &Endpoint) -> crate::mcp::McpAddDraft {
             key: "Authorization".to_string(),
             value: format!("Bearer {}", endpoint.token),
         }],
+        // `direct`, never pi's default `codemode`: with codemode the tools are
+        // only reachable from a codemode script and the model is told about
+        // none of them, so `mcp__nabla-browser__navigate` does not exist and the
+        // agent answers "Tool not found" while the server sits connected.
+        exposure: Some("direct".to_string()),
         bearer_token_env_var: None,
     }
 }
@@ -1360,6 +1365,8 @@ mod tests {
         assert_eq!(draft.name, SERVER_NAME);
         assert_eq!(draft.scope, crate::mcp::McpScope::Global);
         assert_eq!(draft.transport, crate::mcp::McpTransport::Http);
+        // The mode that actually declares the tools to the model.
+        assert_eq!(draft.exposure.as_deref(), Some("direct"));
 
         let argv = crate::mcp::add_args(&draft).expect("a valid registration draft");
         assert_eq!(
@@ -1368,6 +1375,8 @@ mod tests {
                 "mcp",
                 "add",
                 SERVER_NAME,
+                "--exposure",
+                "direct",
                 "--url",
                 "http://127.0.0.1:51234/mcp",
                 "--header",

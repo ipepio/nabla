@@ -449,6 +449,11 @@ export interface McpAddDraft {
   headers?: McpKeyValue[];
   /** http only: the variable pi reads for `Authorization: Bearer`. */
   bearerTokenEnvVar?: string | null;
+  /**
+   * How the model reaches the tools (`--exposure`): `direct` declares them as
+   * `mcp__<server>__<tool>`; pi's default `codemode` declares nothing.
+   */
+  exposure?: string | null;
 }
 
 // ── shell sessions (F2 of `odd/tasks/tool-drawer-and-mcp.md`) ───────────────
