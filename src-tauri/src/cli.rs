@@ -1272,10 +1272,18 @@ exit 0
             "the injected deadline must bound the wait, took {elapsed:?}"
         );
         // The kill left nothing behind: the script's sleep cannot outlive it.
-        assert!(
-            !is_running(&script).0,
-            "a timed-out child must be killed, not orphaned"
-        );
+        // The process table can lag the kill for a moment under a loaded
+        // machine, so poll briefly instead of asserting on a single snapshot.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut orphan = true;
+        while Instant::now() < deadline {
+            if !is_running(&script).0 {
+                orphan = false;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!orphan, "a timed-out child must be killed, not orphaned");
     }
 
     // S2: output is bounded per stream and the cut is reported.

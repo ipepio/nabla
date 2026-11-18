@@ -10,10 +10,13 @@
 // A fence that never closes is not an error: a stream mid-token has an open
 // fence all the time, so it renders as a code block holding what exists so far.
 
-/** A run of prose, with the inline code spans it contains already marked. */
+/** A run of prose, with its inline code and emphasis already marked. */
 export type InlinePart =
   | { type: "plain"; text: string }
-  | { type: "inlineCode"; code: string };
+  | { type: "inlineCode"; code: string }
+  | { type: "bold"; text: string }
+  | { type: "italic"; text: string }
+  | { type: "link"; href: string; text: string };
 
 /** One piece of a message: Prose with line breaks, or a fenced code block. */
 export type TextSegment =
@@ -32,8 +35,14 @@ export type TextSegment =
 const FENCE_OPEN = /^[ \t]*```(.*)$/;
 /** A line that closes one: the backticks and nothing else. */
 const FENCE_CLOSE = /^[ \t]*```[ \t]*$/;
-/** Inline code: one backtick pair on the same line, non-empty content. */
-const INLINE_CODE = /`([^`\n]+)`/g;
+/**
+ * Inline markdown, one combined pass. The alternation order matters: bold
+ * (`**`/`__`) before italic (`*`/`_`), otherwise `**x**` would match the
+ * single-asterisk rule first. Groups: 1 code, 2 bold-asterisk, 3 bold-underscore,
+ * 4 italic-asterisk, 5 italic-underscore, 6 link text, 7 link href.
+ */
+const INLINE_MARKDOWN =
+  /`([^`\n]+)`|\*\*([^*\n]+)\*\*|__([^_\n]+)__|\*([^*\n]+)\*|_([^_\n]+)_|\[([^\]\n]+)\]\(([^)\s]+)\)/g;
 
 interface Line {
   text: string;
@@ -63,19 +72,40 @@ function languageOf(info: string): string {
   return first;
 }
 
+/** Only http(s) targets render as links; anything else stays inert text. */
+function safeHref(href: string): string | null {
+  return /^https?:\/\//i.test(href) ? href : null;
+}
+
+/** Turns one inline-markdown match into the part it describes. */
+function partOf(match: RegExpExecArray): InlinePart {
+  const [, code, boldStar, boldUnder, italicStar, italicUnder, linkText, href] =
+    match;
+  if (code !== undefined) return { type: "inlineCode", code };
+  if (boldStar !== undefined || boldUnder !== undefined)
+    return { type: "bold", text: boldStar ?? boldUnder };
+  if (italicStar !== undefined || italicUnder !== undefined)
+    return { type: "italic", text: italicStar ?? italicUnder };
+  const safe = safeHref(href ?? "");
+  if (linkText !== undefined && safe !== null)
+    return { type: "link", href: safe, text: linkText };
+  return { type: "plain", text: match[0] };
+}
+
 /**
- * A prose region, split around its inline code spans. A newline that merely
- * separated prose from a fence (or ended the message) is structural and dropped,
- * so an ordinary paragraph does not gain a blank line next to its code block.
+ * A prose region, split around its inline code and emphasis. A newline that
+ * merely separated prose from a fence (or ended the message) is structural and
+ * dropped, so an ordinary paragraph does not gain a blank line next to its code
+ * block.
  */
 function textSegment(raw: string): TextSegment | null {
   if (raw === "") return null;
   const parts: InlinePart[] = [];
   let last = 0;
-  for (const match of raw.matchAll(INLINE_CODE)) {
+  for (const match of raw.matchAll(INLINE_MARKDOWN)) {
     const at = match.index ?? 0;
     if (at > last) parts.push({ type: "plain", text: raw.slice(last, at) });
-    parts.push({ type: "inlineCode", code: match[1] });
+    parts.push(partOf(match));
     last = at + match[0].length;
   }
   if (last < raw.length) parts.push({ type: "plain", text: raw.slice(last) });

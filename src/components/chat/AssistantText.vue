@@ -27,6 +27,16 @@ const segments = computed(() => segmentsOf(props.text));
             class="rounded bg-muted px-1 py-0.5 font-mono text-[0.85em]"
             >{{ part.code }}</code
           >
+          <strong v-else-if="part.type === 'bold'">{{ part.text }}</strong>
+          <em v-else-if="part.type === 'italic'">{{ part.text }}</em>
+          <a
+            v-else-if="part.type === 'link'"
+            :href="part.href"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="underline decoration-muted-foreground/50 underline-offset-2 hover:decoration-foreground"
+            >{{ part.text }}</a
+          >
           <template v-else>{{ part.text }}</template>
         </template>
       </p>
