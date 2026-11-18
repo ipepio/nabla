@@ -743,6 +743,10 @@ struct SessionProcess {
 /// Nabla needs are kept) and `pi-rpc-manager.ts` `buildPiArgs`.
 /// S7 adds the explicit provider/model pair: the model selector decides them per
 /// spawn, so pi never falls back to whatever provider it would pick itself.
+///
+/// The Nabla identity rides along as an appended system prompt so every session
+/// knows what it is and what it can (and cannot) do; the text is versioned in
+/// `resources/nabla-system-prompt.md` and embedded at compile time.
 fn spawn_args(session_file: &Path, provider: &str, model: &str) -> Vec<String> {
     vec![
         "--mode".to_string(),
@@ -753,8 +757,14 @@ fn spawn_args(session_file: &Path, provider: &str, model: &str) -> Vec<String> {
         provider.to_string(),
         "--model".to_string(),
         model.to_string(),
+        "--append-system-prompt".to_string(),
+        NABLA_SYSTEM_PROMPT.to_string(),
     ]
 }
+
+/// The Nabla identity, embedded at build time from the versioned markdown file
+/// so it never depends on a runtime path or a packaged resource.
+const NABLA_SYSTEM_PROMPT: &str = include_str!("../../../resources/nabla-system-prompt.md");
 
 /// Exact variable names the engine needs to reach its providers and to run
 /// (interpreter lookups, `~`, node modules).
@@ -1122,8 +1132,12 @@ sleep 30
                 "nan".to_string(),
                 "--model".to_string(),
                 "deepseek-v4-flash".to_string(),
+                "--append-system-prompt".to_string(),
+                NABLA_SYSTEM_PROMPT.to_string(),
             ]
         );
+        // The identity actually says who we are: it is not an empty placeholder.
+        assert!(NABLA_SYSTEM_PROMPT.contains("Nabla"));
     }
 
     // S7: the configured provider and model reach the child process, in the
