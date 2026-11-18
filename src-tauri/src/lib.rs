@@ -76,6 +76,12 @@ pub fn run() {
                 mcp_server::new_token(),
             )
             .ok();
+            // `webview-control.md` S4, defect L8: whether this run's endpoint
+            // reached pi's `mcp.json`. A session start waits on this gate before
+            // spawning pi, because pi reads that file exactly once — a spawn
+            // inside the registration's `remove`→`add` window would inherit a
+            // config with no `nabla-browser` tools for its whole life.
+            let mcp_registration = Arc::new(mcp_server::RegistrationGate::new());
             app.manage(AppState {
                 store,
                 config_dir,
@@ -104,6 +110,7 @@ pub fn run() {
                 // window.
                 embeds,
                 mcp_endpoint,
+                mcp_registration: mcp_registration.clone(),
             });
             // S4 of `webview-control.md` (T3): the endpoint is written into pi's
             // global `mcp.json` so every session pi spawns already carries the
@@ -112,14 +119,28 @@ pub fn run() {
             // binary may delay the window from painting. Best effort from here on:
             // without the entry the app works the same, only without agent control
             // of the embedded browser.
+            //
+            // Defect L8: the outcome is not swallowed any more. Every path —
+            // registered, skipped, failed — completes the gate, so a session start
+            // can only ever pay its bounded wait instead of hanging on a thread
+            // that died silently. A failure is announced once, by the first
+            // session start that has to live with it.
             let registration = app.handle().clone();
-            std::thread::Builder::new()
+            let gate = mcp_registration.clone();
+            let thread = std::thread::Builder::new()
                 .name("nabla-mcp-register".to_string())
                 .spawn(move || {
                     let state = registration.state::<AppState>();
-                    let _ = commands::register_mcp_server(&state);
-                })
-                .ok();
+                    gate.complete(commands::register_mcp_server(&state));
+                });
+            if thread.is_err() {
+                // No thread, no report: the gate is opened with the failure so
+                // every session start fails fast instead of waiting out the
+                // timeout it would otherwise never learn the reason for.
+                mcp_registration.complete(mcp_server::RegistrationOutcome::Failed(
+                    "the registration thread could not start".to_string(),
+                ));
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

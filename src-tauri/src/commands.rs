@@ -12,6 +12,7 @@ use tauri_plugin_opener::OpenerExt;
 
 use crate::cli::{self, CliSessions, CliSink, PiAuthStatus, PiCliResult};
 use crate::mcp::{self, McpAddDraft, McpScope, McpServerSummary};
+use crate::mcp_server::{REGISTRATION_WAIT, RegistrationGate, RegistrationOutcome};
 use crate::process::{ProcessManager, StartupOutcome};
 use crate::providers::{
     ModelInfo as ProviderModelInfo, ModelOption, ProviderDraft, ProviderModelDraft, ProviderModels,
@@ -54,6 +55,14 @@ pub struct AppState {
     /// port could not be bound — the app works the same, only without agent
     /// control of the browser.
     pub mcp_endpoint: Option<crate::mcp_server::Endpoint>,
+    /// S4 of `webview-control.md`: whether this run's endpoint reached pi's
+    /// `mcp.json`, and the latch a session start waits on before spawning pi.
+    ///
+    /// pi reads that file once, when it starts (L8), so a session spawned before
+    /// the registration lands inherits a config without `nabla-browser` and keeps
+    /// it for its whole life. The gate is what makes that window impossible, and
+    /// it keeps the outcome afterwards instead of swallowing it.
+    pub mcp_registration: Arc<RegistrationGate>,
 }
 
 // Errors cross the bridge as plain strings for now: StoreError and SettingsError
@@ -638,6 +647,38 @@ impl SessionSpawn {
     }
 }
 
+/// Waits for the boot-time registration before pi is spawned (S4 of
+/// `webview-control.md`, defect L8).
+///
+/// pi reads `mcp.json` once at start, and the registration is a `remove` followed
+/// by an `add`: a spawn inside that window reads a config with no
+/// `nabla-browser` entry and never recovers. This is the fence in front of every
+/// spawn, bounded by `REGISTRATION_WAIT` so a registration that never reports
+/// costs a pause, never a session.
+///
+/// Synchronous, and therefore only ever called from `spawn_blocking`: a `Condvar`
+/// wait on an async thread would stall the runtime that serves every other
+/// command. The outcome is not discarded — a failure is announced once, with what
+/// it costs the human.
+fn await_mcp_registration(gate: &RegistrationGate) -> RegistrationOutcome {
+    let outcome = gate.wait(REGISTRATION_WAIT);
+    if let Some(notice) = gate.announce(&outcome) {
+        eprintln!("{notice}");
+    }
+    outcome
+}
+
+/// The spawn a `start_session` owes: the gate first, then pi.
+///
+/// Split out of the detached task so the fence is testable without racing it: the
+/// test drives this exactly as the detached task does, and can assert that pi is
+/// not started while the registration is still in flight. Always called from
+/// `spawn_blocking`, because `await_mcp_registration` is a blocking wait.
+fn boot_session(spawn: SessionSpawn, registration: Arc<RegistrationGate>) {
+    await_mcp_registration(&registration);
+    spawn.run();
+}
+
 /// A `start_session` that has already answered its caller: the index row is
 /// written, and the spawn pi still owes travels with it.
 struct PendingSessionStart {
@@ -737,10 +778,14 @@ pub async fn start_session(
     // Detached on purpose: nothing waits for this task and dropping its handle
     // never cancels it, so the start runs to completion either way. A failed
     // start is visible through the runtime's own events, not through this task.
+    let registration = state.mcp_registration.clone();
     tauri::async_runtime::spawn(async move {
         // The same blocking spawn as before: the readiness probe is a synchronous
-        // wait, so it belongs on a worker thread, not on an async one.
-        let _ = tauri::async_runtime::spawn_blocking(move || spawn.run()).await;
+        // wait, so it belongs on a worker thread, not on an async one. The MCP
+        // registration is waited for on that same thread and before the first
+        // byte of pi's argv: pi reads `mcp.json` when it starts (L8).
+        let _ = tauri::async_runtime::spawn_blocking(move || boot_session(spawn, registration))
+            .await;
     });
     Ok(session)
 }
@@ -1069,6 +1114,7 @@ async fn open_session_core(
     store: &Store,
     runtime: &ProcessManager,
     config_dir: &Path,
+    mcp_registration: &Arc<RegistrationGate>,
     session_id: &str,
 ) -> Result<SessionDto, String> {
     // The index row is the runtime key (S1): resolving it first means an id that
@@ -1092,10 +1138,14 @@ async fn open_session_core(
     // the whole spawn and stall every other command meanwhile. The handle and
     // the paths are owned before the move so the closure is `'static`.
     let spawned_runtime = runtime.clone();
+    let registration = mcp_registration.clone();
     let key = session_id.to_string();
     let pi_session_path = row.pi_session_path.clone();
     let workspace_path = workspace.path.clone();
     let spawned = tauri::async_runtime::spawn_blocking(move || {
+        // pi reads `mcp.json` once at start (L8): the gate is waited for here,
+        // on the worker thread, before anything is spawned.
+        await_mcp_registration(&registration);
         spawned_runtime.spawn(
             &key,
             &settings.pi_binary,
@@ -1147,7 +1197,9 @@ pub async fn open_session(
     let store = state.store.clone();
     let runtime = state.runtime.clone();
     let config_dir = state.config_dir.clone();
-    let opened = open_session_core(&store, &runtime, &config_dir, &session_id).await?;
+    let registration = state.mcp_registration.clone();
+    let opened =
+        open_session_core(&store, &runtime, &config_dir, &registration, &session_id).await?;
     // Opening an existing session is activity too: it must show up as recent.
     if let Ok(row_id) = session_id.parse::<i64>() {
         let _ = store.touch_session(row_id);
@@ -2025,11 +2077,27 @@ pub fn mcp_endpoint(state: State<'_, AppState>) -> Option<crate::mcp_server::End
 /// The caller treats this as best effort too: a missing `pi` binary must never
 /// break boot, so the entry simply is not written and the app runs without agent
 /// control of the browser.
-pub fn register_mcp_server(state: &AppState) -> Result<(), String> {
+///
+/// The outcome is returned, not dropped, and the caller puts it on the
+/// `RegistrationGate`: a session start must be able to tell "the entry is there"
+/// from "it is not" (L8), and a failure nobody reads is how the browser tools
+/// disappeared in silence once already.
+pub fn register_mcp_server(state: &AppState) -> RegistrationOutcome {
     let Some(endpoint) = state.mcp_endpoint.as_ref() else {
         // Nothing was bound, so there is nothing to register.
-        return Ok(());
+        return RegistrationOutcome::Skipped;
     };
+    match write_registration(state, endpoint) {
+        Ok(()) => RegistrationOutcome::Registered,
+        Err(reason) => RegistrationOutcome::Failed(reason),
+    }
+}
+
+/// The write itself: `remove` then `add` through pi's CLI.
+fn write_registration(
+    state: &AppState,
+    endpoint: &crate::mcp_server::Endpoint,
+) -> Result<(), String> {
     // The argv is built before the existing entry is touched: an invalid draft
     // must not leave the human with no registration at all.
     let args =
@@ -2529,6 +2597,14 @@ done
         ProcessManager::with_timeouts(sink, lifecycle_timeouts())
     }
 
+    /// A gate that already reported success: the lifecycle tests are about the
+    /// spawn, not about waiting for the boot-time registration.
+    fn registered_gate() -> Arc<RegistrationGate> {
+        let gate = Arc::new(RegistrationGate::new());
+        gate.complete(RegistrationOutcome::Registered);
+        gate
+    }
+
     fn process_attempts(fixture: &SessionFixture) -> usize {
         std::fs::read_to_string(fixture.path("attempts"))
             .map(|raw| raw.lines().count())
@@ -2568,11 +2644,13 @@ done
         let row = fixture.add_session("s1.jsonl", true, "");
         let runtime = lifecycle_runtime();
         let key = row.id.to_string();
+        let gate = registered_gate();
 
         let first = block_on(open_session_core(
             &fixture.store,
             &runtime,
             &fixture.config_dir(),
+            &gate,
             &key,
         ))
         .expect("first open");
@@ -2592,6 +2670,7 @@ done
             &fixture.store,
             &runtime,
             &fixture.config_dir(),
+            &gate,
             &key,
         ))
         .expect("second open");
@@ -2621,6 +2700,7 @@ done
             &fixture.store,
             &runtime,
             &fixture.config_dir(),
+            &registered_gate(),
             &row.id.to_string(),
         ))
         .expect("open session");
@@ -2645,6 +2725,132 @@ done
         runtime.stop_all();
     }
 
+    // Defect L8: the wait for the boot-time registration is a synchronous
+    // `Condvar` wait, so it runs on a `spawn_blocking` worker, never on an async
+    // thread. This test runs the reopen path on a *current-thread* runtime: an
+    // inline wait would hold that single thread for the whole timeout, so the
+    // completion below could not run until it had expired.
+    #[cfg(unix)]
+    #[test]
+    fn the_registration_wait_never_blocks_the_async_runtime() {
+        let fixture = SessionFixture::new("registration_async");
+        let script = fixture.write_fake_pi("fake-pi.sh");
+        fixture.write_settings(&script);
+        let row = fixture.add_session("s9.jsonl", true, "");
+        let runtime = lifecycle_runtime();
+        let gate = Arc::new(RegistrationGate::new());
+
+        let store = fixture.store.clone();
+        let manager = runtime.clone();
+        let config_dir = fixture.config_dir();
+        let key = row.id.to_string();
+        let waiting = gate.clone();
+        let current_thread = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime");
+
+        let started = Instant::now();
+        let dto = current_thread
+            .block_on(async move {
+                let open = tokio::spawn(async move {
+                    open_session_core(&store, &manager, &config_dir, &waiting, &key).await
+                });
+                // The task is what reaches the wait: yield so it gets there, then
+                // report from this same thread. An inline wait would keep these
+                // lines from running at all until the timeout had passed.
+                tokio::task::yield_now().await;
+                std::thread::sleep(Duration::from_millis(80));
+                gate.complete(RegistrationOutcome::Registered);
+                open.await.expect("the open task must not panic")
+            })
+            .expect("a session opens while the registration is still running");
+        let elapsed = started.elapsed();
+
+        assert_eq!(dto.status, RuntimeStatus::Ready);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the wait is off the async thread: the session opened after {elapsed:?}"
+        );
+        runtime.stop_all();
+    }
+
+    // The defect itself (L8), on the path it was reported from: a session created
+    // right after boot must not start pi while the `nabla-browser` entry is still
+    // being written, because pi reads `mcp.json` exactly once.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_created_while_the_registration_runs_waits_before_spawning() {
+        let fixture = SessionFixture::new("start_gate");
+        let script = fixture.write_fake_pi("fake-pi.sh");
+        fixture.write_settings(&script);
+        let runtime = lifecycle_runtime();
+        let gate = Arc::new(RegistrationGate::new());
+
+        let pending = prepare_session_start(
+            &fixture.store,
+            &fixture.config_dir(),
+            &fixture.dir,
+            &runtime,
+            fixture.workspace_id,
+        )
+        .expect("prepare a start");
+        let key = pending.session.session_id.clone();
+
+        // Exactly what the detached task runs, on a worker thread of its own.
+        let booting = {
+            let gate = gate.clone();
+            std::thread::spawn(move || boot_session(pending.spawn, gate))
+        };
+
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            process_attempts(&fixture),
+            0,
+            "pi must not start inside the registration window"
+        );
+
+        gate.complete(RegistrationOutcome::Registered);
+        booting.join().expect("the boot thread panicked");
+
+        assert_eq!(process_attempts(&fixture), 1, "pi starts once the entry is there");
+        assert_eq!(
+            runtime.live_ids(),
+            vec![key],
+            "the index row id is still the runtime key"
+        );
+
+        runtime.stop_all();
+    }
+
+    // The honesty half of L8: a failed registration costs the browser tools, not
+    // the session. The pane and the app work without them, so a session that
+    // cannot have the tools still starts — and says so once, with its cost.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_registration_still_lets_the_session_start() {
+        let fixture = SessionFixture::new("registration_failed");
+        let script = fixture.write_fake_pi("fake-pi.sh");
+        fixture.write_settings(&script);
+        let row = fixture.add_session("s10.jsonl", true, "");
+        let runtime = lifecycle_runtime();
+        let gate = Arc::new(RegistrationGate::new());
+        gate.complete(RegistrationOutcome::Failed("pi is not installed".to_string()));
+
+        let dto = block_on(open_session_core(
+            &fixture.store,
+            &runtime,
+            &fixture.config_dir(),
+            &gate,
+            &row.id.to_string(),
+        ))
+        .expect("a failed registration must not block the session");
+        assert_eq!(dto.status, RuntimeStatus::Ready);
+        assert_eq!(process_attempts(&fixture), 1, "pi still starts");
+
+        runtime.stop_all();
+    }
+
     // S3 negative guard: an id that is not indexed is an error and must never
     // start a process.
     #[cfg(unix)]
@@ -2659,6 +2865,7 @@ done
             &fixture.store,
             &runtime,
             &fixture.config_dir(),
+            &registered_gate(),
             "424242",
         ))
         .expect_err("an unindexed id cannot be opened");
@@ -2671,6 +2878,7 @@ done
             &fixture.store,
             &runtime,
             &fixture.config_dir(),
+            &registered_gate(),
             "not-a-number",
         ))
         .expect_err("a non-numeric id cannot be opened");

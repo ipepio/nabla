@@ -22,7 +22,9 @@
 //! inherit that capability.
 
 use std::net::TcpListener;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use axum::{
     Router,
@@ -616,6 +618,146 @@ pub fn registration_draft(endpoint: &Endpoint) -> crate::mcp::McpAddDraft {
             value: format!("Bearer {}", endpoint.token),
         }],
         bearer_token_env_var: None,
+    }
+}
+
+/// What the boot-time registration of this run's endpoint into pi's `mcp.json`
+/// came to (S4 of `webview-control.md`).
+///
+/// A value, not a `Result`: "no endpoint was bound" is a state of the app, not a
+/// failure, and a session start has to read all three the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistrationOutcome {
+    /// The `nabla-browser` entry was written: a session started now has the tools.
+    Registered,
+    /// No endpoint was bound, so there was nothing to write.
+    Skipped,
+    /// The attempt failed, or never finished. The reason is kept for the one line
+    /// that says what it costs.
+    Failed(String),
+}
+
+impl RegistrationOutcome {
+    /// The line to log when this outcome is a failure, phrased with its cost: a
+    /// session started now runs without the browser tools.
+    pub fn failure_notice(&self) -> Option<String> {
+        match self {
+            RegistrationOutcome::Failed(reason) => Some(format!(
+                "nabla: the MCP registration failed ({reason}): \
+                 the agent will not have the browser tools in sessions started now"
+            )),
+            RegistrationOutcome::Registered | RegistrationOutcome::Skipped => None,
+        }
+    }
+}
+
+/// How long a session start waits for the registration before starting anyway.
+///
+/// Bounded on purpose: the browser pane and the app work without the agent
+/// tools, so a registration that never reports costs a short pause, never a
+/// session that cannot be created.
+pub const REGISTRATION_WAIT: Duration = Duration::from_secs(5);
+
+/// The reason `wait` answers when nobody completed the gate in time.
+pub const REGISTRATION_TIMEOUT: &str = "the registration did not finish in time";
+
+/// The one-shot latch that closes the window this defect came from
+/// (`webview-control.md` L6, L8).
+///
+/// pi reads `mcp.json` **once**, when it starts, so the tools a session has are
+/// decided by that single read. The registration runs on a background thread and
+/// is a `remove` followed by an `add`, which is a moment with no entry at all: a
+/// session spawned inside it inherits a config without `nabla-browser` and keeps
+/// that config for its whole life, with no error anywhere — every call just
+/// answers "tool not found". This gate is the fence around that moment. A
+/// completion (success, skipped or failure) opens it for every waiter, now and
+/// later.
+///
+/// A `Condvar`, not an async primitive: the waiters are pi spawns, and pi spawns
+/// already run on worker threads. `wait` therefore never runs on an async one.
+pub struct RegistrationGate {
+    state: Mutex<GateState>,
+    opened: Condvar,
+    reported: AtomicBool,
+}
+
+#[derive(Default)]
+struct GateState {
+    outcome: Option<RegistrationOutcome>,
+}
+
+impl RegistrationGate {
+    pub fn new() -> RegistrationGate {
+        RegistrationGate {
+            state: Mutex::new(GateState::default()),
+            opened: Condvar::new(),
+            reported: AtomicBool::new(false),
+        }
+    }
+
+    /// Records the outcome and opens the gate for everyone waiting on it.
+    ///
+    /// Idempotent: the first completion wins. Sessions may already have read and
+    /// acted on it, so a later one cannot rewrite what the app already promised.
+    pub fn complete(&self, outcome: RegistrationOutcome) {
+        let mut state = self.lock();
+        if state.outcome.is_none() {
+            state.outcome = Some(outcome);
+            // Woken while the lock is still held: a waiter cannot miss this
+            // notification, because it re-checks the outcome under the lock.
+            self.opened.notify_all();
+        }
+    }
+
+    /// The outcome, waiting for it at most `timeout`.
+    ///
+    /// Returns immediately when the gate is already completed, and answers
+    /// `Failed(REGISTRATION_TIMEOUT)` when nobody completes it in time instead of
+    /// hanging the caller forever.
+    pub fn wait(&self, timeout: Duration) -> RegistrationOutcome {
+        let started = Instant::now();
+        let mut state = self.lock();
+        loop {
+            if let Some(outcome) = state.outcome.as_ref() {
+                return outcome.clone();
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                return RegistrationOutcome::Failed(REGISTRATION_TIMEOUT.to_string());
+            }
+            // Spurious wake-ups loop back here, so the elapsed time is what
+            // bounds the wait, never a single `wait_timeout` call.
+            let (next, _) = self
+                .opened
+                .wait_timeout(state, timeout - elapsed)
+                .unwrap_or_else(|poison| poison.into_inner());
+            state = next;
+        }
+    }
+
+    /// The line to log for `outcome`, at most once for this gate.
+    ///
+    /// Every session start asks the gate the same question, and a failure has one
+    /// consequence: one line naming it, not one per session. Returns `None` for a
+    /// success, and for a failure already announced.
+    pub fn announce(&self, outcome: &RegistrationOutcome) -> Option<String> {
+        let notice = outcome.failure_notice()?;
+        if self.reported.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        Some(notice)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, GateState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
+impl Default for RegistrationGate {
+    fn default() -> RegistrationGate {
+        RegistrationGate::new()
     }
 }
 
@@ -1324,6 +1466,109 @@ mod tests {
         let mut response = String::new();
         stream.read_to_string(&mut response).expect("read the answer");
         response
+    }
+
+    // ── the registration gate (S4 of `webview-control.md`, defect L8) ───────
+
+    // A completed gate is a value a session start reads, not a wait: the
+    // registration already reported, so nothing may pause here.
+    #[test]
+    fn the_gate_answers_a_completed_outcome_without_waiting() {
+        let gate = RegistrationGate::new();
+        gate.complete(RegistrationOutcome::Registered);
+
+        let started = Instant::now();
+        let outcome = gate.wait(Duration::from_secs(30));
+
+        assert_eq!(outcome, RegistrationOutcome::Registered);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a completed gate never waits, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    // The defect itself (L8): a session created while the registration is still
+    // running must wait for it and get its real answer, not the timeout.
+    #[test]
+    fn the_gate_opens_when_the_registration_completes_while_a_session_waits() {
+        let gate = Arc::new(RegistrationGate::new());
+        let completing = Arc::clone(&gate);
+        let registration = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            completing.complete(RegistrationOutcome::Registered);
+        });
+
+        let started = Instant::now();
+        let outcome = gate.wait(Duration::from_secs(10));
+        let waited = started.elapsed();
+        registration.join().expect("the completing thread panicked");
+
+        assert_eq!(
+            outcome,
+            RegistrationOutcome::Registered,
+            "the gate hands over what the registration reported"
+        );
+        assert!(
+            waited >= Duration::from_millis(50),
+            "it must have waited for the completion, returned after {waited:?}"
+        );
+    }
+
+    // A registration that never reports must not hang a session: the wait is
+    // bounded, and says what the silence costs instead of pretending success.
+    #[test]
+    fn the_gate_answers_a_timeout_when_the_registration_never_reports() {
+        let gate = RegistrationGate::new();
+
+        let started = Instant::now();
+        let outcome = gate.wait(Duration::from_millis(80));
+        let waited = started.elapsed();
+
+        assert_eq!(
+            outcome,
+            RegistrationOutcome::Failed("the registration did not finish in time".to_string())
+        );
+        assert!(
+            waited >= Duration::from_millis(80),
+            "the wait is the timeout it was given, returned after {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "and no longer than that, took {waited:?}"
+        );
+    }
+
+    // The first report is the one sessions may already have acted on, so a
+    // second completion cannot rewrite it.
+    #[test]
+    fn completing_the_gate_twice_keeps_the_first_outcome() {
+        let gate = RegistrationGate::new();
+        gate.complete(RegistrationOutcome::Skipped);
+        gate.complete(RegistrationOutcome::Failed("a late failure".to_string()));
+
+        assert_eq!(gate.wait(Duration::from_secs(30)), RegistrationOutcome::Skipped);
+    }
+
+    // The failure is announced once and names its cost: every session start asks
+    // the same gate, and one line is the honest amount of noise.
+    #[test]
+    fn a_failed_registration_is_announced_once_with_its_consequence() {
+        let gate = RegistrationGate::new();
+        let failed = RegistrationOutcome::Failed("pi is not installed".to_string());
+
+        let notice = gate.announce(&failed).expect("the first failure is logged");
+        assert!(notice.contains("pi is not installed"), "got {notice:?}");
+        assert!(
+            notice.contains("will not have the browser tools"),
+            "the line names the consequence, got {notice:?}"
+        );
+        assert_eq!(gate.announce(&failed), None, "the failure is logged once");
+
+        // A success has nothing to say, before or after a failure.
+        let quiet = RegistrationGate::new();
+        assert_eq!(quiet.announce(&RegistrationOutcome::Registered), None);
+        assert_eq!(quiet.announce(&RegistrationOutcome::Skipped), None);
     }
 }
 
