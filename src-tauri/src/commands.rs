@@ -546,7 +546,17 @@ fn now_millis() -> u128 {
 /// caller, so the formatting is repeated here instead of widening another
 /// module's API for one string.
 fn now_iso() -> String {
-    let secs = now_millis() / 1000;
+    iso_from_system_time(std::time::SystemTime::now())
+}
+
+/// The store's `YYYY-MM-DDTHH:MM:SSZ` shape for any instant. Fixed width on
+/// purpose: two of these compare correctly as plain strings, which is how the
+/// preview's freshness is decided (see `preview_is_stale`).
+fn iso_from_system_time(time: std::time::SystemTime) -> String {
+    let secs = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
     let days_since_epoch = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
@@ -587,28 +597,74 @@ fn ensure_session_in_workspace(
     }
 }
 
-/// Spawns one headless pi for this workspace and registers it in the session
-/// index (S1, S3, S7). The returned `sessionId` is the index row id in decimal
-/// form — the key every later session command uses.
+/// The spawn one created session still owes, with everything the worker thread
+/// needs owned before the move (the closure must be `'static`, and the command
+/// must not keep a borrow of the shared state).
+struct SessionSpawn {
+    runtime: ProcessManager,
+    /// The runtime key: the index row id in decimal form.
+    key: String,
+    pi_binary: String,
+    provider: String,
+    model: String,
+    pi_session_path: PathBuf,
+    workspace_path: PathBuf,
+}
+
+impl SessionSpawn {
+    /// Boots pi and waits for its readiness probe, exactly as the create command
+    /// did inline before it stopped waiting.
+    ///
+    /// The outcome is deliberately not returned. Every transition — `spawning`,
+    /// `ready`, `crashed` — and the stderr tail of a failed start leave through
+    /// the runtime's own `process_status`/`process_exit` events (S4), the channel
+    /// the panel already renders, so a start that fails in the background is
+    /// never silent. `Err` only means the attempt could not be made at all (a
+    /// live process under the same key), and that process reports for it.
+    fn run(self) {
+        let _ = self.runtime.spawn(
+            &self.key,
+            &self.pi_binary,
+            &self.pi_session_path,
+            &self.provider,
+            &self.model,
+            &self.workspace_path,
+        );
+    }
+}
+
+/// A `start_session` that has already answered its caller: the index row is
+/// written, and the spawn pi still owes travels with it.
+struct PendingSessionStart {
+    /// What the command answers before pi exists: `spawning`, no pid (S1, S4).
+    session: SessionDto,
+    spawn: SessionSpawn,
+}
+
+/// Indexes one session for the workspace and prepares its spawn, without
+/// starting pi yet (S1, S3, S7).
 ///
-/// `async` on purpose: creating the process costs seconds of readiness wait, and
-/// a synchronous command would hold Tauri's IPC thread for all of it. The
-/// directory, the index row and the settings stay on the caller's thread; only
-/// the spawn runs on a worker.
-#[tauri::command]
-pub async fn start_session(
-    state: State<'_, AppState>,
+/// Everything that can fail before a child exists — the workspace lookup, the
+/// settings, the session directory, the index row — happens here and keeps the
+/// error mapping it always had, so a caller either gets a row it can show or the
+/// same message it got before. What is left is the readiness wait, which the
+/// command deliberately stops paying.
+fn prepare_session_start(
+    store: &Store,
+    config_dir: &Path,
+    data_dir: &Path,
+    runtime: &ProcessManager,
     workspace_id: i64,
-) -> Result<SessionDto, String> {
+) -> Result<PendingSessionStart, String> {
     // A workspace is a directory on disk: spawning pi somewhere else would
     // produce a session the user never asked for.
-    let workspace = workspace_by_id(&state.store, workspace_id)?;
+    let workspace = workspace_by_id(store, workspace_id)?;
 
     // The engine path, provider and model are user-configured, so they are read
     // per start, not cached (S7).
-    let settings = settings::load(&settings_path(&state)).map_err(display_err)?;
+    let settings = settings::load(&settings_file(config_dir)).map_err(display_err)?;
 
-    let sessions_dir = state.data_dir.join(SESSIONS_DIR);
+    let sessions_dir = data_dir.join(SESSIONS_DIR);
     std::fs::create_dir_all(&sessions_dir).map_err(display_err)?;
     let pi_session_path = sessions_dir.join(format!(
         "{}.jsonl",
@@ -619,8 +675,7 @@ pub async fn start_session(
     // Index first: the row id is the runtime key, and no transcript is ever
     // stored here — only the path pi owns (S7).
     let timestamp = now_iso();
-    let row = state
-        .store
+    let row = store
         .upsert_session(&SessionNew {
             workspace_id,
             pi_session_path: pi_session_path_string.clone(),
@@ -630,39 +685,59 @@ pub async fn start_session(
             updated_at: timestamp,
         })
         .map_err(display_err)?;
-    let session_id = row.id.to_string();
 
-    // The spawn waits for pi's readiness probe; the handle and the paths are
-    // owned before the move so the closure is `'static`. `settings` is only
-    // needed by the spawn, so it moves with them.
-    let runtime = state.runtime.clone();
-    let key = session_id.clone();
-    let workspace_path = workspace.path.clone();
-    let report = tauri::async_runtime::spawn_blocking(move || {
-        runtime.spawn(
-            &key,
-            &settings.pi_binary,
-            &pi_session_path,
-            &settings.provider,
-            &settings.model,
-            Path::new(&workspace_path),
-        )
-    })
-    .await
-    .map_err(display_err)?
-    .map_err(display_err)?;
-
-    if report.outcome != StartupOutcome::Ready {
-        let detail = report.stderr_tail.join("\n");
-        return Err(startup_failure_message(report.outcome, &detail));
-    }
-    Ok(SessionDto {
-        session_id,
+    let session = SessionDto {
+        session_id: row.id.to_string(),
         workspace_id,
         pi_session_path: pi_session_path_string,
-        pid: report.pid.unwrap_or(0),
-        status: report.status,
-    })
+        // Nothing is running yet: a real pid arrives with `ready`, through the
+        // runtime's events, and this answer must never claim one.
+        pid: 0,
+        status: RuntimeStatus::Spawning,
+    };
+    let spawn = SessionSpawn {
+        runtime: runtime.clone(),
+        key: session.session_id.clone(),
+        pi_binary: settings.pi_binary,
+        provider: settings.provider,
+        model: settings.model,
+        pi_session_path,
+        workspace_path: PathBuf::from(workspace.path),
+    };
+    Ok(PendingSessionStart { session, spawn })
+}
+
+/// Creates one headless pi for this workspace and returns its session as soon as
+/// the index row exists (S1, S3, S7).
+///
+/// The answer is `spawning` with no pid: the readiness wait (~2 s) is no longer
+/// part of the command, so a session is usable the moment it is asked for
+/// instead of after pi boots. The spawn runs detached and its answer is not
+/// awaited — not a silent hand-off, because the runtime reports `spawning`,
+/// `ready`, `crashed` and the exit on the event bridge the panel already draws
+/// (S4). `async` remains only so the task is spawned from inside the runtime,
+/// never so the command waits for it.
+#[tauri::command]
+pub async fn start_session(
+    state: State<'_, AppState>,
+    workspace_id: i64,
+) -> Result<SessionDto, String> {
+    let PendingSessionStart { session, spawn } = prepare_session_start(
+        &state.store,
+        &state.config_dir,
+        &state.data_dir,
+        &state.runtime,
+        workspace_id,
+    )?;
+    // Detached on purpose: nothing waits for this task and dropping its handle
+    // never cancels it, so the start runs to completion either way. A failed
+    // start is visible through the runtime's own events, not through this task.
+    tauri::async_runtime::spawn(async move {
+        // The same blocking spawn as before: the readiness probe is a synchronous
+        // wait, so it belongs on a worker thread, not on an async one.
+        let _ = tauri::async_runtime::spawn_blocking(move || spawn.run()).await;
+    });
+    Ok(session)
 }
 
 /// Sends a prompt to the session's pi process. The answer that matters is the
@@ -1806,7 +1881,7 @@ pub fn embed_close_all(state: State<'_, AppState>, app: tauri::AppHandle) -> usi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     /// Scratch directory in the system temp dir (never the worktree): one fresh
@@ -2417,6 +2492,164 @@ done
             0,
             "the engine must never be started for an absent row"
         );
+    }
+
+    // ── creating a session without waiting for pi ──────────────────────────
+
+    /// Records the lifecycle transitions a spawn reports, so a test can assert
+    /// what the webview would have received through the event bridge.
+    fn recording_runtime() -> (ProcessManager, Arc<Mutex<Vec<RuntimeStatus>>>) {
+        let seen: Arc<Mutex<Vec<RuntimeStatus>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let sink: crate::process::EventSink = Arc::new(move |_, event| {
+            if let AgentEvent::ProcessStatus { status, .. } = event {
+                recorded.lock().expect("record status").push(*status);
+            }
+        });
+        (
+            ProcessManager::with_timeouts(sink, lifecycle_timeouts()),
+            seen,
+        )
+    }
+
+    // S1/S7: creating a session answers as soon as its index row exists. The
+    // engine boots behind that answer, so the caller gets `spawning` with no pid
+    // instead of waiting out pi's readiness probe — the wait that kept the
+    // composer disabled for seconds.
+    #[cfg(unix)]
+    #[test]
+    fn start_session_answers_spawning_before_pi_boots() {
+        let fixture = SessionFixture::new("start_spawning");
+        let script = fixture.write_fake_pi("fake-pi.sh");
+        fixture.write_settings(&script);
+        let runtime = lifecycle_runtime();
+
+        let pending = prepare_session_start(
+            &fixture.store,
+            &fixture.config_dir(),
+            &fixture.dir,
+            &runtime,
+            fixture.workspace_id,
+        )
+        .expect("prepare a start");
+
+        assert_eq!(pending.session.status, RuntimeStatus::Spawning);
+        assert_eq!(pending.session.pid, 0, "nothing is running yet");
+        assert_eq!(pending.session.workspace_id, fixture.workspace_id);
+
+        // The row is already readable through the index: the panel renders the
+        // session before pi exists.
+        let indexed = fixture
+            .store
+            .list_sessions(fixture.workspace_id)
+            .expect("list sessions");
+        assert_eq!(indexed.len(), 1, "the index row is written before the spawn");
+        assert_eq!(indexed[0].id.to_string(), pending.session.session_id);
+        assert_eq!(indexed[0].pi_session_path, pending.session.pi_session_path);
+
+        // The path pi owns lives in the app's sessions directory and nothing has
+        // written it yet: pi creates it.
+        let session_file = PathBuf::from(&pending.session.pi_session_path);
+        assert!(
+            session_file.starts_with(fixture.dir.join("sessions")),
+            "got {}",
+            session_file.display()
+        );
+        assert!(!session_file.exists(), "pi owns that file, not the app");
+
+        // Preparing is not starting: no child, not even an attempt.
+        assert!(runtime.live_ids().is_empty());
+        assert_eq!(process_attempts(&fixture), 0);
+    }
+
+    // The other half of that answer: the background spawn is not a silent one.
+    // Every transition reaches the sink the host forwards to the webview, so a
+    // start that ends `ready` — or `crashed` — is visible there and nowhere else.
+    #[cfg(unix)]
+    #[test]
+    fn the_background_spawn_reports_its_lifecycle_through_the_runtime_events() {
+        let fixture = SessionFixture::new("start_spawn_events");
+        let script = fixture.write_fake_pi("fake-pi.sh");
+        fixture.write_settings(&script);
+        let (runtime, seen) = recording_runtime();
+
+        let pending = prepare_session_start(
+            &fixture.store,
+            &fixture.config_dir(),
+            &fixture.dir,
+            &runtime,
+            fixture.workspace_id,
+        )
+        .expect("prepare a start");
+        // Exactly what the detached task runs; run here so the test can assert
+        // on the events instead of racing them.
+        pending.spawn.run();
+
+        let statuses = seen.lock().expect("read statuses").clone();
+        assert_eq!(
+            statuses.first(),
+            Some(&RuntimeStatus::Spawning),
+            "the attempt is announced before anything can fail: {statuses:?}"
+        );
+        assert!(
+            statuses.contains(&RuntimeStatus::Ready),
+            "a start that lands is reported as ready: {statuses:?}"
+        );
+        assert_eq!(process_attempts(&fixture), 1, "one child, one attempt");
+        assert_eq!(
+            runtime.live_ids(),
+            vec![pending.session.session_id.clone()],
+            "the index row id is the runtime key"
+        );
+
+        runtime.stop_all();
+    }
+
+    // Everything that can fail before a child exists keeps the error mapping it
+    // always had, and nothing is left behind when it does fail.
+    #[test]
+    fn start_session_keeps_the_error_map_of_the_steps_before_the_spawn() {
+        let fixture = SessionFixture::new("start_errors");
+        let runtime = lifecycle_runtime();
+
+        let unknown = prepare_session_start(
+            &fixture.store,
+            &fixture.config_dir(),
+            &fixture.dir,
+            &runtime,
+            4242,
+        )
+        .err()
+        .expect("an unindexed workspace cannot start a session");
+        assert_eq!(unknown, "unknown workspace: 4242");
+
+        // Unreadable preferences are the same failure they were before: pi's
+        // path, provider and model are configured per start.
+        std::fs::create_dir_all(fixture.config_dir()).expect("create config dir");
+        std::fs::write(settings_file(&fixture.config_dir()), "{not json at all")
+            .expect("write broken settings");
+        let broken = prepare_session_start(
+            &fixture.store,
+            &fixture.config_dir(),
+            &fixture.dir,
+            &runtime,
+            fixture.workspace_id,
+        )
+        .err()
+        .expect("unreadable settings cannot start a session");
+        assert!(!broken.is_empty(), "the failure carries a reason");
+
+        // A failed prepare leaves no row behind, so the index never lists a
+        // session no process could ever be started for.
+        assert!(
+            fixture
+                .store
+                .list_sessions(fixture.workspace_id)
+                .expect("list sessions")
+                .is_empty(),
+            "nothing is indexed when the start failed before the spawn"
+        );
+        assert!(runtime.live_ids().is_empty());
     }
 
     // S3: the transcript is normalized from pi's own file. The known shapes are
