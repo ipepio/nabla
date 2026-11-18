@@ -233,9 +233,11 @@ impl EmbedSessions {
     }
 
     /// Every registered view, in creation order. A copy, so a caller never holds
-    /// the registry lock while it talks to a webview. Test-facing: the app
-    /// addresses one view by id, never the whole list.
-    #[cfg(test)]
+    /// the registry lock while it talks to a webview.
+    ///
+    /// The app itself addresses one view by id; the caller that needs the whole
+    /// list is the MCP server, which has to tell the agent which views exist
+    /// before it can drive one (`webview-control.md` T1).
     pub fn views(&self) -> Vec<EmbeddedView> {
         lock(&self.inner.views).clone()
     }

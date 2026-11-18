@@ -49,6 +49,11 @@ pub struct AppState {
     /// window, plus the last url each one reported. Tauri owns the webviews;
     /// this registry is the handle the commands address.
     pub embeds: crate::embed::EmbedSessions,
+    /// `webview-control.md` T1: the local MCP server the agent connects to in
+    /// order to drive those views, and the token of this run. `None` when the
+    /// port could not be bound — the app works the same, only without agent
+    /// control of the browser.
+    pub mcp_endpoint: Option<crate::mcp_server::Endpoint>,
 }
 
 // Errors cross the bridge as plain strings for now: StoreError and SettingsError
@@ -1995,6 +2000,16 @@ pub fn embed_url(state: State<'_, AppState>, view_id: String) -> Result<String, 
 #[tauri::command]
 pub fn embed_close_all(state: State<'_, AppState>, app: tauri::AppHandle) -> usize {
     state.embeds.close_all(&app)
+}
+
+/// The MCP endpoint this run offers so the agent can drive those views, or `None`
+/// when the port could not be bound (`webview-control.md` T1).
+///
+/// The token travels with it on purpose: it is what the registration of T3 writes
+/// into pi's `mcp.json`, and it never leaves the machine.
+#[tauri::command]
+pub fn mcp_endpoint(state: State<'_, AppState>) -> Option<crate::mcp_server::Endpoint> {
+    state.mcp_endpoint.clone()
 }
 
 #[cfg(test)]

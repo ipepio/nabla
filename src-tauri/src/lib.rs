@@ -3,6 +3,9 @@ mod commands;
 // The embedded browser: one child webview per view, added to the main window.
 mod embed;
 mod mcp;
+// The other end of MCP: a local server pi connects to in order to drive the
+// embedded webview (`webview-control.md`).
+mod mcp_server;
 mod process;
 mod providers;
 mod rpc;
@@ -58,6 +61,21 @@ pub fn run() {
             let cli_sink: cli::CliSink = Arc::new(move |event: &cli::CliEvent| {
                 let _ = cli_handle.emit("pi-cli", event.clone());
             });
+            // The embedded browser's registry, shared by the commands and by the
+            // MCP server: the agent drives exactly the views the human sees.
+            let embeds = embed::EmbedSessions::new();
+            // `webview-control.md` T1: the MCP server pi connects to in order to
+            // drive those views. A failure to bind is not fatal — the app runs
+            // without agent control of the browser, which is the honest
+            // degradation for a local port a firewall may refuse.
+            let mcp_endpoint = mcp_server::start(
+                Arc::new(mcp_server::EmbedDriver::new(
+                    app.handle().clone(),
+                    embeds.clone(),
+                )),
+                mcp_server::new_token(),
+            )
+            .ok();
             app.manage(AppState {
                 store,
                 config_dir,
@@ -84,7 +102,8 @@ pub fn run() {
                 // child webview reported. Tauri owns the webviews themselves —
                 // here the app only keeps the metadata it can test without a
                 // window.
-                embeds: embed::EmbedSessions::new(),
+                embeds,
+                mcp_endpoint,
             });
             Ok(())
         })
@@ -190,7 +209,10 @@ pub fn run() {
             commands::embed_eval,
             commands::embed_close,
             commands::embed_url,
-            commands::embed_close_all
+            commands::embed_close_all,
+            // `webview-control.md` T1: the local MCP endpoint the agent connects
+            // to so it can drive those views.
+            commands::mcp_endpoint
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
