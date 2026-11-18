@@ -386,5 +386,5 @@
   "tools.browser.controlError": "No se pudo ejecutar esa acción en la página: {message}",
   "tools.browser.layoutError": "No se pudo colocar la vista de navegador: {message}",
   "tools.browser.syncError": "La barra de direcciones no puede seguir la página: {message}",
-  "tools.browser.agentNote": "Un agente aún no puede manejar esta vista: eso llega con un MCP local. Por ahora la controla la app."
+  "tools.browser.agentNote": "El agente conduce esta vista con las tools MCP de nabla-browser: navega, lee y pulsa en la página que estás viendo."
 }

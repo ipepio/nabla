@@ -1152,6 +1152,36 @@ sleep 30
         assert!(!NABLA_SYSTEM_PROMPT.contains("el Gentleman"));
     }
 
+    // The browser pane became drivable when the MCP server landed, and this
+    // prompt went on claiming the opposite for long enough that the agent
+    // answered "no puedo ver esa pestaña" while ten `nabla-browser` tools were
+    // connected in the same session. The prompt is the only place that can draw
+    // the line between "the drawer is the human's" and "this one tab is yours".
+    #[test]
+    fn the_identity_tells_the_agent_it_can_drive_the_browser_pane() {
+        assert!(
+            NABLA_SYSTEM_PROMPT.contains("nabla-browser"),
+            "without the server name the agent cannot find its browser tools"
+        );
+        for tool in ["navigate", "eval", "click", "list_targets"] {
+            assert!(
+                NABLA_SYSTEM_PROMPT.contains(tool),
+                "the identity must name `{tool}`"
+            );
+        }
+        // The sentence that caused the denial. The drawer is still the human's,
+        // but stating it as "not yours" also denies the browser tools.
+        assert!(
+            !NABLA_SYSTEM_PROMPT.contains("not yours"),
+            "a blanket claim over the drawer also denies the browser tools"
+        );
+        // The honest limits stay stated: no screenshot, no other tabs.
+        assert!(NABLA_SYSTEM_PROMPT.contains("screenshots"));
+        // And what to do when there is nothing to drive. Asserted on a fragment
+        // that cannot be split by re-wrapping the file.
+        assert!(NABLA_SYSTEM_PROMPT.contains("no view is open"));
+    }
+
     // S7: the configured provider and model reach the child process, in the
     // exact flag order pi expects. Asserted on the child's own argv, not on the
     // builder, so a broken pipe of the setting would show up here.
