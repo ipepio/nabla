@@ -8,9 +8,9 @@ Alcance: convertir el panel derecho en un área de herramientas con pestañas, e
 - **S1** «primero que nada tenemos que darle a pi, la posibilidad de configurar mcps» — Ajustes gana una sección **MCP** que lista, añade, elimina, hace login/logout y muestra estado de servidores, sobre lo que pi ya sabe hacer.
 - **S2** «en ese drawer quiero poner un terminal, un explorador de archivos con previsualización … un navegador … todo esto irá por pestañas dentro de ese drawer» — el panel derecho aloja **pestañas**: Files, Changes, Terminal, Browser.
 - **S3** «el explorador de archivos … que cuando lo selecciones, te lo abre en la misma pestaña» — árbol del workspace; al elegir un archivo se previsualiza en la propia pestaña (no en otra vista).
-- **S4** «el navegador, que el agente lo pueda utilizar» — la pestaña Browser muestra estado/capturas y el **agente** navega; el humano no conduce un navegador embebido.
+- **S4** «el navegador, que el agente lo pueda utilizar» — **revisado en L4**: la pestaña Browser es un navegador **embebido** que el humano conduce, y el *agente* lo utiliza cuando tenga el puente (ver `odd/tasks/webview-control.md`). La lectura original («el humano no conduce un navegador embebido») quedó superseded; la cita no cambia.
 - **S5** «estas herramientas podríamos activarlas en la parte de configuración» — cada herramienta se habilita/deshabilita en Ajustes y el estado persiste (`enabledTools`), con el mismo criterio que los flags actuales.
-- **S6** «¿Qué pasa si se instala en un navegador que no es browserOS?» — el navegador objetivo es cualquier **Chromium con CDP** (Chrome, Edge, Brave, Chromium, BrowserOS). Safari/Firefox → pestaña deshabilitada con motivo visible. Alternativa soportada: registrar `chrome-devtools-mcp` como **servidor MCP**.
+- **S6** «¿Qué pasa si se instala en un navegador que no es browserOS?» — **revisado en L4**: la pregunta perdió objeto al embeberse la vista; Nabla ya no busca ni lanza un Chromium del sistema (ver L4). Sigue vigente que el agente pueda usar `chrome-devtools-mcp` como servidor MCP desde Ajustes.
 
 ## Hechos verificados (no re-investigar)
 
@@ -51,14 +51,15 @@ Objetivo: una terminal real en el workspace.
 - **Fuera**: allowlist de comandos (teatro de seguridad), multiplexores, perfiles de shell.
 - **Verificación**: test Rust de arranque/cierre del PTY con un comando falso; smoke manual con `pwd`/`ls`.
 
-### F3 — Browser  · riesgo medio (opt-in) · ✅ HECHO
-Objetivo: que el agente navegue y el humano vea qué pasa.
+### F3 — Browser  · riesgo medio (opt-in) · ✅ HECHO con alcance cambiado (L4)
+Objetivo revisado: que **el humano** navegue dentro de Nabla, en la misma vista que el agente podrá conducir después.
 
-- **Decisión**: **lanzar** una instancia Chromium dedicada (perfil propio, `--remote-debugging-port`) en vez de adjuntar a la del usuario.
-- **Detección**: buscar Chromium/Chrome/Edge/Brave/BrowserOS; si sólo hay Safari/Firefox, la pestaña queda **deshabilitada con motivo** y se ofrece la alternativa MCP (`chrome-devtools-mcp` desde F0).
-- **Rutas**: (a) extensión `pi-browser-harness` (CDP, tools navigate/click/type/screenshot/extract); (b) MCP `chrome-devtools-mcp`. Nabla muestra estado, URL actual y capturas; **no** conduce el navegador.
-- **Fuera**: navegador embebido en el drawer; Safari/Firefox.
-- **Verificación**: detección y arranque en macOS; captura de pantalla en la pestaña; una navegación real desde el agente.
+- **Decisión vigente (L4)**: navegador **embebido** como webview hija de Tauri. Sustituye a la decisión anterior (lanzar un Chromium dedicado por CDP), que duplicaba el navegador fuera de la app y dejaba al agente mirando una ventana que el humano no veía.
+- **Lo que existe**: `embed_create`, `embed_set_bounds`, `embed_navigate`, `embed_eval`, `embed_url`, `embed_close`, `embed_close_all`. La vista es del host, la UI la conduce y el path externo se eliminó (`src-tauri/src/browser.rs`, 1657 líneas, borrado en `f18d160`).
+- **Lo que falta, y por eso S4 no está cerrada**: el **puente hacia pi**. Sin él `embed_*` es superficie de UI, no de agente. Vive en `odd/tasks/webview-control.md` (servidor MCP dentro de Tauri).
+- **Detección de navegadores**: fuera de alcance. Ya no se busca Chromium/Chrome/Edge/Brave/BrowserOS en el sistema, así que la pestaña deshabilitada con motivo ya no aplica.
+- **Fuera**: conducción del navegador por parte del agente (va en `webview-control`); captura de pantalla; Safari/Firefox.
+- **Verificación**: `cargo test` + `npm run build` verdes en la rama; navegación, resize con el split y cierre de la vista quedan como aceptación manual en macOS.
 
 ### F4 — Después (no en esta tanda)
 Pestaña Review (candidato congelado), tarjetas de subagentes, medidor de contexto/coste por sesión, Changes con worktrees de subagentes.
@@ -81,6 +82,7 @@ Pestaña Review (candidato congelado), tarjetas de subagentes, medidor de contex
 - **L1** Usuario: MCP primero; drawer con pestañas (terminal, files con preview, browser usable por el agente); herramientas activables en Ajustes; dudas sobre navegadores no-BrowserOS y sobre cómo lo hace el harness de DeepSeek.
 - **L2** Hallazgos: `pi mcp` cubre el ciclo completo y Navla sólo necesita UI + allowlist + PTY; dsh trata MCP como superficie de capacidades (cua-mcp, puente ACP); el navegador puede ser un MCP, no una extensión propia.
 - **L3** Decisión propuesta: navegador = Chromium + CDP, con pestaña deshabilitada y motivo explícito si no hay ninguno; alternativa chrome-devtools-mcp desde la sección MCP.
+- **L4** (18 nov) **Corrección de esta doc, no del código**: L3 quedó superseded. Usuario: «para el navegador tendremos que tirar el webview hijo, no?» → se embebió la vista como webview hija de Tauri y se borró el path externo por CDP (`f18d160`), de modo que el humano navega dentro de Nabla. Consecuencias: S4 se parte en dos roles (el humano conduce la vista; el agente la usará vía MCP), S6 pierde su detección de navegadores del sistema, y F3 se cierra como superficie de UI mientras el puente del agente se muda a `odd/tasks/webview-control.md`. Las citas de S4/S6 no se tocan; sólo su interpretación, y el cambio queda registrado aquí.
 
 ## Catálogo de MCPs (decisión propuesta)
 
