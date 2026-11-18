@@ -278,6 +278,40 @@ pub fn new_token() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+// ── the registration pi reads (S4 of `webview-control.md`) ─────────────────
+
+/// The `pi mcp add` draft that puts this run's endpoint in front of every session
+/// pi spawns (T3, S4).
+///
+/// Three decisions live here and nowhere else:
+///
+/// - **global scope**: the project scope writes `.pi/mcp.json` inside the human's
+///   repository, and this entry belongs to the app, not to the project;
+/// - **http, url of this run**: the port is ephemeral, so the entry is rewritten
+///   on every start and removed on exit;
+/// - **the token in a header** (S6): the url carries no secret, so a leaked
+///   `mcp.json` or the output of `pi mcp list` never shows the key that opens a
+///   view holding the human's cookies.
+///
+/// Turning this into argv is `mcp::add_args`; this function owns only what the
+/// entry *is*, so it can be tested without pi or a socket.
+pub fn registration_draft(endpoint: &Endpoint) -> crate::mcp::McpAddDraft {
+    crate::mcp::McpAddDraft {
+        name: SERVER_NAME.to_string(),
+        scope: crate::mcp::McpScope::Global,
+        transport: crate::mcp::McpTransport::Http,
+        command: None,
+        args: Vec::new(),
+        env: Vec::new(),
+        url: Some(endpoint.url.clone()),
+        headers: vec![crate::mcp::McpKeyValue {
+            key: "Authorization".to_string(),
+            value: format!("Bearer {}", endpoint.token),
+        }],
+        bearer_token_env_var: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,6 +573,50 @@ mod tests {
         assert_eq!(first.len(), 64, "32 bytes in hex");
         assert_ne!(first, second);
         assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // S4: what Nabla hands to `pi mcp add`. The scope is global on purpose: the
+    // project scope writes `.pi/mcp.json` inside the human's repository, and this
+    // entry belongs to the app, not to the project.
+    //
+    // S6: the token travels in the `Authorization` header, so the url a leaked
+    // `mcp.json` or a `pi mcp list` shows carries no secret.
+    #[test]
+    fn the_registration_is_one_global_http_server_with_the_token_in_a_header() {
+        let endpoint = Endpoint {
+            url: "http://127.0.0.1:51234/mcp".to_string(),
+            token: "0123456789abcdef0123456789abcdef".to_string(),
+        };
+        let draft = registration_draft(&endpoint);
+
+        assert_eq!(draft.name, SERVER_NAME);
+        assert_eq!(draft.scope, crate::mcp::McpScope::Global);
+        assert_eq!(draft.transport, crate::mcp::McpTransport::Http);
+
+        let argv = crate::mcp::add_args(&draft).expect("a valid registration draft");
+        assert_eq!(
+            argv,
+            [
+                "mcp",
+                "add",
+                SERVER_NAME,
+                "--url",
+                "http://127.0.0.1:51234/mcp",
+                "--header",
+                "Authorization=Bearer 0123456789abcdef0123456789abcdef",
+            ]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect::<Vec<_>>()
+        );
+
+        // The url is the endpoint's own, and holds no secret.
+        let url = &argv[argv.iter().position(|arg| arg == "--url").expect("--url") + 1];
+        assert_eq!(url, &endpoint.url);
+        assert!(
+            !url.contains(&endpoint.token),
+            "the url must carry no secret: {url}"
+        );
     }
 
     // S6: the endpoint is useless without the token, binds a local port that the

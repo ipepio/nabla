@@ -2012,6 +2012,62 @@ pub fn mcp_endpoint(state: State<'_, AppState>) -> Option<crate::mcp_server::End
     state.mcp_endpoint.clone()
 }
 
+/// S4 of `webview-control.md`: writes this run's endpoint into pi's global
+/// `mcp.json`, so every session pi spawns already ships the `nabla-browser`
+/// tools without the human configuring anything.
+///
+/// `remove` runs first, and its answer is ignored: a run that was killed (or a
+/// crash) can leave an entry pointing at a dead port behind, and re-adding over it
+/// is only safe when the old one is gone. On the normal first run there is
+/// nothing to remove, which `pi mcp remove` reports as a failure — hence
+/// best effort.
+///
+/// The caller treats this as best effort too: a missing `pi` binary must never
+/// break boot, so the entry simply is not written and the app runs without agent
+/// control of the browser.
+pub fn register_mcp_server(state: &AppState) -> Result<(), String> {
+    let Some(endpoint) = state.mcp_endpoint.as_ref() else {
+        // Nothing was bound, so there is nothing to register.
+        return Ok(());
+    };
+    // The argv is built before the existing entry is touched: an invalid draft
+    // must not leave the human with no registration at all.
+    let args =
+        mcp::add_args(&crate::mcp_server::registration_draft(endpoint)).map_err(display_err)?;
+    let _ = unregister_mcp_server(state);
+    let result = mcp_call(state, &args, cli::DEFAULT_TIMEOUT_MS)?;
+    check_mcp_mutation(&result, "add")
+}
+
+/// S4: takes the entry back out when the app exits. The url names this run's
+/// ephemeral port, so what stays behind after a quit is a server that can never
+/// connect again.
+///
+/// "No such server" is not an error: it is the state the app wants, and on a run
+/// whose registration never happened it is the only state there is.
+pub fn unregister_mcp_server(state: &AppState) -> Result<(), String> {
+    let args = mcp::remove_args(crate::mcp_server::SERVER_NAME, McpScope::Global)
+        .map_err(display_err)?;
+    let result = mcp_call(state, &args, cli::DEFAULT_TIMEOUT_MS)?;
+    if nothing_to_remove(&result) {
+        return Ok(());
+    }
+    check_mcp_mutation(&result, "remove")
+}
+
+/// Whether `pi mcp remove` answered "there was nothing to remove".
+///
+/// pi exits 1 in that case and says `No global MCP server named "…" in <file>`, so
+/// the exit code alone would report a normal first run as a failure. The phrase is
+/// matched on a normalized copy: it is pi's wording, and a change in it only makes
+/// this answer `false`, which the caller already treats as best effort.
+fn nothing_to_remove(result: &PiCliResult) -> bool {
+    result
+        .stderr
+        .to_ascii_lowercase()
+        .contains("no global mcp server named")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3219,6 +3275,31 @@ done
         let killed = cli_result("", None, false);
         let err = check_mcp_mutation(&killed, "logout").expect_err("no code is not success");
         assert!(err.contains("no diagnostic"), "got: {err}");
+    }
+
+    // S4 of `webview-control.md`: an entry that is not there is exactly the state
+    // the app wants, so a `remove` that finds nothing must not be reported as a
+    // failure — it is the normal answer of a run that never registered.
+    #[test]
+    fn nothing_to_remove_reads_pi_refusing_an_absent_entry() {
+        let mut absent = cli_result("", Some(1), false);
+        absent.stderr =
+            "No global MCP server named \"nabla-browser\" in /home/somebody/.pi/agent/mcp.json.\n"
+                .to_string();
+        assert!(nothing_to_remove(&absent));
+
+        // A real failure — pi could not rewrite the file — is not that answer.
+        let mut unreadable = cli_result("", Some(1), false);
+        unreadable.stderr =
+            "Could not update /home/somebody/.pi/agent/mcp.json: EACCES\n".to_string();
+        assert!(!nothing_to_remove(&unreadable));
+
+        // A successful remove is not "nothing to remove" either.
+        assert!(!nothing_to_remove(&cli_result(
+            "Removed global MCP server \"nabla-browser\"\n",
+            Some(0),
+            false
+        )));
     }
 
     // S1: the file path is absolute and names pi's own file for each scope.

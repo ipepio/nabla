@@ -105,6 +105,21 @@ pub fn run() {
                 embeds,
                 mcp_endpoint,
             });
+            // S4 of `webview-control.md` (T3): the endpoint is written into pi's
+            // global `mcp.json` so every session pi spawns already carries the
+            // `nabla-browser` tools. On a background thread on purpose: the
+            // registration spawns the `pi` CLI, and neither a slow nor a missing
+            // binary may delay the window from painting. Best effort from here on:
+            // without the entry the app works the same, only without agent control
+            // of the embedded browser.
+            let registration = app.handle().clone();
+            std::thread::Builder::new()
+                .name("nabla-mcp-register".to_string())
+                .spawn(move || {
+                    let state = registration.state::<AppState>();
+                    let _ = commands::register_mcp_server(&state);
+                })
+                .ok();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -222,8 +237,15 @@ pub fn run() {
             // the `close_all` of the registry: a `Drop` cannot do it, because a
             // dropping registry has no app handle to close a webview with.
             if matches!(event, tauri::RunEvent::Exit) {
-                let embeds = app.state::<AppState>().embeds.clone();
-                embeds.close_all(app);
+                let state = app.state::<AppState>();
+                // S4 of `webview-control.md` (T3): the registration names this
+                // run's ephemeral port, so it is taken out as the process that
+                // owns that port goes away. One short `pi mcp remove`, run here
+                // synchronously because a thread would not outlive the exit; a
+                // failure leaves an entry that can never connect again, which is
+                // the only trace it leaves.
+                let _ = commands::unregister_mcp_server(&state);
+                state.embeds.close_all(app);
             }
         });
 }

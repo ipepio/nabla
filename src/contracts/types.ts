@@ -578,3 +578,22 @@ export interface EmbedNavEvent {
   viewId: string;
   url: string;
 }
+
+// ── the app's own MCP endpoint (T3 of `odd/tasks/webview-control.md`) ───────
+
+/**
+ * The local MCP endpoint this run of the app offers so the agent can drive the
+ * embedded views, and the token that opens it (S6). Nothing renders it yet: the
+ * app writes the registration into pi's `mcp.json` itself, so this mirror exists
+ * to keep the seam symmetric — the command, its DTO and this type move together.
+ *
+ * The token is a secret of this run, not of the human's account: it dies with the
+ * process, and it never leaves the machine. Mirrors `Endpoint` in
+ * `src-tauri/src/mcp_server.rs`.
+ */
+export interface McpEndpoint {
+  /** `http://127.0.0.1:<port>/mcp` — an ephemeral port of this run. */
+  url: string;
+  /** The bearer token every request to that endpoint must carry. */
+  token: string;
+}

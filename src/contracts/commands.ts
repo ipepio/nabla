@@ -13,6 +13,7 @@ import type {
   FsPreview,
   GitEntry,
   McpAddDraft,
+  McpEndpoint,
   McpScope,
   McpServerSummary,
   ModelInfo,
@@ -827,4 +828,17 @@ export async function subscribeEmbedNav(
   return listen<EmbedNavEvent>("embed-nav", ({ payload }) => {
     handler(payload);
   });
+}
+
+/**
+ * T3 of `webview-control.md`: the local MCP endpoint this run offers so the agent
+ * can drive those views, or `null` when the port could not be bound — the app
+ * works the same, only without agent control of the browser (S6).
+ *
+ * Nabla registers the endpoint with pi itself, so nothing in the UI needs this
+ * to work; the wrapper keeps the seam symmetric, with the payload, its command and
+ * this function moving together.
+ */
+export function mcpEndpoint(): Promise<McpEndpoint | null> {
+  return invoke<McpEndpoint | null>("mcp_endpoint");
 }
