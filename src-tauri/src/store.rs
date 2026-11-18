@@ -69,6 +69,20 @@ pub struct ProviderStatusRow {
     pub checked_at: String,
 }
 
+/// A stored session preview plus the moment the app snapshotted it.
+///
+/// The timestamp travels *alongside* the JSON on purpose: freshness is a decision
+/// for the command layer, which is the only place that knows about pi's file (see
+/// `preview_is_stale` in `commands.rs`). The store never reads transcripts, so it
+/// has nothing to compare against and must not pretend to judge.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionPreviewRow {
+    /// The serialized messages, exactly as the command layer wrote them.
+    pub preview: String,
+    /// ISO-8601 UTC stamp of the snapshot (`save_session_preview` writes it).
+    pub updated_at: String,
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     Sqlite(String),
@@ -186,6 +200,27 @@ impl Store {
                    checked_at TEXT NOT NULL
                  );
                  PRAGMA user_version = 3;
+                 COMMIT;",
+            )?;
+        }
+        if current < 4 {
+            // v4: the per-session preview — the newest turns of a conversation
+            // exactly as the app last streamed them, reasoning included, so the
+            // chat paints before pi boots.
+            //
+            // This is the one place conversation *text* is mirrored, and it is a
+            // bounded, disposable copy: pi's JSONL file remains the transcript,
+            // the table is derived from it, and losing every row costs one instant
+            // paint and nothing else (AGENTS.md rule 2/3). The cascade keeps the
+            // mirror from outliving the session it belongs to.
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS session_preview (
+                   session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                   preview TEXT NOT NULL,
+                   updated_at TEXT NOT NULL
+                 );
+                 PRAGMA user_version = 4;
                  COMMIT;",
             )?;
         }
@@ -399,6 +434,53 @@ impl Store {
         Ok(affected > 0)
     }
 
+    /// v4: writes the preview of one session, replacing the previous one for that
+    /// same session and touching no other row.
+    ///
+    /// The `INSERT … SELECT` only produces a row when the session is really
+    /// indexed, so an id that does not exist stores nothing instead of failing on
+    /// the foreign key — a preview is best-effort, and its caller carries on either
+    /// way. Returns whether a preview row was written.
+    pub fn upsert_session_preview(
+        &self,
+        session_id: i64,
+        preview: &str,
+        updated_at: &str,
+    ) -> StoreResult<bool> {
+        let conn = self.conn()?;
+        let affected = conn.execute(
+            "INSERT INTO session_preview (session_id, preview, updated_at)
+             SELECT ?1, ?2, ?3 FROM sessions WHERE id = ?1
+             ON CONFLICT(session_id) DO UPDATE SET
+               preview = excluded.preview,
+               updated_at = excluded.updated_at",
+            rusqlite::params![session_id, preview, updated_at],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// v4: the stored preview of one session with the moment it was snapshotted,
+    /// or `None` when the session has none. The JSON is handed back unparsed (and
+    /// the stamp alongside it) because only the command layer decides whether the
+    /// snapshot is still worth painting.
+    pub fn session_preview(&self, session_id: i64) -> StoreResult<Option<SessionPreviewRow>> {
+        use rusqlite::OptionalExtension;
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                "SELECT preview, updated_at FROM session_preview WHERE session_id = ?1",
+                [session_id],
+                |row| {
+                    Ok(SessionPreviewRow {
+                        preview: row.get(0)?,
+                        updated_at: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     pub fn list_sessions(&self, workspace_id: i64) -> StoreResult<Vec<SessionRow>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
@@ -605,9 +687,10 @@ mod tests {
             .upsert_session(&session_new(all[0].id, "/sessions/v1.jsonl"))
             .expect("sessions still work after the upgrade");
         assert!(session.id > 0);
-        // The migration chain runs to its head, so a v1 file leaves at v3 and
-        // the cache table is present along the way.
-        assert_eq!(user_version(&store), 3);
+        // The migration chain runs to its head, so a v1 file leaves at v4 (the
+        // preview table joined in v4) and every earlier table is present along
+        // the way.
+        assert_eq!(user_version(&store), 4);
         assert!(store.list_provider_status().expect("list status").is_empty());
         // A second open must not re-run the ALTER statements.
         drop(store);
@@ -681,7 +764,222 @@ mod tests {
             .expect("the cache accepts a row after the upgrade");
         assert_eq!(store.list_provider_status().expect("list").len(), 1);
 
-        assert_eq!(user_version(&store), 3, "v3 is the migration contract");
+        assert_eq!(user_version(&store), 4, "v4 is the migration contract");
+    }
+
+    // v4: the preview table is additive. Workspaces, sessions and the provider
+    // cache must arrive on the other side of the migration exactly as they were,
+    // and the new table must be usable straight away.
+    #[test]
+    fn open_upgrades_a_v3_database_to_v4_keeping_every_row() {
+        let db = TempDb::new("migrate_v3");
+        {
+            // Faithful v3 schema: v1 + the pin/recency columns + the cache.
+            let conn = rusqlite::Connection::open(&db.0).expect("create v3 db");
+            conn.execute_batch(
+                "CREATE TABLE workspaces (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   path TEXT NOT NULL UNIQUE,
+                   name TEXT NOT NULL,
+                   created_at TEXT NOT NULL,
+                   pinned INTEGER NOT NULL DEFAULT 0,
+                   last_used_at TEXT
+                 );
+                 CREATE TABLE sessions (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+                   pi_session_path TEXT NOT NULL UNIQUE,
+                   title TEXT,
+                   model TEXT,
+                   started_at TEXT NOT NULL,
+                   updated_at TEXT NOT NULL
+                 );
+                 CREATE INDEX idx_sessions_workspace_updated
+                   ON sessions(workspace_id, updated_at DESC);
+                 CREATE TABLE provider_status (
+                   provider TEXT PRIMARY KEY,
+                   state TEXT NOT NULL,
+                   credential INTEGER NOT NULL,
+                   checked_at TEXT NOT NULL
+                 );
+                 INSERT INTO workspaces (path, name, created_at, pinned, last_used_at)
+                   VALUES ('/tmp/v3-proj', 'v3-proj', '2026-03-01T00:00:00Z', 1,
+                           '2026-03-02T00:00:00Z');
+                 INSERT INTO sessions
+                   (workspace_id, pi_session_path, title, model, started_at, updated_at)
+                   VALUES (1, '/sessions/v3.jsonl', 'kept', 'gpt-6.1-sol',
+                           '2026-03-01T00:00:00Z', '2026-03-01T00:10:00Z');
+                 INSERT INTO provider_status (provider, state, credential, checked_at)
+                   VALUES ('openai', 'ready', 1, '2026-03-01T00:00:00Z');
+                 PRAGMA user_version = 3;",
+            )
+            .expect("seed v3 schema");
+        }
+
+        let store = Store::open(&db.0).expect("upgrade v3 -> v4");
+
+        assert_eq!(user_version(&store), 4);
+        let workspaces = store.list_workspaces().expect("list workspaces");
+        assert_eq!(workspaces.len(), 1, "the v3 workspace must survive");
+        assert!(workspaces[0].pinned);
+        assert_eq!(
+            workspaces[0].last_used_at.as_deref(),
+            Some("2026-03-02T00:00:00Z")
+        );
+        let sessions = store.list_sessions(workspaces[0].id).expect("list");
+        assert_eq!(sessions.len(), 1, "the indexed v3 session must survive");
+        assert_eq!(sessions[0].title.as_deref(), Some("kept"));
+        assert_eq!(
+            store.list_provider_status().expect("list status"),
+            vec![ProviderStatusRow {
+                provider: "openai".to_string(),
+                state: "ready".to_string(),
+                credential: true,
+                checked_at: "2026-03-01T00:00:00Z".to_string(),
+            }],
+            "the v3 cache must survive the upgrade"
+        );
+
+        // The new table starts empty and accepts a row for an indexed session.
+        assert_eq!(
+            store.session_preview(sessions[0].id).expect("preview"),
+            None,
+            "an upgraded database has no previews until one is written"
+        );
+        assert!(
+            store
+                .upsert_session_preview(
+                    sessions[0].id,
+                    "[]",
+                    "2026-03-03T00:00:00Z"
+                )
+                .expect("write a preview after the upgrade")
+        );
+
+        // Reopening an already-migrated database re-runs nothing.
+        drop(store);
+        let reopened = Store::open(&db.0).expect("reopen");
+        assert_eq!(user_version(&reopened), 4);
+        assert!(
+            reopened
+                .session_preview(sessions[0].id)
+                .expect("preview")
+                .is_some(),
+            "the preview written after the upgrade is durable"
+        );
+    }
+
+    // v4: one preview per session, replaced in place by the next snapshot. The
+    // stamp moves with it, because it is what the command layer reads to decide
+    // whether the snapshot is still worth painting.
+    #[test]
+    fn upsert_session_preview_replaces_the_row_of_that_session_only() {
+        let db = TempDb::new("preview_upsert");
+        let store = Store::open(&db.0).expect("open");
+        let ws = ws_new(&store, "/tmp/proj-preview");
+        let first = store
+            .upsert_session(&session_new(ws.id, "/sessions/p1.jsonl"))
+            .expect("insert");
+        let second = store
+            .upsert_session(&session_new(ws.id, "/sessions/p2.jsonl"))
+            .expect("insert");
+
+        assert!(
+            store
+                .upsert_session_preview(first.id, r#"[{"role":"user"}]"#, "2026-04-01T10:00:00Z")
+                .expect("insert preview")
+        );
+        assert!(
+            store
+                .upsert_session_preview(second.id, "[]", "2026-04-01T10:00:01Z")
+                .expect("insert second preview")
+        );
+        assert!(
+            store
+                .upsert_session_preview(first.id, "[]", "2026-04-01T10:05:00Z")
+                .expect("update preview")
+        );
+
+        assert_eq!(
+            store.session_preview(first.id).expect("preview"),
+            Some(SessionPreviewRow {
+                preview: "[]".to_string(),
+                updated_at: "2026-04-01T10:05:00Z".to_string(),
+            }),
+            "the same session reuses its row with the newest snapshot"
+        );
+        assert_eq!(
+            store
+                .session_preview(second.id)
+                .expect("preview")
+                .map(|row| row.updated_at),
+            Some("2026-04-01T10:00:01Z".to_string()),
+            "a sibling session's preview is untouched"
+        );
+        // An id that is not indexed has nothing to attach a preview to.
+        assert!(
+            !store
+                .upsert_session_preview(9_999, "[]", "2026-04-01T10:00:00Z")
+                .expect("unknown session"),
+            "an unindexed id stores no preview and is not an error"
+        );
+        assert_eq!(store.session_preview(9_999).expect("preview"), None);
+    }
+
+    // v4: deleting a session takes its preview with it, so a mirror can never
+    // outlive the row it describes.
+    #[test]
+    fn deleting_a_session_cascades_its_preview() {
+        let db = TempDb::new("preview_cascade");
+        let store = Store::open(&db.0).expect("open");
+        let ws = ws_new(&store, "/tmp/proj-cascade");
+        let doomed = store
+            .upsert_session(&session_new(ws.id, "/sessions/doomed.jsonl"))
+            .expect("insert");
+        let kept = store
+            .upsert_session(&session_new(ws.id, "/sessions/kept.jsonl"))
+            .expect("insert");
+        for row in [&doomed, &kept] {
+            store
+                .upsert_session_preview(row.id, "[]", "2026-04-02T10:00:00Z")
+                .expect("write preview");
+        }
+
+        assert!(store.delete_session(doomed.id).expect("delete"));
+        assert_eq!(
+            store.session_preview(doomed.id).expect("preview"),
+            None,
+            "the deleted session's preview is gone"
+        );
+        assert!(
+            store
+                .session_preview(kept.id)
+                .expect("preview")
+                .is_some(),
+            "a sibling session keeps its preview"
+        );
+    }
+
+    // v4: the preview goes with the workspace too, one level further up the
+    // cascade: a workspace delete removes its sessions, and their previews follow.
+    #[test]
+    fn removing_a_workspace_cascades_the_previews_of_its_sessions() {
+        let db = TempDb::new("preview_ws_cascade");
+        let store = Store::open(&db.0).expect("open");
+        let ws = ws_new(&store, "/tmp/proj-ws-cascade");
+        let row = store
+            .upsert_session(&session_new(ws.id, "/sessions/w.jsonl"))
+            .expect("insert");
+        store
+            .upsert_session_preview(row.id, "[]", "2026-04-03T10:00:00Z")
+            .expect("write preview");
+
+        assert!(store.remove_workspace(ws.id).expect("remove"));
+        assert_eq!(
+            store.session_preview(row.id).expect("preview"),
+            None,
+            "the preview of a removed workspace's session is gone"
+        );
     }
 
     // S5: reopening an already-migrated database runs no migration again, so the
@@ -695,10 +993,10 @@ mod tests {
             .expect("insert");
         drop(store);
 
-        let reopened = Store::open(&db.0).expect("reopen a v3 database");
+        let reopened = Store::open(&db.0).expect("reopen a v4 database");
         assert_eq!(
             user_version(&reopened),
-            3,
+            4,
             "reopening must not change the schema version"
         );
         let rows = reopened.list_provider_status().expect("list");

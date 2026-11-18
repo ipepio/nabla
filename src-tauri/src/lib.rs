@@ -131,6 +131,10 @@ pub fn run() {
             // and read back from the pi-owned file.
             commands::open_session,
             commands::session_transcript,
+            // The preview: the newest turns as the app last streamed them, with
+            // their reasoning, so a session paints before pi boots.
+            commands::save_session_preview,
+            commands::load_session_preview,
             commands::live_session_ids,
             commands::send_prompt,
             commands::stop_session,

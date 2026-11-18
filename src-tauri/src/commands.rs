@@ -1332,6 +1332,125 @@ pub fn session_transcript(
     session_transcript_for(&state.store, &session_id)
 }
 
+// ── session preview: the instant first paint ────────────────────────────────
+
+/// How many messages a preview keeps. Matches the tail `session-store.ts` sends,
+/// and is enforced here too so a longer payload can never grow the database. It is
+/// the newest messages that are kept: those are the ones a human opening a
+/// conversation is looking at.
+const PREVIEW_MESSAGE_LIMIT: usize = 30;
+
+/// One message of a session preview: what the webview hands over after a turn and
+/// reads back when the session is opened again.
+///
+/// `role` is only ever one of the three the transcript renders (any other word is
+/// dropped on the way in), and `reasoning` is what the app streamed for that turn —
+/// exactly the part pi's JSONL file does not store, which is why this preview exists
+/// at all. camelCase like every other payload crossing the bridge.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewMessage {
+    pub role: String,
+    pub text: String,
+    pub reasoning: Option<String>,
+    pub at: Option<String>,
+}
+
+/// Freshness rule of the stored preview, and the reason the store hands
+/// `updated_at` back alongside the JSON instead of judging it itself.
+///
+/// A snapshot is **stale** only when pi's transcript file was written at least a
+/// full second *after* it. Anything else goes to the preview, and ties go to the
+/// preview deliberately: the app snapshots at turn end from the same events pi used
+/// to write its file, and the preview is the only of the two that carries the turn's
+/// reasoning. A session with no file has nothing newer than the snapshot, and an
+/// unindexed session has no file at all — neither is stale.
+///
+/// The timestamps are the store's fixed-width ISO shape, so they compare as strings.
+fn preview_is_stale(store: &Store, session_id: i64, snapshotted_at: &str) -> bool {
+    let Ok(Some(row)) = store.session_by_id(session_id) else {
+        return false;
+    };
+    let Ok(modified) = std::fs::metadata(&row.pi_session_path).and_then(|meta| meta.modified())
+    else {
+        return false;
+    };
+    iso_from_system_time(modified).as_str() > snapshotted_at
+}
+
+/// Stores the tail of a conversation as that session's preview.
+///
+/// `false` means nothing was written — the session is not indexed, or the store
+/// failed — and the caller carries on, because a preview is only a head start on
+/// painting. Messages whose role the transcript cannot render are dropped: they
+/// would cost an open instead of speeding it up.
+fn save_session_preview_for(
+    store: &Store,
+    session_id: i64,
+    messages: &[PreviewMessage],
+) -> bool {
+    let mut kept: Vec<PreviewMessage> = messages
+        .iter()
+        .filter_map(|message| {
+            transcript_role(&message.role).map(|role| PreviewMessage {
+                role: role.to_string(),
+                text: message.text.clone(),
+                reasoning: message.reasoning.clone(),
+                at: message.at.clone(),
+            })
+        })
+        .collect();
+    if kept.len() > PREVIEW_MESSAGE_LIMIT {
+        kept.drain(..kept.len() - PREVIEW_MESSAGE_LIMIT);
+    }
+    let Ok(preview) = serde_json::to_string(&kept) else {
+        return false;
+    };
+    store
+        .upsert_session_preview(session_id, &preview, &now_iso())
+        .unwrap_or(false)
+}
+
+/// The stored preview of a session, or `None` when there is nothing worth
+/// painting: no snapshot, one that no longer parses, or one pi's file has outgrown.
+///
+/// A malformed row is deliberately not an error. `None` makes the caller read pi's
+/// JSONL file, exactly as it did before this preview existed, so a corrupt snapshot
+/// can never keep a session from opening.
+fn load_session_preview_for(store: &Store, session_id: i64) -> Option<Vec<PreviewMessage>> {
+    let stored = store.session_preview(session_id).ok().flatten()?;
+    if preview_is_stale(store, session_id, &stored.updated_at) {
+        return None;
+    }
+    serde_json::from_str::<Vec<PreviewMessage>>(&stored.preview).ok()
+}
+
+/// Saves the newest turns of a session so the next open paints them before pi
+/// boots (`mostrar los últimos mensajes y por detrás, abrir la sesión`).
+///
+/// Best-effort by contract: `false` means nothing was stored and the caller carries
+/// on. pi's JSONL file is the transcript; this is a bounded copy of its tail with
+/// the reasoning the file never had, so a failed save must never break the turn
+/// that produced it.
+#[tauri::command]
+pub fn save_session_preview(
+    state: State<'_, AppState>,
+    session_id: i64,
+    messages: Vec<PreviewMessage>,
+) -> bool {
+    save_session_preview_for(&state.store, session_id, &messages)
+}
+
+/// The preview of a session — its newest turns with their reasoning — or `None`
+/// when the caller should read pi's file instead (see `load_session_preview_for`).
+#[tauri::command]
+pub fn load_session_preview(
+    state: State<'_, AppState>,
+    session_id: i64,
+) -> Option<Vec<PreviewMessage>> {
+    load_session_preview_for(&state.store, session_id)
+}
+
 /// S5: ids with a live pi process, read from the runtime registry only. The
 /// list paints per-session state; it never opens anything (S2).
 #[tauri::command]
@@ -2880,6 +2999,138 @@ done
         assert_eq!(json["role"], serde_json::json!("user"));
         assert_eq!(json["text"], serde_json::json!("hola"));
         assert_eq!(json["at"], serde_json::Value::Null);
+    }
+
+    // ── session preview (instant first paint) ───────────────────────────────
+
+    fn preview(role: &str, text: &str, reasoning: Option<&str>, at: Option<&str>) -> PreviewMessage {
+        PreviewMessage {
+            role: role.to_string(),
+            text: text.to_string(),
+            reasoning: reasoning.map(str::to_string),
+            at: at.map(str::to_string),
+        }
+    }
+
+    // The whole point of the preview: the newest turns come back exactly as they
+    // went in, reasoning included — the part pi's JSONL file never stored.
+    #[test]
+    fn session_preview_round_trips_with_its_reasoning() {
+        let fixture = SessionFixture::new("preview_round_trip");
+        let row = fixture.add_session("preview.jsonl", true, "");
+        let messages = vec![
+            preview("user", "¿cómo va el chat?", None, Some("2026-05-01T10:00:00Z")),
+            preview(
+                "assistant",
+                "Pinta desde el preview.",
+                Some("El usuario quiere que abra rápido."),
+                Some("2026-05-01T10:00:02Z"),
+            ),
+            preview("tool", "read src/App.vue", None, None),
+        ];
+
+        assert!(
+            save_session_preview_for(&fixture.store, row.id, &messages),
+            "an indexed session stores its preview"
+        );
+        assert_eq!(
+            load_session_preview_for(&fixture.store, row.id),
+            Some(messages),
+            "the preview reads back message by message, reasoning included"
+        );
+
+        // A later snapshot of the same session replaces the previous one.
+        let shorter = vec![preview("user", "solo esto", None, None)];
+        assert!(save_session_preview_for(&fixture.store, row.id, &shorter));
+        assert_eq!(load_session_preview_for(&fixture.store, row.id), Some(shorter));
+    }
+
+    // A snapshot written before pi's file grew is no longer worth painting: the
+    // file has turns the preview does not, so the caller reads the file instead.
+    #[test]
+    fn session_preview_is_dropped_once_pis_file_outgrows_it() {
+        let fixture = SessionFixture::new("preview_stale");
+        let row = fixture.add_session("stale.jsonl", true, "");
+        // Written by hand with a stamp the file's own mtime is well past.
+        assert!(
+            fixture
+                .store
+                .upsert_session_preview(row.id, "[]", "2020-01-01T00:00:00Z")
+                .expect("store a stale preview")
+        );
+        assert_eq!(
+            load_session_preview_for(&fixture.store, row.id),
+            None,
+            "a preview pi's file outgrew is not painted"
+        );
+    }
+
+    // A corrupt snapshot is not an error: the caller falls back to pi's file, so a
+    // preview written by an older build can never keep a session from opening.
+    #[test]
+    fn session_preview_answers_none_when_the_stored_json_is_corrupt() {
+        let fixture = SessionFixture::new("preview_corrupt");
+        let row = fixture.add_session("corrupt.jsonl", true, "");
+        assert!(
+            fixture
+                .store
+                .upsert_session_preview(row.id, "{not json at all", &now_iso())
+                .expect("store the corrupt preview")
+        );
+        assert_eq!(load_session_preview_for(&fixture.store, row.id), None);
+    }
+
+    // Saving is best-effort: an id that is not indexed stores nothing and says so
+    // instead of failing the turn that produced the snapshot.
+    #[test]
+    fn saving_a_preview_for_an_unindexed_session_writes_nothing() {
+        let fixture = SessionFixture::new("preview_unindexed");
+        assert!(!save_session_preview_for(
+            &fixture.store,
+            9_999,
+            &[preview("user", "hola", None, None)]
+        ));
+        assert_eq!(load_session_preview_for(&fixture.store, 9_999), None);
+    }
+
+    // The preview is bounded: a long conversation keeps its newest messages, which
+    // are the ones an open is looking at, and unknown roles are dropped instead of
+    // costing a paint the UI cannot render.
+    #[test]
+    fn session_preview_keeps_the_newest_messages_and_only_renderable_roles() {
+        let fixture = SessionFixture::new("preview_cap");
+        let row = fixture.add_session("cap.jsonl", true, "");
+        let mut messages: Vec<PreviewMessage> = (0..PREVIEW_MESSAGE_LIMIT + 5)
+            .map(|index| preview("user", &format!("m{index}"), None, None))
+            .collect();
+        messages.push(preview("system", "no se renderiza", None, None));
+
+        assert!(save_session_preview_for(&fixture.store, row.id, &messages));
+        let stored = load_session_preview_for(&fixture.store, row.id).expect("preview");
+        assert_eq!(stored.len(), PREVIEW_MESSAGE_LIMIT, "capped");
+        assert_eq!(stored.first().map(|m| m.text.as_str()), Some("m5"));
+        assert_eq!(
+            stored.last().map(|m| m.text.as_str()),
+            Some(format!("m{}", PREVIEW_MESSAGE_LIMIT + 4).as_str()),
+            "a role the transcript does not render is not stored"
+        );
+    }
+
+    // Contract shape: `{ role, text, reasoning, at }`, `null` for what was never
+    // there. The TS mirror (`PreviewMessage` in `src/contracts/types.ts`) is these
+    // exact keys.
+    #[test]
+    fn preview_message_serializes_as_role_text_reasoning_and_at() {
+        let json = serde_json::to_value(preview("assistant", "hola", None, None))
+            .expect("serialize");
+        assert_eq!(json["role"], serde_json::json!("assistant"));
+        assert_eq!(json["text"], serde_json::json!("hola"));
+        assert_eq!(json["reasoning"], serde_json::Value::Null);
+        assert_eq!(json["at"], serde_json::Value::Null);
+        // And the null fields parse back as absent options, so a payload with no
+        // reasoning is not a decode error.
+        let parsed: PreviewMessage = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(parsed.reasoning, None);
     }
 
     // ── MCP configuration (F0 of `tool-drawer-and-mcp.md`) ─────────────────
