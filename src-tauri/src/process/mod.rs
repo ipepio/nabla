@@ -757,6 +757,13 @@ fn spawn_args(session_file: &Path, provider: &str, model: &str) -> Vec<String> {
         provider.to_string(),
         "--model".to_string(),
         model.to_string(),
+        // Nabla is its own harness: it must not inherit the user's terminal
+        // harness extensions (gentle-ai injects an "el Gentleman" identity via
+        // appendSystemPrompt), so extension discovery is disabled and only the
+        // extensions Nabla itself needs are loaded back explicitly.
+        "--no-extensions".to_string(),
+        "-e".to_string(),
+        "builtin:mcp".to_string(),
         "--append-system-prompt".to_string(),
         NABLA_SYSTEM_PROMPT.to_string(),
     ]
@@ -1132,12 +1139,17 @@ sleep 30
                 "nan".to_string(),
                 "--model".to_string(),
                 "deepseek-v4-flash".to_string(),
+                "--no-extensions".to_string(),
+                "-e".to_string(),
+                "builtin:mcp".to_string(),
                 "--append-system-prompt".to_string(),
                 NABLA_SYSTEM_PROMPT.to_string(),
             ]
         );
         // The identity actually says who we are: it is not an empty placeholder.
         assert!(NABLA_SYSTEM_PROMPT.contains("Nabla"));
+        // And it must never claim the terminal harness's identity.
+        assert!(!NABLA_SYSTEM_PROMPT.contains("el Gentleman"));
     }
 
     // S7: the configured provider and model reach the child process, in the
