@@ -1211,7 +1211,6 @@ onUnmounted(() => {
     <template v-else>
       <ChatHeader
         :title="workspaceName"
-        :mode="t('chat.standardMode')"
         :tools-open="toolsOpen"
         :is-dark="isDark"
         @toggle-tools="emit('toggleTools')"

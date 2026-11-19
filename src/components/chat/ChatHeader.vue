@@ -8,17 +8,13 @@
 // the panel owns, and `toggleTheme` asks the panel for the next one (S4: the
 // theme is applied by `src/lib/theme.ts` only).
 import { MoreHorizontalIcon, PanelRightOpenIcon } from "@lucide/vue";
-import PermissionModeChip from "@/components/chat/PermissionModeChip.vue";
 import ThemeToggle from "@/components/chat/ThemeToggle.vue";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { t } from "@/lib/i18n";
 
 defineProps<{
   /** Workspace/session name. */
   title: string;
-  /** Interaction mode label; only "Standard mode" exists today. */
-  mode: string;
   /** Right tools drawer visibility, so the control reflects the real state. */
   toolsOpen: boolean;
   /** Is the app currently on the dark palette? Decides the icon and the label. */
@@ -35,9 +31,6 @@ const emit = defineEmits<{
   <header class="flex items-center gap-2 border-b border-border px-4 py-2">
     <div class="flex min-w-0 flex-1 items-center gap-2">
       <h1 class="truncate text-sm font-semibold">{{ title }}</h1>
-      <Badge variant="outline" class="shrink-0 text-muted-foreground">
-        {{ mode }}
-      </Badge>
     </div>
 
     <!-- Tools drawer toggle: collapsed by default and reachable from here and
@@ -54,11 +47,6 @@ const emit = defineEmits<{
     >
       <PanelRightOpenIcon />
     </Button>
-
-    <!-- Permission mode (S1 of `permission-modes.md`): the mode the agent is
-         obeying, one click away from the next one. The chip persists the choice
-         itself, so the header stays presentation plus one seam call. -->
-    <PermissionModeChip />
 
     <!-- Theme switch: the icon names the *target* palette (sun = light), and
          the panel persists the new mode in settings.json. Shared with the

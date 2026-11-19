@@ -27,6 +27,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { t } from "@/lib/i18n";
 import { COMPOSER_MAX_WIDTH, COMPOSER_MIN_WIDTH } from "@/lib/layout";
 import type { ProviderModels } from "@/contracts/types";
+import PermissionModeChip from "@/components/chat/PermissionModeChip.vue";
 
 /**
  * A model choice is provider-scoped (S2 of `models-by-provider.md`): the same id
@@ -311,6 +312,12 @@ function chooseModel(provider: string, model: string) {
       </span>
 
       <div class="ms-auto flex min-w-0 shrink items-center gap-1.5">
+        <!-- Permission mode: what the agent is allowed to do right now, next to
+             the controls that shape the turn it will run in. It belongs with the
+             composer — the row where the human decides what happens next — not
+             in the header, which only names the conversation. -->
+        <PermissionModeChip />
+
         <!-- Provider → model: one trigger naming the current pair (provider as
              a muted prefix), and one menu where each provider row opens its own
              enabled models laterally. Reka owns the keyboard walk: no custom
