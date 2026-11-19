@@ -81,6 +81,34 @@ export interface QueuedPrompt {
 }
 
 /**
+ * One question the session's agent is blocked on (S3 of
+ * `agent-question-bridge.md`), as the chat renders it.
+ *
+ * Not a transcript message: it is a live request, not history. It lives in the
+ * session's buffer so a question survives switching to another session and back
+ * (it belongs to the session that asked it, S3), and it leaves the buffer only
+ * when it is answered or when its process can no longer receive an answer.
+ *
+ * The wire shape comes from `AgentEvent::ExtensionUiRequest`, whose optional
+ * fields are normalized here: a card always has a title, an option list and the
+ * two method-specific fields, empty or absent rather than undefined.
+ */
+export interface PendingQuestion {
+  /** pi's request id; the answer must echo it verbatim. */
+  id: string;
+  /** pi's wire discriminator: `select` | `confirm` | `input` | `editor`. */
+  method: string;
+  /** The question itself; `""` when pi sent none. */
+  title: string;
+  /** `select` only, oldest-first as pi sent them; `[]` for every other method. */
+  options: string[];
+  /** `confirm` only: what exactly is being confirmed. */
+  message: string | null;
+  /** `input` only: the hint shown inside the empty field. */
+  placeholder: string | null;
+}
+
+/**
  * Id of the next message. Prefixed with the session id so a deleted session's
  * bookkeeping (the reasoning toggle state) can be pruned by prefix, and
  * monotonic — one counter for the whole app run, never reset — so no id is ever
@@ -164,6 +192,15 @@ export interface SessionBuffer {
    * prompt the human typed.
    */
   queue: QueuedPrompt[];
+  /**
+   * S3: the questions this session's agent is blocked on, in arrival order.
+   *
+   * A stack, because pi allows any number of concurrent dialogs and each one
+   * waits for its own answer: the first question asked is the first card. It is
+   * cleared when the process stops or crashes — nobody can answer a dead
+   * session — and an answered question is removed by id, never by position.
+   */
+  questions: PendingQuestion[];
 }
 
 /** Per-session state, keyed by the session index id in decimal form (S1). */
@@ -371,6 +408,7 @@ function ensureBuffer(sessionId: string, workspaceId: number | null = null): Ses
     busy: false,
     workspaceId,
     queue: [],
+    questions: [],
   });
   sessions.set(sessionId, created);
   return created;
@@ -566,6 +604,76 @@ export function removeQueuedPrompt(
   if (removed !== undefined) dropTranscriptMessage(buffer, removed.id);
 }
 
+// ── the agent's questions (S3 of `agent-question-bridge.md`) ────────────────
+
+/**
+ * Normalizes one wire request into the shape the card renders. The optional
+ * fields of `AgentEvent::ExtensionUiRequest` become empty or absent values here,
+ * so a template never has to ask whether a title or an option list exists.
+ */
+function normalizeQuestion(event: {
+  id: string;
+  method: string;
+  title?: string;
+  options?: string[];
+  message?: string;
+  placeholder?: string;
+}): PendingQuestion {
+  return {
+    id: event.id,
+    method: event.method,
+    title: event.title ?? "",
+    // A copy of pi's array: the card renders it, and the store never hands out a
+    // reference into the event the bridge created.
+    options: [...(event.options ?? [])],
+    message: event.message ?? null,
+    placeholder: event.placeholder ?? null,
+  };
+}
+
+/**
+ * S3: the questions of one session still waiting for an answer, in arrival
+ * order. A copy, like the queue above: only `resolveQuestion` and the lifecycle
+ * may change the list, while the panel only renders it.
+ *
+ * Reading through the reactive buffer is what keeps the panel live: a question
+ * that arrives while the chat is on screen renders without another event, and an
+ * answered one disappears the moment it is removed.
+ */
+export function pendingQuestions(sessionId: string | null): PendingQuestion[] {
+  const buffer = sessionBuffer(sessionId);
+  if (buffer === null) return [];
+  return buffer.questions.map((question) => question);
+}
+
+/**
+ * S3: drops one answered question by its id. The id, not a position: the human
+ * can answer the second question first, and a stale click must never close a
+ * different one.
+ */
+export function resolveQuestion(
+  sessionId: string | null,
+  requestId: string,
+): void {
+  const buffer = sessionBuffer(sessionId);
+  if (buffer === null) return;
+  const index = buffer.questions.findIndex(
+    (question) => question.id === requestId,
+  );
+  if (index !== -1) buffer.questions.splice(index, 1);
+}
+
+/**
+ * Drops every pending question of a session. Called on the transitions that make
+ * an answer impossible — stopped, crashed, exited — because pi is blocked on an
+ * answer that can never reach it, and a card nobody can close is worse than no
+ * card at all.
+ */
+function clearQuestions(buffer: SessionBuffer): void {
+  if (buffer.questions.length === 0) return;
+  buffer.questions.splice(0, buffer.questions.length);
+}
+
 /**
  * S3: hands the next queued prompt of a session to pi, after the turn that just
  * ended. Exactly one per turn end, so a queue of three takes three turns — same
@@ -748,6 +856,12 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
       buffer.status = event.status;
       buffer.error = event.error ?? null;
       markLive(sessionId, event.status);
+      // S3: a question only exists while the process that asked it is alive. pi
+      // stays blocked on an answer that can no longer arrive, so the card goes
+      // with the process instead of waiting for a human who cannot be heard.
+      if (event.status === "stopped" || event.status === "crashed") {
+        clearQuestions(buffer);
+      }
       // A prompt typed while pi was still booting waits in the queue (its stdin
       // does not exist yet). The transition into a live process is what drains
       // it, so the prompt the human typed into a session that was still starting
@@ -759,8 +873,18 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
     }
     case "process_exit":
       buffer.exitCode = event.code ?? null;
+      // The question bridge dies with the child (S3): no process, no answer.
+      clearQuestions(buffer);
       liveIds.value = liveIds.value.filter((id) => id !== sessionId);
       return;
+    case "extension_ui_request": {
+      // One card per request id: pi allows concurrent dialogs, so the list is a
+      // stack, but a duplicated frame (a stale hot-reload listener) must never
+      // ask the same question twice.
+      if (buffer.questions.some((question) => question.id === event.id)) return;
+      buffer.questions.push(normalizeQuestion(event));
+      return;
+    }
     default:
       // A fresh turn starts with no tool chips: the list describes the turn in
       // progress, not a running log, or a long session becomes a wall of badges.
@@ -1095,6 +1219,12 @@ export function recordSessionStatus(
   const buffer = ensureBuffer(sessionId);
   buffer.status = status;
   buffer.error = error;
-  if (status === "stopped" || status === "crashed") buffer.busy = false;
+  if (status === "stopped" || status === "crashed") {
+    // A session that is stopped or crashed is not working, and every pending
+    // question became unanswerable with the process that asked it (S3): pi stays
+    // blocked on an answer that can never arrive.
+    buffer.busy = false;
+    clearQuestions(buffer);
+  }
   markLive(sessionId, status);
 }

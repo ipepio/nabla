@@ -25,6 +25,7 @@ import ThemeToggle from "@/components/chat/ThemeToggle.vue";
 import ChatHeader from "@/components/chat/ChatHeader.vue";
 import Composer from "@/components/chat/Composer.vue";
 import MessageBubble from "@/components/chat/MessageBubble.vue";
+import QuestionCard from "@/components/chat/QuestionCard.vue";
 import { draftKeyFor, usePromptDraft } from "@/components/chat/use-prompt-draft";
 import { useThrottledText } from "@/components/chat/use-throttled-text";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -32,6 +33,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
+  answerUiRequest,
   commandErrorMessage,
   getSettings,
   saveSettings,
@@ -42,6 +44,7 @@ import type {
   AppSettings,
   SessionDto,
   TranscriptRole,
+  UiAnswer,
   WorkspaceInfo,
 } from "@/contracts/types";
 import { useAppearance } from "@/lib/appearance";
@@ -63,12 +66,15 @@ import {
   isSessionSpawning,
   isTranscriptLoading,
   newSession,
+  pendingQuestions,
   queuedCount,
   queuedPrompts,
   recordSessionStatus,
   removeQueuedPrompt,
+  resolveQuestion,
   sendUserTurn,
   sessionBuffer,
+  type PendingQuestion,
   type SessionBuffer,
   type ToolEntry,
 } from "@/lib/session-store";
@@ -436,6 +442,23 @@ const queuedForSession = computed(() =>
 const queuedList = computed(() =>
   queuedPrompts(currentSession.value?.sessionId ?? null),
 );
+
+/**
+ * S3 of `agent-question-bridge.md`: the questions this session's agent is blocked
+ * on, in arrival order (pi allows concurrent dialogs, so it is a stack). The
+ * store owns the list — it clears it when the process stops — so the panel only
+ * renders it and answers it.
+ */
+const questions = computed(() =>
+  pendingQuestions(currentSession.value?.sessionId ?? null),
+);
+
+/**
+ * Id of the question whose answer is on its way. While set, every card is inert:
+ * a second click would write a second answer for a question pi has already
+ * resolved, and the protocol has no way to take an answer back.
+ */
+const answering = ref<string | null>(null);
 
 /**
  * The queue stack shares the composer's ceiling, so it lines up with the box
@@ -838,6 +861,35 @@ function handleRemoveQueued(index: number) {
 }
 
 /**
+ * S3: answers one pending question, which is what unblocks the agent's turn.
+ *
+ * The card leaves only once the line really reached the child
+ * (`answer_ui_request` rejects for a session that is not running), so a card
+ * that is gone always means the agent has the answer. A failure keeps it on
+ * screen with the reason in the error card, which is the honest state: still
+ * unanswered.
+ */
+async function handleAnswer(question: PendingQuestion, answer: UiAnswer) {
+  const current = currentSession.value;
+  if (current === null || answering.value !== null) return;
+  answering.value = question.id;
+  panelError.value = null;
+  try {
+    await answerUiRequest(
+      current.workspaceId,
+      Number(current.sessionId),
+      question.id,
+      answer,
+    );
+    resolveQuestion(current.sessionId, question.id);
+  } catch (cause) {
+    panelError.value = commandErrorMessage(cause);
+  } finally {
+    answering.value = null;
+  }
+}
+
+/**
  * Stops the active session. This is the only path that stops a process —
  * changing sessions never does (S4), and the button only touches the session on
  * screen.
@@ -912,6 +964,23 @@ onUnmounted(() => {
     >
       <template #composer>
         <div class="flex w-full flex-col gap-1.5">
+          <!-- S3 of `agent-question-bridge.md`: what the agent is blocked on,
+               answered here or cancelled. Above the queue: an unanswered
+               question is the turn, a queued prompt is only what comes next. -->
+          <div
+            v-if="questions.length > 0"
+            class="mx-auto flex w-full flex-col gap-1.5"
+            :style="{ maxWidth: queueMaxWidth }"
+          >
+            <QuestionCard
+              v-for="question in questions"
+              :key="question.id"
+              :question="question"
+              :busy="answering !== null"
+              @answer="handleAnswer(question, $event)"
+            />
+          </div>
+
           <!-- S3: this session's waiting prompts, directly above the composer
                (see the conversation branch below for the same stack). -->
           <div
@@ -1109,6 +1178,23 @@ onUnmounted(() => {
            No rule above it: the conversation and its input read as one
            surface instead of two panes. -->
       <div class="px-4 py-3">
+        <!-- S3 of `agent-question-bridge.md`: the same card stack as the empty
+             state above, so a question is answered in the same place whichever
+             state the panel is in. -->
+        <div
+          v-if="questions.length > 0"
+          class="mx-auto mb-1.5 flex w-full flex-col gap-1.5"
+          :style="{ maxWidth: queueMaxWidth }"
+        >
+          <QuestionCard
+            v-for="question in questions"
+            :key="question.id"
+            :question="question"
+            :busy="answering !== null"
+            @answer="handleAnswer(question, $event)"
+          />
+        </div>
+
         <!-- S3: this session's waiting prompts, directly above the composer and
              capped to three visible rows so the input never leaves the screen.
              Same stack as the empty state above. -->
