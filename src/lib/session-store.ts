@@ -1193,6 +1193,22 @@ export async function sendUserTurn(
   const prompt = text.trim();
   if (prompt === "") return;
   const buffer = ensureBuffer(sessionId, workspaceId);
+  // A session the runtime no longer hosts — stopped, crashed, or its child
+  // gone — has no stdin to receive this prompt: sending would only fail and
+  // roll the turn back. The send re-opens the session instead. `open_session`
+  // is idempotent, so a live child is reused (a stale liveness hint costs one
+  // harmless call) and a dead one is re-spawned, pi reloading its own
+  // transcript; a re-opened child answers `spawning`, and the prompt waits in
+  // the queue until it reports live — the same drain that carries a prompt
+  // typed while a session spawns. Stop is a pause, not a dead end.
+  if (!liveIds.value.includes(sessionId)) {
+    const opened = await openSession(sessionId);
+    markLive(sessionId, opened.status);
+    if (opened.status === "spawning") {
+      enqueuePrompt(sessionId, prompt, workspaceId);
+      return;
+    }
+  }
   const id = pushUserTurn(sessionId, buffer, prompt);
   buffer.busy = true;
   try {
