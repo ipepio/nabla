@@ -36,6 +36,8 @@ use axum::{
 use serde_json::{json, Value};
 use tauri::Emitter;
 
+use crate::embed::EmbedError;
+
 /// The name pi will see in `tools/list` sources and in its own tool names
 /// (`mcp__nabla-browser__navigate`).
 pub const SERVER_NAME: &str = "nabla-browser";
@@ -75,12 +77,48 @@ pub trait WebviewDriver: Send + Sync + 'static {
 
     /// Navigates one existing view. The url is validated by the driver, which is
     /// where the `http`/`https`/`about:blank` rule already lives.
-    fn navigate(&self, view_id: &str, url: &str) -> Result<(), String>;
+    fn navigate(&self, view_id: &str, url: &str) -> Result<(), DriverFailure>;
 
     /// Runs a script in one existing view and answers what the platform
     /// serialized from it.
-    fn eval(&self, view_id: &str, script: &str) -> Result<String, String>;
+    fn eval(&self, view_id: &str, script: &str) -> Result<String, DriverFailure>;
 }
+
+/// A driver failure, typed so the dispatcher can tell an accident from an answer.
+///
+/// Flattening both into one string is what used to let a platform detail reach the
+/// model as if the app were broken. The split is the dispatcher's whole retry rule:
+/// [`DriverFailure::ViewGone`] is the one failure worth one more attempt, because
+/// the human may have closed the pane between resolving the view and using it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriverFailure {
+    /// The view the tool resolved is no longer driveable: the registry lost it, or
+    /// its webview did. The driver has already evicted the dead entry.
+    ViewGone,
+    /// Everything the driver actually answered — a script error, a refused url, a
+    /// page that never replied. Rendered to the model verbatim.
+    Other(String),
+}
+
+impl DriverFailure {
+    /// A failure that is an answer, not an accident: nothing to retry.
+    pub fn other(message: impl Into<String>) -> DriverFailure {
+        DriverFailure::Other(message.into())
+    }
+}
+
+impl std::fmt::Display for DriverFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Replaced by the honest no-view message before it reaches the model;
+            // readable here so a test or a log line still says what happened.
+            DriverFailure::ViewGone => write!(f, "the browser view is no longer open"),
+            DriverFailure::Other(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for DriverFailure {}
 
 /// The endpoint one run of the app offers, and the token that opens it.
 ///
@@ -145,6 +183,12 @@ pub fn dispatch(driver: &dyn WebviewDriver, request: &Value) -> Option<Value> {
 /// to open the pane (`auto-open-pane.md`, S1/S3) and use what the UI creates with
 /// its own rect. `list_targets` is the tool whose *answer* is the registry: an
 /// empty list is a valid reply, not a failure, so it never asks for a pane.
+///
+/// A tool that hits a view which disappeared under it (the human closed the pane
+/// between resolving and using it, or a registry entry outlived its webview) asks
+/// for a pane once and retries once — see the block below the resolution. A view
+/// that goes away twice, or a pane nobody opens, answers [`NO_VIEW_ERROR`]: the
+/// platform's own words would read to the model as a broken app.
 fn call_tool(driver: &dyn WebviewDriver, id: &Value, params: &Value) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     if !TOOL_NAMES.contains(&name) {
@@ -170,60 +214,137 @@ fn call_tool(driver: &dyn WebviewDriver, id: &Value, params: &Value) -> Value {
     }
 
     let view = match resolve_view(&views, asked_view) {
-        Ok(view) => view,
+        Ok(view) => view.clone(),
         Err(message) => return tool_result(id, &message, true),
     };
 
-    let outcome = match name {
-        "navigate" => {
-            let Some(url) = argument(&arguments, "url") else {
-                return error(id, -32602, "navigate needs a `url` argument");
-            };
-            driver
-                .navigate(&view.id, url)
-                .map(|()| format!("navigated `{}` to {url}", view.id))
-        }
-        "eval" => {
-            let Some(script) = argument(&arguments, "script") else {
-                return error(id, -32602, "eval needs a `script` argument");
-            };
-            driver.eval(&view.id, script)
-        }
-        // The url the registry holds for this view: the agent's own navigation
-        // is not the only way it changes, so the page is never asked.
-        "get_url" => Ok(view.url.clone()),
-        "get_title" => driver.eval(&view.id, TITLE_SCRIPT),
-        "click" => {
-            let Some(selector) = argument(&arguments, "selector") else {
-                return error(id, -32602, "click needs a `selector` argument");
-            };
-            run_script(driver, view, &click_script(selector))
-        }
-        "type" => {
-            let Some(selector) = argument(&arguments, "selector") else {
-                return error(id, -32602, "type needs a `selector` argument");
-            };
-            // An empty text is a request to clear the field, which is a real
-            // thing to do, so only a missing or non-string one is refused.
-            let Some(text) = arguments.get("text").and_then(Value::as_str) else {
-                return error(id, -32602, "type needs a `text` argument");
-            };
-            run_script(driver, view, &type_script(selector, text))
-        }
-        "back" => history(driver, view, "history.back()", "went back one history entry"),
-        "forward" => history(
-            driver,
-            view,
-            "history.forward()",
-            "went forward one history entry",
-        ),
-        "reload" => history(driver, view, "location.reload()", "reloaded the page"),
-        other => unreachable!("`{other}` is in TOOL_NAMES and has no arm"),
+    let action = match Action::parse(name, &arguments) {
+        Ok(action) => action,
+        Err(message) => return error(id, -32602, &message),
+    };
+
+    // One retry, never a loop. `ViewGone` means the view this call resolved is
+    // already gone (the human closed the pane in between, or an entry outlived its
+    // webview) and the driver has evicted the dead entry. Asking for a pane once
+    // and retrying once is what turns "embed: no embedded browser embed-1 is open"
+    // — which reads to the model as "the app is broken" — into either the work it
+    // asked for or the honest no-view answer. Everything else is an answer: a
+    // script error, a refused url, a selector that matches nothing.
+    let outcome = match action.run(driver, &view) {
+        Err(DriverFailure::ViewGone) => match reopen(driver, asked_view) {
+            Ok(view) => action.run(driver, &view),
+            Err(message) => Err(DriverFailure::other(message)),
+        },
+        outcome => outcome,
     };
 
     match outcome {
         Ok(text) => tool_result(id, &text, false),
-        Err(message) => tool_result(id, &message, true),
+        // A view that went away twice is the same honest answer as a pane nobody
+        // opened: the tool needs a view and there is none to drive. The driver's
+        // own words here are an app-level detail the model cannot act on.
+        Err(DriverFailure::ViewGone) => tool_result(id, NO_VIEW_ERROR, true),
+        Err(failure) => tool_result(id, &failure.to_string(), true),
+    }
+}
+
+/// Asks the app for a pane once and resolves the view to retry on.
+///
+/// The `Err` is a message already fit for the model: either the honest no-view
+/// answer, or what `resolve_view` refuses.
+fn reopen(driver: &dyn WebviewDriver, asked: Option<&str>) -> Result<LiveView, String> {
+    if !driver.ensure_view(VIEW_WAIT) {
+        return Err(NO_VIEW_ERROR.to_string());
+    }
+    let views = driver.views();
+    resolve_view(&views, asked).cloned()
+}
+
+/// What one tool run needs, resolved before the driver is called.
+///
+/// The arguments a tool cannot run without are checked in [`Action::parse`], so a
+/// missing one stays a protocol error (a broken request) and can never be mistaken
+/// for a page that failed. Splitting the action out is also what lets the retry
+/// re-run the same tool against a new view without a second copy of this match.
+enum Action {
+    Navigate(String),
+    Eval(String),
+    GetUrl,
+    GetTitle,
+    Click(String),
+    Type { selector: String, text: String },
+    Back,
+    Forward,
+    Reload,
+}
+
+impl Action {
+    /// The action a view-needing tool name means, or the message its arguments
+    /// earn. Every name here is in [`TOOL_NAMES`] and is not `list_targets`.
+    fn parse(name: &str, arguments: &Value) -> Result<Action, String> {
+        fn needed<'a>(arguments: &'a Value, key: &str, tool: &str) -> Result<&'a str, String> {
+            argument(arguments, key).ok_or_else(|| format!("{tool} needs a `{key}` argument"))
+        }
+        Ok(match name {
+            "navigate" => Action::Navigate(needed(arguments, "url", name)?.to_string()),
+            "eval" => Action::Eval(needed(arguments, "script", name)?.to_string()),
+            "get_url" => Action::GetUrl,
+            "get_title" => Action::GetTitle,
+            "click" => Action::Click(needed(arguments, "selector", name)?.to_string()),
+            "type" => {
+                let selector = needed(arguments, "selector", name)?.to_string();
+                // An empty text is a request to clear the field, which is a real
+                // thing to do, so only a missing or non-string one is refused.
+                let Some(text) = arguments.get("text").and_then(Value::as_str) else {
+                    return Err("type needs a `text` argument".to_string());
+                };
+                Action::Type {
+                    selector,
+                    text: text.to_string(),
+                }
+            }
+            "back" => Action::Back,
+            "forward" => Action::Forward,
+            "reload" => Action::Reload,
+            other => unreachable!("`{other}` is in TOOL_NAMES and has no arm"),
+        })
+    }
+
+    /// Runs against one view. `Err` is a driver failure, so the caller can tell the
+    /// one retryable case from the answers.
+    fn run(&self, driver: &dyn WebviewDriver, view: &LiveView) -> Result<String, DriverFailure> {
+        match self {
+            Action::Navigate(url) => driver
+                .navigate(&view.id, url)
+                .map(|()| format!("navigated `{}` to {url}", view.id)),
+            Action::Eval(script) => driver.eval(&view.id, script),
+            // The url the registry holds for this view: the agent's own navigation
+            // is not the only way it changes, so the page is never asked. The
+            // registry is re-read rather than trusted from the snapshot this call
+            // resolved: an entry evicted in between would otherwise answer a url
+            // for a view nobody has, which is the stale url this tool must never
+            // report.
+            Action::GetUrl => {
+                if driver.views().iter().any(|live| live.id == view.id) {
+                    Ok(view.url.clone())
+                } else {
+                    Err(DriverFailure::ViewGone)
+                }
+            }
+            Action::GetTitle => driver.eval(&view.id, TITLE_SCRIPT),
+            Action::Click(selector) => run_script(driver, view, &click_script(selector)),
+            Action::Type { selector, text } => {
+                run_script(driver, view, &type_script(selector, text))
+            }
+            Action::Back => history(driver, view, "history.back()", "went back one history entry"),
+            Action::Forward => history(
+                driver,
+                view,
+                "history.forward()",
+                "went forward one history entry",
+            ),
+            Action::Reload => history(driver, view, "location.reload()", "reloaded the page"),
+        }
     }
 }
 
@@ -247,11 +368,11 @@ fn run_script(
     driver: &dyn WebviewDriver,
     view: &LiveView,
     script: &str,
-) -> Result<String, String> {
+) -> Result<String, DriverFailure> {
     let answer = driver.eval(&view.id, script)?;
     match serde_json::from_str::<Value>(&answer) {
         Ok(value) => match value.get("error").and_then(Value::as_str) {
-            Some(message) => Err(message.to_string()),
+            Some(message) => Err(DriverFailure::other(message)),
             None => Ok(answer),
         },
         Err(_) => Ok(answer),
@@ -265,7 +386,7 @@ fn history(
     view: &LiveView,
     script: &str,
     done: &str,
-) -> Result<String, String> {
+) -> Result<String, DriverFailure> {
     driver.eval(&view.id, script).map(|_| done.to_string())
 }
 
@@ -804,15 +925,25 @@ impl Default for RegistrationGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::io::{Read, Write};
     use std::sync::Mutex;
 
     /// A driver that records what it was asked and answers what the test set.
+    ///
+    /// Its registry is mutable for one reason: a scripted `ViewGone` must remove
+    /// the entry it answered for, because that is what the real driver does before
+    /// it reports the failure. A fake that kept the dead entry would let a retry
+    /// hit the same view again and prove nothing.
     struct FakeDriver {
-        views: Vec<LiveView>,
+        views: Mutex<Vec<LiveView>>,
         navigated: Mutex<Vec<(String, String)>>,
         evaluated: Mutex<Vec<(String, String)>>,
-        eval_answer: Result<String, String>,
+        /// What successive `navigate` calls answer, in order; the last entry
+        /// repeats, so a one-entry script means "every call answers this".
+        navigate_answers: Mutex<VecDeque<Result<(), DriverFailure>>>,
+        /// Same rule for `eval`.
+        eval_answers: Mutex<VecDeque<Result<String, DriverFailure>>>,
         /// What the app registers when a tool asks for a pane. Empty is the
         /// human keeping the pane closed, or the Browser tool being off.
         opens: Vec<LiveView>,
@@ -822,13 +953,26 @@ mod tests {
         ensured: Mutex<Vec<Duration>>,
     }
 
+    /// The next scripted answer: entries are popped in order and the last one
+    /// repeats, so a script of one means "always", and an empty script is the
+    /// type's own fallback.
+    fn next_answer<T: Clone>(answers: &Mutex<VecDeque<T>>, fallback: T) -> T {
+        let mut answers = answers.lock().expect("the answer script");
+        if answers.len() > 1 {
+            answers.pop_front().expect("a queued answer")
+        } else {
+            answers.front().cloned().unwrap_or(fallback)
+        }
+    }
+
     impl FakeDriver {
         fn with_views(views: Vec<LiveView>) -> FakeDriver {
             FakeDriver {
-                views,
+                views: Mutex::new(views),
                 navigated: Mutex::new(Vec::new()),
                 evaluated: Mutex::new(Vec::new()),
-                eval_answer: Ok("\"ok\"".to_string()),
+                navigate_answers: Mutex::new(VecDeque::from([Ok(())])),
+                eval_answers: Mutex::new(VecDeque::from([Ok("\"ok\"".to_string())])),
                 opens: Vec::new(),
                 opened: Mutex::new(Vec::new()),
                 ensured: Mutex::new(Vec::new()),
@@ -854,11 +998,48 @@ mod tests {
         fn asks(&self) -> usize {
             self.ensured.lock().unwrap().len()
         }
+
+        /// What successive `eval` calls answer; the last one repeats.
+        fn answer_eval(&self, answer: Result<String, DriverFailure>) {
+            *self.eval_answers.lock().unwrap() = VecDeque::from([answer]);
+        }
+
+        /// What successive `navigate` calls answer; the last one repeats.
+        fn answer_navigate(&self, answers: impl IntoIterator<Item = Result<(), DriverFailure>>) {
+            *self.navigate_answers.lock().unwrap() = answers.into_iter().collect();
+        }
+
+        /// What the real driver does with a `ViewGone`: the dead entry leaves the
+        /// registry before the failure is answered.
+        fn evict(&self, view_id: &str) {
+            self.views
+                .lock()
+                .unwrap()
+                .retain(|view| view.id != view_id);
+        }
+
+        /// The views the app registers once a tool asks for a pane, on an open
+        /// registry: the shape of "the human closed the pane and the tool asked for
+        /// it again".
+        fn with_pane(mut self, opens: Vec<LiveView>) -> FakeDriver {
+            self.opens = opens;
+            self
+        }
+
+        /// Every id the fake's own registry holds, dead entries included or not.
+        fn registered(&self) -> Vec<String> {
+            self.views
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|view| view.id.clone())
+                .collect()
+        }
     }
 
     impl WebviewDriver for FakeDriver {
         fn views(&self) -> Vec<LiveView> {
-            let mut views = self.views.clone();
+            let mut views = self.views.lock().unwrap().clone();
             views.extend(self.opened.lock().unwrap().iter().cloned());
             views
         }
@@ -875,20 +1056,31 @@ mod tests {
             true
         }
 
-        fn navigate(&self, view_id: &str, url: &str) -> Result<(), String> {
+        fn navigate(&self, view_id: &str, url: &str) -> Result<(), DriverFailure> {
             self.navigated
                 .lock()
                 .unwrap()
                 .push((view_id.to_string(), url.to_string()));
-            Ok(())
+            let answer = next_answer(&self.navigate_answers, Ok(()));
+            if answer == Err(DriverFailure::ViewGone) {
+                self.evict(view_id);
+            }
+            answer
         }
 
-        fn eval(&self, view_id: &str, script: &str) -> Result<String, String> {
+        fn eval(&self, view_id: &str, script: &str) -> Result<String, DriverFailure> {
             self.evaluated
                 .lock()
                 .unwrap()
                 .push((view_id.to_string(), script.to_string()));
-            self.eval_answer.clone()
+            let answer = next_answer(
+                &self.eval_answers,
+                Err(DriverFailure::other("the fake has no answer left")),
+            );
+            if answer == Err(DriverFailure::ViewGone) {
+                self.evict(view_id);
+            }
+            answer
         }
     }
 
@@ -990,8 +1182,8 @@ mod tests {
     // not this server, decides what the JSON means.
     #[test]
     fn eval_answers_the_script_result_verbatim() {
-        let mut driver = FakeDriver::one();
-        driver.eval_answer = Ok("{\"title\":\"Example Domain\"}".to_string());
+        let driver = FakeDriver::one();
+        driver.answer_eval(Ok("{\"title\":\"Example Domain\"}".to_string()));
         let answer = dispatch(
             &driver,
             &request(
@@ -1062,8 +1254,8 @@ mod tests {
     // message and retry, so it travels as `isError`, with the protocol intact.
     #[test]
     fn a_failing_script_is_a_tool_error_not_a_protocol_error() {
-        let mut driver = FakeDriver::one();
-        driver.eval_answer = Err("ReferenceError: foo is not defined".to_string());
+        let driver = FakeDriver::one();
+        driver.answer_eval(Err(DriverFailure::other("ReferenceError: foo is not defined")));
         let answer = dispatch(
             &driver,
             &request(
@@ -1193,8 +1385,8 @@ mod tests {
     // element is what fails silently) and clicks it.
     #[test]
     fn click_scrolls_the_element_into_view_then_clicks_it() {
-        let mut driver = FakeDriver::one();
-        driver.eval_answer = Ok("{\"clicked\":true}".to_string());
+        let driver = FakeDriver::one();
+        driver.answer_eval(Ok("{\"clicked\":true}".to_string()));
         let answer = dispatch(
             &driver,
             &request(
@@ -1221,8 +1413,8 @@ mod tests {
     // Assigning `element.value` updates the DOM and leaves the framework behind.
     #[test]
     fn type_sets_the_value_through_the_native_setter_and_fires_the_events() {
-        let mut driver = FakeDriver::one();
-        driver.eval_answer = Ok("{\"typed\":true}".to_string());
+        let driver = FakeDriver::one();
+        driver.answer_eval(Ok("{\"typed\":true}".to_string()));
         let answer = dispatch(
             &driver,
             &request(
@@ -1253,8 +1445,8 @@ mod tests {
     // it) and the tool reports a failure with the message intact.
     #[test]
     fn a_click_the_page_cannot_satisfy_is_a_tool_error_naming_the_selector() {
-        let mut driver = FakeDriver::one();
-        driver.eval_answer = Ok("{\"error\":\"nothing matches the selector #nope\"}".to_string());
+        let driver = FakeDriver::one();
+        driver.answer_eval(Ok("{\"error\":\"nothing matches the selector #nope\"}".to_string()));
         let page = dispatch(
             &driver,
             &request(
@@ -1271,8 +1463,8 @@ mod tests {
         );
 
         // A driver failure of its own is preserved verbatim.
-        let mut broken = FakeDriver::one();
-        broken.eval_answer = Err("embed-1 did not answer within 10s".to_string());
+        let broken = FakeDriver::one();
+        broken.answer_eval(Err(DriverFailure::other("embed-1 did not answer within 10s")));
         let answer = dispatch(
             &broken,
             &request(
@@ -1363,8 +1555,8 @@ mod tests {
     // S1: the title is the page's own, read where the page is.
     #[test]
     fn get_title_reads_the_pages_own_title() {
-        let mut driver = FakeDriver::one();
-        driver.eval_answer = Ok("\"Example Domain\"".to_string());
+        let driver = FakeDriver::one();
+        driver.answer_eval(Ok("\"Example Domain\"".to_string()));
         let answer = dispatch(
             &driver,
             &request("tools/call", json!({ "name": "get_title", "arguments": {} })),
@@ -1525,6 +1717,161 @@ mod tests {
         assert_eq!(answer["result"]["isError"], false, "an empty list is an answer");
         assert!(answer_text(&answer).contains("open the browser pane"));
         assert_eq!(driver.asks(), 0, "the registry answers; nothing waits");
+    }
+
+    // ── a view that disappears under a tool call ─────────────────────────────
+    //
+    // The defect: `list_targets` reported `embed-1` open, `navigate` answered the
+    // platform's own words — "embed: no embedded browser embed-1 is open" — and the
+    // model read a broken app instead of a closed pane. The driver now types that
+    // failure, evicts the dead entry, and the dispatcher makes exactly one attempt
+    // to get a view back.
+
+    #[test]
+    fn a_view_that_disappeared_is_retried_once_after_the_pane_reopens() {
+        let driver = FakeDriver::one().with_pane(vec![LiveView {
+            id: "embed-7".to_string(),
+            url: "about:blank".to_string(),
+        }]);
+        driver.answer_navigate([Err(DriverFailure::ViewGone), Ok(())]);
+
+        let answer = call(&driver, "navigate");
+
+        assert_eq!(answer["result"]["isError"], false, "{}", answer_text(&answer));
+        assert_eq!(answer_text(&answer), "navigated `embed-7` to https://example.org/");
+        assert_eq!(driver.asks(), 1, "the tool asked the app for a pane exactly once");
+        assert_eq!(
+            driver.navigated.lock().unwrap().as_slice(),
+            [
+                ("embed-1".to_string(), "https://example.org/".to_string()),
+                ("embed-7".to_string(), "https://example.org/".to_string()),
+            ],
+            "the dead view once, then the view the app opened"
+        );
+        // The dead entry left the registry: a second look no longer lists it, so
+        // nothing can be resolved onto it again.
+        assert!(
+            driver.registered().is_empty(),
+            "the driver evicted it: {:?}",
+            driver.registered()
+        );
+        assert_eq!(
+            driver.views().iter().map(|view| view.id.as_str()).collect::<Vec<_>>(),
+            ["embed-7"]
+        );
+    }
+
+    // Exactly one retry, never a loop: two `ViewGone` answers cost one ask and one
+    // second attempt, and the model gets the honest no-view message — not the
+    // platform's string.
+    #[test]
+    fn a_view_that_disappears_twice_gets_one_retry_then_the_honest_answer() {
+        let driver = FakeDriver::one().with_pane(vec![LiveView {
+            id: "embed-7".to_string(),
+            url: "about:blank".to_string(),
+        }]);
+        driver.answer_navigate([Err(DriverFailure::ViewGone), Err(DriverFailure::ViewGone)]);
+
+        let answer = call(&driver, "navigate");
+
+        assert_eq!(answer["result"]["isError"], true);
+        assert_eq!(answer_text(&answer), NO_VIEW_ERROR, "the honest answer, verbatim");
+        assert_eq!(driver.asks(), 1, "one re-open ask, not one per attempt");
+        assert_eq!(
+            driver.navigated.lock().unwrap().len(),
+            2,
+            "the first attempt plus exactly one retry"
+        );
+        for leak in ["embed-", "no embedded browser", "could not navigate"] {
+            assert!(
+                !answer_text(&answer).contains(leak),
+                "the platform's words must not reach the model: {leak}"
+            );
+        }
+    }
+
+    // A page failure is an answer: the script ran, the page said no, and asking the
+    // human for a pane would be noise.
+    #[test]
+    fn a_script_error_is_an_answer_not_a_retry() {
+        let driver = FakeDriver::one();
+        driver.answer_eval(Err(DriverFailure::other("ReferenceError: foo is not defined")));
+
+        let answer = call(&driver, "eval");
+
+        assert_eq!(answer["result"]["isError"], true);
+        assert_eq!(answer_text(&answer), "ReferenceError: foo is not defined");
+        assert_eq!(driver.asks(), 0, "nothing was asked for a pane");
+        assert_eq!(driver.evaluated.lock().unwrap().len(), 1, "the script ran once");
+    }
+
+    // `get_url` answers from the registry, so it is the one tool that can report a
+    // url for a view the registry has already dropped. It re-reads the registry
+    // instead of trusting the snapshot, and a stale entry is `ViewGone` — which the
+    // dispatcher turns into the honest no-view answer, never a stale url.
+    #[test]
+    fn get_url_never_answers_the_url_of_an_evicted_view() {
+        let driver = FakeDriver::with_views(Vec::new());
+        let stale = LiveView {
+            id: "embed-1".to_string(),
+            url: "https://example.com/".to_string(),
+        };
+
+        assert_eq!(
+            Action::GetUrl.run(&driver, &stale),
+            Err(DriverFailure::ViewGone),
+            "a snapshot the registry no longer holds is not an answer"
+        );
+        // And a live entry still answers with its own url, without a script.
+        let live = FakeDriver::one();
+        assert_eq!(
+            Action::GetUrl.run(&live, &stale),
+            Ok("https://example.com/".to_string())
+        );
+        assert!(live.evaluated.lock().unwrap().is_empty(), "the page was not asked");
+    }
+
+    // `list_targets` is the tool whose answer IS the registry, and an eviction
+    // leaves it empty: an empty list is an answer, not a failure.
+    #[test]
+    fn list_targets_still_answers_an_empty_registry_after_an_eviction() {
+        let driver = FakeDriver::one();
+        driver.answer_navigate([Err(DriverFailure::ViewGone)]);
+
+        let failed = call(&driver, "navigate");
+        assert_eq!(failed["result"]["isError"], true);
+        assert_eq!(answer_text(&failed), NO_VIEW_ERROR);
+        let asks_before = driver.asks();
+
+        let targets = call(&driver, "list_targets");
+        assert_eq!(targets["result"]["isError"], false);
+        assert!(answer_text(&targets).contains("no browser view is open"));
+        assert_eq!(
+            driver.asks(),
+            asks_before,
+            "the registry answers; list_targets never asks for a pane"
+        );
+    }
+
+    // The registry check is the primary signal; the platform's own words are the
+    // narrow second one, and a page-level failure stays an answer.
+    #[test]
+    fn only_a_missing_webview_is_a_view_gone() {
+        assert!(missing_webview(&EmbedError::UnknownView("embed-1".into())));
+        // `tauri::Error::WebviewNotFound`'s `Display`, inside the failure that
+        // wraps it.
+        assert!(missing_webview(&EmbedError::Navigate("webview not found".into())));
+        assert!(missing_webview(&EmbedError::Eval("webview not found".into())));
+
+        for answer in [
+            EmbedError::Eval("ReferenceError: foo is not defined".into()),
+            EmbedError::Eval("embed-1 did not answer within 5s".into()),
+            EmbedError::Navigate("could not resolve the url".into()),
+            EmbedError::InvalidUrl("file:///etc/passwd".into()),
+            EmbedError::Create("no window labelled main".into()),
+        ] {
+            assert!(!missing_webview(&answer), "{answer} is an answer, not a retry");
+        }
     }
 
     #[test]
@@ -1798,6 +2145,62 @@ impl EmbedDriver {
     pub fn new(app: tauri::AppHandle, embeds: crate::embed::EmbedSessions) -> EmbedDriver {
         EmbedDriver { app, embeds }
     }
+
+    /// What one embed failure means to the dispatcher, and what is corrected
+    /// before answering it.
+    ///
+    /// Two signals, in this order:
+    /// 1. the registry, which this app owns: an id it no longer holds is gone by
+    ///    definition;
+    /// 2. [`missing_webview`], for the orphan the registry cannot see — an entry
+    ///    that outlived its webview.
+    ///
+    /// A `ViewGone` evicts the entry before answering, so the same dead id cannot
+    /// be resolved, listed or driven twice. Nothing else is evicted: a script error
+    /// or a refused url leaves a perfectly good view in place.
+    fn failure(&self, view_id: &str, error: EmbedError) -> DriverFailure {
+        if self.embeds.get(view_id).is_some() && !missing_webview(&error) {
+            return DriverFailure::Other(error.to_string());
+        }
+        // The registry is the thing being corrected, not the webview: the webview
+        // is already gone (that is why we are here), while the entry would keep
+        // answering `views()` and keep being resolved by the next tool call.
+        self.embeds.evict(view_id);
+        DriverFailure::ViewGone
+    }
+
+    /// Whether a call may run at all: the registry is checked first, before the
+    /// platform is asked anything, because it is the primary signal.
+    fn driveable(&self, view_id: &str) -> Result<(), DriverFailure> {
+        match self.embeds.get(view_id) {
+            Some(_) => Ok(()),
+            None => Err(DriverFailure::ViewGone),
+        }
+    }
+}
+
+/// Whether the platform said the **webview itself** is missing.
+///
+/// The registry check in [`EmbedDriver::failure`] is the primary signal and is
+/// enough for the common case; this exists because one case is invisible to it: an
+/// entry can outlive its webview (a creation that failed halfway through, or a
+/// close racing the call), and then `views()` lists `embed-1` while Tauri has no
+/// such webview.
+///
+/// `EmbedError::UnknownView` is this crate's own words for exactly that — the
+/// registry had the id, the platform did not. The string is
+/// `tauri::Error::WebviewNotFound`'s `Display`, which is what an operation on a
+/// vanished webview answers. Both checks are deliberately narrow: a script error
+/// or a refused url that happens to mention a webview must stay an answer, never
+/// become a retry.
+fn missing_webview(error: &EmbedError) -> bool {
+    match error {
+        EmbedError::UnknownView(_) => true,
+        EmbedError::Navigate(message) | EmbedError::Eval(message) => {
+            message.contains("webview not found")
+        }
+        _ => false,
+    }
 }
 
 impl WebviewDriver for EmbedDriver {
@@ -1822,16 +2225,18 @@ impl WebviewDriver for EmbedDriver {
         self.embeds.wait_for_first_view(timeout)
     }
 
-    fn navigate(&self, view_id: &str, url: &str) -> Result<(), String> {
+    fn navigate(&self, view_id: &str, url: &str) -> Result<(), DriverFailure> {
+        self.driveable(view_id)?;
         self.embeds
             .navigate(&self.app, view_id, url)
-            .map_err(|error| error.to_string())
+            .map_err(|error| self.failure(view_id, error))
     }
 
-    fn eval(&self, view_id: &str, script: &str) -> Result<String, String> {
+    fn eval(&self, view_id: &str, script: &str) -> Result<String, DriverFailure> {
+        self.driveable(view_id)?;
         self.embeds
             .eval(&self.app, view_id, script)
-            .map_err(|error| error.to_string())
+            .map_err(|error| self.failure(view_id, error))
     }
 }
 

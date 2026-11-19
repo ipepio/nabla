@@ -379,9 +379,29 @@ impl EmbedSessions {
     fn forget(&self, view_id: &str) -> Option<EmbeddedView> {
         let mut views = lock(&self.inner.views);
         self.inner.closed.fetch_add(1, Ordering::SeqCst);
+        // Woken while the lock is still held, and even when nothing is removed:
+        // the waiter re-checks the registry and the close counter under the lock.
         self.inner.changed.notify_all();
-        let index = views.iter().position(|view| view.id == view_id)?;
-        Some(views.remove(index))
+        take(&mut views, view_id)
+    }
+
+    /// Drops a registry entry whose webview no longer exists, and answers what was
+    /// dropped.
+    ///
+    /// The one caller is `mcp_server::EmbedDriver`: a tool call found the entry in
+    /// this registry but no webview behind it (a creation that failed halfway, or
+    /// a close that raced the call). The **registry** is what is corrected here,
+    /// not the webview — the webview is already gone, that is the whole reason the
+    /// driver is here — and correcting it is what keeps the same dead entry from
+    /// being listed, resolved or driven again.
+    ///
+    /// Deliberately not a [`Self::forget`]: nobody said the pane is not there, so
+    /// the close counter a tool waiting for a pane reads is left alone. Waiters are
+    /// still woken, because the list they check changed.
+    pub fn evict(&self, view_id: &str) -> Option<EmbeddedView> {
+        let mut views = lock(&self.inner.views);
+        self.inner.changed.notify_all();
+        take(&mut views, view_id)
     }
 
     /// Removes every view and answers them, for `close_all`.
@@ -392,6 +412,13 @@ impl EmbedSessions {
         self.inner.changed.notify_all();
         drained
     }
+}
+
+/// The one removal step [`EmbedSessions::forget`] and [`EmbedSessions::evict`]
+/// share: taken by id, under the registry lock.
+fn take(views: &mut Vec<EmbeddedView>, view_id: &str) -> Option<EmbeddedView> {
+    let index = views.iter().position(|view| view.id == view_id)?;
+    Some(views.remove(index))
 }
 
 /// One lock helper for the whole module, so a poisoned mutex is a panic here
@@ -842,6 +869,51 @@ mod tests {
         assert_eq!(sessions.forget("embed-99"), None);
         let message = EmbedError::UnknownView("embed-99".into()).to_string();
         assert!(message.contains("embed-99"), "unexpected: {message}");
+    }
+
+    // An eviction corrects the registry when a webview vanished under it: the
+    // entry goes away, so nothing lists, resolves or drives it again.
+    #[test]
+    fn evict_removes_the_entry_from_the_registry() {
+        let sessions = EmbedSessions::new();
+        let dead = sessions.reserve(DEFAULT_URL.into()).expect("dead");
+        let live = sessions.reserve("https://example.com/".into()).expect("live");
+
+        assert_eq!(sessions.evict(&dead.id), Some(dead.clone()));
+        assert_eq!(sessions.get(&dead.id), None, "the dead entry is gone");
+        // A second look at the registry no longer lists it.
+        assert_eq!(sessions.views(), vec![live]);
+        // The navigation handler of a webview that fired late cannot resurrect it.
+        assert!(!sessions.set_url(&dead.id, "https://example.com/"));
+        assert_eq!(sessions.evict(&dead.id), None, "evicting twice is empty, not a panic");
+    }
+
+    // An eviction is not the human's close: a tool waiting for a pane keeps
+    // waiting instead of reading the registry correction as "the pane is not
+    // there". The evicted id is one the registry never held — the second of two
+    // tool calls that both found the same dead view — because that is the only
+    // way an eviction can race a wait: a waiter only sleeps on an empty registry.
+    #[test]
+    fn evicting_is_not_a_close_and_does_not_cancel_a_wait() {
+        let sessions = EmbedSessions::new();
+        let waiting = {
+            let sessions = sessions.clone();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let opened = sessions.wait_for_first_view(Duration::from_millis(300));
+                (opened, started.elapsed())
+            })
+        };
+        // The waiter is asleep by now: the eviction below is what it wakes on.
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(sessions.evict("embed-99"), None);
+
+        let (opened, waited) = waiting.join().expect("the waiting thread panicked");
+        assert!(!opened, "no view appeared, so the answer is still no");
+        assert!(
+            waited >= Duration::from_millis(300),
+            "the wait ran out instead of being cancelled as a close would, took {waited:?}"
+        );
     }
 
     #[test]
