@@ -204,6 +204,7 @@
   "chat.tool.failed": "failed",
   "chat.tools.summary": "{count} actions",
   "chat.tools.failures": "failures: {count}",
+  "chat.turn.steps": "{count} steps",
   "chat.reasoning.label": "Reasoning",
   "chat.code.label": "code",
   "chat.code.copy": "Copy code",

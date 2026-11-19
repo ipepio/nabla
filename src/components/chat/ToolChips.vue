@@ -1,12 +1,13 @@
 <script setup lang="ts">
-// The chips of one turn's tool calls — the compact badges the transcript has
+// The chips of one step's tool calls — the compact badges the transcript has
 // always rendered (`navigate · running`, `eval · done`, a failed one in the
 // destructive variant).
 //
-// One component, two call sites: the turn still running shows them expanded
-// under the live answer, and a committed turn folds them behind the collapsed
-// row of `ToolSummary`. Extracting them is what keeps the disclosure honest —
-// expanding a finished turn reveals exactly the same markup, not a look-alike.
+// One component, three call sites: the step running right now shows them outside
+// the turn's fold, a finished step shows them inside it, and `ToolSummary`
+// counts them on the collapsed line of the turn. Extracting them is what keeps
+// the disclosure honest — expanding a turn reveals exactly the same markup, not a
+// look-alike.
 import type { Component } from "vue";
 import { CheckIcon, CircleAlertIcon, LoaderIcon } from "@lucide/vue";
 import { Badge } from "@/components/ui/badge";
@@ -14,7 +15,7 @@ import { t } from "@/lib/i18n";
 import type { ToolEntry } from "@/lib/session-store";
 
 defineProps<{
-  /** The turn's tool calls, oldest first. */
+  /** The step's tool calls, oldest first. */
   tools: ToolEntry[];
 }>();
 

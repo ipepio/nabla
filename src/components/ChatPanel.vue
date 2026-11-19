@@ -13,18 +13,16 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import {
   PanelRightOpenIcon,
-  WrenchIcon,
   XIcon,
 } from "@lucide/vue";
 import ChatEmptyState from "@/components/chat/ChatEmptyState.vue";
 import ThemeToggle from "@/components/chat/ThemeToggle.vue";
 import ChatHeader from "@/components/chat/ChatHeader.vue";
 import Composer from "@/components/chat/Composer.vue";
-import MessageBubble from "@/components/chat/MessageBubble.vue";
 import QuestionCard from "@/components/chat/QuestionCard.vue";
 import QuestionPrompt from "@/components/chat/QuestionPrompt.vue";
-import ToolChips from "@/components/chat/ToolChips.vue";
-import ToolSummary from "@/components/chat/ToolSummary.vue";
+import TurnGroup from "@/components/chat/TurnGroup.vue";
+import { deriveTurnGroups } from "@/components/chat/turn-groups";
 import { draftKeyFor, usePromptDraft } from "@/components/chat/use-prompt-draft";
 import { useThrottledText } from "@/components/chat/use-throttled-text";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -41,7 +39,6 @@ import {
 import type {
   AppSettings,
   SessionDto,
-  TranscriptRole,
   UiAnswer,
   WorkspaceInfo,
 } from "@/contracts/types";
@@ -159,47 +156,37 @@ const buffer = computed<SessionBuffer | null>(() =>
 );
 const transcript = computed(() => buffer.value?.transcript ?? []);
 /**
- * Every tool call of the session, oldest first, each one stamped with the turn
- * it belongs to (`ToolEntry.turnId`). No longer cleared per turn: that is what
- * lets a finished turn keep its chips while the turn in progress owns the live
- * area.
+ * Every tool call of the session, oldest first, each one stamped with the human
+ * turn it was made for (`ToolEntry.turnId`) and with the step it ran in
+ * (`ToolEntry.stepId`). No longer cleared per turn: that is what lets a finished
+ * turn keep its chips inside its own disclosure.
  */
 const tools = computed<ToolEntry[]>(() => buffer.value?.tools ?? []);
 
-/** One turn's tool calls, keyed by the id of the turn (see `toolsForTurn`). */
-const toolsByTurn = computed<Map<string, ToolEntry[]>>(() => {
-  const groups = new Map<string, ToolEntry[]>();
-  for (const entry of tools.value) {
-    const group = groups.get(entry.turnId);
-    if (group === undefined) groups.set(entry.turnId, [entry]);
-    else group.push(entry);
-  }
-  return groups;
-});
-
 /**
- * The chips of the turn a committed message belongs to, empty when the turn
- * called no tool. The message id *is* the turn id (`ensureLiveMessageId`), so a
- * finished turn's chips are found from the message that renders them — that is
- * the whole attribution: no positional guess, no cross-referencing of two lists.
- */
-function toolsForTurn(messageId: string): ToolEntry[] {
-  return toolsByTurn.value.get(messageId) ?? [];
-}
-
-/**
- * The chips of the turn that is not in the transcript yet — the one running
- * right now — rendered expanded under the live answer, exactly as before.
+ * The turn the store is answering right now, or `null` when the session is idle.
  *
- * A turn whose message never reached the transcript (pi called a tool and
- * streamed no text at all) stays here instead of vanishing: an unfinished turn
- * is the informative moment, so its chips stay visible rather than being folded
- * under a message that does not exist.
+ * It is the id of the human message that opened it (`SessionBuffer.turnId`), and
+ * `busy` is what says the turn has not ended: at `turn_end` everything folds and
+ * the answer is the last thing left out of the fold (S3).
  */
-const liveTools = computed<ToolEntry[]>(() => {
-  const committed = new Set(transcript.value.map((message) => message.id));
-  return tools.value.filter((entry) => !committed.has(entry.turnId));
+const liveTurnId = computed<string | null>(() => {
+  const current = buffer.value;
+  if (current === null || !current.busy) return null;
+  return current.turnId;
 });
+
+/**
+ * The conversation, grouped by human turn (S1): one group per human message,
+ * holding the steps pi took for it, its chips and its final answer.
+ *
+ * `turn-groups.ts` owns the derivation, including the difference between a live
+ * turn (attribution stamped by the store) and a transcript read back from pi's
+ * file (grouped by message order, since nothing about it is persisted).
+ */
+const turnGroups = computed(() =>
+  deriveTurnGroups(transcript.value, tools.value, liveTurnId.value),
+);
 const streamingText = computed(() => buffer.value?.streamingText ?? "");
 /**
  * The reasoning still streaming for the turn in progress. Rendered by the same
@@ -751,14 +738,6 @@ watch(
 );
 
 /**
- * `MessageBubble` knows the two speaking roles; a `tool` line of a recovered
- * transcript renders as the muted note below instead of a bubble.
- */
-function bubbleRole(role: TranscriptRole): "user" | "assistant" {
-  return role === "user" ? "user" : "assistant";
-}
-
-/**
  * S1: the empty state has no "start session" control, so the first send starts
  * the session itself. N1: it starts through the shared store, so this and the
  * drawer's "New session" button are one creation path and the drawer sees the
@@ -1300,91 +1279,47 @@ onUnmounted(() => {
             {{ t("chat.loadingConversation") }}
           </p>
 
-          <!-- L3/S4: the active session's buffer, which kept filling while
-               this session was off screen. -->
-          <template v-for="message in transcript" :key="message.id">
-            <!-- S3: a question the agent asked, settled into history. Answered or
-                 cancelled, it stays in the conversation as a read-only card: the
-                 request is gone, the exchange is not. -->
-            <QuestionCard
-              v-if="message.question"
-              :question="message.question"
-            />
-            <div
-              v-else-if="message.role === 'tool'"
-              class="flex items-start gap-2 text-xs text-muted-foreground"
-            >
-              <WrenchIcon class="mt-0.5 size-3 shrink-0" aria-hidden="true" />
-              <span class="min-w-0 whitespace-pre-wrap">{{ message.text }}</span>
-            </div>
-            <!-- A queued prompt is not here yet: it lives in the queue strip
-                 above the composer until it is handed to pi, and only then
-                 becomes a turn in the conversation. -->
-            <MessageBubble
-              v-else
-              :role="bubbleRole(message.role)"
-              :text="message.text"
-              :at="timeLabel(message.at)"
-              :reasoning="showReasoning ? message.reasoning : undefined"
-              :message-id="message.id"
-            >
-              <!-- Point 1: the chips of a turn that is already committed fold
-                   into one collapsed row inside that turn, right under its
-                   reasoning block — the natural neighbour, both being folded
-                   context above the answer. The turn in progress keeps its
-                   chips expanded below the transcript (see `liveTools`). -->
-              <template #tools>
-                <ToolSummary
-                  v-if="toolsForTurn(message.id).length > 0"
-                  :turn-id="message.id"
-                  :tools="toolsForTurn(message.id)"
-                />
-              </template>
-            </MessageBubble>
-          </template>
+          <!-- L3/S4: the active session's buffer, grouped by human turn (S1 of
+               `chat-turn-groups.md`): one group per human message, holding the
+               steps pi took for it inside a single disclosure and its final
+               answer visible under it (S2). A turn still running keeps the step
+               in progress outside that fold (S3). -->
+          <TurnGroup
+            v-for="group in turnGroups"
+            :key="group.id"
+            :turn-id="group.id"
+            :prompt="group.prompt"
+            :at="group.prompt === null ? undefined : timeLabel(group.prompt.at)"
+            :question="group.question"
+            :steps="group.steps"
+            :tools="group.tools"
+            :answer="group.answer"
+            :live="group.live"
+            :live-text="liveText"
+            :live-reasoning="streamingReasoning"
+            :live-message-id="liveMessageId"
+            :live-tools="group.liveTools"
+            :show-reasoning="showReasoning"
+          />
 
           <!-- S3 of `agent-question-bridge.md`: a question the agent is blocked
                on is part of the conversation while it waits, not a surface that
-               appears from nowhere. It renders right after the last message —
+               appears from nowhere. It renders right after the last turn —
                which is where the newest thing a blocked turn has produced sits,
                because nothing streams after the tool call that asked — and in
                arrival order when pi asked several. Answering it swaps this
-               read-only pending card for the settled one in the very same slot:
-               the entry `resolveQuestion` appends becomes the last message of
-               the loop above, so the exchange never jumps down the transcript
-               and never appears twice. -->
+               pending card for the settled one in the very same slot: the entry
+               `resolveQuestion` appends becomes the next turn group above, so the
+               exchange never jumps down the transcript and never appears twice. -->
           <QuestionCard
             v-for="question in questions"
             :key="question.id"
             :question="question"
           />
 
-          <!-- The turn still streaming: it becomes a transcript entry when
-               pi closes the message. Reasoning streams above the answer and
-               keeps its own open/closed state under the id it flushes into.
-               S2: with "Show reasoning" off the block is not rendered at all —
-               not merely collapsed — for this turn and for every stored one. -->
-          <MessageBubble
-            v-if="
-              liveText !== '' ||
-              (showReasoning && streamingReasoning !== '')
-            "
-            role="assistant"
-            :text="liveText"
-            :reasoning="
-              showReasoning && streamingReasoning !== ''
-                ? streamingReasoning
-                : undefined
-            "
-            :message-id="liveMessageId ?? undefined"
-            reasoning-live
-          />
-
-          <!-- The turn in progress shows its chips expanded and inline: a
-               running tool is the informative moment, so it is never folded
-               behind a summary. Once the turn lands in the transcript they
-               collapse into its own row (see `ToolSummary`). -->
-          <ToolChips v-if="liveTools.length > 0" :tools="liveTools" />
+          <!-- The turn in progress renders inside its own group (S3): its
+               finished steps are folded, the step being written is not — see
+               `TurnGroup`. Nothing about it is appended here. -->
         </div>
       </ScrollArea>
 

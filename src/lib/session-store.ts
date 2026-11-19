@@ -42,15 +42,25 @@ export interface ToolEntry {
   toolName: string;
   state: "running" | "done" | "error";
   /**
-   * The turn this call belongs to: the id of the message it is rendered with.
+   * The human turn this call was made for: the id of the message the human sent
+   * (`pushUserTurn`), never the id of an assistant message.
    *
-   * Stamped at tool start from `ensureLiveMessageId`, which is the same id the
-   * turn flushes into, so a tool that started before any text still ends up
-   * attributed to the message the turn produces. The panel groups by it: the
-   * turn still running shows its chips expanded, and a committed turn folds
-   * them into one collapsed row next to its own content.
+   * This is the attribution the panel groups by (S1/S5 of
+   * `chat-turn-groups.md`): one human turn can take a dozen steps, and all of
+   * their work belongs to the same disclosure. A call that arrives before any
+   * human turn is attributed to its own step, so a chip is never unattributed;
+   * the panel then keeps it in the turn it was rendered under.
    */
   turnId: string;
+  /**
+   * The step the call ran in: the assistant message this call belongs to.
+   *
+   * Stamped at tool start from `ensureLiveMessageId`, which is the same id the
+   * step flushes into, so a tool that started before any text still ends up
+   * attributed to the message the step produces. The panel uses it to place the
+   * chips next to their own step's reasoning, inside the turn's disclosure.
+   */
+  stepId: string;
 }
 
 /**
@@ -67,6 +77,17 @@ export interface ChatMessage {
   role: TranscriptRole;
   text: string;
   at: string | null;
+  /**
+   * The human turn this entry answered: the id of the human message that opened
+   * the exchange (S5 of `chat-turn-groups.md`).
+   *
+   * Present only on assistant messages this store stamped live. Entries read
+   * back from pi's JSONL file and from the stored preview have none — nothing is
+   * persisted for it — so the panel derives the groups of a recovered transcript
+   * from message order (a `user` line opens a turn) and this field only confirms
+   * the attribution of the live ones.
+   */
+  turnId?: string;
   /** The turn's reasoning, absent when pi streamed none. */
   reasoning?: string;
   /**
@@ -186,6 +207,17 @@ export interface SessionBuffer {
    * while it streams stays open once the turn lands in the transcript.
    */
   liveMessageId: string | null;
+  /**
+   * Id of the human message that opened the turn in progress — its `turnId`.
+   *
+   * Minted in `pushUserTurn`, so the human message id *is* the turn id: there is
+   * no second id space to keep in sync. Every assistant message and every tool
+   * chip pushed afterwards is attributed to it, which is what lets the panel
+   * fold a whole 13-step turn into one disclosure (S1/S5 of
+   * `chat-turn-groups.md`). It names the most recent human turn, so it keeps
+   * pointing at it while the turn is being answered.
+   */
+  turnId: string | null;
   tools: ToolEntry[];
   status: RuntimeStatus | null;
   /** Runtime diagnosis (a crash's stderr tail) or the last command failure. */
@@ -442,6 +474,7 @@ function ensureBuffer(sessionId: string, workspaceId: number | null = null): Ses
     streamingText: "",
     streamingReasoning: "",
     liveMessageId: null,
+    turnId: null,
     tools: [],
     status: null,
     error: null,
@@ -485,6 +518,9 @@ function flushStreaming(sessionId: string, buffer: SessionBuffer): void {
     at: new Date().toISOString(),
   };
   if (reasoning !== "") message.reasoning = reasoning;
+  // S5: a step belongs to the human turn it answered. Absent when no human turn
+  // opened it (an agent resuming on its own), never invented.
+  if (buffer.turnId !== null) message.turnId = buffer.turnId;
   buffer.transcript.push(message);
 }
 
@@ -498,6 +534,11 @@ function pushUserTurn(
   text: string,
 ): string {
   const id = nextMessageId(sessionId);
+  // S5 of `chat-turn-groups.md`: the human message id *is* the turn id. Minting
+  // it here rather than in a second counter is what makes the attribution
+  // unambiguous — there is one id per human turn and everything the agent does
+  // for it (steps, chips) inherits that same id.
+  buffer.turnId = id;
   buffer.transcript.push({
     id,
     role: "user",
@@ -533,6 +574,9 @@ function settleQueuedMessage(
   entry: QueuedPrompt,
 ): void {
   void sessionId;
+  // The queued prompt opens its own turn, exactly as a direct send does: its id
+  // (minted at enqueue time) becomes the turn id the answer is attributed to.
+  buffer.turnId = entry.id;
   buffer.transcript.push({
     id: entry.id,
     role: "user",
@@ -730,8 +774,15 @@ function settleQuestion(
     placeholder: question.placeholder,
     answer,
   };
+  const id = nextMessageId(sessionId);
+  // The answer opens the turn the agent continues in: the card is a `user` line
+  // of the transcript, so it starts a group like any other, and the steps that
+  // follow the answer are attributed to it (`ChatMessage.turnId`). Without this
+  // the continuation would be stamped with the turn that asked the question and
+  // the panel would read the exchange out of order.
+  buffer.turnId = id;
   buffer.transcript.push({
-    id: nextMessageId(sessionId),
+    id,
     // The human's side of the exchange: what the conversation gained. A surface
     // without the structured half (the stored preview) then still reads as the
     // human answering the agent.
@@ -864,12 +915,14 @@ function findTool(buffer: SessionBuffer, toolCallId: string) {
 }
 
 /**
- * Appends one tool chip, attributed to the turn it was called in.
+ * Appends one tool chip: the only writer of `buffer.tools`.
  *
- * The attribution is the whole point of this function: `ensureLiveMessageId` is
- * the only place a turn id is minted, so a chip can never be unattributed — a
- * tool that starts before its turn streamed any text mints the id here and the
- * turn's message then reuses it (`flushStreaming`).
+ * A chip carries two attributions, and both are stamped here so neither can
+ * drift (S5): the *step* it ran in (`ensureLiveMessageId`, the id the step's
+ * message flushes into) and the *human turn* it was made for (`buffer.turnId`,
+ * minted by `pushUserTurn`). A tool that starts before its step streamed any
+ * text mints the step id here and the message reuses it (`flushStreaming`), so a
+ * chip is never unattributed.
  */
 function pushTool(
   sessionId: string,
@@ -878,11 +931,15 @@ function pushTool(
   toolName: string,
   state: ToolEntry["state"],
 ): void {
+  const stepId = ensureLiveMessageId(sessionId, buffer);
   buffer.tools.push({
     toolCallId,
     toolName,
     state,
-    turnId: ensureLiveMessageId(sessionId, buffer),
+    // Falls back to the step when no human turn opened the exchange: the panel
+    // then keeps the chip in the turn it is rendered under instead of dropping it.
+    turnId: buffer.turnId ?? stepId,
+    stepId,
   });
 }
 
@@ -1012,9 +1069,10 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
     }
     default:
       // A fresh turn no longer discards the previous one's chips: each entry
-      // carries its `turnId`, so the panel folds a finished turn's chips into
-      // one collapsed row with that turn instead of losing them. Only the turn
-      // in progress keeps a wall of badges, which is where it is informative.
+      // carries its `turnId` (the human turn) and its `stepId` (the assistant
+      // message), so the panel folds a finished turn's work into one collapsed
+      // row with that turn instead of losing it. Only the step in progress keeps
+      // its chips expanded, which is where they are informative.
       return;
   }
 }
