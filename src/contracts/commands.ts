@@ -815,6 +815,21 @@ export function embedSetBounds(
 }
 
 /**
+ * Shows or hides one view without closing it.
+ *
+ * A child webview floats above the HTML, so CSS cannot hide it: this is the
+ * platform's own switch, and it keeps the page. The pane calls it with `false`
+ * when the drawer collapses and with `true` when it reopens — the same page comes
+ * back, never a reload — and both directions are idempotent.
+ */
+export function embedSetVisible(
+  viewId: string,
+  visible: boolean,
+): Promise<void> {
+  return invoke<void>("embed_set_visible", { viewId, visible });
+}
+
+/**
  * Navigates one view. The pane validates locally first and only ever passes an
  * `http(s)` or `about:blank` url; Rust refuses anything else as a second line.
  */

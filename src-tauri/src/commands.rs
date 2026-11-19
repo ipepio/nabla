@@ -2023,6 +2023,26 @@ pub fn embed_set_bounds(
         .map_err(display_err)
 }
 
+/// Shows or hides one view without closing it.
+///
+/// The drawer is hidden with `display: none` while it stays mounted, and a child
+/// webview floats ABOVE the HTML: without this call a collapsed drawer would
+/// leave the page painted over the chat. Hiding is not closing — the page keeps
+/// its document, its history and its JS context — so showing it again brings back
+/// the same page instead of reloading it.
+#[tauri::command]
+pub fn embed_set_visible(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    view_id: String,
+    visible: bool,
+) -> Result<(), String> {
+    state
+        .embeds
+        .set_visible(&app, &view_id, visible)
+        .map_err(display_err)
+}
+
 /// Navigates one view. Only `http`, `https` and `about:blank` are accepted; a
 /// `file:` or `javascript:` url is refused before the webview ever sees it.
 #[tauri::command]

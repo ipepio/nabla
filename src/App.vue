@@ -45,9 +45,8 @@ async function openBrowserPane(): Promise<void> {
   if (!isToolEnabled("browser")) return;
 
   toolsOpen.value = true;
-  // Let the drawer mount BEFORE building the tab: its host reconciles the tabs
-  // against the active workspace on mount (`applyDock`), and a tab created for a
-  // workspace the drawer has not seen yet is one of the tabs it clears.
+  // Let the drawer become visible BEFORE building the tab: the pane measures its
+  // own rect on mount, and an element that is still hidden measures nothing.
   await nextTick();
 
   // A tab that already holds a browser pane is activated, not duplicated: the
@@ -112,18 +111,33 @@ onBeforeUnmount(() => {
           RIGHT VIEWPORT (S6, resizable since S3) — the tools drawer (S2 of
           `tool-drawer-and-mcp.md`). `ResizableAside` owns the drag handle, the
           pointer and keyboard resizing, and the panel width itself (S4: one
-          owner); this component keeps only `toolsOpen`, so the panel resets to
-          its default width when reopened.
+          owner); this component keeps only `toolsOpen`.
+
+          THE DRAWER STAYS MOUNTED (`v-show`, never `v-if`). Collapsing it must not
+          restart what lives inside: a Terminal holds its pty and a Browser holds a
+          child webview, and unmounting threw both away on every close — the
+          reported bug ("al cerrar el drawer y volverlo a abrir, se reinician las
+          aplicaciones"). Keeping it mounted has two consequences the rest of this
+          file and `BrowserTool.vue` respect:
+
+            - the width is NOT recomputed on reopen: `ResizableAside` measured it
+              once, at mount, and the human's drag survives the round trip;
+            - `v-show` writes an inline `display`, which is why the utility classes
+              below can stay (`hidden md:flex` re-applies as soon as the inline
+              value goes back to empty), and why the browser pane needs its own
+              native hide: a child webview floats above the HTML and ignores CSS.
 
           The body is `ToolTabs`, which hosts the DOCK: a split tree of tool
           instances (`components/tools/dock.ts`) whose "+ Add tool" menu is the
           registry. That is the whole integration: a new tool is a registry
           entry, never an edit here. The dock receives the active workspace,
           which is the default context of a new pane and the reset rule of the
-          layout, so a workspace switch never shows the previous folder's panes.
+          layout, so a workspace switch never shows the previous folder's panes;
+          it also receives `visible`, the one fact a child webview cannot learn
+          from CSS.
         -->
         <ResizableAside
-          v-if="toolsOpen"
+          v-show="toolsOpen"
           :aria-label="t('tools.title')"
           class="hidden md:flex"
         >
@@ -140,7 +154,7 @@ onBeforeUnmount(() => {
             </Button>
           </div>
 
-          <ToolTabs :workspace="activeWorkspace" />
+          <ToolTabs :workspace="activeWorkspace" :visible="toolsOpen" />
         </ResizableAside>
       </div>
     </SidebarInset>

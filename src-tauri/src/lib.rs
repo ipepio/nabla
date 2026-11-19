@@ -261,6 +261,7 @@ pub fn run() {
             // webview, not an iframe (X-Frame-Options forbids that).
             commands::embed_create,
             commands::embed_set_bounds,
+            commands::embed_set_visible,
             commands::embed_navigate,
             commands::embed_eval,
             commands::embed_close,

@@ -27,6 +27,8 @@ const props = defineProps<{
   depth: number;
   /** Whether this tab is the drawn one (a browser pane needs it, see DockPane). */
   active: boolean;
+  /** Whether the drawer around this tree is on screen (same reason, see DockPane). */
+  visible: boolean;
   workspace: WorkspaceInfo | null;
 }>();
 
@@ -52,6 +54,7 @@ const separatorClass = computed(() =>
       :instance="node.instance"
       :depth="depth"
       :active="active"
+      :visible="visible"
       :workspace="workspace"
     />
 
@@ -62,6 +65,7 @@ const separatorClass = computed(() =>
           :tab-id="tabId"
           :depth="depth + 1"
           :active="active"
+          :visible="visible"
           :workspace="workspace"
         />
       </div>
@@ -71,6 +75,7 @@ const separatorClass = computed(() =>
           :tab-id="tabId"
           :depth="depth + 1"
           :active="active"
+          :visible="visible"
           :workspace="workspace"
         />
       </div>

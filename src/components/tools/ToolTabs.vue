@@ -1,10 +1,11 @@
 <script lang="ts">
 // The drawer's tab model lives at MODULE scope, not in this component.
 //
-// Why: the drawer unmounts whenever it is collapsed (the parent keeps only
-// `toolsOpen`), so a component-local `ref` would throw the tabs away every time the
-// human hides the panel. The tabs themselves — and the rules around them — live in
-// `./dock.ts`; this file is only the host that renders them.
+// Why: the host that renders the tabs can come and go (it is mounted with the
+// drawer, and the drawer's own visibility is its parent's business), so a
+// component-local `ref` would throw the tabs away with it. The tabs themselves —
+// and the rules around them — live in `./dock.ts`; this file is only the host that
+// renders them.
 </script>
 
 <script setup lang="ts">
@@ -35,7 +36,9 @@
 // component, so hiding the body keeps the shell and its scrollback instead of
 // reopening it on every tab switch. The one tool a CSS hide cannot serve is the
 // Browser — its view is a child webview, which floats above the HTML — so the pane
-// passes `active` down and `BrowserTool.vue` closes/rebuilds its view instead.
+// passes `active` and `visible` down and `BrowserTool.vue` closes/rebuilds its view
+// (a tab that stopped being drawn) or hides/shows it (the drawer did), which is the
+// difference between restarting a page and leaving it alone.
 //
 // Adding a tool is one registry entry (`./registry.ts`), never an edit here. Each
 // pane's header, splits and folder chip belong to `DockPane.vue`; a tab's layout
@@ -61,7 +64,18 @@ import {
 } from "./dock";
 import { toolById, visibleTools, type ToolDefinition } from "./registry";
 
-const props = defineProps<{ workspace: WorkspaceInfo | null }>();
+const props = withDefaults(
+  defineProps<{
+    workspace: WorkspaceInfo | null;
+    /**
+     * The drawer around this host is on screen. Only one tool cares — a child
+     * webview is not hidden by CSS — and absent means "on screen", so a host
+     * rendered somewhere else keeps working.
+     */
+    visible?: boolean;
+  }>(),
+  { visible: true },
+);
 
 /** S5: the enabled tools, in registry order — the whole tool chooser. */
 const available = computed<ToolDefinition[]>(() =>
@@ -174,6 +188,7 @@ function start(tabId: string, toolId: ToolDefinition["id"]): void {
           :tab-id="tab.id"
           :depth="0"
           :active="tab.id === activeTabId"
+          :visible="props.visible"
           :workspace="workspace"
         />
 

@@ -32,16 +32,27 @@
 // reach this webview yet; that arrives with a local MCP. The pane says so in the
 // footer rather than implying a capability that does not exist.
 //
-// TEARDOWN — a view lives exactly as long as this pane is DRAWN, not as long as
-// its component is mounted. The drawer keeps every tab's body mounted and only
-// shows the active one (`v-show` in `ToolTabs.vue`) so a terminal keeps its shell;
-// a child webview cannot be hidden that way, because it floats above the HTML and
-// would keep painting over whatever tab is on screen. So the pane receives `active`
-// and (a) closes its view when its tab stops being drawn, (b) builds a fresh one
-// when the tab is drawn again. Everything else follows the component: unmount
-// closes the view (collapsing the drawer, closing the pane, quitting), a workspace
-// switch closes it and rebuilds it, and a create that answers after teardown closes
-// the view it just made instead of leaking it.
+// TEARDOWN — a view lives as long as this pane is DRAWN, and the two reasons it
+// stops being drawn are not the same thing. The drawer keeps every tab's body
+// mounted and only shows the active one (`v-show` in `ToolTabs.vue`) so a terminal
+// keeps its shell; a child webview cannot be hidden that way, because it floats
+// above the HTML and would keep painting over whatever tab is on screen. So the
+// pane receives `active` (its tab is drawn) and `visible` (the drawer is on
+// screen):
+//
+//   - tab not drawn (`active === false`): the view is CLOSED when the tab leaves
+//     the screen and rebuilt when it comes back. A tab switch is the human saying
+//     they are looking at something else, and a fresh view for each tab is what
+//     keeps four tabs from holding four live pages;
+//   - drawer collapsed (`visible === false`): the view is HIDDEN, never closed.
+//     `embed_set_visible` is the platform's own switch, so the drawer reopening
+//     restores the SAME page — document, history, scroll position and login — over
+//     a re-measured rect. Closing it here is exactly the bug this pane used to
+//     carry one level up: collapsing the drawer restarted every tool.
+//
+// Everything else follows the component: unmount closes the view (closing the pane,
+// quitting), a workspace switch closes it and rebuilds it, and a create that
+// answers after teardown closes the view it just made instead of leaking it.
 //
 // URL POLICY — `http`, `https` and `about:blank`, nothing else, and the check is
 // LOCAL: a rejected address shows the message and never reaches Rust. A bare host
@@ -63,6 +74,7 @@ import {
   embedEval,
   embedNavigate,
   embedSetBounds,
+  embedSetVisible,
   embedUrl,
   subscribeEmbedNav,
 } from "@/contracts/commands";
@@ -77,10 +89,22 @@ const props = defineProps<{
    * does not know about tabs still works.
    */
   active?: boolean;
+  /**
+   * The drawer this pane lives in is on screen. `false` HIDES the child webview
+   * natively (CSS cannot) and `true` shows it again with the same page loaded;
+   * absent means "on screen".
+   */
+  visible?: boolean;
 }>();
 
 /** Whether this pane should have a live view right now (see the teardown note). */
 const drawn = computed(() => props.active !== false);
+
+/**
+ * Whether the drawer is on screen, which is the difference between hiding a view
+ * and closing it (see the teardown note).
+ */
+const shown = computed(() => props.visible !== false);
 
 /** What a fresh view shows. The pane offers no generated start page: only the
  *  http(s) addresses Rust accepts, and a blank document until the human types. */
@@ -392,7 +416,15 @@ function handleNav(event: EmbedNavEvent): void {
  * behind; a create that answers after teardown closes what it built.
  */
 async function createView(): Promise<void> {
-  if (viewId.value !== null || creating.value || disposed || !drawn.value) return;
+  if (
+    viewId.value !== null ||
+    creating.value ||
+    disposed ||
+    !drawn.value ||
+    !shown.value
+  ) {
+    return;
+  }
   creating.value = true;
   status.value = null;
   try {
@@ -414,7 +446,10 @@ async function createView(): Promise<void> {
     );
     // Torn down, or its tab was hidden while the platform was building it: close
     // it, because a hidden pane must not leave a webview painting over the app.
-    if (disposed || !drawn.value) {
+    // The drawer going away is the other case: creating is gated on `shown`, so a
+    // view is never built behind a closed drawer; the resize observer that fires
+    // when it reopens builds it then.
+    if (disposed || !drawn.value || !shown.value) {
       void embedClose(id).catch(() => {});
       return;
     }
@@ -543,20 +578,81 @@ watch(
 );
 
 /**
+ * Brings an already built view back on screen without rebuilding it.
+ *
+ * The platform still holds the rect from before the drawer collapsed, so the rect
+ * is re-measured and applied FIRST and the view is shown afterwards: showing it
+ * before would flash the page at the old position. Nothing is reloaded — the same
+ * view, the same document.
+ */
+async function revealView(): Promise<void> {
+  const id = viewId.value;
+  if (id === null || disposed) return;
+  // Unknown until the fresh rect is applied: the drawer's width survived, but the
+  // chat column it shared the row with did not.
+  appliedRect = null;
+  await nextTick();
+  await nextFrame();
+  if (disposed || viewId.value !== id || !shown.value) return;
+  await syncBounds();
+  // `syncBounds` is serialized: a call that lands while another one is in flight
+  // is remembered and re-run, not applied now. A second pass one frame later means
+  // the rect is on the platform before the view is shown.
+  await nextFrame();
+  if (disposed || viewId.value !== id) return;
+  await syncBounds();
+  if (disposed || viewId.value !== id) return;
+  try {
+    await embedSetVisible(id, true);
+  } catch (cause) {
+    if (disposed) return;
+    status.value = t("tools.browser.createError", {
+      message: commandErrorMessage(cause),
+    });
+  }
+}
+
+/**
  * A hidden tab closes its view and a drawn one builds a fresh view. `post` so the
  * parent has already applied `v-show` and the body has a measurable rect.
  */
 watch(
   drawn,
-  (visible) => {
+  (isDrawn) => {
     if (disposed) return;
-    if (!visible) {
+    if (!isDrawn) {
       void closeView();
       return;
     }
     // A timer left over from the hidden period would measure nothing useful.
     appliedRect = null;
     void createView();
+  },
+  { flush: "post" },
+);
+
+/**
+ * The drawer collapsed or reopened. This is NOT a close: the view is hidden with
+ * the platform's own switch and shown again over a re-measured rect, so the page
+ * the human was reading is still there (the reported bug: closing and reopening the
+ * drawer restarted every tool). `viewId === null` means nothing is built yet and
+ * creation is already gated on `shown`, so there is nothing to do.
+ */
+watch(
+  shown,
+  (visible) => {
+    if (disposed) return;
+    const id = viewId.value;
+    if (id === null) return;
+    if (visible) {
+      void revealView();
+      return;
+    }
+    void embedSetVisible(id, false).catch(() => {
+      // The drawer is already hidden, so a status line here would be shown to
+      // nobody. Showing the view again re-issues the call, and that path does
+      // report its own failure.
+    });
   },
   { flush: "post" },
 );

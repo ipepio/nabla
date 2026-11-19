@@ -16,6 +16,11 @@
 // - **One lifetime per view.** A view is created inside the main window, moved
 //   and sized by the app (the UI keeps it in sync with its panel rect), and
 //   closed on request, on `embed_close_all`, or when the app exits.
+// - **Hidden is not closed.** `hide`/`show` are the platform's own visibility
+//   switch: the view keeps its document, its history and its JS context, so the
+//   page a human was reading survives the drawer collapsing. That is what makes
+//   a closed drawer possible at all — the view floats above the HTML, so CSS
+//   cannot hide it — and it is why the pane hides instead of closing.
 //
 // Platform notes:
 // - **macOS (the path built and verified here).** `Window::add_child` maps to a
@@ -117,6 +122,8 @@ pub enum EmbedError {
     Create(String),
     /// Position or size was refused by the platform.
     Bounds(String),
+    /// The platform refused to show or hide the view.
+    Visibility(String),
     /// The navigation was refused by the platform.
     Navigate(String),
     /// The script could not be evaluated, or the page never answered.
@@ -144,6 +151,9 @@ impl std::fmt::Display for EmbedError {
             }
             EmbedError::Bounds(message) => {
                 write!(f, "embed: could not place the embedded browser: {message}")
+            }
+            EmbedError::Visibility(message) => {
+                write!(f, "embed: could not show or hide the embedded browser: {message}")
             }
             EmbedError::Navigate(message) => {
                 write!(f, "embed: could not navigate the embedded browser: {message}")
@@ -482,6 +492,30 @@ impl EmbedSessions {
             .map_err(|err| EmbedError::Bounds(err.to_string()))
     }
 
+    /// Shows or hides a view without closing it. Both directions are idempotent:
+    /// asking twice is the same as asking once.
+    ///
+    /// Why this exists: the view floats ABOVE the HTML, so `display: none` on the
+    /// panel that reserves its rect would leave the page painted over the rest of
+    /// the app. `Webview::hide`/`show` are the platform's own switch (wry maps
+    /// them to `NSView.hidden`, `ShowWindow` and GTK show/hide), and — unlike a
+    /// close — they keep the document, the history and the JS context, so the
+    /// same page comes back instead of a reload.
+    pub fn set_visible(
+        &self,
+        app: &AppHandle,
+        view_id: &str,
+        visible: bool,
+    ) -> Result<(), EmbedError> {
+        let webview = self.webview(app, view_id)?;
+        let answer = if visible {
+            webview.show()
+        } else {
+            webview.hide()
+        };
+        answer.map_err(|err| EmbedError::Visibility(err.to_string()))
+    }
+
     /// Navigates a view. The url is validated with [`validate_url`] first, so an
     /// unsupported scheme is refused before the webview ever sees it.
     pub fn navigate(&self, app: &AppHandle, view_id: &str, url: &str) -> Result<(), EmbedError> {
@@ -581,6 +615,15 @@ impl EmbedSessions {
         _y: f64,
         _width: f64,
         _height: f64,
+    ) -> Result<(), EmbedError> {
+        Err(EmbedError::Unsupported)
+    }
+
+    pub fn set_visible(
+        &self,
+        _app: &tauri::AppHandle,
+        _view_id: &str,
+        _visible: bool,
     ) -> Result<(), EmbedError> {
         Err(EmbedError::Unsupported)
     }
@@ -738,6 +781,19 @@ mod tests {
             .reserve("https://example.com/".into())
             .expect("a closed view frees its slot");
         assert_eq!(sessions.len(), MAX_VIEWS);
+    }
+
+    // The drawer hides a view natively instead of closing it, so a refused
+    // `hide`/`show` is a failure the human can read: it names the action and
+    // carries the platform's own reason.
+    #[test]
+    fn visibility_failures_name_the_action_and_the_platform_reason() {
+        let message = EmbedError::Visibility("the platform refused".into()).to_string();
+        assert!(message.contains("show or hide"), "unexpected: {message}");
+        assert!(
+            message.contains("the platform refused"),
+            "the platform's reason travels: {message}"
+        );
     }
 
     #[test]

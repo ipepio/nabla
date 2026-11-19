@@ -23,9 +23,12 @@
 // `v-show`), it does not unmount it, so a terminal keeps its pty.
 //
 // THE ONE EXCEPTION — a Browser pane owns a CHILD WEBVIEW, which floats above the
-// HTML and cannot be hidden by CSS. `active` says whether this pane's tab is the
-// drawn one; `BrowserTool.vue` closes its view when it is not and rebuilds it when
-// it is again.
+// HTML and cannot be hidden by CSS. Two facts travel down to it and they mean
+// different things: `active` says whether this pane's tab is the DRAWN one, and
+// `visible` says whether the DRAWER around it is on screen. `BrowserTool.vue`
+// closes its view when the tab stops being drawn and rebuilds it when it is drawn
+// again; when only the drawer went away it hides the view natively instead, so the
+// page is still there (same document, same history) when the drawer reopens.
 //
 // The component receives its own props from `binding`, one shape per tool: Files
 // takes `rootPath` and emits `browse`, Terminal takes `cwd`, and the two read-only
@@ -59,6 +62,8 @@ const props = defineProps<{
   depth: number;
   /** This pane's tab is the drawn one. */
   active: boolean;
+  /** The drawer around this pane is on screen (a browser pane needs it too). */
+  visible: boolean;
   workspace: WorkspaceInfo | null;
 }>();
 
@@ -108,7 +113,13 @@ const binding = computed(() => {
       return { workspace: props.workspace };
     case "browser":
       // `active`: the pane's tab is drawn, so the child webview may exist.
-      return { workspace: props.workspace, active: props.active };
+      // `visible`: the drawer it lives in is drawn, so the view may be shown;
+      // when the drawer hides, the pane hides the view instead of closing it.
+      return {
+        workspace: props.workspace,
+        active: props.active,
+        visible: props.visible,
+      };
   }
 });
 

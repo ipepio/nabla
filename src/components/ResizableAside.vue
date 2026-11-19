@@ -4,7 +4,9 @@
 //
 // OWNERSHIP (spec S4 — one owner per piece of state): this component owns the
 // panel width. The parent keeps only whether the panel is open, so the width has
-// exactly one home and no duplicated `ref` gets out of sync.
+// exactly one home and no duplicated `ref` gets out of sync. Because the parent
+// keeps this component MOUNTED and only hides it (`v-show`), the width a human
+// dragged survives collapsing and reopening the drawer.
 //
 // Width is SESSION state on purpose: nothing is persisted here. Remembering the
 // width across launches would need a `settings.json` key (task T4 follow-up),
@@ -14,18 +16,19 @@ import { onBeforeUnmount, onMounted, ref } from "vue";
 import { CHAT_MIN_WIDTH } from "@/lib/layout";
 
 /**
- * The width of a fresh panel: half the window.
+ * What the panel starts at, and what a double-click (or Home) restores: the width
+ * of a fresh panel, half the window.
  *
  * A tool pane is a workspace, not a sidebar. At the old 280px a browser or a
  * terminal was unusable — the human's first act was always to drag it wider — so
- * the panel now opens at half the window and the human narrows it (or
- * double-clicks back to this) from there. `clampWidth` still bounds the result:
- * the chat keeps its own minimum, and narrow windows shrink the panel with it.
+ * the panel starts at half the window and the human narrows it from there.
+ * `clampWidth` still bounds the result: the chat keeps its own minimum, and narrow
+ * windows shrink the panel with it.
  *
- * The same value serves the two ways a panel appears: the human opening the
- * drawer, and the agent asking for it (`embed-need-view`). A width the human
- * dragged by hand is never overwritten — this is only what a panel starts at,
- * and what a double-click restores.
+ * It is read ONCE, when this component mounts (the drawer is mounted from the
+ * start and only hidden), so opening the drawer never resets a width the human
+ * dragged: this is what a panel starts at, and what a double-click restores, never
+ * something an open/close cycle re-applies.
  */
 function defaultWidth(): number {
   if (typeof window === "undefined") return 280;
