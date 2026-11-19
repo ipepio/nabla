@@ -13,9 +13,9 @@ Alcance: los dos ajustes de conversación que quedan vivos de la fila «Pulido d
 
 | ID | Tarea | Specs | Estado | Commit |
 | --- | --- | --- | --- | --- |
-| P1 | Throttle del parse de `segmentsOf` durante el streaming: el texto vivo se re-parsea como mucho cada ~120 ms; el resultado final es byte-idéntico al de hoy y el commit del turno no pinta una cola obsoleta | S1, S2, S3 | pending | |
-| P2 | Borradores no enviados por sesión, persistidos en `localStorage` (primer uso del repo: clave `nabla.draft.*`), restaurados al cambiar/abrir sesión, guardados con debounce, borrados al enviar o encolar | S1, S2, S3 | pending | |
-| P3 | Verificación: `npm run build` + QA manual del humano | S2 | pending | — |
+| P1 | Throttle del parse de `segmentsOf` durante el streaming: el texto vivo se re-parsea como mucho cada ~120 ms; el resultado final es byte-idéntico al de hoy y el commit del turno no pinta una cola obsoleta | S1, S2, S3 | done | 9ea1398 |
+| P2 | Borradores no enviados por sesión, persistidos en `localStorage` (primer uso del repo: clave `nabla.draft.*`), restaurados al cambiar/abrir sesión, guardados con debounce, borrados al enviar o encolar | S1, S2, S3 | done | 9ea1398 |
+| P3 | Verificación: `npm run build` + QA manual del humano | S2 | done (build verde; QA manual entregada) | 9ea1398 |
 
 ## Log
 
@@ -23,3 +23,4 @@ Alcance: los dos ajustes de conversación que quedan vivos de la fila «Pulido d
 - **L2** Origen de la tanda: encuesta de inspiración sobre 10 repos (nan-desktop, Stark pi-desktop, dsh, chat-demo, PI-Desktop vastsa, phosphor, gentle-shell, Gentleman.Dots, gentle-ai, gentle-shell-desktop). Nada se copia: patrones y decisiones de producto. La fila aceptada era «Parse de markdown acelerado durante el streaming, razonamiento como flujo plegable con estilo propio, borradores no enviados persistidos, copiar por mensaje, parar/continuar».
 - **L3** Orden acordado para después de esta feature: **puente de preguntas del agente → auto-open del panel → continuidad de turno**.
 - **L4** Recon (paths verificados): el render de texto no es una librería markdown — `AssistantText.vue:11` computa `segmentsOf()` de `src/components/chat/code-segments.ts` y la computada re-evalúa **por cada delta** (`session-store.ts:685` `streamingText += delta`), sin throttle en todo el camino del chat. No hay `localStorage` en el repo (P2 lo estrena). `ChatPanel.vue` no usa i18n (strings del propio archivo). `message.id` es la clave estable del transcript; la sesión se direcciona por `sessionId` string.
+- **L5** **P1+P2 hechos** (`9ea1398`, rama `feat/chat-polish`): `use-throttled-text.ts` (espejo del texto vivo a 120 ms; publish forzado cuando el turno comitea, cuando empieza otro, o cuando la cola deja de extender lo pintado — reemplazo, no crecimiento; los turnos commiteados nunca pasan por el throttle) y `use-prompt-draft.ts` (borrador por sesión en `localStorage`, `nabla.draft.<id>` / `nabla.draft.new.<workspaceId>` antes de la primera sesión; guardado con debounce 300 ms; restauración sólo en composer vacío; olvidado al enviar **y** al encolar, y el primer envío borra también el borrador `new.*` bajo el que se tecleó). Sin runner de tests en el frontend: el gate existente (`npm run build`, verde) se corrió; QA manual entregada al humano junto con la de webview-control. Diagnósticos de pi-lens sobre exports sin uso: stale, verificado que no existen.
