@@ -1,52 +1,65 @@
 <script setup lang="ts">
-// One pending question the session's agent is blocked on (S3 of
+// A question the agent asked, once it is history (S3 of
 // `odd/tasks/agent-question-bridge.md`).
 //
-// Presentation only: it renders one `extension_ui_request` and emits the answer
-// the human gave. The command that sends it and the store that removes the card
-// live in `ChatPanel.vue` and `src/lib/session-store.ts`, so this component never
-// touches the contracts seam.
+// Pending questions do not render here any more: they take over the composer
+// slot (`QuestionPrompt.vue`), which is where the human's hands already are.
+// This card is what a question becomes when it is answered or cancelled, so the
+// transcript keeps both halves of the exchange after the request is gone — the
+// entry is a normal `ChatMessage` carrying a `SettledQuestion`, never a second
+// message kind.
 //
-// Every method this slice draws has its own control. A method it does not draw
-// (`editor`, or whatever a newer pi adds) still offers Cancel: a card nobody can
-// answer would block the agent's turn forever (S4).
+// Read-only by construction: it has no emit, draws no control and cannot be
+// answered, because the protocol exchange it belongs to is already closed.
 //
 // The strings are literal English rather than `t(...)` keys: the catalogue
 // (`src/locales/`) is out of this feature's edit surface, and inventing keys the
 // catalogue does not carry would break `vue-tsc` (a missing key is a build error).
-import { computed, ref } from "vue";
-import { MessageCircleQuestionIcon, SendIcon } from "@lucide/vue";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import type { UiAnswer } from "@/contracts/types";
-import type { PendingQuestion } from "@/lib/session-store";
+import { computed } from "vue";
+import { CheckIcon, MessageCircleQuestionIcon } from "@lucide/vue";
+import type { SettledQuestion } from "@/lib/session-store";
 
 const props = defineProps<{
-  /** The request, normalized by the store (no optional fields to guard). */
-  question: PendingQuestion;
-  /** An answer of this session is already on its way: every card is inert. */
-  busy: boolean;
+  /** The request as pi sent it, plus what the human did with it. */
+  question: SettledQuestion;
 }>();
 
-const emit = defineEmits<{ (e: "answer", answer: UiAnswer): void }>();
+/** The question itself, falling back to what it was asking about. */
+const headline = computed(() => {
+  if (props.question.title !== "") return props.question.title;
+  if (props.question.message !== null && props.question.message !== "") {
+    return props.question.message;
+  }
+  return "The agent asked a question.";
+});
 
-/** The `input` method's text. Per card, so two pending inputs never share it. */
-const text = ref("");
+/**
+ * The answer in one line: the chosen option, `Yes`/`No`, or the typed text.
+ * `""` when the question was cancelled — nothing was answered then.
+ */
+const answerText = computed(() => {
+  const answer = props.question.answer;
+  if (answer === null || "cancelled" in answer) return "";
+  if ("confirmed" in answer) return answer.confirmed ? "Yes" : "No";
+  return answer.value;
+});
 
-/** Methods this card can draw; anything else can only be cancelled. */
-const supported = computed(
-  () =>
-    props.question.method === "select" ||
-    props.question.method === "confirm" ||
-    props.question.method === "input",
+/** The question was closed without an answer. */
+const cancelled = computed(
+  () => props.question.answer === null || "cancelled" in props.question.answer,
 );
 
-/** Sends the typed text, never an empty one: an empty value is not an answer. */
-function answerInput(): void {
-  const value = text.value.trim();
-  if (value === "" || props.busy) return;
-  emit("answer", { value });
-}
+/**
+ * The options the question offered, with the chosen one marked. A `confirm` has
+ * no option list on the wire — its two answers are fixed — and anything else
+ * (a typed answer, or a method with no control here) offers none, so the answer
+ * is printed as a line instead.
+ */
+const choices = computed<string[]>(() => {
+  if (props.question.options.length > 0) return props.question.options;
+  if (props.question.method === "confirm") return ["Yes", "No"];
+  return [];
+});
 </script>
 
 <template>
@@ -58,79 +71,59 @@ function answerInput(): void {
       />
       <div class="min-w-0 flex-1">
         <p class="text-sm font-medium break-words whitespace-pre-wrap">
-          {{ question.title || "The agent has a question." }}
+          {{ headline }}
         </p>
-        <!-- `confirm` carries what exactly is being confirmed. -->
+        <!-- `confirm` carries what exactly was confirmed; `input` carries the
+             hint its empty field showed. -->
         <p
           v-if="question.message"
           class="mt-1 text-xs break-words whitespace-pre-wrap text-muted-foreground"
         >
           {{ question.message }}
         </p>
-      </div>
-    </div>
+        <p
+          v-else-if="question.placeholder"
+          class="mt-1 text-xs break-words whitespace-pre-wrap text-muted-foreground"
+        >
+          {{ question.placeholder }}
+        </p>
 
-    <!-- The method's own control. -->
-    <div class="mt-2 flex flex-col gap-1.5">
-      <div v-if="question.method === 'select'" class="flex flex-wrap gap-1.5">
-        <Button
-          v-for="option in question.options"
-          :key="option"
-          variant="outline"
-          size="sm"
-          :disabled="busy"
-          @click="emit('answer', { value: option })"
+        <!-- The options, with the one the human picked marked. A cancelled
+             question marks none of them: nothing was chosen. -->
+        <ul v-if="choices.length > 0" class="mt-1.5 flex flex-col gap-0.5">
+          <li
+            v-for="choice in choices"
+            :key="choice"
+            class="flex items-center gap-1.5 text-xs"
+            :class="
+              choice === answerText ? 'text-foreground' : 'text-muted-foreground'
+            "
+          >
+            <CheckIcon
+              v-if="choice === answerText"
+              class="size-3 shrink-0"
+              aria-hidden="true"
+            />
+            <span v-else class="size-3 shrink-0" aria-hidden="true" />
+            <span class="min-w-0 break-words">{{ choice }}</span>
+          </li>
+        </ul>
+        <!-- A typed answer has no option to mark, so it is the line itself. -->
+        <p
+          v-else-if="answerText !== ''"
+          class="mt-1.5 text-xs break-words whitespace-pre-wrap text-foreground"
         >
-          {{ option }}
-        </Button>
+          {{ answerText }}
+        </p>
       </div>
-      <div v-else-if="question.method === 'confirm'" class="flex flex-wrap gap-1.5">
-        <Button size="sm" :disabled="busy" @click="emit('answer', { confirmed: true })">
-          Yes
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          :disabled="busy"
-          @click="emit('answer', { confirmed: false })"
-        >
-          No
-        </Button>
-      </div>
-      <div v-else-if="question.method === 'input'" class="flex items-center gap-1.5">
-        <Input
-          v-model="text"
-          class="h-8 text-sm"
-          :placeholder="question.placeholder ?? 'Type your answer'"
-          :disabled="busy"
-          @keydown.enter.prevent="answerInput"
-        />
-        <Button
-          size="icon-sm"
-          aria-label="Send answer"
-          :disabled="busy || text.trim() === ''"
-          @click="answerInput"
-        >
-          <SendIcon />
-        </Button>
-      </div>
-      <p v-else-if="!supported" class="text-xs text-muted-foreground">
-        This question has no control in the chat. Cancel it so the agent can carry
-        on.
-      </p>
-    </div>
 
-    <!-- Cancel is not optional: without it a pending question can only be
-         closed by stopping the whole session (S4). -->
-    <div class="mt-1.5 flex items-center justify-end">
-      <Button
-        variant="ghost"
-        size="xs"
-        :disabled="busy"
-        @click="emit('answer', { cancelled: true })"
+      <!-- How the exchange ended, at a glance. -->
+      <span
+        class="shrink-0 text-[10px] font-medium tracking-wider uppercase"
+        :class="cancelled ? 'text-muted-foreground' : 'text-success'"
       >
-        Cancel
-      </Button>
+        {{ cancelled ? "Cancelled" : "Answered" }}
+      </span>
     </div>
   </div>
 </template>

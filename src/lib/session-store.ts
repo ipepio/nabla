@@ -32,6 +32,7 @@ import type {
   SessionSummary,
   TranscriptMessage,
   TranscriptRole,
+  UiAnswer,
 } from "../contracts/types";
 import { queueMessages } from "./preferences";
 
@@ -58,6 +59,36 @@ export interface ChatMessage {
   at: string | null;
   /** The turn's reasoning, absent when pi streamed none. */
   reasoning?: string;
+  /**
+   * Present when this entry is a question the agent asked and the human
+   * answered (or cancelled), rather than a line of dialogue (S3 of
+   * `agent-question-bridge.md`). The panel renders it as the settled card, so
+   * the exchange stays in the conversation after the request is gone.
+   */
+  question?: SettledQuestion;
+}
+
+/**
+ * One question of the agent's, moved out of "the agent is blocked" into history
+ * (S3 of `agent-question-bridge.md`).
+ *
+ * It carries the request as pi sent it plus what the human did with it, which is
+ * enough to render the card read-only: the request id belongs to a protocol
+ * exchange that is already closed, so it is not kept.
+ */
+export interface SettledQuestion {
+  /** pi's wire discriminator: `select` | `confirm` | `input` | ... */
+  method: string;
+  /** The question itself; `""` when pi sent none. */
+  title: string;
+  /** `select` only, oldest-first as pi sent them; `[]` for every other method. */
+  options: string[];
+  /** `confirm` only: what exactly was confirmed. */
+  message: string | null;
+  /** `input` only: the hint the empty field carried. */
+  placeholder: string | null;
+  /** What the human answered, or `null` when it was cancelled. */
+  answer: UiAnswer | null;
 }
 
 /**
@@ -647,30 +678,97 @@ export function pendingQuestions(sessionId: string | null): PendingQuestion[] {
 }
 
 /**
- * S3: drops one answered question by its id. The id, not a position: the human
- * can answer the second question first, and a stale click must never close a
- * different one.
+ * S3: the line a settled question contributes when a surface renders plain text
+ * instead of the card. The stored preview (`snapshotPreview`) keeps role, text
+ * and time only, so reopening a session still shows what was asked and answered
+ * even though the structured half of the entry cannot be persisted without
+ * changing the contract.
+ */
+function settledText(question: SettledQuestion): string {
+  const headline =
+    question.title !== ""
+      ? question.title
+      : question.message ?? "The agent asked a question.";
+  const answer = question.answer;
+  if (answer === null || "cancelled" in answer) return `${headline} — cancelled`;
+  if ("confirmed" in answer) return `${headline} — ${answer.confirmed ? "Yes" : "No"}`;
+  return `${headline} — ${answer.value}`;
+}
+
+/**
+ * S3: turns one question into a transcript entry. This is how a question leaves
+ * the pending stack: answered or cancelled, it settles into the conversation as
+ * the human's side of the exchange — the request itself is gone, so an entry
+ * that vanished with it would leave the transcript holding one half of a
+ * dialogue.
+ *
+ * The card is read-only from here (`ChatMessage.question`), which is why it does
+ * not need a second message kind: it is the same `ChatMessage` the transcript
+ * already renders, carrying the settled question as extra UI-only state.
+ */
+function settleQuestion(
+  sessionId: string,
+  buffer: SessionBuffer,
+  question: PendingQuestion,
+  answer: UiAnswer | null,
+): void {
+  const settled: SettledQuestion = {
+    method: question.method,
+    title: question.title,
+    options: [...question.options],
+    message: question.message,
+    placeholder: question.placeholder,
+    answer,
+  };
+  buffer.transcript.push({
+    id: nextMessageId(sessionId),
+    // The human's side of the exchange: what the conversation gained. A surface
+    // without the structured half (the stored preview) then still reads as the
+    // human answering the agent.
+    role: "user",
+    text: settledText(settled),
+    at: new Date().toISOString(),
+    question: settled,
+  });
+}
+
+/**
+ * S3: drops one answered question by its id and settles it into the transcript
+ * with the answer the human gave. The id, not a position: the human can answer
+ * the second question first, and a stale answer must never close a different
+ * one.
  */
 export function resolveQuestion(
   sessionId: string | null,
   requestId: string,
+  answer: UiAnswer,
 ): void {
   const buffer = sessionBuffer(sessionId);
-  if (buffer === null) return;
+  if (buffer === null || sessionId === null) return;
   const index = buffer.questions.findIndex(
     (question) => question.id === requestId,
   );
-  if (index !== -1) buffer.questions.splice(index, 1);
+  if (index === -1) return;
+  const [resolved] = buffer.questions.splice(index, 1);
+  if (resolved !== undefined) settleQuestion(sessionId, buffer, resolved, answer);
 }
 
 /**
- * Drops every pending question of a session. Called on the transitions that make
- * an answer impossible — stopped, crashed, exited — because pi is blocked on an
- * answer that can never reach it, and a card nobody can close is worse than no
- * card at all.
+ * Empties the pending stack of a session by settling every question as
+ * cancelled. Called on the transitions that make an answer impossible —
+ * stopped, crashed, exited — because pi is blocked on an answer that can never
+ * reach it, and a question nobody can answer is worse than none.
+ *
+ * Settling rather than deleting is the whole point: a question the process can
+ * no longer receive must not vanish from the conversation either. The stack is
+ * emptied only after every entry has been recorded, so a failure in between
+ * cannot silently drop one.
  */
-function clearQuestions(buffer: SessionBuffer): void {
+function clearQuestions(sessionId: string, buffer: SessionBuffer): void {
   if (buffer.questions.length === 0) return;
+  for (const question of [...buffer.questions]) {
+    settleQuestion(sessionId, buffer, question, { cancelled: true });
+  }
   buffer.questions.splice(0, buffer.questions.length);
 }
 
@@ -857,10 +955,10 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
       buffer.error = event.error ?? null;
       markLive(sessionId, event.status);
       // S3: a question only exists while the process that asked it is alive. pi
-      // stays blocked on an answer that can no longer arrive, so the card goes
-      // with the process instead of waiting for a human who cannot be heard.
+      // stays blocked on an answer that can no longer arrive, so the question
+      // settles as cancelled instead of waiting for a human who cannot be heard.
       if (event.status === "stopped" || event.status === "crashed") {
-        clearQuestions(buffer);
+        clearQuestions(sessionId, buffer);
       }
       // A prompt typed while pi was still booting waits in the queue (its stdin
       // does not exist yet). The transition into a live process is what drains
@@ -874,7 +972,7 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
     case "process_exit":
       buffer.exitCode = event.code ?? null;
       // The question bridge dies with the child (S3): no process, no answer.
-      clearQuestions(buffer);
+      clearQuestions(sessionId, buffer);
       liveIds.value = liveIds.value.filter((id) => id !== sessionId);
       return;
     case "extension_ui_request": {
@@ -1238,9 +1336,10 @@ export function recordSessionStatus(
   if (status === "stopped" || status === "crashed") {
     // A session that is stopped or crashed is not working, and every pending
     // question became unanswerable with the process that asked it (S3): pi stays
-    // blocked on an answer that can never arrive.
+    // blocked on an answer that can never arrive, so each one settles as
+    // cancelled instead of disappearing.
     buffer.busy = false;
-    clearQuestions(buffer);
+    clearQuestions(sessionId, buffer);
   }
   markLive(sessionId, status);
 }

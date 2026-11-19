@@ -11,7 +11,7 @@
 // nothing here starts, stops or resets a process, and the previous session keeps
 // running and keeps accumulating events off screen.
 import type { Component } from "vue";
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import {
   CheckIcon,
   CircleAlertIcon,
@@ -26,6 +26,7 @@ import ChatHeader from "@/components/chat/ChatHeader.vue";
 import Composer from "@/components/chat/Composer.vue";
 import MessageBubble from "@/components/chat/MessageBubble.vue";
 import QuestionCard from "@/components/chat/QuestionCard.vue";
+import QuestionPrompt from "@/components/chat/QuestionPrompt.vue";
 import { draftKeyFor, usePromptDraft } from "@/components/chat/use-prompt-draft";
 import { useThrottledText } from "@/components/chat/use-throttled-text";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -446,19 +447,107 @@ const queuedList = computed(() =>
 /**
  * S3 of `agent-question-bridge.md`: the questions this session's agent is blocked
  * on, in arrival order (pi allows concurrent dialogs, so it is a stack). The
- * store owns the list — it clears it when the process stops — so the panel only
- * renders it and answers it.
+ * store owns the list — it settles every one of them when the process stops — so
+ * the panel only renders one at a time and answers it.
  */
 const questions = computed(() =>
   pendingQuestions(currentSession.value?.sessionId ?? null),
 );
 
 /**
- * Id of the question whose answer is on its way. While set, every card is inert:
- * a second click would write a second answer for a question pi has already
- * resolved, and the protocol has no way to take an answer back.
+ * Id of the question whose answer is on its way. While set, the question's
+ * controls are inert: a second answer would write a second response for a request
+ * pi has already resolved, and the protocol has no way to take one back.
  */
 const answering = ref<string | null>(null);
+
+/**
+ * Which pending question holds the composer slot. `null` means "the oldest one":
+ * questions are answered in the order they were asked unless the human walks the
+ * stack with Tab, and an id whose question already left falls back to the oldest
+ * remaining instead of leaving the slot empty.
+ */
+const focusedQuestionId = ref<string | null>(null);
+
+/**
+ * What has been typed for each pending question, keyed by its request id. The
+ * text belongs to the question that asked for it, so walking the stack with Tab
+ * never shows one question the answer typed for another.
+ */
+const answerDrafts = reactive(new Map<string, string>());
+
+/** Position of the question on screen in the pending stack; `-1` when none. */
+const focusedQuestionIndex = computed(() => {
+  const list = questions.value;
+  if (list.length === 0) return -1;
+  const index = list.findIndex(
+    (question) => question.id === focusedQuestionId.value,
+  );
+  return index === -1 ? 0 : index;
+});
+
+/** The question the composer slot is asking right now, or `null`. */
+const focusedQuestion = computed<PendingQuestion | null>(
+  () => questions.value[focusedQuestionIndex.value] ?? null,
+);
+
+/**
+ * The answer field's text (`v-model` of the question prompt): the draft of the
+ * question on screen, and only that one. As a computed it needs no resetting —
+ * moving the focus is enough for the field to show the right text.
+ */
+const answerText = computed<string>({
+  get: () => {
+    const id = focusedQuestion.value?.id;
+    return id === undefined ? "" : (answerDrafts.get(id) ?? "");
+  },
+  set: (value) => {
+    const id = focusedQuestion.value?.id;
+    if (id === undefined) return;
+    if (value === "") answerDrafts.delete(id);
+    else answerDrafts.set(id, value);
+  },
+});
+
+/**
+ * The block that hosts the composer, so focus can be put back in its field by a
+ * lookup instead of a component contract: the composer is a fresh mount each time
+ * the slot stops asking a question, so an instance handle is less reliable here
+ * than the element itself.
+ */
+const composerSlot = ref<HTMLElement | null>(null);
+
+/**
+ * Point 5 of the design: while a question holds the composer slot the composer is
+ * not rendered, so "focus returns to the input" is a focus call and not a browser
+ * default. It runs when the last question leaves — answered, cancelled, or
+ * settled as cancelled by a stop — and never while one is still asking, which is
+ * what keeps an `ask_input` field from being interrupted mid-word.
+ *
+ * The session id is watched with it because switching sessions changes the count
+ * too, and the human's focus is in the drawer then: taking it into a composer
+ * they did not ask for is not this behaviour.
+ */
+watch(
+  () => [activeSessionId.value, questions.value.length] as const,
+  ([session, next], [previousSession, previous]) => {
+    if (session !== previousSession) return;
+    if (next > 0 || previous === 0) return;
+    void nextTick(() => composerSlot.value?.querySelector("textarea")?.focus());
+  },
+);
+
+/**
+ * Forgets the draft of every question that is no longer pending, and nothing else.
+ * A settled question takes its half-typed text with it: the request is closed, so
+ * keeping the text would only resurrect it on a request id that never returns.
+ */
+watch(questions, (list) => {
+  const live = new Set(list.map((question) => question.id));
+  for (const id of [...answerDrafts.keys()]) {
+    if (!live.has(id)) answerDrafts.delete(id);
+  }
+});
 
 /**
  * The queue stack shares the composer's ceiling, so it lines up with the box
@@ -792,6 +881,18 @@ async function handleSelectModel(choice: { provider: string; model: string }) {
  * composer usable in the same instant the session appears.
  */
 async function handleSend() {
+  // S3 (point 6 of the design): while a question holds the composer slot, absent
+  // a picker there is no prompt to send — the slot is busy being the answer. A
+  // typed question is answered from the same Enter that would otherwise send; the
+  // picker has no field, so Enter there is the highlighted option's own and this
+  // only refuses to invent a send.
+  const question = focusedQuestion.value;
+  if (question !== null) {
+    if (asksForText(question) && answerText.value.trim() !== "") {
+      void handleAnswer(question, { value: answerText.value.trim() });
+    }
+    return;
+  }
   const text = prompt.value.trim();
   if (text === "") return;
   // The key the text was typed under, before a send can create its session.
@@ -863,17 +964,23 @@ function handleRemoveQueued(index: number) {
 /**
  * S3: answers one pending question, which is what unblocks the agent's turn.
  *
- * The card leaves only once the line really reached the child
- * (`answer_ui_request` rejects for a session that is not running), so a card
- * that is gone always means the agent has the answer. A failure keeps it on
- * screen with the reason in the error card, which is the honest state: still
+ * The question leaves the composer slot only once the line really reached the
+ * child (`answer_ui_request` rejects for a session that is not running), so a
+ * question that is gone always means the agent has the answer. A failure keeps it
+ * on screen with the reason in the error card, which is the honest state: still
  * unanswered.
+ *
+ * Settling is part of the same step, and the store owns it: the answer travels
+ * with the removal (`resolveQuestion`) so the transcript gains the exchange in the
+ * moment the pending stack loses it.
  */
 async function handleAnswer(question: PendingQuestion, answer: UiAnswer) {
   const current = currentSession.value;
   if (current === null || answering.value !== null) return;
   answering.value = question.id;
   panelError.value = null;
+  // Where the question stood, read before the store removes it.
+  const index = focusedQuestionIndex.value;
   try {
     await answerUiRequest(
       current.workspaceId,
@@ -881,12 +988,68 @@ async function handleAnswer(question: PendingQuestion, answer: UiAnswer) {
       question.id,
       answer,
     );
-    resolveQuestion(current.sessionId, question.id);
+    resolveQuestion(current.sessionId, question.id, answer);
+    advanceFocus(index);
   } catch (cause) {
     panelError.value = commandErrorMessage(cause);
   } finally {
     answering.value = null;
   }
+}
+
+/**
+ * S3: after an answer, focus advances to the question that followed the one just
+ * answered — or to the last one left when it was the last. `index` is where that
+ * question stood before the store removed it.
+ */
+function advanceFocus(index: number): void {
+  const remaining = questions.value;
+  if (remaining.length === 0) {
+    focusedQuestionId.value = null;
+    return;
+  }
+  const next = Math.max(0, Math.min(index, remaining.length - 1));
+  focusedQuestionId.value = remaining[next]?.id ?? null;
+}
+
+/**
+ * S3: Tab / Shift+Tab walk the pending questions of this session. Only meaningful
+ * with more than one, and wrapping at both ends, because a stack of two is a ring
+ * the human moves around rather than a list with edges.
+ */
+function focusQuestionByOffset(offset: number): void {
+  const list = questions.value;
+  if (list.length < 2) return;
+  const index =
+    (focusedQuestionIndex.value + offset + list.length) % list.length;
+  focusedQuestionId.value = list[index]?.id ?? null;
+}
+
+/**
+ * S3: cancels the question on screen — the visible half of Escape. It goes through
+ * the same command as an answer, with the protocol's cancellation, so pi gets its
+ * turn back and the question settles into the transcript as cancelled.
+ */
+function handleCancelQuestion(): void {
+  const question = focusedQuestion.value;
+  if (question === null) return;
+  void handleAnswer(question, { cancelled: true });
+}
+
+/** S3: the answer the question on screen is waiting for. */
+function handleQuestionAnswer(answer: UiAnswer): void {
+  const question = focusedQuestion.value;
+  if (question === null) return;
+  void handleAnswer(question, answer);
+}
+
+/**
+ * The question on screen is answered by typing rather than by picking a row. The
+ * picker has no field, so this is also what tells `handleSend` that Enter means
+ * "answer" instead of "send a prompt".
+ */
+function asksForText(question: PendingQuestion): boolean {
+  return question.options.length === 0 && question.method !== "confirm";
 }
 
 /**
@@ -963,24 +1126,9 @@ onUnmounted(() => {
       :hint="workspace === null ? t('chat.noWorkspaceHint') : null"
     >
       <template #composer>
-        <div class="flex w-full flex-col gap-1.5">
-          <!-- S3 of `agent-question-bridge.md`: what the agent is blocked on,
-               answered here or cancelled. Above the queue: an unanswered
-               question is the turn, a queued prompt is only what comes next. -->
-          <div
-            v-if="questions.length > 0"
-            class="mx-auto flex w-full flex-col gap-1.5"
-            :style="{ maxWidth: queueMaxWidth }"
-          >
-            <QuestionCard
-              v-for="question in questions"
-              :key="question.id"
-              :question="question"
-              :busy="answering !== null"
-              @answer="handleAnswer(question, $event)"
-            />
-          </div>
-
+        <!-- `composerSlot`: where focus goes back to when the last pending
+             question leaves (S3, point 5 of the design). -->
+        <div ref="composerSlot" class="flex w-full flex-col gap-1.5">
           <!-- S3: this session's waiting prompts, directly above the composer
                (see the conversation branch below for the same stack). -->
           <div
@@ -1022,7 +1170,27 @@ onUnmounted(() => {
             </ul>
           </div>
 
+          <!-- S3 of `agent-question-bridge.md`: a pending question takes the
+               composer's place, not the transcript's — the answer belongs where
+               the human's hands already are. The queue keeps its strip above it:
+               what waits for the next turn is still visible, and still
+               removable, while the question owns the input row. -->
+          <QuestionPrompt
+            v-if="focusedQuestion"
+            :key="focusedQuestion.id"
+            v-model="answerText"
+            :question="focusedQuestion"
+            :position="focusedQuestionIndex + 1"
+            :total="questions.length"
+            :busy="answering !== null"
+            :max-width="COMPOSER_MAX_WIDTH"
+            @answer="handleQuestionAnswer"
+            @cancel="handleCancelQuestion"
+            @next="focusQuestionByOffset(1)"
+            @previous="focusQuestionByOffset(-1)"
+          />
           <Composer
+            v-else
             v-model="prompt"
             :max-width="COMPOSER_MAX_WIDTH"
             :provider-id="providerId"
@@ -1120,8 +1288,15 @@ onUnmounted(() => {
           <!-- L3/S4: the active session's buffer, which kept filling while
                this session was off screen. -->
           <template v-for="message in transcript" :key="message.id">
+            <!-- S3: a question the agent asked, settled into history. Answered or
+                 cancelled, it stays in the conversation as a read-only card: the
+                 request is gone, the exchange is not. -->
+            <QuestionCard
+              v-if="message.question"
+              :question="message.question"
+            />
             <div
-              v-if="message.role === 'tool'"
+              v-else-if="message.role === 'tool'"
               class="flex items-start gap-2 text-xs text-muted-foreground"
             >
               <WrenchIcon class="mt-0.5 size-3 shrink-0" aria-hidden="true" />
@@ -1177,24 +1352,7 @@ onUnmounted(() => {
       <!-- Composer, pinned under the transcript, plus the turns/steps meta.
            No rule above it: the conversation and its input read as one
            surface instead of two panes. -->
-      <div class="px-4 py-3">
-        <!-- S3 of `agent-question-bridge.md`: the same card stack as the empty
-             state above, so a question is answered in the same place whichever
-             state the panel is in. -->
-        <div
-          v-if="questions.length > 0"
-          class="mx-auto mb-1.5 flex w-full flex-col gap-1.5"
-          :style="{ maxWidth: queueMaxWidth }"
-        >
-          <QuestionCard
-            v-for="question in questions"
-            :key="question.id"
-            :question="question"
-            :busy="answering !== null"
-            @answer="handleAnswer(question, $event)"
-          />
-        </div>
-
+      <div ref="composerSlot" class="px-4 py-3">
         <!-- S3: this session's waiting prompts, directly above the composer and
              capped to three visible rows so the input never leaves the screen.
              Same stack as the empty state above. -->
@@ -1237,7 +1395,26 @@ onUnmounted(() => {
           </ul>
         </div>
 
+        <!-- S3 of `agent-question-bridge.md`: the question takes the composer's
+             place, and the queue keeps its strip above it — what waits for the
+             next turn stays visible, and removable, while the question owns the
+             input row. Same order as the empty state above. -->
+        <QuestionPrompt
+          v-if="focusedQuestion"
+          :key="focusedQuestion.id"
+          v-model="answerText"
+          :question="focusedQuestion"
+          :position="focusedQuestionIndex + 1"
+          :total="questions.length"
+          :busy="answering !== null"
+          :max-width="CONVERSATION_COMPOSER_MAX_WIDTH"
+          @answer="handleQuestionAnswer"
+          @cancel="handleCancelQuestion"
+          @next="focusQuestionByOffset(1)"
+          @previous="focusQuestionByOffset(-1)"
+        />
         <Composer
+          v-else
           v-model="prompt"
           :max-width="CONVERSATION_COMPOSER_MAX_WIDTH"
           :provider-id="providerId"
