@@ -13,7 +13,25 @@ import type { HTMLAttributes } from "vue";
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { CHAT_MIN_WIDTH } from "@/lib/layout";
 
-const DEFAULT_WIDTH = 280;
+/**
+ * The width of a fresh panel: half the window.
+ *
+ * A tool pane is a workspace, not a sidebar. At the old 280px a browser or a
+ * terminal was unusable — the human's first act was always to drag it wider — so
+ * the panel now opens at half the window and the human narrows it (or
+ * double-clicks back to this) from there. `clampWidth` still bounds the result:
+ * the chat keeps its own minimum, and narrow windows shrink the panel with it.
+ *
+ * The same value serves the two ways a panel appears: the human opening the
+ * drawer, and the agent asking for it (`embed-need-view`). A width the human
+ * dragged by hand is never overwritten — this is only what a panel starts at,
+ * and what a double-click restores.
+ */
+function defaultWidth(): number {
+  if (typeof window === "undefined") return 280;
+  return Math.round(window.innerWidth / 2);
+}
+
 const MIN_WIDTH = 240;
 const KEYBOARD_STEP = 16;
 
@@ -34,7 +52,7 @@ const props = withDefaults(
 );
 
 const asideEl = ref<HTMLElement | null>(null);
-const width = ref(DEFAULT_WIDTH);
+const width = ref(defaultWidth());
 const isDragging = ref(false);
 
 /**
@@ -54,7 +72,7 @@ function clampWidth(candidate: number): number {
 }
 
 /** Width ceiling for the ARIA values, read at render time. */
-const maxWidthNow = ref(DEFAULT_WIDTH);
+const maxWidthNow = ref(defaultWidth());
 
 /** Keep the ceiling current and never let a shrink hide the chat. */
 function handleViewportResize(): void {
@@ -68,7 +86,7 @@ function rightEdge(): number {
 }
 
 function resetWidth(): void {
-  width.value = clampWidth(DEFAULT_WIDTH);
+  width.value = clampWidth(defaultWidth());
 }
 
 function onPointerDown(event: PointerEvent): void {
@@ -105,7 +123,7 @@ function onKeyDown(event: KeyboardEvent): void {
   } else if (event.key === "ArrowRight") {
     candidate = width.value - KEYBOARD_STEP;
   } else if (event.key === "Home") {
-    candidate = DEFAULT_WIDTH;
+    candidate = defaultWidth();
   } else {
     return;
   }
