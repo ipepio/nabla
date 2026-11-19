@@ -34,6 +34,7 @@ import {
   getSettings,
   saveSettings,
   sessionStatus,
+  setSessionModel,
   stopSession,
 } from "@/contracts/commands";
 import type {
@@ -60,6 +61,7 @@ import {
   enqueuePrompt,
   isSessionSpawning,
   isTranscriptLoading,
+  liveIds,
   newSession,
   pendingQuestions,
   queuedCount,
@@ -838,7 +840,18 @@ async function handleToggleTheme() {
  *
  * The whole settings file is re-read first so the write cannot clobber a
  * preference the drawer changed in the meantime (`save_settings` replaces the
- * file). The choice applies to the next spawn.
+ * file). That write is the default the NEXT session spawns with.
+ *
+ * A session that is already live is switched in place, through pi's own
+ * `set_model`: persisting alone would leave the running child on the model the
+ * human just left, with the effort list and the agent's reasoning still belonging
+ * to it. The level pi re-clamps after the switch reaches the effort selector as
+ * `thinking_level_changed`, so nothing here touches the level.
+ *
+ * The liveness check is the store's own hint (the runtime's last word), so a
+ * session that is spawning or gone takes the persist-only path and reports
+ * nothing: the choice is waiting for the next spawn. A live child that refuses
+ * the switch does surface it, because nothing was switched.
  */
 async function handleSelectModel(choice: { provider: string; model: string }) {
   if (choice.model === "" || choice.provider === "") return;
@@ -851,6 +864,29 @@ async function handleSelectModel(choice: { provider: string; model: string }) {
       provider: choice.provider,
       model: choice.model,
     });
+
+    const session = currentSession.value;
+    if (session === null || !liveIds.value.includes(session.sessionId)) return;
+    try {
+      const live = await setSessionModel(
+        session.workspaceId,
+        Number(session.sessionId),
+        choice.provider,
+        choice.model,
+      );
+      // pi's answer, not this panel's echo: an alias becomes the model it named,
+      // and that is the honest default for the next session too (the file is
+      // re-read first, exactly like the write above).
+      if (live.provider !== choice.provider || live.id !== choice.model) {
+        settings.value = await saveSettings({
+          ...(await getSettings()),
+          provider: live.provider,
+          model: live.id,
+        });
+      }
+    } catch (cause) {
+      panelError.value = commandErrorMessage(cause);
+    }
   } catch (cause) {
     panelError.value = commandErrorMessage(cause);
   } finally {

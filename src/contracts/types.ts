@@ -343,6 +343,20 @@ export interface SessionStatusDto {
   error: string | null;
 }
 
+/**
+ * The model one live session is really running, as pi answered `set_model` (S2 of
+ * `odd/tasks/models-by-provider.md`): its own provider, id and name, so the
+ * composer can trust the engine instead of its own echo. Mirrors
+ * `SessionModelInfo` in `src-tauri/src/commands.rs`.
+ */
+export interface SessionModelInfo {
+  /** Provider the model belongs to: model ids are provider-scoped. */
+  provider: string;
+  id: string;
+  /** Human label; pi always sends one and Rust falls back to the id. */
+  name: string;
+}
+
 // ── pi CLI bridge (S1-S4 of `odd/tasks/pi-cli-bridge.md`) ────────────────────
 
 /**

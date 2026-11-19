@@ -249,6 +249,10 @@ pub fn run() {
             // session's default; the commands are pi's own list, proxied.
             commands::session_thinking_levels,
             commands::set_session_thinking_level,
+            // S2 of `models-by-provider.md`: the composer's model pick, applied
+            // to the live session (the persisted default is the webview's own
+            // write, so the two can never disagree about the file).
+            commands::set_session_model,
             commands::session_commands,
             // S3 of `agent-question-bridge.md`: the human's answer to a question
             // the agent asked. It writes the protocol line to that session's

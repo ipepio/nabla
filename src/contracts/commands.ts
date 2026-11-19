@@ -31,6 +31,7 @@ import type {
   ProviderSummary,
   SessionDto,
   SessionCommand,
+  SessionModelInfo,
   SessionStatusDto,
   SessionSummary,
   ShellOutputEvent,
@@ -661,6 +662,36 @@ export function setSessionThinkingLevel(
     workspaceId,
     sessionId,
     level,
+  });
+}
+
+/**
+ * S2 of `odd/tasks/models-by-provider.md`: switches the model of the LIVE session
+ * through pi's `set_model` — no respawn — so the effort list and the agent's
+ * reasoning really belong to the model the human picked.
+ *
+ * Model ids are provider-scoped, which is why both travel together. The answer is
+ * the model pi says it is now running, so the composer trusts the engine rather
+ * than the words it sent. pi re-clamps the thinking level to the new model's
+ * range and reports it as `thinking_level_changed`, so nothing here touches the
+ * level.
+ *
+ * Rejects when the session has no live process (spawning or gone): nothing was
+ * switched, and a success would claim a change that never happened. The default
+ * for the next session is `saveSettings`, which the caller keeps doing on its
+ * own.
+ */
+export function setSessionModel(
+  workspaceId: number,
+  sessionId: number,
+  provider: string,
+  modelId: string,
+): Promise<SessionModelInfo> {
+  return invoke<SessionModelInfo>("set_session_model", {
+    workspaceId,
+    sessionId,
+    provider,
+    modelId,
   });
 }
 

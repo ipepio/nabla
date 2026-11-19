@@ -608,6 +608,22 @@ pub struct SessionStatusDto {
     pub error: Option<String>,
 }
 
+/// The model one live session is really running, as pi answered `set_model`
+/// (S2 of `models-by-provider.md`). pi answers with its own `Model`, so the
+/// provider and the id are the ones the child resolved — an alias becomes the
+/// model it names — and the panel can trust this instead of its own echo.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionModelInfo {
+    /// Provider the model belongs to: model ids are provider-scoped, so a
+    /// switch that answered only the id would be ambiguous.
+    pub provider: String,
+    pub id: String,
+    /// Human label. pi always sends one; a blank falls back to the id so the
+    /// selector never shows an empty name.
+    pub name: String,
+}
+
 /// Stem of the session file for one start: `<workspace>-<ts>`.
 /// S7: the index row is keyed by the resulting `.jsonl` path, so the stem must
 /// be workspace-scoped and unique per start.
@@ -1099,8 +1115,105 @@ fn set_thinking_level_for(
     Ok(settings.thinking_level)
 }
 
-/// S2: the levels the session's model accepts, for the effort selector. Proxied
-/// from `get_available_thinking_levels`, so a model without reasoning support
+/// S2 of `models-by-provider.md`: reads the model pi named in its answer.
+///
+/// The response's `data` is pi's own `Model`, so its `provider`/`id`/`name` are
+/// the effective ones. The requested pair stands in only when the answer names
+/// none (an older or newer pi): the switch still happened, and the words the UI
+/// sent are the best available label for it.
+fn model_info_from_data(
+    data: Option<&serde_json::Value>,
+    provider: &str,
+    model_id: &str,
+) -> SessionModelInfo {
+    let field = |key: &str| -> Option<String> {
+        data?
+            .get(key)?
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    let id = field("id").unwrap_or_else(|| model_id.to_string());
+    let name = field("name").unwrap_or_else(|| id.clone());
+    SessionModelInfo {
+        provider: field("provider").unwrap_or_else(|| provider.to_string()),
+        id,
+        name,
+    }
+}
+
+/// S2 of `models-by-provider.md`: switches the model of the LIVE child.
+///
+/// Same plumbing as `set_thinking_level_for`: one correlated request on the
+/// child's stdin (the protocol's own `set_model`, provider and model id) and the
+/// same bounded wait for its answer. What differs is the stance on a session
+/// with no process: there is nothing to switch, so it is an error and never a
+/// quiet success. The composer keeps the pick as the next spawn's default on its
+/// own (`save_settings`), which is why refusing here loses nothing.
+///
+/// The answer is the model pi now runs — not the words that were sent — because
+/// pi re-clamps the thinking level to the new model's range and reports that
+/// separately as `thinking_level_changed`.
+fn set_session_model_for(
+    runtime: &ProcessManager,
+    key: &str,
+    provider: &str,
+    model_id: &str,
+) -> Result<SessionModelInfo, String> {
+    if provider.trim().is_empty() || model_id.trim().is_empty() {
+        return Err("a model switch needs both a provider and a model id".to_string());
+    }
+
+    let status = runtime.status(key).map(|snapshot| snapshot.status);
+    if !matches!(
+        status,
+        Some(RuntimeStatus::Ready) | Some(RuntimeStatus::Running)
+    ) {
+        return Err(format!(
+            "session {key} is not live ({}), so its model cannot be switched",
+            runtime_status_word(status)
+        ));
+    }
+
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "provider".to_string(),
+        serde_json::Value::String(provider.to_string()),
+    );
+    fields.insert(
+        "modelId".to_string(),
+        serde_json::Value::String(model_id.to_string()),
+    );
+    let response = runtime
+        .send(key, "set_model", fields)
+        .map_err(display_err)?;
+    if !response.success {
+        return Err(response
+            .error
+            .unwrap_or_else(|| "pi refused the model switch".to_string()));
+    }
+    Ok(model_info_from_data(
+        response.data.as_ref(),
+        provider,
+        model_id,
+    ))
+}
+
+/// The lifecycle word of one status, for a message a human reads.
+fn runtime_status_word(status: Option<RuntimeStatus>) -> &'static str {
+    match status {
+        Some(RuntimeStatus::Spawning) => "spawning",
+        Some(RuntimeStatus::Ready) | Some(RuntimeStatus::Running) => "running",
+        Some(RuntimeStatus::Stopped) => "stopped",
+        Some(RuntimeStatus::Crashed) => "crashed",
+        None => "no process",
+    }
+}
+
+/// S2 of `models-by-provider.md`: the levels the session's model accepts, for the
+/// effort selector. Proxied from `get_available_thinking_levels`, so a model
+/// without reasoning support
 /// answers exactly the levels pi says it has (for most, just `off`).
 #[tauri::command]
 pub fn session_thinking_levels(
@@ -1129,6 +1242,24 @@ pub fn set_session_thinking_level(
         &session_id.to_string(),
         &level,
     )
+}
+
+/// S2 of `models-by-provider.md`: the human's new model, applied to the LIVE
+/// session without a respawn. The answer is the model pi says it now runs.
+///
+/// The persisted default for the next spawn is NOT written here: the composer
+/// already keeps the pick in `settings.json`, and a session that is not live is
+/// exactly the case where that write is the whole effect.
+#[tauri::command]
+pub fn set_session_model(
+    state: State<'_, AppState>,
+    workspace_id: i64,
+    session_id: i64,
+    provider: String,
+    model_id: String,
+) -> Result<SessionModelInfo, String> {
+    ensure_session_in_workspace(&state.store, workspace_id, session_id)?;
+    set_session_model_for(&state.runtime, &session_id.to_string(), &provider, &model_id)
 }
 
 /// S3: the commands this session offers (extension commands, prompt templates and
@@ -2968,8 +3099,8 @@ mod tests {
     // The fake child of the lifecycle tests. It records its argv, its attempt
     // count and every line of its stdin, and answers the requests the composer
     // features send (`get_available_thinking_levels`, `get_commands`,
-    // `set_thinking_level`) with pi's own documented payloads, plus a generic
-    // success for anything else. `sh` on purpose: no dependency, and the tests
+    // `set_thinking_level`, `set_model`) with pi's own documented payloads, plus a
+    // generic success for anything else. `sh` on purpose: no dependency, and the tests
     // assert on real bytes rather than on a mock.
     const FAKE_SESSION_PI: &str = r#"#!/bin/sh
 printf '%s\n' "$@" >> '@ARGS@'
@@ -2985,6 +3116,8 @@ while IFS= read -r line; do
       printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_commands\",\"success\":true,\"data\":{\"commands\":[{\"name\":\"fix-tests\",\"description\":\"Fix failing tests\",\"source\":\"prompt\",\"sourceInfo\":{\"path\":\"/w/fix-tests.md\"}},{\"name\":\"skill:commit\",\"source\":\"skill\"}]}}" ;;
     *'"type":"set_thinking_level"'*)
       printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"set_thinking_level\",\"success\":true}" ;;
+    *'"type":"set_model"'*)
+      printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"set_model\",\"success\":true,\"data\":{\"provider\":\"anthropic\",\"id\":\"claude-sonnet-4-5\",\"name\":\"Claude Sonnet 4.5\",\"api\":\"anthropic-messages\",\"contextWindow\":200000}}" ;;
     *)
       printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"success\":true,\"data\":{}}" ;;
   esac
@@ -4333,6 +4466,153 @@ done
         );
 
         runtime.stop_all();
+    }
+
+    // ── S2 of `models-by-provider.md`: switching the LIVE session's model ───
+
+    // S2: the pick reaches the live child as the protocol's own `set_model`
+    // request — the same correlated line every other request uses — and what
+    // comes back is the model pi says it is running, not an echo of the wish.
+    // Asserted on the bytes the child received, and on the attempt count: a model
+    // switch is not a respawn.
+    #[cfg(unix)]
+    #[test]
+    fn set_session_model_reaches_a_live_child_and_returns_pis_answer() {
+        let fixture = SessionFixture::new("set_model_live");
+        let script = fixture.write_fake_pi("fake-pi.sh");
+        fixture.write_settings(&script);
+        let row = fixture.add_session("s1.jsonl", true, "");
+        let runtime = lifecycle_runtime();
+        let key = row.id.to_string();
+
+        block_on(open_session_core(
+            &fixture.store,
+            &runtime,
+            &fixture.config_dir(),
+            &registered_gate(),
+            &key,
+        ))
+        .expect("open session");
+        assert_eq!(process_attempts(&fixture), 1);
+
+        let info = set_session_model_for(&runtime, &key, "anthropic", "claude-sonnet-4-5")
+            .expect("set model");
+
+        let sent = recorded_stdin(&fixture, "fake-pi.sh");
+        let request = sent
+            .iter()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+            .find(|value| value["type"] == "set_model")
+            .expect("the child must receive set_model");
+        assert_eq!(request["provider"], "anthropic", "got: {request}");
+        assert_eq!(request["modelId"], "claude-sonnet-4-5", "got: {request}");
+        assert_eq!(
+            request["id"].as_str().map(|id| id.is_empty()),
+            Some(false),
+            "the request is correlated by an id Nabla allocated: {request}"
+        );
+
+        assert_eq!(
+            info,
+            SessionModelInfo {
+                provider: "anthropic".to_string(),
+                id: "claude-sonnet-4-5".to_string(),
+                name: "Claude Sonnet 4.5".to_string(),
+            },
+            "the answer is pi's model, read from its response"
+        );
+        assert_eq!(
+            process_attempts(&fixture),
+            1,
+            "S2: a model switch must never respawn the session"
+        );
+
+        runtime.stop_all();
+    }
+
+    // S2: with no live child there is nothing to switch, and the command says so
+    // instead of reporting a success that never happened — the persisted default
+    // for the next spawn is the composer's own write, not this one.
+    #[test]
+    fn set_session_model_refuses_a_session_that_is_not_live() {
+        let fixture = SessionFixture::new("set_model_dead");
+        let runtime = lifecycle_runtime();
+        let key = "7";
+
+        let err = set_session_model_for(&runtime, key, "anthropic", "claude-sonnet-4-5")
+            .expect_err("refuse");
+        assert!(err.contains("not live"), "a dead session is refused: {err}");
+        assert!(err.contains(key), "the error names the session: {err}");
+        assert!(
+            !settings_file(&fixture.config_dir()).exists(),
+            "the command writes no settings: the composer owns that default"
+        );
+    }
+
+    // S2: pi's answer is the source of truth about the model it now runs. A
+    // response that names none (an older or newer pi) still reports the pair the
+    // switch was asked for, and a blank name falls back to the id: the switch did
+    // happen either way, and a label is never empty.
+    #[test]
+    fn set_session_model_reads_the_model_pi_names() {
+        let named = serde_json::json!({
+            "provider": "anthropic",
+            "id": "claude-opus-4-1",
+            "name": "Claude Opus 4.1",
+            "api": "anthropic-messages",
+            "contextWindow": 200000,
+        });
+        assert_eq!(
+            model_info_from_data(Some(&named), "anthropic", "alias"),
+            SessionModelInfo {
+                provider: "anthropic".to_string(),
+                id: "claude-opus-4-1".to_string(),
+                name: "Claude Opus 4.1".to_string(),
+            }
+        );
+
+        let nameless = serde_json::json!({ "provider": "custom", "id": "m-1", "name": "  " });
+        assert_eq!(
+            model_info_from_data(Some(&nameless), "custom", "m"),
+            SessionModelInfo {
+                provider: "custom".to_string(),
+                id: "m-1".to_string(),
+                name: "m-1".to_string(),
+            }
+        );
+
+        assert_eq!(
+            model_info_from_data(None, "custom", "m"),
+            SessionModelInfo {
+                provider: "custom".to_string(),
+                id: "m".to_string(),
+                name: "m".to_string(),
+            }
+        );
+    }
+
+    // Every session command is scoped to the workspace that indexes it: a row of
+    // another workspace must never reach this session's runtime key.
+    #[test]
+    fn set_session_model_refuses_a_session_of_another_workspace() {
+        let fixture = SessionFixture::new("set_model_guard");
+        let row = fixture.add_session("s1.jsonl", true, "");
+        let other = fixture
+            .store
+            .add_workspace("/tmp/another-workspace", None)
+            .expect("add workspace");
+
+        let err = ensure_session_in_workspace(&fixture.store, other.id, row.id)
+            .expect_err("refuse");
+        assert!(
+            err.contains("is not indexed in workspace"),
+            "got: {err}"
+        );
+
+        // The workspace that does index it is accepted: the guard filters, it is
+        // not a wall.
+        ensure_session_in_workspace(&fixture.store, fixture.workspace_id, row.id)
+            .expect("own workspace");
     }
 
     // ── F2 of `tool-drawer-and-mcp.md`: the workspace terminal ─────────────
