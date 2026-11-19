@@ -30,10 +30,12 @@ import type {
   ProviderStatusRow,
   ProviderSummary,
   SessionDto,
+  SessionCommand,
   SessionStatusDto,
   SessionSummary,
   ShellOutputEvent,
   ShellSession,
+  ThinkingLevel,
   TranscriptMessage,
   UiAnswer,
   WorkspaceInfo,
@@ -614,6 +616,71 @@ export function stopSession(
   sessionId: number,
 ): Promise<void> {
   return invoke<void>("stop_session", { workspaceId, sessionId });
+}
+
+/**
+ * S2 of `odd/tasks/composer-inputs.md`: the thinking levels the session's model
+ * accepts, proxied from pi's `get_available_thinking_levels` by Rust. pi answers
+ * for the model that is really running, so the effort selector offers exactly
+ * what that model can do (a model without reasoning support answers `["off"]`).
+ *
+ * Rejects when the session has no live process: an empty list would claim the
+ * model supports no level at all, which is a different thing from "nothing is
+ * running yet".
+ */
+export function sessionThinkingLevels(
+  workspaceId: number,
+  sessionId: number,
+): Promise<ThinkingLevel[]> {
+  return invoke<ThinkingLevel[]>("session_thinking_levels", {
+    workspaceId,
+    sessionId,
+  });
+}
+
+/**
+ * S2: applies one thinking level to the open session through pi's
+ * `set_thinking_level` — no respawn — and keeps it as the new default in
+ * `settings.json`, so the next session starts there (`--thinking <level>`).
+ *
+ * The answer is what the file now holds. The level pi really adopted arrives
+ * later as a `thinking_level_changed` event, because pi clamps the request to the
+ * model: the selector must render that event, never this answer.
+ *
+ * A session with no live process only persists the default — there is nothing to
+ * change — while a live child that refuses the request fails the call and leaves
+ * the file untouched. A word this build does not know rejects before anything is
+ * written or sent.
+ */
+export function setSessionThinkingLevel(
+  workspaceId: number,
+  sessionId: number,
+  level: ThinkingLevel,
+): Promise<ThinkingLevel> {
+  return invoke<ThinkingLevel>("set_session_thinking_level", {
+    workspaceId,
+    sessionId,
+    level,
+  });
+}
+
+/**
+ * S3 of `odd/tasks/composer-inputs.md`: the commands the session offers —
+ * extension commands, prompt templates and skills — proxied from pi's
+ * `get_commands` by Rust. Nabla only lists them: sending the text `/name` through
+ * the existing prompt path is what runs one, and pi expands it there.
+ *
+ * Rejects when the session has no live process; the `/` completion treats that
+ * as "nothing to offer yet" and shows no list, never an error.
+ */
+export function sessionCommands(
+  workspaceId: number,
+  sessionId: number,
+): Promise<SessionCommand[]> {
+  return invoke<SessionCommand[]>("session_commands", {
+    workspaceId,
+    sessionId,
+  });
 }
 
 /**

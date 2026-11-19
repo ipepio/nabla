@@ -244,6 +244,12 @@ pub fn run() {
             commands::load_session_preview,
             commands::live_session_ids,
             commands::send_prompt,
+            // S2/S3 of `composer-inputs.md`: the effort selector and the `/`
+            // completion. The level is applied live and kept as the next
+            // session's default; the commands are pi's own list, proxied.
+            commands::session_thinking_levels,
+            commands::set_session_thinking_level,
+            commands::session_commands,
             // S3 of `agent-question-bridge.md`: the human's answer to a question
             // the agent asked. It writes the protocol line to that session's
             // child, which is the only channel an `extension_ui_request` has.

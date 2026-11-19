@@ -13,7 +13,7 @@ use tauri_plugin_opener::OpenerExt;
 use crate::cli::{self, CliSessions, CliSink, PiAuthStatus, PiCliResult};
 use crate::mcp::{self, McpAddDraft, McpScope, McpServerSummary};
 use crate::mcp_server::{REGISTRATION_WAIT, RegistrationGate, RegistrationOutcome};
-use crate::process::{ProcessManager, StartupOutcome};
+use crate::process::{ProcessManager, SessionModel, StartupOutcome};
 use crate::providers::{
     ModelInfo as ProviderModelInfo, ModelOption, ProviderDraft, ProviderModelDraft, ProviderModels,
     ProviderSummary,
@@ -706,6 +706,10 @@ struct SessionSpawn {
     pi_binary: String,
     provider: String,
     model: String,
+    /// S2 of `composer-inputs.md`: the persisted thinking level a NEW session
+    /// starts at (`--thinking <level>`), or `None` when the file holds no level
+    /// this build knows.
+    thinking: Option<String>,
     pi_session_path: PathBuf,
     workspace_path: PathBuf,
 }
@@ -725,8 +729,13 @@ impl SessionSpawn {
             &self.key,
             &self.pi_binary,
             &self.pi_session_path,
-            &self.provider,
-            &self.model,
+            SessionModel {
+                provider: &self.provider,
+                model: &self.model,
+                // S2 of `composer-inputs.md`: the persisted level, so a NEW
+                // session starts where the effort selector was left.
+                thinking: self.thinking.as_deref(),
+            },
             &self.workspace_path,
         );
     }
@@ -826,12 +835,17 @@ fn prepare_session_start(
         pid: 0,
         status: RuntimeStatus::Spawning,
     };
+    // S2 of `composer-inputs.md`: read per start, like the pair below, so a
+    // level the human changed in the composer reaches the new session. An actual
+    // unknown word is dropped here instead of reaching pi's argv.
+    let thinking = settings.thinking().map(str::to_string);
     let spawn = SessionSpawn {
         runtime: runtime.clone(),
         key: session.session_id.clone(),
         pi_binary: settings.pi_binary,
         provider: settings.provider,
         model: settings.model,
+        thinking,
         pi_session_path,
         workspace_path: PathBuf::from(workspace.path),
     };
@@ -916,6 +930,218 @@ pub fn send_prompt(
             .error
             .unwrap_or_else(|| "pi refused the prompt".to_string()))
     }
+}
+
+// ── composer inputs: effort, / commands (S2, S3 of `composer-inputs.md`) ───
+//
+// Two proxies over one live child and one preference write. Nabla never
+// interprets a command and never decides a level: pi answers which levels the
+// model accepts, pi executes `/name` through the existing prompt path, and pi
+// confirms the level it really adopted through `thinking_level_changed`.
+
+/// S3: one command the session offers, as pi reports it (`get_commands`).
+/// `name` never carries the leading slash — the composer adds it when it
+/// completes, and the prompt path invokes it as `/name` (pi docs/rpc-commands.md).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCommand {
+    pub name: String,
+    /// Optional on the wire for extension commands, so an absent one stays absent
+    /// instead of becoming a blank line the list would render as a subtitle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// What kind of command this is, verbatim from pi: `extension`, `prompt` or
+    /// `skill`. A word from a newer pi crosses unchanged rather than being
+    /// dropped, so the badge never lies about the source.
+    pub source: String,
+}
+
+/// S2: the levels `get_available_thinking_levels` offers `{ "levels": [...] }`.
+/// Only non-empty strings are levels; anything else is not a level pi named, so
+/// the selector is offered nothing rather than something invented.
+fn thinking_levels_from_response(data: Option<&serde_json::Value>) -> Vec<String> {
+    data.and_then(|value| value.get("levels"))
+        .and_then(serde_json::Value::as_array)
+        .map(|levels| {
+            levels
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|level| !level.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// S3: the commands of `get_commands`, keeping the three fields the list renders.
+/// `sourceInfo` is deliberately dropped: Nabla lists and completes a command, it
+/// never reads the file behind it. An entry with no name cannot be completed or
+/// run, so it is skipped instead of showing a row that does nothing.
+fn session_commands_from_response(data: Option<&serde_json::Value>) -> Vec<SessionCommand> {
+    let Some(commands) = data
+        .and_then(|value| value.get("commands"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    commands
+        .iter()
+        .filter_map(|command| {
+            let name = command.get("name")?.as_str()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some(SessionCommand {
+                name: name.to_string(),
+                // A blank description is pi saying nothing, not a subtitle.
+                description: command
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_string),
+                source: command
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// S2: the levels this session's model accepts, asked of the child that owns the
+/// model. A session with no process is an error: an empty list would claim the
+/// model supports nothing.
+fn session_thinking_levels_for(
+    runtime: &ProcessManager,
+    key: &str,
+) -> Result<Vec<String>, String> {
+    let response = runtime
+        .send(key, "get_available_thinking_levels", serde_json::Map::new())
+        .map_err(display_err)?;
+    if !response.success {
+        return Err(response
+            .error
+            .unwrap_or_else(|| "pi refused the thinking levels query".to_string()));
+    }
+    Ok(thinking_levels_from_response(response.data.as_ref()))
+}
+
+/// S3: the commands the session offers. Same stance as the levels above: the
+/// child is the only thing that knows, and a failed query is an error instead of
+/// an empty list that reads as "this session has no commands".
+fn session_commands_for(
+    runtime: &ProcessManager,
+    key: &str,
+) -> Result<Vec<SessionCommand>, String> {
+    let response = runtime
+        .send(key, "get_commands", serde_json::Map::new())
+        .map_err(display_err)?;
+    if !response.success {
+        return Err(response
+            .error
+            .unwrap_or_else(|| "pi refused the commands query".to_string()));
+    }
+    Ok(session_commands_from_response(response.data.as_ref()))
+}
+
+/// S2: applies one level to the live child and keeps it as the new default.
+///
+/// The live half comes first and is a no-op when the session has no process: in
+/// that case the persisted default IS the change (the next spawn passes it as
+/// `--thinking`), and refusing the write would make the selector useless while pi
+/// boots. A child that is live but rejects the request fails the whole call and
+/// leaves the file as it was — nothing is reported as applied when it was not.
+///
+/// The answer is what the file now holds, so the selector renders the stored word
+/// instead of its own guess; the level pi really adopted still arrives as
+/// `thinking_level_changed`, because pi clamps to the model.
+fn set_thinking_level_for(
+    config_dir: &Path,
+    runtime: &ProcessManager,
+    key: &str,
+    level: &str,
+) -> Result<String, String> {
+    let level = crate::settings::parse_thinking_level(level).ok_or_else(|| {
+        format!(
+            "unknown thinking level: {level:?} (expected \"off\", \"minimal\", \"low\", \
+             \"medium\", \"high\", \"xhigh\" or \"max\")"
+        )
+    })?;
+
+    if let Some(snapshot) = runtime.status(key)
+        && matches!(
+            snapshot.status,
+            RuntimeStatus::Ready | RuntimeStatus::Running
+        )
+    {
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "level".to_string(),
+            serde_json::Value::String(level.to_string()),
+        );
+        let response = runtime
+            .send(key, "set_thinking_level", fields)
+            .map_err(display_err)?;
+        if !response.success {
+            return Err(response
+                .error
+                .unwrap_or_else(|| "pi refused the thinking level".to_string()));
+        }
+    }
+
+    let path = settings_file(config_dir);
+    let mut settings = settings::load(&path).map_err(display_err)?;
+    settings.thinking_level = level.to_string();
+    settings::save(&path, &settings).map_err(display_err)?;
+    Ok(settings.thinking_level)
+}
+
+/// S2: the levels the session's model accepts, for the effort selector. Proxied
+/// from `get_available_thinking_levels`, so a model without reasoning support
+/// answers exactly the levels pi says it has (for most, just `off`).
+#[tauri::command]
+pub fn session_thinking_levels(
+    state: State<'_, AppState>,
+    workspace_id: i64,
+    session_id: i64,
+) -> Result<Vec<String>, String> {
+    ensure_session_in_workspace(&state.store, workspace_id, session_id)?;
+    session_thinking_levels_for(&state.runtime, &session_id.to_string())
+}
+
+/// S2: the human's new effort. Applied to the live session without a respawn,
+/// and persisted so the NEXT session starts there too. An unknown word is
+/// rejected before anything is written or sent.
+#[tauri::command]
+pub fn set_session_thinking_level(
+    state: State<'_, AppState>,
+    workspace_id: i64,
+    session_id: i64,
+    level: String,
+) -> Result<String, String> {
+    ensure_session_in_workspace(&state.store, workspace_id, session_id)?;
+    set_thinking_level_for(
+        &state.config_dir,
+        &state.runtime,
+        &session_id.to_string(),
+        &level,
+    )
+}
+
+/// S3: the commands this session offers (extension commands, prompt templates and
+/// skills). Nabla only lists them: sending the text `/name` through the existing
+/// prompt path is what runs one, and that is pi's own input expansion.
+#[tauri::command]
+pub fn session_commands(
+    state: State<'_, AppState>,
+    workspace_id: i64,
+    session_id: i64,
+) -> Result<Vec<SessionCommand>, String> {
+    ensure_session_in_workspace(&state.store, workspace_id, session_id)?;
+    session_commands_for(&state.runtime, &session_id.to_string())
 }
 
 /// Alias for a session, derived from its first prompt: the first line with
@@ -1263,6 +1489,9 @@ async fn open_session_core(
     let key = session_id.to_string();
     let pi_session_path = row.pi_session_path.clone();
     let workspace_path = workspace.path.clone();
+    // S2 of `composer-inputs.md`: the persisted level travels into the spawn, so
+    // opening a stopped session starts pi at the effort the human left behind.
+    let thinking = settings.thinking();
     let spawned = tauri::async_runtime::spawn_blocking(move || {
         // pi reads `mcp.json` once at start (L8): the gate is waited for here,
         // on the worker thread, before anything is spawned.
@@ -1275,8 +1504,11 @@ async fn open_session_core(
             // written yet is not an error: pi creates it exactly there, keeping
             // index and file equal.
             Path::new(&pi_session_path),
-            &settings.provider,
-            &settings.model,
+            SessionModel {
+                provider: &settings.provider,
+                model: &settings.model,
+                thinking,
+            },
             Path::new(&workspace_path),
         )
     })
@@ -2733,12 +2965,29 @@ mod tests {
 
     /// A scripted stand-in for pi: records its argv once, answers the readiness
     /// probe, then reads stdin until it is closed. No real pi, no network.
+    // The fake child of the lifecycle tests. It records its argv, its attempt
+    // count and every line of its stdin, and answers the requests the composer
+    // features send (`get_available_thinking_levels`, `get_commands`,
+    // `set_thinking_level`) with pi's own documented payloads, plus a generic
+    // success for anything else. `sh` on purpose: no dependency, and the tests
+    // assert on real bytes rather than on a mock.
     const FAKE_SESSION_PI: &str = r#"#!/bin/sh
 printf '%s\n' "$@" >> '@ARGS@'
 printf 'attempt\n' >> '@ATTEMPTS@'
 printf '%s\n' '{"type":"response","id":"__startup_probe__","command":"get_state","success":true,"data":{}}'
 while IFS= read -r line; do
-  :
+  printf '%s\n' "$line" >> '@LINES@'
+  id=`printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'`
+  case "$line" in
+    *'"type":"get_available_thinking_levels"'*)
+      printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_available_thinking_levels\",\"success\":true,\"data\":{\"levels\":[\"off\",\"minimal\",\"low\",\"medium\",\"high\"]}}" ;;
+    *'"type":"get_commands"'*)
+      printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_commands\",\"success\":true,\"data\":{\"commands\":[{\"name\":\"fix-tests\",\"description\":\"Fix failing tests\",\"source\":\"prompt\",\"sourceInfo\":{\"path\":\"/w/fix-tests.md\"}},{\"name\":\"skill:commit\",\"source\":\"skill\"}]}}" ;;
+    *'"type":"set_thinking_level"'*)
+      printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"set_thinking_level\",\"success\":true}" ;;
+    *)
+      printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"success\":true,\"data\":{}}" ;;
+  esac
 done
 "#;
 
@@ -2819,7 +3068,8 @@ done
             let path = self.path(name);
             let body = FAKE_SESSION_PI
                 .replace("@ARGS@", &path.with_extension("args").display().to_string())
-                .replace("@ATTEMPTS@", &self.path("attempts").display().to_string());
+                .replace("@ATTEMPTS@", &self.path("attempts").display().to_string())
+                .replace("@LINES@", &path.with_extension("lines").display().to_string());
             std::fs::write(&path, body).expect("write fake pi");
             let mut perms = std::fs::metadata(&path)
                 .expect("stat fake pi")
@@ -2860,6 +3110,30 @@ done
     fn lifecycle_runtime() -> ProcessManager {
         let sink: crate::process::EventSink = Arc::new(|_, _| {});
         ProcessManager::with_timeouts(sink, lifecycle_timeouts())
+    }
+
+    /// Every complete line the fake child received on stdin, bounded by a
+    /// deadline because it is written by the child's own process.
+    #[cfg(unix)]
+    fn recorded_stdin(fixture: &SessionFixture, name: &str) -> Vec<String> {
+        let path = fixture.path(name).with_extension("lines");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                let lines: Vec<String> = raw.lines().map(|line| line.to_string()).collect();
+                // The startup probe is the first line; a real request is what the
+                // caller is waiting for.
+                if lines.iter().any(|line| !line.contains("__startup_probe__")) {
+                    return lines;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fake pi never received a request at {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// A gate that already reported success: the lifecycle tests are about the
@@ -3790,6 +4064,275 @@ done
 
         // A relative root would display a path the app cannot open.
         assert!(mcp_file_path_for(Path::new("home"), project, McpScope::Global).is_err());
+    }
+
+    // ── composer inputs: effort, / commands and @ mentions ────────────────
+    // (S2, S3 of `composer-inputs.md`)
+
+    // S2: pi answers `{"levels": [...]}` for the ACTIVE model
+    // (pi docs/rpc-commands.md, get_available_thinking_levels). Those words are
+    // what the effort selector offers, in pi's order: Nabla proposes, pi decides.
+    #[test]
+    fn thinking_levels_from_response_reads_the_model_levels_in_order() {
+        let data = serde_json::json!({ "levels": ["off", "minimal", "high"] });
+        assert_eq!(
+            thinking_levels_from_response(Some(&data)),
+            vec!["off".to_string(), "minimal".to_string(), "high".to_string()]
+        );
+
+        // Nothing to offer is an empty list, never an invented one: a model
+        // without reasoning support answers `["off"]`, and an answer that is
+        // not a list of strings leaves the selector with nothing to choose.
+        assert!(thinking_levels_from_response(None).is_empty());
+        assert!(
+            thinking_levels_from_response(Some(&serde_json::json!({ "levels": "high" })))
+                .is_empty()
+        );
+        let mixed = serde_json::json!({ "levels": ["low", 7, "", " max "] });
+        assert_eq!(
+            thinking_levels_from_response(Some(&mixed)),
+            vec!["low".to_string(), "max".to_string()],
+            "only real, non-empty words are levels"
+        );
+    }
+
+    // S3: pi answers `{commands: [{name, description?, source, sourceInfo}]}`.
+    // Nabla keeps the three fields the list renders and drops the rest — it does
+    // not interpret a command, it names it (the `prompt` command runs it).
+    #[test]
+    fn session_commands_from_response_keeps_name_description_and_source() {
+        let data = serde_json::json!({
+            "commands": [
+                {
+                    "name": "fix-tests",
+                    "description": "Fix failing tests",
+                    "source": "prompt",
+                    "sourceInfo": { "path": "/work/.pi/prompts/fix-tests.md" }
+                },
+                { "name": "skill:commit", "source": "skill" },
+                { "name": "review", "source": "extension" },
+                // No name is not a command: nothing could be completed or run.
+                { "description": "nameless", "source": "prompt" },
+                { "name": "   ", "source": "prompt" }
+            ]
+        });
+        let commands = session_commands_from_response(Some(&data));
+        assert_eq!(commands.len(), 3, "a command needs a name: {commands:?}");
+        assert_eq!(commands[0].name, "fix-tests");
+        assert_eq!(commands[0].description.as_deref(), Some("Fix failing tests"));
+        assert_eq!(commands[0].source, "prompt");
+        // An absent description stays absent instead of becoming an empty string
+        // the list would render as a blank line.
+        assert_eq!(commands[1].description, None);
+        assert_eq!(commands[1].source, "skill");
+        assert_eq!(commands[2].source, "extension");
+
+        // The webview mirrors this shape field by field (R4): no `sourceInfo`,
+        // no `null` where pi sent nothing.
+        let wire = serde_json::to_value(&commands[1]).expect("serialize");
+        assert_eq!(wire, serde_json::json!({ "name": "skill:commit", "source": "skill" }));
+
+        // An answer that carries no list at all is empty, never an error: a
+        // session that has nothing to offer shows no list.
+        assert!(session_commands_from_response(None).is_empty());
+        assert!(
+            session_commands_from_response(Some(&serde_json::json!({ "commands": 3 }))).is_empty()
+        );
+    }
+
+    // S2: a word that is not a level pi documents is refused before anything is
+    // written — picking one on the human's behalf would change the agent's
+    // reasoning on a typo.
+    #[test]
+    fn set_thinking_level_rejects_an_unknown_word_and_writes_nothing() {
+        let fixture = SessionFixture::new("thinking_level_bad");
+        let runtime = lifecycle_runtime();
+
+        for bad in ["", "  ", "maximo", "on", "none"] {
+            let err = set_thinking_level_for(&fixture.config_dir(), &runtime, "1", bad)
+                .expect_err("reject");
+            assert!(
+                err.contains("unknown thinking level"),
+                "{bad:?} must be rejected with a reason: {err}"
+            );
+        }
+        assert!(
+            !settings_file(&fixture.config_dir()).exists(),
+            "a rejected level writes no settings file"
+        );
+    }
+
+    // S2: with no live child there is nothing to change in a session, but the
+    // choice is still the default the next spawn uses — that is the whole point
+    // of persisting it. The answer is what the file now holds.
+    #[test]
+    fn set_thinking_level_without_a_live_child_persists_the_default() {
+        let fixture = SessionFixture::new("thinking_level_file");
+        let runtime = lifecycle_runtime();
+
+        assert_eq!(
+            set_thinking_level_for(&fixture.config_dir(), &runtime, "1", "high").expect("set"),
+            "high"
+        );
+        let stored = settings::load(&settings_file(&fixture.config_dir())).expect("load");
+        assert_eq!(stored.thinking_level, "high");
+        assert_eq!(stored.thinking(), Some("high"));
+
+        // The word the human picked is normalized, not stored twice in two cases.
+        assert_eq!(
+            set_thinking_level_for(&fixture.config_dir(), &runtime, "1", "  OFF ").expect("set"),
+            "off"
+        );
+        assert_eq!(
+            settings::load(&settings_file(&fixture.config_dir()))
+                .expect("load")
+                .thinking_level,
+            "off"
+        );
+    }
+
+    // S2: a live session changes WITHOUT a respawn: the level leaves as the
+    // protocol's own `set_thinking_level` request on the child's stdin, and the
+    // file keeps it as the default for the next session. Asserted on the bytes
+    // the child received, not on the builder.
+    #[cfg(unix)]
+    #[test]
+    fn set_thinking_level_reaches_a_live_child_and_persists() {
+        let fixture = SessionFixture::new("thinking_level_live");
+        let script = fixture.write_fake_pi("fake-pi.sh");
+        fixture.write_settings(&script);
+        let row = fixture.add_session("s1.jsonl", true, "");
+        let runtime = lifecycle_runtime();
+        let key = row.id.to_string();
+        let gate = registered_gate();
+
+        block_on(open_session_core(
+            &fixture.store,
+            &runtime,
+            &fixture.config_dir(),
+            &gate,
+            &key,
+        ))
+        .expect("open session");
+        assert_eq!(
+            process_attempts(&fixture),
+            1,
+            "S2: a level change must never respawn the session"
+        );
+
+        assert_eq!(
+            set_thinking_level_for(&fixture.config_dir(), &runtime, &key, "high").expect("set"),
+            "high"
+        );
+
+        let sent = recorded_stdin(&fixture, "fake-pi.sh");
+        let request = sent
+            .iter()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+            .find(|value| value["type"] == "set_thinking_level")
+            .expect("the child must receive set_thinking_level");
+        assert_eq!(request["level"], "high", "got: {request}");
+        assert_eq!(
+            request["id"].as_str().map(|id| id.is_empty()),
+            Some(false),
+            "the request is correlated by an id Nabla allocated: {request}"
+        );
+        assert_eq!(
+            settings::load(&settings_file(&fixture.config_dir()))
+                .expect("load")
+                .thinking_level,
+            "high",
+            "and the file keeps it as the default for the next session"
+        );
+        assert_eq!(process_attempts(&fixture), 1, "still no respawn");
+
+        runtime.stop_all();
+    }
+
+    // S2: the levels the selector offers are the ones the session's model
+    // accepts, read through the child that owns the model.
+    #[cfg(unix)]
+    #[test]
+    fn session_thinking_levels_proxies_the_live_session() {
+        let fixture = SessionFixture::new("thinking_levels_proxy");
+        let script = fixture.write_fake_pi("fake-pi.sh");
+        fixture.write_settings(&script);
+        let row = fixture.add_session("s1.jsonl", true, "");
+        let runtime = lifecycle_runtime();
+        let key = row.id.to_string();
+
+        // A session with no process cannot answer, and that is an error: an empty
+        // list would claim the model supports no level at all.
+        assert!(
+            session_thinking_levels_for(&runtime, &key).is_err(),
+            "a stopped session must not answer with an empty list"
+        );
+
+        block_on(open_session_core(
+            &fixture.store,
+            &runtime,
+            &fixture.config_dir(),
+            &registered_gate(),
+            &key,
+        ))
+        .expect("open session");
+
+        assert_eq!(
+            session_thinking_levels_for(&runtime, &key).expect("levels"),
+            vec![
+                "off".to_string(),
+                "minimal".to_string(),
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string()
+            ]
+        );
+
+        runtime.stop_all();
+    }
+
+    // S3: the session's commands cross the seam with their source, so the list
+    // can wear a badge without Nabla ever reading a command's body.
+    #[cfg(unix)]
+    #[test]
+    fn session_commands_proxies_the_live_session() {
+        let fixture = SessionFixture::new("session_commands_proxy");
+        let script = fixture.write_fake_pi("fake-pi.sh");
+        fixture.write_settings(&script);
+        let row = fixture.add_session("s1.jsonl", true, "");
+        let runtime = lifecycle_runtime();
+        let key = row.id.to_string();
+
+        assert!(
+            session_commands_for(&runtime, &key).is_err(),
+            "a stopped session answers no commands, and that is an error"
+        );
+
+        block_on(open_session_core(
+            &fixture.store,
+            &runtime,
+            &fixture.config_dir(),
+            &registered_gate(),
+            &key,
+        ))
+        .expect("open session");
+
+        let commands = session_commands_for(&runtime, &key).expect("commands");
+        let pairs: Vec<(&str, &str)> = commands
+            .iter()
+            .map(|command| (command.name.as_str(), command.source.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![("fix-tests", "prompt"), ("skill:commit", "skill")],
+            "pi's list crosses with its own sources: {commands:?}"
+        );
+        assert_eq!(
+            commands[0].description.as_deref(),
+            Some("Fix failing tests")
+        );
+
+        runtime.stop_all();
     }
 
     // ── F2 of `tool-drawer-and-mcp.md`: the workspace terminal ─────────────

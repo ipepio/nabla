@@ -300,6 +300,16 @@ export interface SessionBuffer {
    * session — and an answered question is removed by id, never by position.
    */
   questions: PendingQuestion[];
+  /**
+   * S2 of `composer-inputs.md`: the thinking level pi CONFIRMED for this session
+   * (`thinking_level_changed`), or `null` while it has announced nothing.
+   *
+   * It is the only truth the effort selector renders, because pi clamps a request
+   * to what the model accepts: what the UI asked for is a wish, this is the level
+   * the agent is really reasoning at. `null` means "pi has not said", which the
+   * selector shows as the persisted default rather than inventing a value.
+   */
+  thinkingLevel: string | null;
 }
 
 /** Per-session state, keyed by the session index id in decimal form (S1). */
@@ -378,6 +388,19 @@ export const sessionGeneration = ref(0);
 export function sessionBuffer(sessionId: string | null): SessionBuffer | null {
   if (sessionId === null) return null;
   return sessions.get(sessionId) ?? null;
+}
+
+/**
+ * S2 of `composer-inputs.md`: the thinking level pi confirmed for one session, or
+ * `null` when it has announced none (a session that just booted, one that never
+ * ran). The effort selector falls back to the persisted default in that case —
+ * which is exactly the level the spawn passed as `--thinking`.
+ */
+export function sessionThinkingLevel(
+  sessionId: string | null,
+): string | null {
+  if (sessionId === null) return null;
+  return sessions.get(sessionId)?.thinkingLevel ?? null;
 }
 
 /** S3: the transcript of a session that is being read for the first time. */
@@ -509,6 +532,9 @@ function ensureBuffer(sessionId: string, workspaceId: number | null = null): Ses
     workspaceId,
     queue: [],
     questions: [],
+    // S2 of `composer-inputs.md`: nothing is claimed about the level until pi
+    // reports one.
+    thinkingLevel: null,
   });
   sessions.set(sessionId, created);
   return created;
@@ -1159,6 +1185,13 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
       // ask the same question twice.
       if (buffer.questions.some((question) => question.id === event.id)) return;
       buffer.questions.push(normalizeQuestion(event));
+      return;
+    }
+    case "thinking_level_changed": {
+      // S2 of `composer-inputs.md`: pi's confirmation, not the UI's wish — it
+      // clamps a requested level to what the model accepts, and it also changes
+      // the level on its own (a model switch, a cycle).
+      buffer.thinkingLevel = event.level;
       return;
     }
     default:

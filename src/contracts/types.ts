@@ -226,6 +226,14 @@ export interface AppSettings {
    * unknown value as `"write"` too, so nothing here may assume `"yolo"`.
    */
   permissionMode: PermissionMode;
+  /**
+   * S2 of `odd/tasks/composer-inputs.md`: the thinking level (effort) a NEW
+   * session starts with, mirrored from `Settings.thinking_level`. Rust defaults
+   * it to `"medium"` — pi's own documented `defaultThinkingLevel` — and keeps an
+   * unknown word verbatim while reading it as "no level", so a value here is not
+   * guaranteed to be one of the levels this build knows.
+   */
+  thinkingLevel: ThinkingLevel;
 }
 
 /**
@@ -239,6 +247,42 @@ export interface AppSettings {
  * Mirrors `PermissionMode` in `src-tauri/src/settings.rs`.
  */
 export type PermissionMode = "read" | "write" | "yolo";
+
+/**
+ * S2 of `odd/tasks/composer-inputs.md`: pi's thinking levels (effort). Mirrors
+ * `THINKING_LEVELS` in `src-tauri/src/settings.rs`, which is also pi's own list
+ * for `--thinking` (pi docs/cli.md:71).
+ *
+ * The union is widened instead of closed: pi clamps the level to what the model
+ * accepts and reports the result through `thinking_level_changed`, so a word a
+ * newer pi introduces must still cross this seam.
+ */
+export type ThinkingLevel =
+  | "off"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max"
+  | (string & {});
+
+/**
+ * S3 of `composer-inputs.md`: one command the session offers, as pi reports it in
+ * its `get_commands` answer. Mirrors `SessionCommand` in
+ * `src-tauri/src/commands.rs`, which keeps only what the list renders.
+ *
+ * `name` never carries the leading slash: the composer adds it back when it
+ * completes the text, and sending `/name` is what invokes the command (pi expands
+ * it, Nabla never interprets one). `description` is absent when pi sent none, and
+ * `source` is pi's own word — `extension`, `prompt` or `skill` — kept verbatim so
+ * the badge cannot lie about where a command comes from.
+ */
+export interface SessionCommand {
+  name: string;
+  description?: string;
+  source: string;
+}
 
 /**
  * What `start_session` returns: the registered session, the pi session file it

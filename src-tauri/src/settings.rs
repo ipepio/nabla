@@ -67,6 +67,15 @@ pub struct Settings {
     /// verbatim — a tool this build does not know is not erased from the file.
     #[serde(default = "default_tools")]
     pub enabled_tools: Vec<String>,
+    /// S2 of `composer-inputs.md`: the thinking level (effort) a NEW session
+    /// starts with, forwarded to pi as `--thinking <level>`. Kept as the raw
+    /// string the file holds, like `language` and `permission_mode`: a value this
+    /// build does not know is never rewritten here and reads as "no level"
+    /// (`Settings::thinking`), which makes the spawn omit the flag and leaves pi
+    /// on its own default. An absent field means `"medium"`, pi's documented
+    /// default for `defaultThinkingLevel`.
+    #[serde(default = "default_thinking_level")]
+    pub thinking_level: String,
 }
 
 /// S2/S3 of `chat-preferences-and-queue.md`: both chat toggles ship enabled, so
@@ -108,6 +117,31 @@ fn default_permission_mode() -> String {
     PermissionMode::Write.as_str().to_string()
 }
 
+/// S2 of `composer-inputs.md`: the levels pi documents for `--thinking`
+/// (pi docs/cli.md:71). One list, so the command that validates a request and
+/// the spawn that forwards it can never disagree about the vocabulary.
+pub const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// S2: the level a fresh install, or a settings file written before this
+/// preference existed, starts with. `medium` is pi's own documented default for
+/// `defaultThinkingLevel` (pi docs/settings.md:15), so an upgrade neither
+/// silences nor inflates the agent's reasoning on its own.
+fn default_thinking_level() -> String {
+    "medium".to_string()
+}
+
+/// S2: parses one `--thinking` word, trimmed and case-insensitively. `None` for
+/// anything else, so a caller that must not guess (the command that applies the
+/// human's choice) can reject it, and the spawn can omit the flag instead of
+/// handing pi a word it would ignore.
+pub fn parse_thinking_level(raw: &str) -> Option<&'static str> {
+    let word = raw.trim().to_ascii_lowercase();
+    THINKING_LEVELS
+        .iter()
+        .copied()
+        .find(|level| *level == word)
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -122,6 +156,7 @@ impl Default for Settings {
             queue_messages: default_true(),
             permission_mode: default_permission_mode(),
             enabled_tools: default_tools(),
+            thinking_level: default_thinking_level(),
         }
     }
 }
@@ -283,6 +318,14 @@ impl Settings {
     /// uncage the agent.
     pub fn mode(&self) -> PermissionMode {
         PermissionMode::parse(&self.permission_mode).unwrap_or_default()
+    }
+
+    /// S2 of `composer-inputs.md`: the thinking level the file names, or `None`
+    /// when it holds a word this build does not know. The spawn omits `--thinking`
+    /// in that case and pi keeps its own default: guessing a level would change
+    /// the agent's reasoning on a typo's behalf.
+    pub fn thinking(&self) -> Option<&'static str> {
+        parse_thinking_level(&self.thinking_level)
     }
 }
 
@@ -958,6 +1001,87 @@ mod tests {
             serde_json::json!({ "mode": "yolo" })
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── thinking level (S2 of `composer-inputs.md`) ─────────────────────────
+
+    // S2: the effort of the next session is a preference like the rest. `medium`
+    // is pi's own documented default for `defaultThinkingLevel`
+    // (pi docs/settings.md:15), so an absent field keeps the level pi would have
+    // chosen on its own instead of switching the agent to reasoning nobody asked
+    // for.
+    #[test]
+    fn thinking_level_defaults_to_medium_and_serializes_camel_case() {
+        let s = Settings::default();
+        assert_eq!(s.thinking_level, "medium");
+        assert_eq!(s.thinking(), Some("medium"));
+
+        // camelCase on the wire, so `types.ts` mirrors this key.
+        let json = serde_json::to_value(Settings::default()).expect("serialize");
+        assert_eq!(json["thinkingLevel"], serde_json::json!("medium"));
+    }
+
+    // S2 + the settings header rule: a file written before the preference
+    // existed loads with the documented default and every other key intact.
+    #[test]
+    fn settings_file_without_thinking_level_uses_the_pi_default() {
+        let cfg = TempCfg::new("pre_thinking_level");
+        std::fs::write(
+            &cfg.0,
+            r#"{"theme":"light","piBinary":"pi","provider":"nan","model":"glm5.3"}"#,
+        )
+        .expect("write fixture");
+        let s = load(&cfg.0).expect("an older settings file must load");
+        assert_eq!(s.theme, "light");
+        assert_eq!(s.thinking_level, "medium");
+    }
+
+    // S2: the level is written verbatim and read back unchanged, so a relaunch
+    // starts the next session with the effort the human picked.
+    #[test]
+    fn thinking_level_round_trips() {
+        let cfg = TempCfg::new("thinking_roundtrip");
+        for level in THINKING_LEVELS {
+            let s = Settings {
+                thinking_level: (*level).to_string(),
+                ..Settings::default()
+            };
+            save(&cfg.0, &s).expect("save");
+            let loaded = load(&cfg.0).expect("load");
+            assert_eq!(loaded.thinking_level, *level, "{level} must survive the file");
+            assert_eq!(loaded.thinking(), Some(*level));
+        }
+    }
+
+    // S2: the words are pi's own (`--thinking`, pi docs/cli.md:71). Anything else
+    // is not a level, so a caller that must not guess can reject it instead of
+    // writing a value pi would silently ignore.
+    #[test]
+    fn parse_thinking_level_accepts_only_the_documented_words() {
+        for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            assert_eq!(parse_thinking_level(level), Some(level));
+        }
+        // Surrounding whitespace and case are normalized, not rejected.
+        assert_eq!(parse_thinking_level("  HIGH "), Some("high"));
+        for bad in ["", "  ", "maximo", "on", "none", "high!"] {
+            assert_eq!(parse_thinking_level(bad), None, "{bad:?} is not a level");
+        }
+    }
+
+    // S2/fail-safe: a hand edit that is not a level reads as "no level chosen",
+    // so the spawn omits `--thinking` and pi keeps its own default instead of
+    // being handed a word it cannot parse.
+    #[test]
+    fn an_unknown_stored_thinking_level_reads_as_none() {
+        let cfg = TempCfg::new("unknown_thinking_level");
+        std::fs::write(
+            &cfg.0,
+            r#"{"theme":"dark","piBinary":"pi","thinkingLevel":"mucho"}"#,
+        )
+        .expect("write fixture");
+        let s = load(&cfg.0).expect("load");
+        assert_eq!(s.thinking_level, "mucho", "the file keeps what was written");
+        assert_eq!(s.thinking(), None, "but it names no level this build knows");
     }
 
     #[test]

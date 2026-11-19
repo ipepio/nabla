@@ -274,6 +274,18 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         placeholder: Option<String>,
     },
+    /// pi confirmed the thinking level (effort) it is now using (S2 of
+    /// `composer-inputs.md`): `set_thinking_level` clamps the request to what the
+    /// model accepts, so this event — never the value the UI sent — is what the
+    /// effort selector renders. It also arrives when pi changes the level on its
+    /// own (a model switch, a cycle).
+    ///
+    /// Wire reference: pi docs/json.md:124 — `{type, level}`. `level` is a string
+    /// rather than an enum so a word from a newer pi still reaches the selector
+    /// instead of demoting the frame to `Other` and leaving it stale.
+    ThinkingLevelChanged {
+        level: String,
+    },
     /// Any pi event Nabla does not model yet, kept by its wire `type` so a newer
     /// pi degrades to "unhandled" instead of "dropped without a trace".
     Other { kind: String },
@@ -1088,6 +1100,55 @@ mod tests {
                 reason
             );
         }
+    }
+
+    #[test]
+    fn decode_thinking_level_changed_keeps_the_level() {
+        // S2 of `composer-inputs.md`: pi confirms the level it actually adopted
+        // (it clamps to the model), and that confirmation is the only truth the
+        // effort selector renders. Before this variant the frame fell into
+        // `Other` and the level was lost with its payload.
+        let mut codec = FrameCodec::new();
+        let chunk = concat!(
+            r#"{"type":"thinking_level_changed","level":"high"}"#, "\n",
+            r#"{"type":"thinking_level_changed","level":"off"}"#, "\n",
+        );
+        let frames = codec.push_bytes(chunk.as_bytes());
+        assert_eq!(frames.len(), 2);
+        let Frame::Event(high) = &frames[0] else {
+            panic!("expected an event, got {:?}", frames[0]);
+        };
+        assert_eq!(
+            high,
+            &AgentEvent::ThinkingLevelChanged {
+                level: "high".into()
+            }
+        );
+        // The webview mirrors this exact shape (R4), so pin it here.
+        assert_eq!(
+            serde_json::to_value(high).unwrap(),
+            json!({"type": "thinking_level_changed", "level": "high"})
+        );
+        let Frame::Event(off) = &frames[1] else {
+            panic!("expected an event, got {:?}", frames[1]);
+        };
+        assert_eq!(
+            serde_json::to_value(off).unwrap(),
+            json!({"type": "thinking_level_changed", "level": "off"})
+        );
+    }
+
+    #[test]
+    fn decode_thinking_level_changed_keeps_a_word_from_a_newer_pi() {
+        // A level pi introduces later must not demote the whole frame to `Other`
+        // and leave the selector stale: the field is a string, so it crosses.
+        let mut codec = FrameCodec::new();
+        let frames = codec
+            .push_bytes(b"{\"type\":\"thinking_level_changed\",\"level\":\"ultra\"}\n");
+        assert!(matches!(
+            &frames[0],
+            Frame::Event(AgentEvent::ThinkingLevelChanged { level }) if level == "ultra"
+        ));
     }
 
     #[test]

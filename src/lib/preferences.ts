@@ -25,7 +25,7 @@
  */
 import { ref } from "vue";
 import { getSettings, saveSettings } from "@/contracts/commands";
-import type { AppSettings } from "@/contracts/types";
+import type { AppSettings, ThinkingLevel } from "@/contracts/types";
 
 /**
  * S2: the reasoning block is rendered. Default `true` — the Rust default for both
@@ -38,6 +38,41 @@ export const showReasoning = ref(true);
  * Default `true`, like pi.
  */
 export const queueMessages = ref(true);
+
+/**
+ * S2 of `odd/tasks/composer-inputs.md`: the levels pi documents for `--thinking`
+ * (pi docs/cli.md:71), in pi's own order. Mirrors `THINKING_LEVELS` in
+ * `src-tauri/src/settings.rs`.
+ *
+ * This is the fallback the effort selector offers when the session cannot say
+ * which levels its model accepts (no live process yet): pi clamps whatever it is
+ * given to the model, so an option the model does not support degrades to the
+ * nearest one instead of becoming an error.
+ */
+export const THINKING_LEVELS: readonly ThinkingLevel[] = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+/**
+ * S2: the effort a NEW session starts with (the Rust default, pi's documented
+ * `defaultThinkingLevel`). An absent field in the file reads as this.
+ */
+export const DEFAULT_THINKING_LEVEL: ThinkingLevel = "medium";
+
+/**
+ * S2: the persisted thinking level, i.e. what the next session starts at. A
+ * session that pi already confirmed a level for shows THAT one instead (the
+ * selector reads `sessionThinkingLevel` first): pi clamps, so its confirmation
+ * wins over this default. Kept at module scope like the other preferences, so a
+ * fresh session and the composer cannot disagree about where the agent starts.
+ */
+export const thinkingLevel = ref<ThinkingLevel>(DEFAULT_THINKING_LEVEL);
 
 /**
  * S5 of `tool-drawer-and-mcp.md`: the tool ids a build knows, in the order the
@@ -98,6 +133,11 @@ export function applyPreferences(settings: AppSettings | null): void {
   showReasoning.value = settings?.showReasoning ?? true;
   queueMessages.value = settings?.queueMessages ?? true;
   enabledTools.value = normalizeEnabledTools(settings?.enabledTools);
+  // S2 of `composer-inputs.md`: an absent field reads as the documented default;
+  // a word this build does not know is kept verbatim, because that is what the
+  // file holds and what the selector must not quietly rewrite.
+  const level = settings?.thinkingLevel?.trim() ?? "";
+  thinkingLevel.value = level === "" ? DEFAULT_THINKING_LEVEL : level;
 }
 
 /**
@@ -129,6 +169,24 @@ export async function setQueueMessages(next: boolean): Promise<void> {
 }
 
 /**
+ * S2 of `composer-inputs.md`: changes the effort a NEW session will start with.
+ *
+ * Only the composer uses this path when there is no session to change — the
+ * default is then the whole effect. A session that exists goes through
+ * `set_session_thinking_level` instead, which applies the level to that live
+ * child and persists the same default in one call (Rust owns that write, so the
+ * two can never disagree about the file).
+ *
+ * The live ref changes first: the selector must not wait for a file write, and a
+ * write that never lands leaves the human looking at what they picked, with the
+ * file as the next read's truth.
+ */
+export async function setThinkingLevel(next: ThinkingLevel): Promise<void> {
+  thinkingLevel.value = next;
+  await persist({ thinkingLevel: next });
+}
+
+/**
  * S5 of `tool-drawer-and-mcp.md`: enables or disables one drawer tool. The live
  * ref changes first — an open drawer drops or gains the tab immediately — and the
  * normalized list is then written through the same read-merge-save path as every
@@ -156,6 +214,7 @@ export function usePreferences() {
     showReasoning,
     queueMessages,
     enabledTools,
+    thinkingLevel,
     isToolEnabled,
     applyPreferences,
   };

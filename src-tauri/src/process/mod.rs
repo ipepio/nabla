@@ -471,14 +471,14 @@ impl ProcessManager {
     /// Spawns one headless pi for `key` and waits for readiness, with the single
     /// crash retry. `Err` means the spawn could not even be attempted (already
     /// running); a failed startup is reported inside `SpawnReport`.
-    /// `provider`/`model` come from settings (S7) and are decided per spawn.
+    /// `model` is what the composer chose (S7 of `pi-runtime.md`) plus the
+    /// persisted effort (S2 of `composer-inputs.md`), decided per spawn.
     pub fn spawn(
         &self,
         key: &str,
         pi_binary: &str,
         session_file: &Path,
-        provider: &str,
-        model: &str,
+        model: SessionModel<'_>,
         cwd: &Path,
     ) -> Result<SpawnReport, ProcessError> {
         // S3: one process per session. Checked before spawning, not after, so a
@@ -488,7 +488,7 @@ impl ProcessManager {
         }
         let mut attempt = 1;
         loop {
-            let report = self.spawn_once(key, pi_binary, session_file, provider, model, cwd);
+            let report = self.spawn_once(key, pi_binary, session_file, model, cwd);
             match report.outcome {
                 // A crash before ready is often transient (an AV lock, a
                 // momentary ENOENT): retry exactly once. A timeout is not
@@ -508,8 +508,7 @@ impl ProcessManager {
         key: &str,
         pi_binary: &str,
         session_file: &Path,
-        provider: &str,
-        model: &str,
+        model: SessionModel<'_>,
         cwd: &Path,
     ) -> SpawnReport {
         // Announce the attempt before anything can fail (S4).
@@ -534,7 +533,6 @@ impl ProcessManager {
         let mut child = match build_command(
             pi_binary,
             session_file,
-            provider,
             model,
             cwd,
             SpawnLayout {
@@ -986,6 +984,21 @@ struct SessionProcess {
     settled: Arc<TurnSettled>,
 }
 
+/// What pi is started with, model-wise: the provider and model the composer
+/// chose (S7) and the thinking level the effort selector left on (S2 of
+/// `composer-inputs.md`). One value because the three travel together and are
+/// read from the same settings file on every spawn; `thinking` is already
+/// validated by the caller, so an unknown word is `None` here and never reaches
+/// pi's argv.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionModel<'a> {
+    pub provider: &'a str,
+    pub model: &'a str,
+    /// `--thinking <level>`: a NEW session starts where the human left the
+    /// selector; `None` omits the flag and leaves pi on its own default.
+    pub thinking: Option<&'a str>,
+}
+
 /// What a child needs to find Nabla's own extensions and the data dir the
 /// permission gate reads its projection from (L4 of `permission-modes.md`).
 /// Bundled in one value so `spawn_args`/`build_command` stay readable instead of
@@ -1015,8 +1028,7 @@ struct SpawnLayout<'a> {
 /// Nabla needs back in — the built-in MCP support and these two.
 fn spawn_args(
     session_file: &Path,
-    provider: &str,
-    model: &str,
+    model: SessionModel<'_>,
     layout: SpawnLayout<'_>,
 ) -> Vec<String> {
     let mut args = vec![
@@ -1025,17 +1037,25 @@ fn spawn_args(
         "--session".to_string(),
         session_file.to_string_lossy().to_string(),
         "--provider".to_string(),
-        provider.to_string(),
+        model.provider.to_string(),
         "--model".to_string(),
-        model.to_string(),
-        // Nabla is its own harness: it must not inherit the user's terminal
-        // harness extensions (gentle-ai injects an "el Gentleman" identity via
-        // appendSystemPrompt), so extension discovery is disabled and only the
-        // extensions Nabla itself needs are loaded back explicitly.
-        "--no-extensions".to_string(),
-        "-e".to_string(),
-        "builtin:mcp".to_string(),
+        model.model.to_string(),
     ];
+    if let Some(level) = model.thinking {
+        // S2 of `composer-inputs.md`: a NEW session starts at the persisted
+        // level. A live session changes through `set_thinking_level` instead (no
+        // respawn), which is why this is a startup flag and not a settings file
+        // pi reads later.
+        args.push("--thinking".to_string());
+        args.push(level.to_string());
+    }
+    // Nabla is its own harness: it must not inherit the user's terminal harness
+    // extensions (gentle-ai injects an "el Gentleman" identity via
+    // appendSystemPrompt), so extension discovery is disabled and only the
+    // extensions Nabla itself needs are loaded back explicitly.
+    args.push("--no-extensions".to_string());
+    args.push("-e".to_string());
+    args.push("builtin:mcp".to_string());
     if let Some(path) = layout.ask_extension {
         // S1/S2 of `agent-question-bridge.md`: the three ask tools exist only
         // because this extension is loaded (`-e` survives `--no-extensions`).
@@ -1158,13 +1178,12 @@ where
 fn build_command(
     pi_binary: &str,
     session_file: &Path,
-    provider: &str,
-    model: &str,
+    model: SessionModel<'_>,
     cwd: &Path,
     layout: SpawnLayout<'_>,
 ) -> Command {
     let mut command = Command::new(pi_binary);
-    command.args(spawn_args(session_file, provider, model, layout));
+    command.args(spawn_args(session_file, model, layout));
     command.current_dir(cwd);
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
@@ -1556,8 +1575,11 @@ printf 'exited\n' >> '@MARKER@'
     fn spawn_args_match_the_pi_rpc_invocation() {
         let args = spawn_args(
             Path::new("/tmp/sessions/1-1700000000.jsonl"),
-            "nan",
-            "deepseek-v4-flash",
+            SessionModel {
+                provider: "nan",
+                model: "deepseek-v4-flash",
+                thinking: Some("high"),
+            },
             SpawnLayout {
                 ask_extension: Some(Path::new("/tmp/nabla/extensions/nabla-ask.ts")),
                 permissions_extension: Some(Path::new(
@@ -1577,6 +1599,10 @@ printf 'exited\n' >> '@MARKER@'
                 "nan".to_string(),
                 "--model".to_string(),
                 "deepseek-v4-flash".to_string(),
+                // S2 of `composer-inputs.md`: a NEW session starts at the
+                // persisted effort, right after the model it applies to.
+                "--thinking".to_string(),
+                "high".to_string(),
                 "--no-extensions".to_string(),
                 "-e".to_string(),
                 "builtin:mcp".to_string(),
@@ -1601,8 +1627,11 @@ printf 'exited\n' >> '@MARKER@'
     fn spawn_args_omit_the_extra_flag_when_no_extension_was_materialized() {
         let args = spawn_args(
             Path::new("/tmp/1.jsonl"),
-            "nan",
-            "m",
+            SessionModel {
+                provider: "nan",
+                model: "m",
+                thinking: None,
+            },
             SpawnLayout::default(),
         );
         // Only the built-in MCP support is loaded back: one `-e` pair, no second.
@@ -1618,6 +1647,13 @@ printf 'exited\n' >> '@MARKER@'
         );
         // The identity is the last flag pair either way.
         assert_eq!(args.last(), Some(&NABLA_SYSTEM_PROMPT.to_string()));
+        // S2 of `composer-inputs.md`: no level chosen means no flag at all, so pi
+        // keeps its own `defaultThinkingLevel` instead of receiving a word this
+        // build could not validate.
+        assert!(
+            !args.iter().any(|arg| arg == "--thinking"),
+            "a session with no level must not carry --thinking: {args:?}"
+        );
     }
 
     // The browser pane became drivable when the MCP server landed, and this
@@ -1775,8 +1811,11 @@ printf 'exited\n' >> '@MARKER@'
         let command = build_command(
             "pi",
             Path::new("/tmp/1.jsonl"),
-            "nan",
-            "m",
+            SessionModel {
+                provider: "nan",
+                model: "m",
+                thinking: None,
+            },
             Path::new("/tmp"),
             SpawnLayout {
                 ask_extension: None,
@@ -1829,8 +1868,11 @@ printf 'exited\n' >> '@MARKER@'
                 "s1",
                 script.to_str().unwrap(),
                 &scratch.path("s1.jsonl"),
-                TEST_PROVIDER,
-                TEST_MODEL,
+                SessionModel {
+                    provider: TEST_PROVIDER,
+                    model: TEST_MODEL,
+                    thinking: None,
+                },
                 &scratch.dir,
             )
             .expect("spawn");
@@ -1914,8 +1956,11 @@ printf 'exited\n' >> '@MARKER@'
                 "s1",
                 script.to_str().unwrap(),
                 &scratch.path("s1.jsonl"),
-                "nan",
-                "glm5.3",
+                SessionModel {
+                    provider: "nan",
+                    model: "glm5.3",
+                    thinking: Some("high"),
+                },
                 &scratch.dir,
             )
             .expect("spawn");
@@ -1938,6 +1983,14 @@ printf 'exited\n' >> '@MARKER@'
         assert!(
             session_at < provider_at.unwrap_or(0) && provider_at.unwrap() < model_at.unwrap(),
             "flags follow --session in provider-then-model order: {args:?}"
+        );
+        // S2 of `composer-inputs.md`: the persisted effort rides along, so a NEW
+        // session starts where the effort selector was left.
+        let thinking_at = args.iter().position(|arg| arg == "--thinking");
+        assert_eq!(
+            thinking_at.and_then(|at| args.get(at + 1)).map(String::as_str),
+            Some("high"),
+            "the child must receive --thinking high, got {args:?}"
         );
         manager.stop_all();
     }
@@ -2018,8 +2071,11 @@ printf 'exited\n' >> '@MARKER@'
             "s1",
             script.to_str().unwrap(),
             &scratch.path("s1.jsonl"),
-            TEST_PROVIDER,
-            TEST_MODEL,
+            SessionModel {
+                provider: TEST_PROVIDER,
+                model: TEST_MODEL,
+                thinking: None,
+            },
             &scratch.dir,
         )
             .expect("spawn");
@@ -2116,8 +2172,11 @@ printf 'exited\n' >> '@MARKER@'
                 "s1",
                 script.to_str().unwrap(),
                 &scratch.path("s1.jsonl"),
-                TEST_PROVIDER,
-                TEST_MODEL,
+                SessionModel {
+                    provider: TEST_PROVIDER,
+                    model: TEST_MODEL,
+                    thinking: None,
+                },
                 &scratch.dir,
             )
             .expect("spawn");
@@ -2215,8 +2274,11 @@ printf 'exited\n' >> '@MARKER@'
                 "s1",
                 script.to_str().unwrap(),
                 &scratch.path("s1.jsonl"),
-                TEST_PROVIDER,
-                TEST_MODEL,
+                SessionModel {
+                    provider: TEST_PROVIDER,
+                    model: TEST_MODEL,
+                    thinking: None,
+                },
                 &scratch.dir,
             )
             .expect("spawn");
@@ -2282,8 +2344,11 @@ printf 'exited\n' >> '@MARKER@'
             "s1",
             script.to_str().unwrap(),
             &scratch.path("s1.jsonl"),
-            TEST_PROVIDER,
-            TEST_MODEL,
+            SessionModel {
+                provider: TEST_PROVIDER,
+                model: TEST_MODEL,
+                thinking: None,
+            },
             &scratch.dir,
         )
             .expect("spawn attempt");
@@ -2329,8 +2394,11 @@ printf 'exited\n' >> '@MARKER@'
             "s1",
             script.to_str().unwrap(),
             &scratch.path("s1.jsonl"),
-            TEST_PROVIDER,
-            TEST_MODEL,
+            SessionModel {
+                provider: TEST_PROVIDER,
+                model: TEST_MODEL,
+                thinking: None,
+            },
             &scratch.dir,
         )
             .expect("spawn attempt");
@@ -2364,8 +2432,11 @@ printf 'exited\n' >> '@MARKER@'
             "s1",
             script.to_str().unwrap(),
             &scratch.path("s1.jsonl"),
-            TEST_PROVIDER,
-            TEST_MODEL,
+            SessionModel {
+                provider: TEST_PROVIDER,
+                model: TEST_MODEL,
+                thinking: None,
+            },
             &scratch.dir,
         )
             .expect("first spawn");
@@ -2373,8 +2444,11 @@ printf 'exited\n' >> '@MARKER@'
             "s1",
             script.to_str().unwrap(),
             &scratch.path("s1.jsonl"),
-            TEST_PROVIDER,
-            TEST_MODEL,
+            SessionModel {
+                provider: TEST_PROVIDER,
+                model: TEST_MODEL,
+                thinking: None,
+            },
             &scratch.dir,
         );
         assert!(
@@ -2387,8 +2461,11 @@ printf 'exited\n' >> '@MARKER@'
             "s2",
             script.to_str().unwrap(),
             &scratch.path("s2.jsonl"),
-            TEST_PROVIDER,
-            TEST_MODEL,
+            SessionModel {
+                provider: TEST_PROVIDER,
+                model: TEST_MODEL,
+                thinking: None,
+            },
             &scratch.dir,
         )
             .expect("second session spawn");
@@ -2418,8 +2495,11 @@ printf 'exited\n' >> '@MARKER@'
                 "s1",
                 script.to_str().unwrap(),
                 &scratch.path("s1.jsonl"),
-                TEST_PROVIDER,
-                TEST_MODEL,
+                SessionModel {
+                    provider: TEST_PROVIDER,
+                    model: TEST_MODEL,
+                    thinking: None,
+                },
                 &scratch.dir,
             )
             .expect("spawn");
@@ -2474,8 +2554,11 @@ printf 'exited\n' >> '@MARKER@'
                 "s1",
                 script.to_str().unwrap(),
                 &scratch.path("s1.jsonl"),
-                TEST_PROVIDER,
-                TEST_MODEL,
+                SessionModel {
+                    provider: TEST_PROVIDER,
+                    model: TEST_MODEL,
+                    thinking: None,
+                },
                 &scratch.dir,
             )
             .expect("first spawn");
@@ -2484,8 +2567,11 @@ printf 'exited\n' >> '@MARKER@'
                 "s2",
                 script.to_str().unwrap(),
                 &scratch.path("s2.jsonl"),
-                TEST_PROVIDER,
-                TEST_MODEL,
+                SessionModel {
+                    provider: TEST_PROVIDER,
+                    model: TEST_MODEL,
+                    thinking: None,
+                },
                 &scratch.dir,
             )
             .expect("second spawn");

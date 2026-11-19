@@ -8,6 +8,8 @@
 // Transport: lib.rs emits every forwarded event on the Tauri channel
 // `agent-event` with the `{ sessionId, event }` envelope below (S6).
 
+import type { ThinkingLevel } from "./types";
+
 /**
  * Lifecycle of one pi child process, owned and supervised by the Nabla host
  * (spec S1, S4). Mirrors `RuntimeStatus` — `spawning -> ready -> running ->
@@ -128,6 +130,18 @@ export type AgentEvent =
       options?: string[];
       message?: string;
       placeholder?: string;
+    }
+  | {
+      /**
+       * S2 of `odd/tasks/composer-inputs.md`: pi confirms the thinking level it is
+       * now using. Mirrors `AgentEvent::ThinkingLevelChanged`.
+       *
+       * This event — never the value the UI sent — is what the effort selector
+       * renders, because pi clamps a request to what the model accepts. It also
+       * arrives when pi changes the level on its own (a model switch, a cycle).
+       */
+      type: "thinking_level_changed";
+      level: ThinkingLevel;
     }
   | {
       /** Synthetic Nabla event: a lifecycle transition (S4). */

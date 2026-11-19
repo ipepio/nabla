@@ -5,7 +5,13 @@
 // Presentation only: every action is emitted, so ChatPanel keeps the single
 // `sendPrompt` / `stopSession` path and this card never touches the contracts
 // seam. Colours come from semantic tokens only (S4) — no hex here.
-import { computed } from "vue";
+//
+// It also owns the two autocompletes of `odd/tasks/composer-inputs.md` (`/`
+// commands and `@` workspace paths) and hosts the effort selector. The rules
+// themselves live in `composer-completion.ts` (what is a trigger, what a pick
+// inserts) and in the two small components this card renders, so the wiring here
+// is only "what did the textarea just ask for, and what does that pick mean".
+import { computed, nextTick, ref } from "vue";
 import {
   ArrowUpIcon,
   CheckIcon,
@@ -26,7 +32,22 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { t } from "@/lib/i18n";
 import { COMPOSER_MAX_WIDTH, COMPOSER_MIN_WIDTH } from "@/lib/layout";
-import type { ProviderModels } from "@/contracts/types";
+import type { FsEntry, ProviderModels, SessionCommand } from "@/contracts/types";
+import {
+  fsListDir,
+  listWorkspaces,
+  sessionCommands,
+} from "@/contracts/commands";
+import {
+  applySuggestion,
+  findCompletionTrigger,
+  splitPathQuery,
+  type CompletionTrigger,
+  type SuggestionItem,
+} from "@/components/chat/composer-completion";
+import ComposerEffort from "@/components/chat/ComposerEffort.vue";
+import ComposerSuggestions from "@/components/chat/ComposerSuggestions.vue";
+import { activeSession } from "@/lib/session-store";
 import PermissionModeChip from "@/components/chat/PermissionModeChip.vue";
 
 /**
@@ -128,8 +149,313 @@ const canSubmit = computed(() =>
 /** The button and the Enter key share this, so they can never disagree. */
 function submit(): void {
   if (!canSubmit.value) return;
+  // The draft is leaving the composer: a list built from it has nothing left to
+  // complete.
+  closeCompletion();
   if (props.streaming) emit("queue");
   else emit("send");
+}
+
+// ── autocompletes (/ commands, @ workspace paths) ──────────────────────────
+//
+// The trigger rule and the "what a pick inserts" rule live in
+// `composer-completion.ts`; this is the wiring. Every entry point is an event on
+// the textarea (input, keydown, mousedown on a row), so no watcher is involved
+// and nothing runs while the human is not typing.
+
+/** The open autocomplete, or `null` when the list is closed. */
+const trigger = ref<CompletionTrigger | null>(null);
+/** The rows of the open list, already filtered and ordered. */
+const items = ref<SuggestionItem[]>([]);
+/** The highlighted row; the arrows move it, Enter and a click take it. */
+const activeIndex = ref(0);
+/**
+ * The live textarea, captured from its own events. Completing a suggestion has to
+ * move the caret, and the element that owns the caret is the one that just told
+ * us what was typed — no template ref and no DOM query needed.
+ */
+const textareaEl = ref<HTMLTextAreaElement | null>(null);
+/**
+ * The session's commands, keyed by session id: a list that only changes when pi
+ * starts a session is worth one read per session, not one per keystroke. A
+ * failed read is deliberately NOT cached, so a session that was still spawning
+ * when the first `/` was typed answers on the next attempt.
+ */
+const commandsBySession = new Map<string, SessionCommand[]>();
+/** The workspace path of the session, resolved once for the `@` walk. */
+let workspacePath: { id: number; path: string } | null = null;
+/** Bumped per request, so a slow answer cannot overwrite a newer list. */
+let completionRequest = 0;
+
+/** The list is only open while it has something to show. */
+const suggestionsOpen = computed(
+  () => trigger.value !== null && items.value.length > 0,
+);
+
+/** What the open list is announcing: the commands of the session, or the workspace. */
+const suggestionsTitle = computed(() =>
+  trigger.value?.kind === "command"
+    ? t("chat.composer.commands")
+    : t("chat.composer.workspacePaths"),
+);
+
+function closeCompletion(): void {
+  trigger.value = null;
+  items.value = [];
+  activeIndex.value = 0;
+  // Any answer still in flight belongs to the list that just closed.
+  completionRequest += 1;
+}
+
+/**
+ * The textarea's own input event. The value it carries is the one on screen right
+ * now, which is what the caret arithmetic needs: `modelValue` is a render behind
+ * during the same tick.
+ */
+function handleInput(event: Event): void {
+  const element = event.target;
+  if (!(element instanceof HTMLTextAreaElement)) return;
+  textareaEl.value = element;
+  void refreshCompletion(element.value, element.selectionStart ?? element.value.length);
+}
+
+/**
+ * Opens, re-filters or closes the list for one caret position.
+ *
+ * `kind` is decided by the text, never by which feature opened last: `/fix` asks
+ * for commands, `@src/a` for paths, and anything else closes the list.
+ */
+async function refreshCompletion(text: string, caret: number): Promise<void> {
+  const session = activeSession.value;
+  const found = findCompletionTrigger(text, caret);
+  // Both autocompletes belong to a session: the commands are that session's, and
+  // the paths are that session's workspace. Without one there is nothing to offer.
+  if (session === null || found === null) {
+    closeCompletion();
+    return;
+  }
+  trigger.value = found;
+  const request = ++completionRequest;
+  const rows =
+    found.kind === "command"
+      ? filterCommands(await commandsOf(session), found.query)
+      : await pathSuggestions(session.workspaceId, found.query);
+  // A newer keystroke already asked for its own list.
+  if (request !== completionRequest) return;
+  items.value = rows;
+  activeIndex.value = 0;
+}
+
+/**
+ * S3: the commands of one session. An answer that is not available (pi still
+ * spawning, the session stopped, the bridge down) is "nothing to offer yet",
+ * never an error: the list simply does not open.
+ */
+async function commandsOf(
+  session: NonNullable<typeof activeSession.value>,
+): Promise<SessionCommand[]> {
+  const cached = commandsBySession.get(session.sessionId);
+  if (cached !== undefined) return cached;
+  try {
+    const commands = await sessionCommands(
+      session.workspaceId,
+      Number(session.sessionId),
+    );
+    commandsBySession.set(session.sessionId, commands);
+    return commands;
+  } catch {
+    return [];
+  }
+}
+
+/** The source badge of a command: pi's own word, translated when this build knows it. */
+function sourceBadge(source: string): string {
+  switch (source) {
+    case "extension":
+      return t("chat.composer.commandSource.extension");
+    case "prompt":
+      return t("chat.composer.commandSource.prompt");
+    case "skill":
+      return t("chat.composer.commandSource.skill");
+    default:
+      // A source from a newer pi: show the word rather than a badge that lies.
+      return source;
+  }
+}
+
+/**
+ * S3: the commands whose name starts with what was typed, with the slash and a
+ * trailing space as the insertion — sending that text is what runs the command,
+ * through the existing prompt path (pi expands it). Capped so a session with a
+ * very long skill list stays one glance, and never truncated silently: the human
+ * narrows with two more characters, which is faster than scrolling.
+ */
+function filterCommands(
+  commands: SessionCommand[],
+  query: string,
+): SuggestionItem[] {
+  const needle = query.trim().toLowerCase();
+  const limit = 30;
+  const rows: SuggestionItem[] = [];
+  for (const command of commands) {
+    if (!command.name.toLowerCase().startsWith(needle)) continue;
+    rows.push({
+      key: command.name,
+      label: `/${command.name}`,
+      hint: command.description,
+      badge: sourceBadge(command.source),
+      insert: `/${command.name} `,
+    });
+    if (rows.length === limit) break;
+  }
+  return rows;
+}
+
+/**
+ * S4: the entries of the directory the caret is typing in, one level at a time.
+ *
+ * The walk is lazy on purpose: only the current segment's directory is read, with
+ * the same workspace-confined `fsListDir` the Files tool uses, so a mention can
+ * never reach outside the workspace and never costs a tree walk. A directory is
+ * inserted with a trailing `/` and keeps the list open on the next segment; a
+ * file completes the path and closes it.
+ */
+async function pathSuggestions(
+  workspaceId: number,
+  query: string,
+): Promise<SuggestionItem[]> {
+  const root = await workspaceOf(workspaceId);
+  if (root === "") return [];
+  const { dir, filter } = splitPathQuery(query);
+  let entries: FsEntry[];
+  try {
+    entries = await fsListDir(root, dir);
+  } catch {
+    // A segment that does not exist (a typo, or a path that left the workspace)
+    // is "nothing to offer", not a dialog to dismiss.
+    return [];
+  }
+  const needle = filter.toLowerCase();
+  const prefix = dir === "" ? "" : `${dir}/`;
+  return entries
+    .filter((entry) => entry.name.toLowerCase().startsWith(needle))
+    .sort((left, right) => {
+      const leftDir = left.kind === "dir" ? 0 : 1;
+      const rightDir = right.kind === "dir" ? 0 : 1;
+      return leftDir - rightDir || left.name.localeCompare(right.name);
+    })
+    .slice(0, 30)
+    .map((entry) => {
+      const path = `${prefix}${entry.name}`;
+      const directory = entry.kind === "dir";
+      return {
+        key: path,
+        label: `@${path}${directory ? "/" : ""}`,
+        badge: directory
+          ? t("chat.composer.folder")
+          : t("chat.composer.file"),
+        insert: `@${path}${directory ? "/" : ""}`,
+        directory,
+      };
+    });
+}
+
+/**
+ * The absolute path of the session's workspace, resolved once and reused: the `@`
+ * picker needs it for `fsListDir`, and the composer only knows the workspace's
+ * name. A workspace that cannot be resolved offers no paths instead of guessing
+ * one.
+ */
+async function workspaceOf(workspaceId: number): Promise<string> {
+  if (workspacePath !== null && workspacePath.id === workspaceId) {
+    return workspacePath.path;
+  }
+  try {
+    const workspaces = await listWorkspaces();
+    const found = workspaces.find((entry) => entry.id === workspaceId);
+    if (found === undefined) return "";
+    workspacePath = { id: workspaceId, path: found.path };
+    return found.path;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Replaces the trigger token with the picked row and puts the caret after it.
+ *
+ * The insertion rules are pi's own shapes: `/name ` is what the prompt path runs,
+ * and `@relative/path` is text the agent reads with its tools (there are no
+ * attachments in the protocol, and Nabla does not invent one).
+ */
+function complete(index: number): void {
+  const open = trigger.value;
+  const item = items.value[index];
+  if (open === null || item === undefined) return;
+  const element = textareaEl.value;
+  const text = element?.value ?? props.modelValue;
+  const caret = element?.selectionStart ?? text.length;
+  const applied = applySuggestion(text, open, caret, item.insert);
+  emit("update:modelValue", applied.text);
+  void nextTick(() => {
+    element?.focus();
+    element?.setSelectionRange(applied.caret, applied.caret);
+  });
+  if (item.directory === true) {
+    // The next segment is what a directory pick is for: walk into it.
+    void refreshCompletion(applied.text, applied.caret);
+  } else {
+    closeCompletion();
+  }
+}
+
+function moveActive(step: number): void {
+  const count = items.value.length;
+  if (count === 0) return;
+  activeIndex.value = (activeIndex.value + step + count) % count;
+}
+
+/**
+ * Every key of the textarea. Two rules, in this order:
+ *
+ *   1. while the list is OPEN, the arrows walk it and Enter or Tab completes —
+ *      so Enter can never both complete and send;
+ *   2. otherwise Enter does exactly what it always did: send the prompt (or queue
+ *      it), and Shift+Enter still inserts a newline.
+ *
+ * A list that is closed (or open with nothing in it — a session with no commands
+ * yet) hijacks nothing: its keys fall through to rule 2.
+ */
+function onKeydown(event: KeyboardEvent): void {
+  const element = event.target;
+  if (element instanceof HTMLTextAreaElement) textareaEl.value = element;
+  if (suggestionsOpen.value) {
+    switch (event.key) {
+      case "ArrowDown":
+        event.preventDefault();
+        moveActive(1);
+        return;
+      case "ArrowUp":
+        event.preventDefault();
+        moveActive(-1);
+        return;
+      case "Enter":
+      case "Tab":
+        event.preventDefault();
+        complete(activeIndex.value);
+        return;
+      case "Escape":
+        event.preventDefault();
+        closeCompletion();
+        return;
+      default:
+        break;
+    }
+  }
+  if (event.key === "Enter" && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
+    event.preventDefault();
+    submit();
+  }
 }
 
 /**
@@ -268,10 +594,23 @@ function chooseModel(provider: string, model: string) {
        narrow ceiling, the conversation state the wide one. -->
   <!-- Bounds come from `src/lib/layout.ts`: the box shrinks with its column and
        stops at half of its normal width, which is also the chat's floor. -->
+  <!-- `relative` is the anchor of the autocomplete list: it opens ABOVE the card
+       and out of the layout flow, so typing `/` or `@` never moves the text. -->
   <div
-    class="mx-auto w-full min-w-0 rounded-2xl border border-border bg-card/60 shadow-sm"
+    class="relative mx-auto w-full min-w-0 rounded-2xl border border-border bg-card/60 shadow-sm"
     :style="{ maxWidth: `${maxWidth}px`, minWidth: `${COMPOSER_MIN_WIDTH}px` }"
   >
+    <!-- S3/S4: the commands of this session, or the entries of the workspace
+         directory the `@` mention is typing in. -->
+    <ComposerSuggestions
+      v-if="suggestionsOpen"
+      :title="suggestionsTitle"
+      :items="items"
+      :active-index="activeIndex"
+      @select="complete"
+      @highlight="activeIndex = $event"
+    />
+
     <Textarea
       :model-value="modelValue"
       :aria-label="t('chat.composer.prompt')"
@@ -279,7 +618,9 @@ function chooseModel(provider: string, model: string) {
       class="max-h-64 min-h-[3.7rem] resize-none border-0 bg-transparent px-3.5 pt-2 pb-1.5 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
       :disabled="disabled"
       @update:model-value="emit('update:modelValue', String($event))"
-      @keydown.enter.exact.prevent="submit"
+      @input="handleInput"
+      @keydown="onKeydown"
+      @click="handleInput"
     />
 
     <div class="flex min-w-0 items-center gap-1 px-2 pb-2">
@@ -317,6 +658,11 @@ function chooseModel(provider: string, model: string) {
              composer — the row where the human decides what happens next — not
              in the header, which only names the conversation. -->
         <PermissionModeChip />
+
+        <!-- S2 of `composer-inputs.md`: the effort of the session, beside the
+             permission chip — the two controls that shape the next turn. It
+             renders the level pi CONFIRMED, not the one the UI asked for. -->
+        <ComposerEffort />
 
         <!-- Provider → model: one trigger naming the current pair (provider as
              a muted prefix), and one menu where each provider row opens its own
