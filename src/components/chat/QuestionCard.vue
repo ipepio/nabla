@@ -1,28 +1,40 @@
 <script setup lang="ts">
-// A question the agent asked, once it is history (S3 of
+// A question the agent asked, in the transcript (S3 of
 // `odd/tasks/agent-question-bridge.md`).
 //
-// Pending questions do not render here any more: they take over the composer
-// slot (`QuestionPrompt.vue`), which is where the human's hands already are.
-// This card is what a question becomes when it is answered or cancelled, so the
-// transcript keeps both halves of the exchange after the request is gone — the
-// entry is a normal `ChatMessage` carrying a `SettledQuestion`, never a second
-// message kind.
+// It has two lives and one look. While the agent is blocked on the answer the
+// card is *pending*: read-only, no control, drawn where the conversation ends —
+// the turn cannot continue until the human answers, so a question that only
+// appeared in the composer slot left the conversation looking finished while pi
+// was in fact waiting. Once the answer lands, the same card becomes *settled*
+// (the ✓ on the chosen option, the typed answer, or the `Cancelled` badge), and
+// it lands in exactly the slot the pending one occupied: the transcript entry
+// that carries the `SettledQuestion` is the last message, which is where this
+// card was.
 //
-// Read-only by construction: it has no emit, draws no control and cannot be
-// answered, because the protocol exchange it belongs to is already closed.
+// Read-only by construction in both states: it has no emit, draws no answer
+// control and cannot be answered. The composer slot (`QuestionPrompt.vue`) is
+// the only interactive half of the exchange.
 //
 // The strings are literal English rather than `t(...)` keys: the catalogue
 // (`src/locales/`) is out of this feature's edit surface, and inventing keys the
 // catalogue does not carry would break `vue-tsc` (a missing key is a build error).
 import { computed } from "vue";
 import { CheckIcon, MessageCircleQuestionIcon } from "@lucide/vue";
-import type { SettledQuestion } from "@/lib/session-store";
+import type { UiAnswer } from "@/contracts/types";
+import type { PendingQuestion, SettledQuestion } from "@/lib/session-store";
 
 const props = defineProps<{
-  /** The request as pi sent it, plus what the human did with it. */
-  question: SettledQuestion;
+  /**
+   * The question as pi sent it, plus what the human did with it once it is
+   * history. The live shape (`PendingQuestion`) has no `answer` field at all,
+   * which is the one difference this card reads.
+   */
+  question: PendingQuestion | SettledQuestion;
 }>();
+
+/** The agent is still blocked on this one: there is no answer to show yet. */
+const pending = computed(() => !("answer" in props.question));
 
 /** The question itself, falling back to what it was asking about. */
 const headline = computed(() => {
@@ -30,40 +42,58 @@ const headline = computed(() => {
   if (props.question.message !== null && props.question.message !== "") {
     return props.question.message;
   }
-  return "The agent asked a question.";
+  return pending.value
+    ? "The agent has a question."
+    : "The agent asked a question.";
 });
 
-/**
- * The answer in one line: the chosen option, `Yes`/`No`, or the typed text.
- * `""` when the question was cancelled — nothing was answered then.
- */
-const answerText = computed(() => {
-  const answer = props.question.answer;
-  if (answer === null || "cancelled" in answer) return "";
-  if ("confirmed" in answer) return answer.confirmed ? "Yes" : "No";
-  return answer.value;
-});
-
-/** The question was closed without an answer. */
-const cancelled = computed(
-  () => props.question.answer === null || "cancelled" in props.question.answer,
+/** What the human answered; `null` while pending and for a cancellation. */
+const answer = computed<UiAnswer | null>(() =>
+  "answer" in props.question ? props.question.answer : null,
 );
 
 /**
- * The options the question offered, with the chosen one marked. A `confirm` has
- * no option list on the wire — its two answers are fixed — and anything else
- * (a typed answer, or a method with no control here) offers none, so the answer
- * is printed as a line instead.
+ * The answer in one line: the chosen option, `Yes`/`No`, or the typed text.
+ * `""` when the question was cancelled — nothing was answered then — and while
+ * it is still pending.
+ */
+const answerText = computed(() => {
+  const given = answer.value;
+  if (given === null || "cancelled" in given) return "";
+  if ("confirmed" in given) return given.confirmed ? "Yes" : "No";
+  return given.value;
+});
+
+/** The question was closed without an answer. */
+const cancelled = computed(() => {
+  const given = answer.value;
+  return given === null || "cancelled" in given;
+});
+
+/**
+ * The options the question offered. A `confirm` has no option list on the wire —
+ * its two answers are fixed, so they are minted here — and anything else (a
+ * typed answer, or a method with no control here) offers none, so the answer is
+ * printed as a line instead.
+ *
+ * While the question is pending only the real options are listed: nothing is
+ * choosable on this card, and minting a `Yes`/`No` pair here would read as two
+ * controls the human cannot press (the composer slot already asks them).
  */
 const choices = computed<string[]>(() => {
   if (props.question.options.length > 0) return props.question.options;
-  if (props.question.method === "confirm") return ["Yes", "No"];
-  return [];
+  if (pending.value) return [];
+  return props.question.method === "confirm" ? ["Yes", "No"] : [];
 });
 </script>
 
 <template>
-  <div class="rounded-lg border border-border bg-muted/30 p-2.5">
+  <div
+    class="rounded-lg border p-2.5"
+    :class="
+      pending ? 'border-dashed border-border bg-muted/20' : 'border-border bg-muted/30'
+    "
+  >
     <div class="flex items-start gap-2">
       <MessageCircleQuestionIcon
         class="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
@@ -88,8 +118,9 @@ const choices = computed<string[]>(() => {
           {{ question.placeholder }}
         </p>
 
-        <!-- The options, with the one the human picked marked. A cancelled
-             question marks none of them: nothing was chosen. -->
+        <!-- The options, with the one the human picked marked. A pending
+             question marks none — nothing has been chosen — and a cancelled one
+             marks none either: nothing will be. -->
         <ul v-if="choices.length > 0" class="mt-1.5 flex flex-col gap-0.5">
           <li
             v-for="choice in choices"
@@ -100,11 +131,15 @@ const choices = computed<string[]>(() => {
             "
           >
             <CheckIcon
-              v-if="choice === answerText"
+              v-if="!pending && choice === answerText"
               class="size-3 shrink-0"
               aria-hidden="true"
             />
-            <span v-else class="size-3 shrink-0" aria-hidden="true" />
+            <span
+              v-else-if="!pending"
+              class="size-3 shrink-0"
+              aria-hidden="true"
+            />
             <span class="min-w-0 break-words">{{ choice }}</span>
           </li>
         </ul>
@@ -115,10 +150,21 @@ const choices = computed<string[]>(() => {
         >
           {{ answerText }}
         </p>
+
+        <!-- The pending card cannot be answered from here; saying where the
+             answer goes is the whole job of this line. -->
+        <p
+          v-if="pending"
+          class="mt-1.5 text-[10px] font-medium tracking-wider text-muted-foreground uppercase"
+        >
+          Waiting for your answer
+        </p>
       </div>
 
-      <!-- How the exchange ended, at a glance. -->
+      <!-- How the exchange ended, at a glance. A pending question has no ending
+           yet, so it carries no badge — the hint above already says it waits. -->
       <span
+        v-if="!pending"
         class="shrink-0 text-[10px] font-medium tracking-wider uppercase"
         :class="cancelled ? 'text-muted-foreground' : 'text-success'"
       >

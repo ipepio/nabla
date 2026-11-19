@@ -642,6 +642,9 @@ const transcriptSignature = computed(() =>
     liveText.value.length,
     streamingReasoning.value.length,
     tools.value.length,
+    // A question that arrives grows the transcript too: it renders at the end of
+    // the flow (S3), so a view glued to the bottom must follow it there.
+    questions.value.length,
     errorText.value?.length ?? 0,
     statusAlert.value?.text ?? "",
   ].join("|"),
@@ -1319,6 +1322,22 @@ onUnmounted(() => {
               :message-id="message.id"
             />
           </template>
+
+          <!-- S3 of `agent-question-bridge.md`: a question the agent is blocked
+               on is part of the conversation while it waits, not a surface that
+               appears from nowhere. It renders right after the last message —
+               which is where the newest thing a blocked turn has produced sits,
+               because nothing streams after the tool call that asked — and in
+               arrival order when pi asked several. Answering it swaps this
+               read-only pending card for the settled one in the very same slot:
+               the entry `resolveQuestion` appends becomes the last message of
+               the loop above, so the exchange never jumps down the transcript
+               and never appears twice. -->
+          <QuestionCard
+            v-for="question in questions"
+            :key="question.id"
+            :question="question"
+          />
 
           <!-- The turn still streaming: it becomes a transcript entry when
                pi closes the message. Reasoning streams above the answer and
