@@ -518,26 +518,6 @@ const answerText = computed<string>({
 const composerSlot = ref<HTMLElement | null>(null);
 
 /**
- * Point 5 of the design: while a question holds the composer slot the composer is
- * not rendered, so "focus returns to the input" is a focus call and not a browser
- * default. It runs when the last question leaves — answered, cancelled, or
- * settled as cancelled by a stop — and never while one is still asking, which is
- * what keeps an `ask_input` field from being interrupted mid-word.
- *
- * The session id is watched with it because switching sessions changes the count
- * too, and the human's focus is in the drawer then: taking it into a composer
- * they did not ask for is not this behaviour.
- */
-watch(
-  () => [activeSessionId.value, questions.value.length] as const,
-  ([session, next], [previousSession, previous]) => {
-    if (session !== previousSession) return;
-    if (next > 0 || previous === 0) return;
-    void nextTick(() => composerSlot.value?.querySelector("textarea")?.focus());
-  },
-);
-
-/**
  * Forgets the draft of every question that is no longer pending, and nothing else.
  * A settled question takes its half-typed text with it: the request is closed, so
  * keeping the text would only resurrect it on a request id that never returns.
@@ -701,6 +681,31 @@ watch(activeSessionId, () => {
     syncPinnedToBottom();
   });
 });
+
+/**
+ * Point 5 of the design: while a question holds the composer slot the composer is
+ * not rendered, so "focus returns to the input" is a focus call and not a browser
+ * default. It runs when the last question leaves — answered, cancelled, or
+ * settled as cancelled by a stop — and never while one is still asking, which is
+ * what keeps an `ask_input` field from being interrupted mid-word.
+ *
+ * The session id is watched with it because switching sessions changes the count
+ * too, and the human's focus is in the drawer then: taking it into a composer
+ * they did not ask for is not this behaviour.
+ *
+ * It lives here, after `activeSessionId`'s declaration, on purpose: a watch's
+ * getter runs once during setup, so referencing a `const` that is declared later
+ * is a temporal-dead-zone crash that blanks the whole panel — the blank-screen
+ * regression this block shipped with taught the file that.
+ */
+watch(
+  () => [activeSessionId.value, questions.value.length] as const,
+  ([session, next], [previousSession, previous]) => {
+    if (session !== previousSession) return;
+    if (next > 0 || previous === 0) return;
+    void nextTick(() => composerSlot.value?.querySelector("textarea")?.focus());
+  },
+);
 
 /**
  * `MessageBubble` knows the two speaking roles; a `tool` line of a recovered
