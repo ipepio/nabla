@@ -4,21 +4,87 @@
 //
 // The drawer owns the workspace and settings data; this component owns only the
 // active selection, so ChatPanel receives one workspace instead of the list.
-import { ref } from "vue";
+import { nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { PanelRightCloseIcon } from "@lucide/vue";
 import AppSidebar from "./components/AppSidebar.vue";
 import ChatPanel from "./components/ChatPanel.vue";
 import ResizableAside from "./components/ResizableAside.vue";
 import ToolTabs from "./components/tools/ToolTabs.vue";
+import {
+  activateTab,
+  addTab,
+  setTabTool,
+  tabPanes,
+  tabs,
+} from "./components/tools/dock";
 import { Button } from "./components/ui/button";
 import { SidebarInset, SidebarProvider } from "./components/ui/sidebar";
+import { subscribeEmbedNeedView } from "./contracts/commands";
 import type { WorkspaceInfo } from "./contracts/types";
 import { t } from "./lib/i18n";
+import { isToolEnabled } from "./lib/preferences";
 
 const activeWorkspace = ref<WorkspaceInfo | null>(null);
 // Right tools drawer (S6): collapsed by default; the chat header and the empty
 // state both expose the toggle, so it is reachable in every state.
 const toolsOpen = ref(false);
+
+/**
+ * `auto-open-pane.md` (S1, S2, S5): a browser tool needs a view and there is
+ * none, so the app opens the pane itself and the agent's call goes through.
+ *
+ * This handler is the only place that can do it: `toolsOpen` is local to this
+ * component, and the rect the view is created with is measured by the pane, never
+ * by Rust (S3). Opening AND focusing (S2) is deliberate — the human sees what the
+ * agent is doing.
+ */
+async function openBrowserPane(): Promise<void> {
+  // S5: the drawer's tools are the human's switches, and Browser is off by
+  // default. Nothing is enabled from behind the counter: the tool answers its
+  // honest "no view" error instead, which names this very cause.
+  if (!isToolEnabled("browser")) return;
+
+  toolsOpen.value = true;
+  // Let the drawer mount BEFORE building the tab: its host reconciles the tabs
+  // against the active workspace on mount (`applyDock`), and a tab created for a
+  // workspace the drawer has not seen yet is one of the tabs it clears.
+  await nextTick();
+
+  // A tab that already holds a browser pane is activated, not duplicated: the
+  // pane is a singleton, and only the drawn tab builds a view.
+  const existing = tabs.value.find((tab) =>
+    tabPanes(tab).some((instance) => instance.toolId === "browser"),
+  );
+  if (existing !== undefined) {
+    activateTab(existing.id);
+    return;
+  }
+
+  // No browser pane anywhere: one empty tab becomes the browser, and the pane's
+  // own active mount creates the view with its measured rect (BrowserTool.vue).
+  const tab = addTab();
+  setTabTool(tab, "browser", activeWorkspace.value);
+}
+
+/** The `embed-need-view` unsubscribe, once the listener is up. */
+let unsubscribeNeedView: (() => void) | null = null;
+/** Set on unmount: a subscribe that answers afterwards releases itself. */
+let disposed = false;
+
+onMounted(async () => {
+  const off = await subscribeEmbedNeedView(() => void openBrowserPane());
+  if (disposed) {
+    off();
+    return;
+  }
+  unsubscribeNeedView = off;
+});
+
+onBeforeUnmount(() => {
+  disposed = true;
+  unsubscribeNeedView?.();
+  unsubscribeNeedView = null;
+});
 </script>
 
 <template>

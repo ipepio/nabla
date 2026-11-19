@@ -857,6 +857,23 @@ export async function subscribeEmbedNav(
 }
 
 /**
+ * Subscribes to `embed-need-view`: the MCP bridge telling the app that a browser
+ * tool needs a view and that there is none (`auto-open-pane.md`, S1/S3). There is
+ * no payload — the request is only "a view is needed" — and the app answers by
+ * opening the browser pane, because the rect the view is created with is geometry
+ * only this webview can measure. The listener lives here for the same reason as
+ * the ones above (contract-seam rule, AGENTS.md 1). Resolves with an unsubscribe
+ * function: call it on unmount or it keeps receiving events after teardown.
+ */
+export async function subscribeEmbedNeedView(
+  handler: () => void,
+): Promise<() => void> {
+  return listen("embed-need-view", () => {
+    handler();
+  });
+}
+
+/**
  * T3 of `webview-control.md`: the local MCP endpoint this run offers so the agent
  * can drive those views, or `null` when the port could not be bound — the app
  * works the same, only without agent control of the browser (S6).

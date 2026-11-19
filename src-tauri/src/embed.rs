@@ -37,10 +37,15 @@
 //
 // Payloads serialize camelCase, like every other payload of the seam: the
 // `embed-nav` event is `{ viewId, url }`.
+//
+// The other event this module owns carries no payload: [`NEED_VIEW_EVENT`] is a
+// one-way request — "a tool needs a view" — that the MCP bridge emits and the app
+// UI answers by creating the pane, with its own rect (`auto-open-pane.md`, S3).
+// The wait for that answer is [`EmbedSessions::wait_for_first_view`].
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use tauri::{Emitter, Manager, Url};
 
@@ -66,6 +71,11 @@ pub const MAIN_WINDOW_LABEL: &str = "main";
 
 /// Channel the navigation handler reports on, one-way, to the app UI.
 pub const NAV_EVENT: &str = "embed-nav";
+
+/// Channel a tool uses to ask the app UI for a view (`auto-open-pane.md`, S3):
+/// emitted with `()` and answered by a `reserve` — the UI creates the pane, and
+/// the view inside it, with the rect only the UI can measure.
+pub const NEED_VIEW_EVENT: &str = "embed-need-view";
 
 /// How long `embed_eval` waits for the page to answer. A page that is loading or
 /// gone never answers, and a command must not hang the caller forever.
@@ -214,6 +224,12 @@ struct Inner {
     /// Counter behind `embed-<n>`. Monotonic, so a label that was closed is not
     /// handed out again while the app runs.
     next_index: AtomicUsize,
+    /// How many views left the registry. A close is the "no" a tool waiting for a
+    /// pane has to respect, and it is the only reason this counter exists.
+    closed: AtomicUsize,
+    /// Signalled on every registry change, under `views`: a view was registered
+    /// (wake a waiter) or removed (cancel it).
+    changed: Condvar,
 }
 
 impl Default for EmbedSessions {
@@ -228,6 +244,8 @@ impl EmbedSessions {
             inner: Arc::new(Inner {
                 views: Mutex::new(Vec::new()),
                 next_index: AtomicUsize::new(0),
+                closed: AtomicUsize::new(0),
+                changed: Condvar::new(),
             }),
         }
     }
@@ -275,6 +293,49 @@ impl EmbedSessions {
         }
     }
 
+    /// Waits at most `timeout` for a view to be registered, and answers whether
+    /// one is there.
+    ///
+    /// This is the tool-facing half of `auto-open-pane.md` (S1, S3, S4): the MCP
+    /// bridge emits [`NEED_VIEW_EVENT`] and waits here while the app UI creates the
+    /// pane — and therefore the view, whose registry entry `reserve` writes before
+    /// the webview exists. Nothing here invents geometry: the answer is only
+    /// whether a view exists.
+    ///
+    /// A close wins over a view that appeared. `forget`/`drain` (and therefore
+    /// `close`/`close_all`) is the human saying the pane is not there, so it
+    /// cancels the wait instead of leaving it to run out the clock (S4,
+    /// respect-close). The signal is snapshotted when the wait starts, so a close
+    /// from before it is not its business.
+    pub fn wait_for_first_view(&self, timeout: Duration) -> bool {
+        let started = Instant::now();
+        let closed_before = self.inner.closed.load(Ordering::SeqCst);
+        let mut views = lock(&self.inner.views);
+        loop {
+            // Before the views on purpose: a registration and the close that
+            // follows it can be two halves of "the pane came and went", and then
+            // the human's no is the honest answer.
+            if self.inner.closed.load(Ordering::SeqCst) != closed_before {
+                return false;
+            }
+            if !views.is_empty() {
+                return true;
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                return false;
+            }
+            // Spurious wake-ups loop back here, so the elapsed time bounds the
+            // wait, never a single `wait_timeout` call.
+            let (next, _) = self
+                .inner
+                .changed
+                .wait_timeout(views, timeout - elapsed)
+                .unwrap_or_else(|poison| poison.into_inner());
+            views = next;
+        }
+    }
+
     /// Takes the next free label and registers the view before the webview
     /// exists, so the navigation handler always finds its own id. Refuses over
     /// the cap without allocating anything.
@@ -294,20 +355,32 @@ impl EmbedSessions {
         };
         let view = EmbeddedView { id, url };
         views.push(view.clone());
+        // Woken while the lock is still held: a waiter cannot miss this
+        // notification, because it re-checks the registry under the lock.
+        self.inner.changed.notify_all();
         Ok(view)
     }
 
     /// Removes one view from the registry and answers it, so the caller can
     /// close the webview it describes.
+    ///
+    /// A close signals even when the id is already gone: for a tool waiting on a
+    /// pane, "this view is not here" and "nothing is here" are the same no.
     fn forget(&self, view_id: &str) -> Option<EmbeddedView> {
         let mut views = lock(&self.inner.views);
+        self.inner.closed.fetch_add(1, Ordering::SeqCst);
+        self.inner.changed.notify_all();
         let index = views.iter().position(|view| view.id == view_id)?;
         Some(views.remove(index))
     }
 
     /// Removes every view and answers them, for `close_all`.
     fn drain(&self) -> Vec<EmbeddedView> {
-        std::mem::take(&mut *lock(&self.inner.views))
+        let mut views = lock(&self.inner.views);
+        let drained = std::mem::take(&mut *views);
+        self.inner.closed.fetch_add(1, Ordering::SeqCst);
+        self.inner.changed.notify_all();
+        drained
     }
 }
 
@@ -724,6 +797,132 @@ mod tests {
         assert_eq!(drained.len(), 2);
         assert!(sessions.is_empty(), "close_all leaves no view behind");
         assert!(sessions.drain().is_empty(), "draining twice is empty, not a panic");
+    }
+
+    // ── waiting for a pane (`auto-open-pane.md`, S1/S3/S4) ───────────────────
+    //
+    // The MCP bridge asks the UI for a view and waits here. What is verified is
+    // every decision that does not need a window: a view that appears answers,
+    // silence is bounded, and a close is a no rather than a longer wait.
+
+    #[test]
+    fn waiting_for_first_view_answers_at_once_when_one_is_open() {
+        let sessions = EmbedSessions::new();
+        sessions.reserve(DEFAULT_URL.into()).expect("an open view");
+
+        let started = Instant::now();
+        assert!(sessions.wait_for_first_view(Duration::from_secs(10)));
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "an open view is not a wait, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn waiting_for_first_view_resolves_when_a_view_is_reserved_elsewhere() {
+        let sessions = EmbedSessions::new();
+        let creating = sessions.clone();
+        let ui = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            // What the pane's `embed_create` does first: the view exists in the
+            // registry before the webview does.
+            creating.reserve(DEFAULT_URL.into()).expect("the pane's create")
+        });
+
+        let started = Instant::now();
+        let opened = sessions.wait_for_first_view(Duration::from_secs(10));
+        let waited = started.elapsed();
+        ui.join().expect("the creating thread panicked");
+
+        assert!(opened, "a registered view answers the wait");
+        assert!(
+            waited >= Duration::from_millis(30),
+            "it waited for the registration instead of guessing, returned after {waited:?}"
+        );
+    }
+
+    #[test]
+    fn waiting_for_first_view_times_out_when_nothing_is_registered() {
+        let sessions = EmbedSessions::new();
+
+        let started = Instant::now();
+        let opened = sessions.wait_for_first_view(Duration::from_millis(80));
+        let waited = started.elapsed();
+
+        assert!(!opened, "silence is a no, not an invented view");
+        assert!(waited >= Duration::from_millis(80), "the wait is the timeout it was given");
+        assert!(waited < Duration::from_secs(5), "and no longer than that, took {waited:?}");
+    }
+
+    /// Runs `close` on another thread once the waiter is inside its wait, so the
+    /// close is what the wait has to observe.
+    fn abort_with(closing: impl FnOnce(EmbedSessions) + Send + 'static) -> bool {
+        let sessions = EmbedSessions::new();
+        let waiting = {
+            let sessions = sessions.clone();
+            std::thread::spawn(move || sessions.wait_for_first_view(Duration::from_secs(10)))
+        };
+        // The waiter is asleep in its wait by now: nothing registers in these
+        // tests, so the close cannot race with a view appearing.
+        std::thread::sleep(Duration::from_millis(80));
+        closing(sessions.clone());
+        let opened = waiting.join().expect("the waiting thread panicked");
+        assert!(sessions.is_empty(), "the helper never registers a view");
+        opened
+    }
+
+    // S4 (respect-close): the human closing the pane while the tool waits is a
+    // no, answered now instead of after the whole timeout.
+    #[test]
+    fn a_close_during_the_wait_aborts_it() {
+        let started = Instant::now();
+        let opened = abort_with(|sessions| {
+            // A close names a view; the registry still answers it as the human's
+            // "the pane is not there" even when that view is already gone.
+            assert_eq!(sessions.forget("embed-1"), None);
+        });
+
+        assert!(!opened, "a close means no view, not a longer wait");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it aborted instead of running out the timeout, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_close_all_during_the_wait_aborts_it() {
+        let started = Instant::now();
+        let opened = abort_with(|sessions| {
+            // `close_all` with nothing registered still says the panes are gone.
+            assert!(sessions.drain().is_empty());
+        });
+
+        assert!(!opened, "close_all means no view, not a longer wait");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it aborted instead of running out the timeout, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    // A close is only the wait's business while the wait runs: the snapshot is
+    // taken when it starts, so an earlier close cannot cancel a later wait.
+    #[test]
+    fn a_close_before_the_wait_is_not_its_business() {
+        let sessions = EmbedSessions::new();
+        let gone = sessions.reserve(DEFAULT_URL.into()).expect("view");
+        assert!(sessions.forget(&gone.id).is_some());
+
+        let creating = sessions.clone();
+        let ui = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            creating.reserve(DEFAULT_URL.into()).expect("a later view")
+        });
+
+        assert!(sessions.wait_for_first_view(Duration::from_secs(10)));
+        ui.join().expect("the creating thread panicked");
     }
 
     // Nothing below runs without a real window: `embed_create`, `set_bounds`,

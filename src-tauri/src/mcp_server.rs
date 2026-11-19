@@ -34,10 +34,16 @@ use axum::{
     routing::post,
 };
 use serde_json::{json, Value};
+use tauri::Emitter;
 
 /// The name pi will see in `tools/list` sources and in its own tool names
 /// (`mcp__nabla-browser__navigate`).
 pub const SERVER_NAME: &str = "nabla-browser";
+
+/// How long a tool that needs a view waits for the app to open the pane
+/// (`auto-open-pane.md`, S4). Bounded like `REGISTRATION_WAIT`: the pane may never
+/// appear, and a tool call must not hang on that.
+pub const VIEW_WAIT: Duration = Duration::from_secs(10);
 
 /// The protocol revision this server speaks. It echoes the client's request when
 /// it recognises it, and falls back to this one otherwise.
@@ -59,6 +65,13 @@ pub struct LiveView {
 pub trait WebviewDriver: Send + Sync + 'static {
     /// Every open view, in a stable order.
     fn views(&self) -> Vec<LiveView>;
+
+    /// Asks the app to open the browser pane and waits at most `timeout` for the
+    /// view to exist (`auto-open-pane.md`, S1/S3/S4). `true` means a view is there.
+    ///
+    /// Required, not defaulted: a driver that cannot open a pane must say so,
+    /// otherwise a tool would report "no view" without ever having asked.
+    fn ensure_view(&self, timeout: Duration) -> bool;
 
     /// Navigates one existing view. The url is validated by the driver, which is
     /// where the `http`/`https`/`about:blank` rule already lives.
@@ -128,9 +141,10 @@ pub fn dispatch(driver: &dyn WebviewDriver, request: &Value) -> Option<Value> {
 /// content the model reads — including failures.
 ///
 /// Every tool but `list_targets` acts on one view, so resolution happens once,
-/// before the tool runs. `list_targets` is the tool whose *answer* is the
-/// registry: an empty list is a valid reply, not a failure, so it never
-/// resolves a view.
+/// before the tool runs. When no view exists, the nine that need one ask the app
+/// to open the pane (`auto-open-pane.md`, S1/S3) and use what the UI creates with
+/// its own rect. `list_targets` is the tool whose *answer* is the registry: an
+/// empty list is a valid reply, not a failure, so it never asks for a pane.
 fn call_tool(driver: &dyn WebviewDriver, id: &Value, params: &Value) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     if !TOOL_NAMES.contains(&name) {
@@ -139,9 +153,20 @@ fn call_tool(driver: &dyn WebviewDriver, id: &Value, params: &Value) -> Value {
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
     let asked_view = arguments.get("viewId").and_then(Value::as_str);
 
-    let views = driver.views();
+    let mut views = driver.views();
     if name == "list_targets" {
         return tool_result(id, &targets_text(&views), false);
+    }
+
+    if views.is_empty() {
+        // The ask is bounded, so a pane nobody opens costs a short wait, never a
+        // hung call. A false answer is not a failure of the app but a state of it:
+        // the human closed the pane, or the Browser tool is off in Settings (S5 —
+        // nothing is enabled behind the human's back).
+        if !driver.ensure_view(VIEW_WAIT) {
+            return tool_result(id, NO_VIEW_ERROR, true);
+        }
+        views = driver.views();
     }
 
     let view = match resolve_view(&views, asked_view) {
@@ -311,6 +336,16 @@ fn type_script(selector: &str, text: &str) -> String {
     )
 }
 
+/// What a view-needing tool answers when no view exists, after asking for one:
+/// the honest error of S4 of `auto-open-pane.md`.
+///
+/// Two causes are invisible from where the agent runs — the human closed the pane,
+/// or the Browser tool is off in Settings — so the message names both and says
+/// whose move it is.
+const NO_VIEW_ERROR: &str = "no browser view is open and none appeared: the browser pane may be \
+     closed, or the Browser tool may be disabled in Settings; ask the human to open the browser \
+     pane or enable the Browser tool, then try again";
+
 /// Which view a tool acts on: the named one, or the only one open.
 ///
 /// The failures here are written for the model, not for a log: they say what to
@@ -324,9 +359,9 @@ fn resolve_view<'a>(views: &'a [LiveView], asked: Option<&str>) -> Result<&'a Li
     }
     match views {
         [only] => Ok(only),
-        [] => Err(
-            "no browser view is open; ask the human to open the browser pane first".to_string(),
-        ),
+        // Reachable only when the app said a view exists and the registry no
+        // longer holds one: the same honest answer as a wait that timed out.
+        [] => Err(NO_VIEW_ERROR.to_string()),
         _ => Err(format!(
             "more than one view is open ({}); pass `viewId`",
             open_views(views)
@@ -778,6 +813,13 @@ mod tests {
         navigated: Mutex<Vec<(String, String)>>,
         evaluated: Mutex<Vec<(String, String)>>,
         eval_answer: Result<String, String>,
+        /// What the app registers when a tool asks for a pane. Empty is the
+        /// human keeping the pane closed, or the Browser tool being off.
+        opens: Vec<LiveView>,
+        /// The views `opens` has registered so far.
+        opened: Mutex<Vec<LiveView>>,
+        /// Every `ensure_view` call, with the timeout it was asked for.
+        ensured: Mutex<Vec<Duration>>,
     }
 
     impl FakeDriver {
@@ -787,6 +829,9 @@ mod tests {
                 navigated: Mutex::new(Vec::new()),
                 evaluated: Mutex::new(Vec::new()),
                 eval_answer: Ok("\"ok\"".to_string()),
+                opens: Vec::new(),
+                opened: Mutex::new(Vec::new()),
+                ensured: Mutex::new(Vec::new()),
             }
         }
 
@@ -796,11 +841,38 @@ mod tests {
                 url: "https://example.com/".to_string(),
             }])
         }
+
+        /// No view open, and a UI that registers `opens` when it is asked.
+        fn opening(opens: Vec<LiveView>) -> FakeDriver {
+            FakeDriver {
+                opens,
+                ..FakeDriver::with_views(Vec::new())
+            }
+        }
+
+        /// How many times a tool asked the app for a pane.
+        fn asks(&self) -> usize {
+            self.ensured.lock().unwrap().len()
+        }
     }
 
     impl WebviewDriver for FakeDriver {
         fn views(&self) -> Vec<LiveView> {
-            self.views.clone()
+            let mut views = self.views.clone();
+            views.extend(self.opened.lock().unwrap().iter().cloned());
+            views
+        }
+
+        fn ensure_view(&self, timeout: Duration) -> bool {
+            self.ensured.lock().unwrap().push(timeout);
+            if self.opens.is_empty() {
+                return false;
+            }
+            self.opened
+                .lock()
+                .unwrap()
+                .extend(self.opens.iter().cloned());
+            true
         }
 
         fn navigate(&self, view_id: &str, url: &str) -> Result<(), String> {
@@ -1339,6 +1411,122 @@ mod tests {
         );
     }
 
+    // ── opening the pane a tool needs (`auto-open-pane.md`) ─────────────────
+
+    /// The nine tools that act on a view, with the least arguments they accept.
+    const VIEW_TOOLS: [&str; 9] = [
+        "navigate", "eval", "get_url", "get_title", "click", "type", "back", "forward",
+        "reload",
+    ];
+
+    fn view_tool_arguments(name: &str) -> Value {
+        match name {
+            "navigate" => json!({ "url": "https://example.org/" }),
+            "eval" => json!({ "script": "1" }),
+            "click" => json!({ "selector": "#go" }),
+            "type" => json!({ "selector": "#email", "text": "a@b.example" }),
+            _ => json!({}),
+        }
+    }
+
+    fn call(driver: &dyn WebviewDriver, name: &str) -> Value {
+        dispatch(
+            driver,
+            &request(
+                "tools/call",
+                json!({ "name": name, "arguments": view_tool_arguments(name) }),
+            ),
+        )
+        .expect("answer")
+    }
+
+    fn answer_text(answer: &Value) -> &str {
+        answer["result"]["content"][0]["text"]
+            .as_str()
+            .expect("a text result")
+    }
+
+    // S1/S3: no view open, so the tool asks the app for a pane and, once the UI
+    // has created one with its real rect, drives THAT view. The geometry stays on
+    // the UI side; here only the id comes back.
+    #[test]
+    fn a_tool_asks_the_app_for_a_pane_and_uses_the_view_it_opens() {
+        let driver = FakeDriver::opening(vec![LiveView {
+            id: "embed-7".to_string(),
+            url: "about:blank".to_string(),
+        }]);
+
+        let answer = call(&driver, "navigate");
+
+        assert_eq!(answer["result"]["isError"], false, "{}", answer_text(&answer));
+        assert_eq!(
+            *driver.ensured.lock().unwrap(),
+            vec![VIEW_WAIT],
+            "the tool waits with the shared bound"
+        );
+        assert_eq!(VIEW_WAIT, Duration::from_secs(10), "≈10s, like REGISTRATION_WAIT");
+        assert_eq!(
+            driver.navigated.lock().unwrap().as_slice(),
+            [("embed-7".to_string(), "https://example.org/".to_string())],
+            "the tool acts on the view the app just opened"
+        );
+    }
+
+    // S4: no view appeared. The two causes are invisible from where the agent
+    // runs, so the message names both and says whose move it is.
+    #[test]
+    fn a_tool_answers_an_honest_error_when_no_view_appears() {
+        let driver = FakeDriver::opening(Vec::new());
+
+        let answer = call(&driver, "eval");
+
+        assert_eq!(answer["result"]["isError"], true);
+        let text = answer_text(&answer);
+        assert!(text.contains("browser pane"), "names the pane cause: {text}");
+        assert!(text.contains("closed"), "names the closed pane: {text}");
+        assert!(
+            text.contains("disabled") && text.contains("Settings"),
+            "names the switch that can turn the tool off: {text}"
+        );
+        assert!(text.contains("ask the human"), "says whose move it is: {text}");
+        assert_eq!(driver.asks(), 1, "it asked once, then answered");
+        assert!(driver.evaluated.lock().unwrap().is_empty(), "no page was touched");
+        assert!(driver.navigated.lock().unwrap().is_empty());
+    }
+
+    // S1/S6: every view-needing tool asks, and only when the registry is empty.
+    #[test]
+    fn the_nine_view_tools_ask_for_a_pane_only_when_none_is_open() {
+        for name in VIEW_TOOLS {
+            let empty = FakeDriver::opening(Vec::new());
+            let answer = call(&empty, name);
+            assert_eq!(empty.asks(), 1, "{name} asks when no view is open");
+            assert_eq!(answer["result"]["isError"], true, "{name}: no view, no work");
+
+            let open = FakeDriver::one();
+            let answer = call(&open, name);
+            assert_eq!(open.asks(), 0, "{name} does not ask when a view is open");
+            assert_eq!(
+                answer["result"]["isError"], false,
+                "{name}: {}",
+                answer_text(&answer)
+            );
+        }
+    }
+
+    // S6: `list_targets` is the tool whose ANSWER is the registry. An empty list
+    // stays a valid answer, so it never waits for a pane to appear.
+    #[test]
+    fn list_targets_never_asks_for_a_pane() {
+        let driver = FakeDriver::opening(Vec::new());
+
+        let answer = call(&driver, "list_targets");
+
+        assert_eq!(answer["result"]["isError"], false, "an empty list is an answer");
+        assert!(answer_text(&answer).contains("open the browser pane"));
+        assert_eq!(driver.asks(), 0, "the registry answers; nothing waits");
+    }
+
     #[test]
     fn a_token_is_long_enough_to_not_be_guessable_and_differs_per_call() {
         let first = new_token();
@@ -1622,6 +1810,16 @@ impl WebviewDriver for EmbedDriver {
                 url: view.url,
             })
             .collect()
+    }
+
+    fn ensure_view(&self, timeout: Duration) -> bool {
+        // Ask, then wait, in that order. The app UI owns the geometry (S3): this
+        // only says "a tool needs a view", and the pane that opens creates it with
+        // the rect it measured, registering it before the webview exists — which
+        // is what wakes the wait. A failed emit is not special-cased: the wait
+        // then answers the same way as a pane nobody opened.
+        let _ = self.app.emit(crate::embed::NEED_VIEW_EVENT, ());
+        self.embeds.wait_for_first_view(timeout)
     }
 
     fn navigate(&self, view_id: &str, url: &str) -> Result<(), String> {
