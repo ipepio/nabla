@@ -571,6 +571,22 @@ export interface GitEntry {
   staged: boolean;
 }
 
+// ── the question bridge (B3 of `odd/tasks/agent-question-bridge.md`) ─────────
+
+/**
+ * The answer the human gave to one `extension_ui_request`, exactly as
+ * `answer_ui_request` takes it. Mirrors `UiAnswer` in `src-tauri/src/rpc/mod.rs`:
+ * an untagged union of the three shapes the protocol defines — a chosen or typed
+ * value, a confirmation, or a cancellation.
+ *
+ * `cancelled` is the literal `true` on purpose: the protocol only defines a
+ * cancellation, so there is no "uncancelled" answer to send.
+ */
+export type UiAnswer =
+  | { value: string }
+  | { confirmed: boolean }
+  | { cancelled: true };
+
 // ── embedded browser (child webview of the main window) ─────────────────────
 
 /**

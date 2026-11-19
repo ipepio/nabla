@@ -34,6 +34,7 @@ import type {
   ShellOutputEvent,
   ShellSession,
   TranscriptMessage,
+  UiAnswer,
   WorkspaceInfo,
 } from "./types";
 
@@ -588,6 +589,31 @@ export function stopSession(
   sessionId: number,
 ): Promise<void> {
   return invoke<void>("stop_session", { workspaceId, sessionId });
+}
+
+/**
+ * S3 of `agent-question-bridge.md`: answers one question the session's agent is
+ * blocking on. Rust writes the exact `extension_ui_response` line to that
+ * child's stdin, pi resolves the extension's promise with the answer, and the
+ * turn continues with it.
+ *
+ * The answer shape is the protocol's own: a `value` for `select`/`input`, a
+ * `confirmed` for `confirm`, or `cancelled` for any dialog. Rejects when the
+ * session is not running — an answer nobody can receive must not look delivered —
+ * and there is nothing else to await: pi sends no response to an answer.
+ */
+export function answerUiRequest(
+  workspaceId: number,
+  sessionId: number,
+  requestId: string,
+  answer: UiAnswer,
+): Promise<void> {
+  return invoke<void>("answer_ui_request", {
+    workspaceId,
+    sessionId,
+    requestId,
+    answer,
+  });
 }
 
 /**

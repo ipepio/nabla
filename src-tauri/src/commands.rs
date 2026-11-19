@@ -18,7 +18,7 @@ use crate::providers::{
     ModelInfo as ProviderModelInfo, ModelOption, ProviderDraft, ProviderModelDraft, ProviderModels,
     ProviderSummary,
 };
-use crate::rpc::{AgentEvent, RuntimeStatus};
+use crate::rpc::{AgentEvent, RuntimeStatus, UiAnswer};
 use crate::settings::{self, Settings};
 use crate::shell::{self, ShellSession, ShellSessions, ShellSink};
 use crate::store::{ProviderStatusRow, SessionNew, SessionRow, Store, StoreResult, Workspace};
@@ -901,6 +901,33 @@ mod title_tests {
     fn empty_prompt_yields_an_empty_title() {
         assert_eq!(derive_session_title("   \n  "), "");
     }
+}
+
+/// Answers one question the session's agent is waiting on (S3 of
+/// `agent-question-bridge.md`): the answer becomes the tool's return value, so
+/// the blocked turn continues with what the human chose, typed or confirmed.
+///
+/// Write-through by design. pi minted the request id and sends no response to an
+/// answer, so there is nothing to correlate and nothing to wait for: this reports
+/// only whether the line left for the child. A session that is not running is an
+/// error, never a silent success — the human would otherwise believe they
+/// answered.
+#[tauri::command]
+pub fn answer_ui_request(
+    state: State<'_, AppState>,
+    workspace_id: i64,
+    session_id: i64,
+    request_id: String,
+    answer: UiAnswer,
+) -> Result<(), String> {
+    ensure_session_in_workspace(&state.store, workspace_id, session_id)?;
+    if request_id.trim().is_empty() {
+        return Err("question id is empty".to_string());
+    }
+    state
+        .runtime
+        .answer_ui_request(&session_id.to_string(), &request_id, &answer)
+        .map_err(display_err)
 }
 
 /// Stops the session's pi process, waiting for it to exit (S4).

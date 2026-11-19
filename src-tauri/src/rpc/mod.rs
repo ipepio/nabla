@@ -155,9 +155,106 @@ pub enum AgentEvent {
         #[serde(default, rename = "stderrTail")]
         stderr_tail: Vec<String>,
     },
+    /// A question an extension is asking the human (S2 of
+    /// `agent-question-bridge.md`): the child emitted `extension_ui_request` and
+    /// blocks until the host answers on stdin. Only the four dialog methods are
+    /// typed; the fire-and-forget ones stay in `Other` (see
+    /// `is_dialog_ui_method`).
+    ///
+    /// Wire reference: `pi/docs/rpc-extension-ui.md` —
+    /// `{type, id, method, title, options?, message?, placeholder?, timeout?}`.
+    /// `timeout` is deliberately dropped: Nabla's extension never sets one (S4),
+    /// and a timeout is pi's own auto-resolution, not something the card renders.
+    ExtensionUiRequest {
+        /// The id pi minted for this question; the answer echoes it verbatim.
+        id: String,
+        /// Wire discriminator, kept verbatim: "select" | "confirm" | "input" |
+        /// "editor". A string rather than an enum so a newer pi's method reaches
+        /// the card instead of becoming an undecodable line.
+        method: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// `select` only: the items the human chooses from.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        options: Option<Vec<String>>,
+        /// `confirm` only: the text under the title.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        /// `input` only, optional on the wire.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placeholder: Option<String>,
+    },
     /// Any pi event Nabla does not model yet, kept by its wire `type` so a newer
     /// pi degrades to "unhandled" instead of "dropped without a trace".
     Other { kind: String },
+}
+
+/// The line that answers one `extension_ui_request`, in the field order the
+/// protocol documents (`{"type":"extension_ui_response","id":<uuid>,...}`):
+/// serde_json serializes struct fields in declaration order, and only the one
+/// answer field that is set is emitted.
+#[derive(Serialize)]
+struct UiResponseLine<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confirmed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cancelled: Option<bool>,
+}
+
+/// Builds the exact line written to the child's stdin to answer one
+/// `extension_ui_request` (S2): the host's half of pi's extension UI
+/// sub-protocol — LF terminated, one line, and *not* a request. pi allocates the
+/// id of a question and sends no response to the answer, so `FrameCodec` must
+/// never mint an id for it.
+///
+/// Wire reference: `pi/docs/rpc-extension-ui.md`, "Responses to Pi".
+/// `cancelled` is written as given: the protocol only defines a cancellation, and
+/// `src/contracts/types.ts` types it as the literal `true`.
+pub fn encode_ui_response(request_id: &str, answer: &UiAnswer) -> String {
+    let (value, confirmed, cancelled) = match answer {
+        UiAnswer::Value { value } => (Some(value.as_str()), None, None),
+        UiAnswer::Confirmed { confirmed } => (None, Some(*confirmed), None),
+        UiAnswer::Cancelled { cancelled } => (None, None, Some(*cancelled)),
+    };
+    let response = UiResponseLine {
+        kind: "extension_ui_response",
+        id: request_id,
+        value,
+        confirmed,
+        cancelled,
+    };
+    // An object of scalars always serializes; the fallback is unreachable
+    // bookkeeping, and an empty line would be rejected by pi's parser.
+    let mut line = serde_json::to_string(&response).unwrap_or_default();
+    line.push('\n');
+    line
+}
+
+/// The methods that wait for an answer from the human. Everything else that pi
+/// sends under `extension_ui_request` (`notify`, `setStatus`, `setWidget`,
+/// `setTitle`, `set_editor_text`) is fire-and-forget: typing it as a question
+/// would put a card in the chat that nobody could ever answer (S4 non-goals).
+fn is_dialog_ui_method(method: &str) -> bool {
+    matches!(method, "select" | "confirm" | "input" | "editor")
+}
+
+/// One answer to an `extension_ui_request`, exactly as the webview sends it
+/// across the bridge (S3): a chosen/typed value, a confirmation, or a cancel.
+/// Mirrors `UiAnswer` in `src/contracts/types.ts`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum UiAnswer {
+    /// `select` and `input`: the chosen item or the typed text.
+    Value { value: String },
+    /// `confirm`: the human's yes or no.
+    Confirmed { confirmed: bool },
+    /// Any dialog: the human dismissed it without answering.
+    Cancelled { cancelled: bool },
 }
 
 /// A correlated answer to one request. pi marks responses with
@@ -304,7 +401,17 @@ impl FrameCodec {
             };
         }
         match serde_json::from_value::<AgentEvent>(value) {
-            Ok(event) => Some(Frame::Event(event)),
+            Ok(event) => {
+                // `extension_ui_request` is one wire type for ten methods. Only
+                // the dialogs are modeled; the fire-and-forget ones keep falling
+                // through to `Other`, exactly as they did before the bridge.
+                if let AgentEvent::ExtensionUiRequest { method, .. } = &event
+                    && !is_dialog_ui_method(method)
+                {
+                    return Some(Frame::Event(AgentEvent::Other { kind }));
+                }
+                Some(Frame::Event(event))
+            }
             // A type we do not model yet: keep the name, drop the payload.
             Err(_) => Some(Frame::Event(AgentEvent::Other { kind })),
         }
@@ -519,11 +626,193 @@ mod tests {
         });
         assert_eq!(frames[0], expected);
         // An event that happens to carry an `id` must not be mistaken for a
-        // response (extension_ui_request has one, ipc-contracts.ts:619).
+        // response (extension_ui_request has one, ipc-contracts.ts:619). Since
+        // the question bridge it decodes into its own typed variant instead of
+        // dying in `Other`.
         assert!(matches!(
             &frames[1],
-            Frame::Event(AgentEvent::Other { kind }) if kind == "extension_ui_request"
+            Frame::Event(AgentEvent::ExtensionUiRequest { id, method, .. })
+                if id == "ui-1" && method == "confirm"
         ));
+    }
+
+    #[test]
+    fn decode_extension_ui_request_select_keeps_the_options() {
+        let mut codec = FrameCodec::new();
+        let line = concat!(
+            r#"{"type":"extension_ui_request","id":"ui-select","method":"select","#,
+            r#""title":"Allow dangerous command?","options":["Allow","Block"]}"#, "\n"
+        );
+        let frames = codec.push_bytes(line.as_bytes());
+        assert_eq!(frames.len(), 1);
+        let Frame::Event(event) = &frames[0] else {
+            panic!("expected event, got {:?}", frames[0]);
+        };
+        let expected = AgentEvent::ExtensionUiRequest {
+            id: "ui-select".into(),
+            method: "select".into(),
+            title: Some("Allow dangerous command?".into()),
+            options: Some(vec!["Allow".into(), "Block".into()]),
+            message: None,
+            placeholder: None,
+        };
+        assert_eq!(event, &expected, "typed fields must mirror pi's frame");
+        // The webview mirrors this exact shape (R4, B3), so pin it here.
+        assert_eq!(serde_json::to_value(event).unwrap(), json!({
+            "type": "extension_ui_request",
+            "id": "ui-select",
+            "method": "select",
+            "title": "Allow dangerous command?",
+            "options": ["Allow", "Block"],
+        }));
+    }
+
+    #[test]
+    fn decode_extension_ui_request_confirm_keeps_the_message() {
+        let mut codec = FrameCodec::new();
+        let line = concat!(
+            r#"{"type":"extension_ui_request","id":"ui-confirm","method":"confirm","#,
+            r#""title":"Clear session?","message":"All messages will be lost."}"#, "\n"
+        );
+        let frames = codec.push_bytes(line.as_bytes());
+        let Frame::Event(event) = &frames[0] else {
+            panic!("expected event, got {:?}", frames[0]);
+        };
+        assert_eq!(serde_json::to_value(event).unwrap(), json!({
+            "type": "extension_ui_request",
+            "id": "ui-confirm",
+            "method": "confirm",
+            "title": "Clear session?",
+            "message": "All messages will be lost.",
+        }));
+    }
+
+    #[test]
+    fn decode_extension_ui_request_input_keeps_the_placeholder_when_present() {
+        let mut codec = FrameCodec::new();
+        let chunk = concat!(
+            r#"{"type":"extension_ui_request","id":"ui-input","method":"input","#,
+            r#""title":"Enter a value","placeholder":"type something..."}"#, "\n",
+            r#"{"type":"extension_ui_request","id":"ui-input-2","method":"input","#,
+            r#""title":"Enter a value"}"#, "\n",
+        );
+        let frames = codec.push_bytes(chunk.as_bytes());
+        assert_eq!(frames.len(), 2);
+        let Frame::Event(with_placeholder) = &frames[0] else {
+            panic!("expected event, got {:?}", frames[0]);
+        };
+        assert_eq!(serde_json::to_value(with_placeholder).unwrap(), json!({
+            "type": "extension_ui_request",
+            "id": "ui-input",
+            "method": "input",
+            "title": "Enter a value",
+            "placeholder": "type something...",
+        }));
+        // Without a placeholder the field is absent on the wire and stays absent
+        // in the mirror: never `null`, which a TS optional would also reject.
+        let Frame::Event(without) = &frames[1] else {
+            panic!("expected event, got {:?}", frames[1]);
+        };
+        assert_eq!(serde_json::to_value(without).unwrap(), json!({
+            "type": "extension_ui_request",
+            "id": "ui-input-2",
+            "method": "input",
+            "title": "Enter a value",
+        }));
+    }
+
+    #[test]
+    fn decode_extension_ui_request_ignores_the_optional_timeout() {
+        // A dialog may carry a timeout (S4: our extension never sets one). It is
+        // not part of what the card renders, so decoding must not depend on it.
+        let mut codec = FrameCodec::new();
+        let line = concat!(
+            r#"{"type":"extension_ui_request","id":"ui-timed","method":"confirm","#,
+            r#""title":"Timed","message":"Five seconds.","timeout":5000}"#, "\n"
+        );
+        let frames = codec.push_bytes(line.as_bytes());
+        assert!(matches!(
+            &frames[0],
+            Frame::Event(AgentEvent::ExtensionUiRequest { id, method, message, .. })
+                if id == "ui-timed" && method == "confirm" && message.as_deref() == Some("Five seconds.")
+        ));
+    }
+
+    #[test]
+    fn fire_and_forget_ui_requests_stay_untyped() {
+        // `notify`, `setStatus`, `setWidget`, `setTitle` and `set_editor_text`
+        // share the wire type but never wait for an answer (S4 non-goals).
+        // Typing them would put a question in the chat that nobody can answer.
+        let mut codec = FrameCodec::new();
+        let chunk = concat!(
+            r#"{"type":"extension_ui_request","id":"n-1","method":"notify","message":"hi","notifyType":"info"}"#, "\n",
+            r#"{"type":"extension_ui_request","id":"s-1","method":"setStatus","statusKey":"k","statusText":"t"}"#, "\n",
+            r#"{"type":"extension_ui_request","id":"w-1","method":"setWidget","widgetKey":"k","widgetLines":["a"]}"#, "\n",
+            r#"{"type":"extension_ui_request","id":"t-1","method":"setTitle","title":"pi"}"#, "\n",
+            r#"{"type":"extension_ui_request","id":"e-1","method":"set_editor_text","text":"x"}"#, "\n",
+        );
+        let frames = codec.push_bytes(chunk.as_bytes());
+        assert_eq!(frames.len(), 5);
+        for frame in &frames {
+            assert!(
+                matches!(frame, Frame::Event(AgentEvent::Other { kind }) if kind == "extension_ui_request"),
+                "a fire-and-forget request must stay untyped: {frame:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_ui_response_writes_the_exact_protocol_line() {
+        // One line, LF terminated, no allocated request id: pi answers nothing
+        // and the id is the one pi chose (S2).
+        assert_eq!(
+            encode_ui_response("3f9c-uuid", &UiAnswer::Value { value: "Allow".into() }),
+            "{\"type\":\"extension_ui_response\",\"id\":\"3f9c-uuid\",\"value\":\"Allow\"}\n"
+        );
+        assert_eq!(
+            encode_ui_response("3f9c-uuid", &UiAnswer::Confirmed { confirmed: true }),
+            "{\"type\":\"extension_ui_response\",\"id\":\"3f9c-uuid\",\"confirmed\":true}\n"
+        );
+        assert_eq!(
+            encode_ui_response("3f9c-uuid", &UiAnswer::Cancelled { cancelled: true }),
+            "{\"type\":\"extension_ui_response\",\"id\":\"3f9c-uuid\",\"cancelled\":true}\n"
+        );
+    }
+
+    #[test]
+    fn encode_ui_response_escapes_the_answer_and_keeps_one_line() {
+        let line = encode_ui_response(
+            "uuid",
+            &UiAnswer::Value {
+                value: "a \"quoted\"\nsecond line".into(),
+            },
+        );
+        assert_eq!(line.matches('\n').count(), 1, "exactly one newline: {line:?}");
+        let parsed: Value = serde_json::from_str(line.trim_end()).expect("valid json");
+        assert_eq!(parsed["type"], "extension_ui_response");
+        assert_eq!(parsed["value"], "a \"quoted\"\nsecond line");
+        assert_eq!(parsed["id"], "uuid");
+    }
+
+    #[test]
+    fn ui_answer_deserializes_the_three_documented_shapes() {
+        assert_eq!(
+            serde_json::from_value::<UiAnswer>(json!({"value": "Allow"})).unwrap(),
+            UiAnswer::Value { value: "Allow".into() }
+        );
+        assert_eq!(
+            serde_json::from_value::<UiAnswer>(json!({"confirmed": false})).unwrap(),
+            UiAnswer::Confirmed { confirmed: false }
+        );
+        assert_eq!(
+            serde_json::from_value::<UiAnswer>(json!({"cancelled": true})).unwrap(),
+            UiAnswer::Cancelled { cancelled: true }
+        );
+        // Nothing to answer is not an answer: the shape is a closed set.
+        assert!(
+            serde_json::from_value::<UiAnswer>(json!({})).is_err(),
+            "an empty answer must be rejected"
+        );
     }
 
     #[test]

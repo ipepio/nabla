@@ -77,6 +77,29 @@ export type AgentEvent =
   | { type: "turn_start" }
   | { type: "turn_end"; message: unknown; toolResults: unknown[] }
   | {
+      /**
+       * S2 of `agent-question-bridge.md`: an extension is asking the human a
+       * question and its tool call blocks until it is answered. Mirrors
+       * `AgentEvent::ExtensionUiRequest`.
+       *
+       * `method` is pi's wire discriminator — `"select" | "confirm" | "input" |
+       * "editor"` — and each method fills its own field: `options` for select,
+       * `message` for confirm, `placeholder` for input. Fire-and-forget requests
+       * (`notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text`) share
+       * the wire type but stay `other`: they never wait for an answer, so they
+       * must never become a card nobody can close. pi's optional `timeout` is
+       * deliberately not modeled either: Nabla never sets one (S4).
+       */
+      type: "extension_ui_request";
+      /** pi's request id; the answer echoes it verbatim. */
+      id: string;
+      method: string;
+      title?: string;
+      options?: string[];
+      message?: string;
+      placeholder?: string;
+    }
+  | {
       /** Synthetic Nabla event: a lifecycle transition (S4). */
       type: "process_status";
       status: RuntimeStatus;

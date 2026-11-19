@@ -36,6 +36,17 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             // SQLite creates the file but not its parent directory.
             std::fs::create_dir_all(&data_dir)?;
+            // S1/S2 of `agent-question-bridge.md`: the first-party question
+            // extension is written from the source embedded in this binary, so
+            // `-e` always points at a file that matches this build. Not fatal:
+            // without it sessions run the same, only without the three ask tools.
+            let ask_extension = match process::materialize_ask_extension(&data_dir) {
+                Ok(path) => Some(path),
+                Err(err) => {
+                    eprintln!("could not materialize the question extension: {err}");
+                    None
+                }
+            };
             let store = Store::open(&data_dir.join("nabla.db"))?;
             // S9: the first launch seeds the user's home directory as the default
             // workspace. `app.path()` is Tauri's resolver; `std::env::home_dir`
@@ -54,6 +65,11 @@ pub fn run() {
                 };
                 let _ = handle.emit("agent-event", envelope);
             }));
+            // Every child this app spawns is loaded with that extension (S2).
+            let runtime = match ask_extension {
+                Some(path) => runtime.with_ask_extension(path),
+                None => runtime,
+            };
             // S1/S3 of `pi-cli-bridge.md`: the interactive CLI sessions emit
             // their `{ cliSessionId, stream, line?, exitCode? }` payload on
             // `pi-cli`, the same one-way bridge the runtime uses.
@@ -192,6 +208,10 @@ pub fn run() {
             commands::load_session_preview,
             commands::live_session_ids,
             commands::send_prompt,
+            // S3 of `agent-question-bridge.md`: the human's answer to a question
+            // the agent asked. It writes the protocol line to that session's
+            // child, which is the only channel an `extension_ui_request` has.
+            commands::answer_ui_request,
             commands::stop_session,
             // Per-session actions: pause is the existing stop, delete archives
             // the transcript and removes the row.

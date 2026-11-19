@@ -21,7 +21,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -32,8 +32,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value};
 
 use crate::rpc::{
-    AgentEvent, Frame, FrameCodec, RpcResponse, RuntimeStatus, STARTUP_PROBE_COMMAND,
-    STARTUP_PROBE_ID,
+    AgentEvent, Frame, FrameCodec, RpcResponse, RuntimeStatus, UiAnswer, STARTUP_PROBE_COMMAND,
+    STARTUP_PROBE_ID, encode_ui_response,
 };
 
 /// Startup attempts per `spawn()`: the initial try plus one retry, used ONLY
@@ -297,6 +297,10 @@ pub struct ProcessManager {
     sink: EventSink,
     timeouts: Timeouts,
     sessions: Arc<Mutex<HashMap<String, Arc<SessionProcess>>>>,
+    /// The first-party extension that lets the agent ask the human a question
+    /// (`agent-question-bridge.md`, S2). `None` when it could not be
+    /// materialized: sessions still work, they just cannot ask anything.
+    ask_extension: Option<PathBuf>,
 }
 
 impl ProcessManager {
@@ -309,7 +313,16 @@ impl ProcessManager {
             sink,
             timeouts,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            ask_extension: None,
         }
+    }
+
+    /// Loads the question extension into every child this manager spawns. The
+    /// path is the one `materialize_ask_extension` answered at boot; without it
+    /// the agent has no way to ask the human anything (S1, S2).
+    pub fn with_ask_extension(mut self, path: PathBuf) -> ProcessManager {
+        self.ask_extension = Some(path);
+        self
     }
 
     /// Spawns one headless pi for `key` and waits for readiness, with the single
@@ -372,7 +385,15 @@ impl ProcessManager {
         let pending: Arc<Mutex<HashMap<String, mpsc::SyncSender<RpcResponse>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        let mut child = match build_command(pi_binary, session_file, provider, model, cwd).spawn() {
+        let mut child = match build_command(
+            pi_binary,
+            session_file,
+            provider,
+            model,
+            cwd,
+            self.ask_extension.as_deref(),
+        )
+        .spawn() {
             Ok(child) => child,
             Err(err) => {
                 let message = format!("failed to spawn pi ({pi_binary}): {err}");
@@ -649,6 +670,30 @@ impl ProcessManager {
         }
     }
 
+    /// Answers one pending extension question (S3): the exact
+    /// `extension_ui_response` line goes to the child's stdin, so the agent's
+    /// blocked tool returns the human's answer and the turn continues.
+    ///
+    /// Deliberately not `send`: that allocates one of our request ids and waits
+    /// for a correlated response. pi allocates the question's id, sends no
+    /// answer to an answer, and a minted id here would be a protocol lie.
+    pub fn answer_ui_request(
+        &self,
+        key: &str,
+        request_id: &str,
+        answer: &UiAnswer,
+    ) -> Result<(), ProcessError> {
+        let session = lock(&self.sessions)
+            .get(key)
+            .cloned()
+            .ok_or_else(|| ProcessError::NotRunning(key.to_string()))?;
+        let line = encode_ui_response(request_id, answer);
+        session
+            .stdin
+            .send(StdinMsg::Line(line))
+            .map_err(|err| ProcessError::Transport(err.to_string()))
+    }
+
     /// Stops the session's child: stdin EOF, then signal the whole process tree
     /// after the grace periods. Idempotent, like `stopAndWait` for a dead child.
     pub fn stop_and_wait(&self, key: &str) -> Result<(), ProcessError> {
@@ -747,8 +792,18 @@ struct SessionProcess {
 /// The Nabla identity rides along as an appended system prompt so every session
 /// knows what it is and what it can (and cannot) do; the text is versioned in
 /// `resources/nabla-system-prompt.md` and embedded at compile time.
-fn spawn_args(session_file: &Path, provider: &str, model: &str) -> Vec<String> {
-    vec![
+///
+/// `ask_extension` is the materialized `nabla-ask.ts` (see
+/// `materialize_ask_extension`): `--no-extensions` turns off discovery, and `-e`
+/// loads exactly the extensions Nabla needs back in — the built-in MCP support
+/// and this one.
+fn spawn_args(
+    session_file: &Path,
+    provider: &str,
+    model: &str,
+    ask_extension: Option<&Path>,
+) -> Vec<String> {
+    let mut args = vec![
         "--mode".to_string(),
         "rpc".to_string(),
         "--session".to_string(),
@@ -764,14 +819,43 @@ fn spawn_args(session_file: &Path, provider: &str, model: &str) -> Vec<String> {
         "--no-extensions".to_string(),
         "-e".to_string(),
         "builtin:mcp".to_string(),
-        "--append-system-prompt".to_string(),
-        NABLA_SYSTEM_PROMPT.to_string(),
-    ]
+    ];
+    if let Some(path) = ask_extension {
+        // S1/S2 of `agent-question-bridge.md`: the three ask tools exist only
+        // because this extension is loaded (`-e` survives `--no-extensions`).
+        args.push("-e".to_string());
+        args.push(path.to_string_lossy().to_string());
+    }
+    args.push("--append-system-prompt".to_string());
+    args.push(NABLA_SYSTEM_PROMPT.to_string());
+    args
 }
 
 /// The Nabla identity, embedded at build time from the versioned markdown file
 /// so it never depends on a runtime path or a packaged resource.
 const NABLA_SYSTEM_PROMPT: &str = include_str!("../../../resources/nabla-system-prompt.md");
+
+/// The first-party pi extension that gives the agent its three ask tools (S1,
+/// S2), embedded at build time like the identity above.
+const ASK_EXTENSION_SOURCE: &str = include_str!("../../../resources/nabla-ask.ts");
+
+/// Writes the embedded extension into `<data_dir>/extensions/nabla-ask.ts` and
+/// answers its absolute path, which is what `-e` receives at spawn.
+///
+/// Idempotent by content: the file is only rewritten when it differs from the
+/// source embedded in this binary, so an app update replaces a stale copy and a
+/// plain restart touches nothing. The returned path always exists when this
+/// succeeds.
+pub fn materialize_ask_extension(data_dir: &Path) -> std::io::Result<PathBuf> {
+    let dir = data_dir.join("extensions");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("nabla-ask.ts");
+    let current = std::fs::read_to_string(&path).ok();
+    if current.as_deref() != Some(ASK_EXTENSION_SOURCE) {
+        std::fs::write(&path, ASK_EXTENSION_SOURCE)?;
+    }
+    Ok(path)
+}
 
 /// Exact variable names the engine needs to reach its providers and to run
 /// (interpreter lookups, `~`, node modules).
@@ -827,9 +911,10 @@ fn build_command(
     provider: &str,
     model: &str,
     cwd: &Path,
+    ask_extension: Option<&Path>,
 ) -> Command {
     let mut command = Command::new(pi_binary);
-    command.args(spawn_args(session_file, provider, model));
+    command.args(spawn_args(session_file, provider, model, ask_extension));
     command.current_dir(cwd);
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
@@ -1073,6 +1158,22 @@ printf 'attempt\n' >> '@ATTEMPTS@'
 sleep 30
 "#;
 
+    /// A child that asks the human one question and records every answer line it
+    /// receives on stdin, so the response path is asserted on the bytes the child
+    /// actually read, not on the builder.
+    const FAKE_PI_UI: &str = r#"#!/bin/sh
+printf '%s\n' "$@" >> '@ARGS@'
+printf 'attempt\n' >> '@ATTEMPTS@'
+printf '%s\n' '{"type":"response","id":"__startup_probe__","command":"get_state","success":true,"data":{}}'
+printf '%s\n' '{"type":"extension_ui_request","id":"ui-1","method":"select","title":"Which one?","options":["A","B"]}'
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"extension_ui_response"'*) printf '%s\n' "$line" >> '@ANSWERS@' ;;
+  esac
+done
+printf 'exited\n' >> '@MARKER@'
+"#;
+
     #[cfg(unix)]
     fn write_script(scratch: &Scratch, name: &str, attempts: &Path, marker: &Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -1080,10 +1181,13 @@ sleep 30
         // Every fake script can log its argv here: the file sits next to the
         // script, outside the worktree, and only exists when the script writes it.
         let args_log = path.with_extension("args");
+        // And every script that answers a question logs the lines it read here.
+        let answers_log = path.with_extension("answers");
         let script = body
             .replace("@ATTEMPTS@", &attempts.display().to_string())
             .replace("@MARKER@", &marker.display().to_string())
-            .replace("@ARGS@", &args_log.display().to_string());
+            .replace("@ARGS@", &args_log.display().to_string())
+            .replace("@ANSWERS@", &answers_log.display().to_string());
         std::fs::write(&path, script).expect("write fake pi");
         let mut perms = std::fs::metadata(&path).expect("stat fake pi").permissions();
         perms.set_mode(0o755);
@@ -1095,18 +1199,29 @@ sleep 30
     /// writer is the child process, not the test thread.
     #[cfg(unix)]
     fn recorded_args(scratch: &Scratch, name: &str) -> Vec<String> {
-        let args_log = scratch.path(name).with_extension("args");
+        recorded_lines(&scratch.path(name).with_extension("args"), "arguments")
+    }
+
+    /// Answer lines the fake engine read on stdin, in arrival order.
+    #[cfg(unix)]
+    fn recorded_answers(scratch: &Scratch, name: &str) -> Vec<String> {
+        recorded_lines(&scratch.path(name).with_extension("answers"), "answers")
+    }
+
+    /// Lines a fake engine wrote to its side log, waiting for the child to flush.
+    #[cfg(unix)]
+    fn recorded_lines(path: &Path, what: &str) -> Vec<String> {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Ok(raw) = std::fs::read_to_string(&args_log)
+            if let Ok(raw) = std::fs::read_to_string(path)
                 && !raw.trim().is_empty()
             {
                 return raw.lines().map(|line| line.to_string()).collect();
             }
             assert!(
                 Instant::now() < deadline,
-                "fake pi never recorded its arguments at {}",
-                args_log.display()
+                "fake pi never recorded its {what} at {}",
+                path.display()
             );
             thread::sleep(Duration::from_millis(10));
         }
@@ -1121,12 +1236,16 @@ sleep 30
 
     // S2/S3/S7: the invocation shape. Provider and model are passed per spawn
     // (S7), so pi can never fall back to the provider it would pick on its own.
+    // B1 of `agent-question-bridge.md`: the question extension is loaded with a
+    // second `-e`, next to the built-in MCP support, because `--no-extensions`
+    // leaves pi without any way to ask the human anything.
     #[test]
     fn spawn_args_match_the_pi_rpc_invocation() {
         let args = spawn_args(
             Path::new("/tmp/sessions/1-1700000000.jsonl"),
             "nan",
             "deepseek-v4-flash",
+            Some(Path::new("/tmp/nabla/extensions/nabla-ask.ts")),
         );
         assert_eq!(
             args,
@@ -1142,6 +1261,8 @@ sleep 30
                 "--no-extensions".to_string(),
                 "-e".to_string(),
                 "builtin:mcp".to_string(),
+                "-e".to_string(),
+                "/tmp/nabla/extensions/nabla-ask.ts".to_string(),
                 "--append-system-prompt".to_string(),
                 NABLA_SYSTEM_PROMPT.to_string(),
             ]
@@ -1150,6 +1271,26 @@ sleep 30
         assert!(NABLA_SYSTEM_PROMPT.contains("Nabla"));
         // And it must never claim the terminal harness's identity.
         assert!(!NABLA_SYSTEM_PROMPT.contains("el Gentleman"));
+    }
+
+    // Without a materialized extension the session still has to start: the agent
+    // simply has no ask tools, and the flag list must not carry a dangling `-e`.
+    #[test]
+    fn spawn_args_omit_the_extra_flag_when_no_extension_was_materialized() {
+        let args = spawn_args(Path::new("/tmp/1.jsonl"), "nan", "m", None);
+        // Only the built-in MCP support is loaded back: one `-e` pair, no second.
+        assert_eq!(
+            args.iter().filter(|arg| *arg == "-e").count(),
+            1,
+            "a missing extension must not leave a dangling flag: {args:?}"
+        );
+        assert_eq!(
+            args.iter().filter(|arg| *arg == "builtin:mcp").count(),
+            1,
+            "the MCP flag rides with its own -e: {args:?}"
+        );
+        // The identity is the last flag pair either way.
+        assert_eq!(args.last(), Some(&NABLA_SYSTEM_PROMPT.to_string()));
     }
 
     // The browser pane became drivable when the MCP server landed, and this
@@ -1180,6 +1321,152 @@ sleep 30
         // And what to do when there is nothing to drive. Asserted on a fragment
         // that cannot be split by re-wrapping the file.
         assert!(NABLA_SYSTEM_PROMPT.contains("no view is open"));
+    }
+
+    // B1: the tool list a user can only trust if it is really in the extension.
+    #[test]
+    fn the_question_extension_registers_the_three_ask_tools() {
+        for tool in ["ask_select", "ask_confirm", "ask_input"] {
+            assert!(
+                ASK_EXTENSION_SOURCE.contains(tool),
+                "the extension must register `{tool}`"
+            );
+        }
+        // S2: the tools are dialogs that defer to pi's UI sub-protocol, never a
+        // paraphrase of it.
+        for dialog in ["ctx.ui.select(", "ctx.ui.confirm(", "ctx.ui.input("] {
+            assert!(
+                ASK_EXTENSION_SOURCE.contains(dialog),
+                "the extension must call `{dialog}`"
+            );
+        }
+        // S4: no question carries a timeout, in code or as a field. The word in
+        // prose is fine; the `timeout:` field is what pi would honour.
+        assert!(
+            !ASK_EXTENSION_SOURCE.contains("timeout:"),
+            "a question must never carry a timeout (S4)"
+        );
+        // S2: there is no built-in ask extension, and the identity must never
+        // claim otherwise (L3 of the task doc).
+        assert!(!ASK_EXTENSION_SOURCE.contains("builtin:ask"));
+    }
+
+    // S5: the identity announces the capability, because a capability the prompt
+    // never mentions is half a feature (L8 of `webview-control.md`).
+    #[test]
+    fn the_identity_announces_the_ask_tools() {
+        for tool in ["ask_select", "ask_confirm", "ask_input"] {
+            assert!(
+                NABLA_SYSTEM_PROMPT.contains(tool),
+                "the identity must name `{tool}`"
+            );
+        }
+    }
+
+    // B1: the extension is embedded and written to the data dir at boot, so `-e`
+    // always points at a file that matches this binary.
+    #[test]
+    fn materialize_ask_extension_writes_the_embedded_source_idempotently() {
+        let scratch = Scratch::new("ask_extension");
+        let path = materialize_ask_extension(&scratch.dir).expect("materialize");
+        assert_eq!(path, scratch.dir.join("extensions").join("nabla-ask.ts"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            ASK_EXTENSION_SOURCE
+        );
+        // A second boot answers the same path and rewrites the same bytes.
+        let again = materialize_ask_extension(&scratch.dir).expect("materialize again");
+        assert_eq!(again, path);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            ASK_EXTENSION_SOURCE
+        );
+    }
+
+    // B2 end to end: a request from the child reaches the sink typed, and the
+    // answer reaches the child's stdin as the exact protocol line.
+    #[cfg(unix)]
+    #[test]
+    fn extension_ui_request_is_forwarded_then_answered_on_stdin() {
+        let scratch = Scratch::new("ui_answer");
+        let attempts = scratch.path("attempts");
+        let marker = scratch.path("marker");
+        let script = write_script(&scratch, "fake-pi.sh", &attempts, &marker, FAKE_PI_UI);
+        let collected = Arc::new(Collected::default());
+        let extension = scratch.path("nabla-ask.ts");
+        let manager = ProcessManager::with_timeouts(collected.sink(), test_timeouts())
+            .with_ask_extension(extension.clone());
+
+        let report = manager
+            .spawn(
+                "s1",
+                script.to_str().unwrap(),
+                &scratch.path("s1.jsonl"),
+                TEST_PROVIDER,
+                TEST_MODEL,
+                &scratch.dir,
+            )
+            .expect("spawn");
+        assert_eq!(report.outcome, StartupOutcome::Ready, "stderr: {:?}", report.stderr_tail);
+
+        // The extension path reached the child as a second `-e`.
+        let args = recorded_args(&scratch, "fake-pi.sh");
+        let extension_flag = args
+            .iter()
+            .position(|arg| arg == extension.to_string_lossy().as_ref());
+        let extension_at = extension_flag.expect("-e <path> must reach the child");
+        assert_eq!(args.get(extension_at - 1).map(String::as_str), Some("-e"));
+
+        // The question is typed on the way to the webview.
+        let events = collected.wait_for("extension ui request", |events| {
+            events.iter().any(|(key, event)| {
+                key == "s1" && matches!(event, AgentEvent::ExtensionUiRequest { .. })
+            })
+        });
+        let request = events
+            .iter()
+            .find_map(|(_, event)| match event {
+                AgentEvent::ExtensionUiRequest {
+                    id,
+                    method,
+                    title,
+                    options,
+                    message,
+                    placeholder,
+                } => Some((
+                    id.clone(),
+                    method.clone(),
+                    title.clone(),
+                    options.clone(),
+                    message.clone(),
+                    placeholder.clone(),
+                )),
+                _ => None,
+            })
+            .expect("typed request");
+        assert_eq!(request.0, "ui-1");
+        assert_eq!(request.1, "select");
+        assert_eq!(request.2.as_deref(), Some("Which one?"));
+        assert_eq!(request.3, Some(vec!["A".to_string(), "B".to_string()]));
+        assert_eq!(request.4, None);
+        assert_eq!(request.5, None);
+
+        // The answer reaches the child as one exact line, not as a request.
+        manager
+            .answer_ui_request("s1", "ui-1", &UiAnswer::Value { value: "A".into() })
+            .expect("answer");
+        let answers = recorded_answers(&scratch, "fake-pi.sh");
+        assert_eq!(
+            answers,
+            vec![r#"{"type":"extension_ui_response","id":"ui-1","value":"A"}"#.to_string()]
+        );
+
+        // A session with no child cannot be answered: it is an error, never silence.
+        assert!(matches!(
+            manager.answer_ui_request("ghost", "ui-1", &UiAnswer::Cancelled { cancelled: true }),
+            Err(ProcessError::NotRunning(_))
+        ));
+        manager.stop_all();
     }
 
     // S7: the configured provider and model reach the child process, in the
