@@ -272,6 +272,62 @@ function bodyRect(): {
 }
 
 /**
+ * The platform answer that means the id no longer names a live webview.
+ *
+ * `EmbedError::UnknownView` renders as `embed: no embedded browser <id> is open`,
+ * and both `embed_set_bounds` and `embed_set_visible` answer exactly that when the
+ * registry entry is gone or the webview vanished under it.
+ *
+ * The match is deliberately NARROW — `no embedded browser`, not `embed:` and not
+ * every rejection — because a placement failure, a platform error or a refused
+ * call is a different thing that belongs in the status row: rebuilding the view
+ * there would throw away the page the human was reading to hide a problem that has
+ * nothing to do with the id.
+ *
+ * The honest alternative is a typed rejection across the bridge — a `kind` field
+ * on the error the pane could switch on — which would make a substring match
+ * unnecessary. Until the contract carries one, the message is the only signal
+ * available here, so the narrowest string that identifies this case is the one used.
+ */
+const DEAD_VIEW_MESSAGE = "no embedded browser";
+
+/** Whether one bridge failure says the view this pane holds is gone. */
+function isDeadView(cause: unknown): boolean {
+  return commandErrorMessage(cause).includes(DEAD_VIEW_MESSAGE);
+}
+
+/**
+ * Drops a view the platform says is gone, and rebuilds it once if the pane is drawn.
+ *
+ * Clearing `viewId` is what heals the pane, and it heals three things at once: the
+ * placeholder (`v-if="viewId === null && !creating"`) becomes visible again, so the
+ * body stops reserving gray space for a webview nobody paints; the bounds loop
+ * stops, because `syncBounds` returns early on a null id and the pending throttle
+ * then finds nothing to place; and the toolbar controls go back to disabled instead
+ * of calling into a dead id.
+ *
+ * The rebuild is ONE attempt through the existing `createView`, never a retry loop:
+ * `createView` bails out while a view exists or while one is being built, so a
+ * second failure lands in its own `catch` — the placeholder and the creation error,
+ * which is the honest state. A pane that is not drawn, or whose drawer is collapsed,
+ * has no view by design (see the teardown note), so nothing is rebuilt there and the
+ * watcher that owns that state builds it when it comes back.
+ *
+ * The new view starts at `START_URL`, because the page went away with the webview:
+ * there is nothing left to restore, and pretending otherwise would mean a second
+ * creation path carrying a url this pane can no longer verify.
+ */
+function healDeadView(): void {
+  if (viewId.value === null) return;
+  viewId.value = null;
+  // Nothing is known about the view that replaces this one.
+  appliedRect = null;
+  status.value = null;
+  if (disposed || !drawn.value || !shown.value) return;
+  void createView();
+}
+
+/**
  * Applies the rect now, serialized: a second request while one is in flight is
  * remembered and re-run afterwards rather than stacked, so a drag cannot leave the
  * webview on a stale rect because the newest call resolved first.
@@ -295,9 +351,15 @@ async function syncBounds(): Promise<void> {
     appliedRect = rect;
   } catch (cause) {
     if (!disposed) {
-      status.value = t("tools.browser.layoutError", {
-        message: commandErrorMessage(cause),
-      });
+      // A view that is gone is not a layout failure: healing it is what stops the
+      // pane repeating this error over an empty rect forever.
+      if (isDeadView(cause)) {
+        healDeadView();
+      } else {
+        status.value = t("tools.browser.layoutError", {
+          message: commandErrorMessage(cause),
+        });
+      }
     }
   } finally {
     boundsInFlight = false;
@@ -606,6 +668,12 @@ async function revealView(): Promise<void> {
     await embedSetVisible(id, true);
   } catch (cause) {
     if (disposed) return;
+    if (isDeadView(cause)) {
+      // Showing a view that is gone is the same dead view the bounds sync heals:
+      // one code path, one rebuild — never a second creation path.
+      healDeadView();
+      return;
+    }
     status.value = t("tools.browser.createError", {
       message: commandErrorMessage(cause),
     });
@@ -648,10 +716,13 @@ watch(
       void revealView();
       return;
     }
-    void embedSetVisible(id, false).catch(() => {
+    void embedSetVisible(id, false).catch((cause: unknown) => {
       // The drawer is already hidden, so a status line here would be shown to
       // nobody. Showing the view again re-issues the call, and that path does
-      // report its own failure.
+      // report its own failure — except for a view that is already gone, which is
+      // cleared here so reopening the drawer builds a fresh one instead of trying
+      // to show a dead id (and painting over the app while it does).
+      if (!disposed && isDeadView(cause)) healDeadView();
     });
   },
   { flush: "post" },

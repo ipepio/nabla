@@ -179,16 +179,20 @@ pub fn dispatch(driver: &dyn WebviewDriver, request: &Value) -> Option<Value> {
 /// content the model reads — including failures.
 ///
 /// Every tool but `list_targets` acts on one view, so resolution happens once,
-/// before the tool runs. When no view exists, the nine that need one ask the app
-/// to open the pane (`auto-open-pane.md`, S1/S3) and use what the UI creates with
-/// its own rect. `list_targets` is the tool whose *answer* is the registry: an
-/// empty list is a valid reply, not a failure, so it never asks for a pane.
+/// before the tool runs. When no view exists AND the caller did not name one, the
+/// nine that need a view ask the app to open the pane (`auto-open-pane.md`,
+/// S1/S3) and use what the UI creates with its own rect. A caller that names a
+/// `viewId` is not asking for a pane: it already said which view it means, so an
+/// id that is not open is answered by name, immediately (see [`resolve_view`]).
+/// `list_targets` is the tool whose *answer* is the registry: an empty list is a
+/// valid reply, not a failure, so it never asks for a pane.
 ///
 /// A tool that hits a view which disappeared under it (the human closed the pane
 /// between resolving and using it, or a registry entry outlived its webview) asks
-/// for a pane once and retries once — see the block below the resolution. A view
-/// that goes away twice, or a pane nobody opens, answers [`NO_VIEW_ERROR`]: the
-/// platform's own words would read to the model as a broken app.
+/// for a pane once and retries once — see the block below the resolution, and
+/// [`reopen`] for why a NAMED view never triggers that ask. A view that goes away
+/// twice, or a pane nobody opens, answers [`NO_VIEW_ERROR`]: the platform's own
+/// words would read to the model as a broken app.
 fn call_tool(driver: &dyn WebviewDriver, id: &Value, params: &Value) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     if !TOOL_NAMES.contains(&name) {
@@ -202,7 +206,13 @@ fn call_tool(driver: &dyn WebviewDriver, id: &Value, params: &Value) -> Value {
         return tool_result(id, &targets_text(&views), false);
     }
 
-    if views.is_empty() {
+    // Only the caller that did NOT name a view is asking for one. Naming an id
+    // means "this view, the one I already know about", so an empty registry is
+    // answered by `resolve_view` instead: a diagnostic `get_url` with an explicit
+    // `viewId` used to open the human's drawer and hold the call for the whole
+    // `VIEW_WAIT`, which is the pane competing with the call that only wanted to
+    // read a url.
+    if asked_view.is_none() && views.is_empty() {
         // The ask is bounded, so a pane nobody opens costs a short wait, never a
         // hung call. A false answer is not a failure of the app but a state of it:
         // the human closed the pane, or the Browser tool is off in Settings (S5 —
@@ -252,8 +262,14 @@ fn call_tool(driver: &dyn WebviewDriver, id: &Value, params: &Value) -> Value {
 ///
 /// The `Err` is a message already fit for the model: either the honest no-view
 /// answer, or what `resolve_view` refuses.
+///
+/// A named view is never a request for a pane here either, for the same reason it
+/// is not one above: the caller said which view it means, so a named id that is
+/// gone is re-resolved against the registry as it is now and answered by name —
+/// not replaced with whatever the app would open next. That keeps the second
+/// `ensure_view` in this file obeying the first one's rule.
 fn reopen(driver: &dyn WebviewDriver, asked: Option<&str>) -> Result<LiveView, String> {
-    if !driver.ensure_view(VIEW_WAIT) {
+    if asked.is_none() && !driver.ensure_view(VIEW_WAIT) {
         return Err(NO_VIEW_ERROR.to_string());
     }
     let views = driver.views();
@@ -1632,6 +1648,17 @@ mod tests {
         .expect("answer")
     }
 
+    /// The same call, with the view NAMED — the case that must never open a pane.
+    fn call_named(driver: &dyn WebviewDriver, name: &str, view_id: &str) -> Value {
+        let mut arguments = view_tool_arguments(name);
+        arguments["viewId"] = json!(view_id);
+        dispatch(
+            driver,
+            &request("tools/call", json!({ "name": name, "arguments": arguments })),
+        )
+        .expect("answer")
+    }
+
     fn answer_text(answer: &Value) -> &str {
         answer["result"]["content"][0]["text"]
             .as_str()
@@ -1717,6 +1744,65 @@ mod tests {
         assert_eq!(answer["result"]["isError"], false, "an empty list is an answer");
         assert!(answer_text(&answer).contains("open the browser pane"));
         assert_eq!(driver.asks(), 0, "the registry answers; nothing waits");
+    }
+
+    // A caller that NAMED a view is not asking for one. The defect this pins:
+    // `get_url` with an explicit `viewId` on an empty registry ran the auto-open
+    // and waited the full `VIEW_WAIT`, so a diagnostic call moved the human's
+    // drawer (and hung the caller). Naming an id answers that id's own honest
+    // error, and the app is never asked to open anything.
+    #[test]
+    fn a_named_view_is_never_a_request_to_open_a_pane() {
+        for name in VIEW_TOOLS {
+            // The pane COULD be opened — the fake would register `embed-7` — which
+            // is why the zero asks matter: nothing opens behind the caller's back.
+            let driver = FakeDriver::opening(vec![LiveView {
+                id: "embed-7".to_string(),
+                url: "about:blank".to_string(),
+            }]);
+
+            let answer = call_named(&driver, name, "embed-1");
+
+            assert_eq!(answer["result"]["isError"], true, "{name}");
+            assert_eq!(driver.asks(), 0, "{name} must not ask for a pane");
+            assert_eq!(
+                answer_text(&answer),
+                "no view with id `embed-1`; open now: none",
+                "{name}: the named-missing answer, not the no-view one"
+            );
+            assert!(
+                driver.views().is_empty(),
+                "{name}: nothing was opened behind the caller: {:?}",
+                driver.views()
+            );
+            assert!(driver.navigated.lock().unwrap().is_empty(), "{name}");
+            assert!(driver.evaluated.lock().unwrap().is_empty(), "{name}");
+        }
+    }
+
+    // The same rule inside one call: a NAMED view that disappeared under it is
+    // answered with its own name, not with a pane the caller never asked for.
+    #[test]
+    fn a_named_view_that_disappeared_is_answered_by_name_not_by_a_new_pane() {
+        let driver = FakeDriver::one().with_pane(vec![LiveView {
+            id: "embed-7".to_string(),
+            url: "about:blank".to_string(),
+        }]);
+        driver.answer_navigate([Err(DriverFailure::ViewGone)]);
+
+        let answer = call_named(&driver, "navigate", "embed-1");
+
+        assert_eq!(answer["result"]["isError"], true);
+        assert_eq!(driver.asks(), 0, "no pane is opened for a named id");
+        assert_eq!(
+            answer_text(&answer),
+            "no view with id `embed-1`; open now: none"
+        );
+        assert_eq!(
+            driver.navigated.lock().unwrap().len(),
+            1,
+            "the one attempt on the named view, then the answer"
+        );
     }
 
     // ── a view that disappears under a tool call ─────────────────────────────
