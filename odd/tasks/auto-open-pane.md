@@ -25,9 +25,9 @@ Alcance: cuando una tool de `nabla-browser` necesita una vista y no hay ninguna 
 
 | ID | Tarea | Specs | Riesgo | Estado | Commit |
 | --- | --- | --- | --- | --- | --- |
-| A1 | Rust: `wait_for_first_view(timeout)` en `EmbedSessions` (Condvar notificado en `reserve` y en `close`/`close_all` para abortar); método `ensure_view` en `WebviewDriver` que emite `embed-need-view` y espera acotada; las tools que necesitan vista (las 9, no `list_targets`) lo llaman cuando `views()` está vacío; mensaje de error honesto ampliado (S4). Test-first con fakes (RED). | S1, S3, S4, S5, S6 | medio | pending | |
-| A2 | TS: `onEmbedNeedView` en contracts (patrón existente); App.vue escucha → `toolsOpen = true`, busca pestaña con hoja browser → `activateTab`, o `addTab` + `setTabTool(browser)` → el mount activo crea la vista con su rect (flujo existente, cero cambios en BrowserTool). | S1, S2, S3 | bajo | pending | |
-| A3 | Verificación: `cargo test` + `cargo clippy` + `npm run build`; QA manual (pedir navegación con el drawer cerrado y el browser desactivado/enabled). | — | — | pending | — |
+| A1 | Rust: `wait_for_first_view(timeout)` en `EmbedSessions` (Condvar notificado en `reserve` y en `close`/`close_all` para abortar); método `ensure_view` en `WebviewDriver` que emite `embed-need-view` y espera acotada; las tools que necesitan vista (las 9, no `list_targets`) lo llaman cuando `views()` está vacío; mensaje de error honesto ampliado (S4). Test-first con fakes (RED). | S1, S3, S4, S5, S6 | medio | done | (unidad auto-open) |
+| A2 | TS: `onEmbedNeedView` en contracts (patrón existente); App.vue escucha → `toolsOpen = true`, busca pestaña con hoja browser → `activateTab`, o `addTab` + `setTabTool(browser)` → el mount activo crea la vista con su rect (flujo existente, cero cambios en BrowserTool). | S1, S2, S3 | bajo | done | (unidad auto-open) |
+| A3 | Verificación: `cargo test` + `cargo clippy` + `npm run build`; QA manual (pedir navegación con el drawer cerrado y el browser desactivado/enabled). | — | — | done (340 tests, clippy 1 preexistente, build verde; QA manual entregada) | — |
 
 ## Log
 
@@ -36,3 +36,5 @@ Alcance: cuando una tool de `nabla-browser` necesita una vista y no hay ninguna 
 - **L3** La pregunta A/B/C (abrir+enfocar / abrir silencioso / exigir humano) quedó sin respuesta explícita del usuario; se aplica la recomendación A (abrir+enfocar), ya hecha dos veces sin objeción. Revisable en QA con cambio menor.
 - **L4** Recon (hechos arriba, con paths). Dato que define el diseño: `toolsOpen` es local de App.vue — el listener vive ahí o no existe.
 - **L5** La lección de T2 (`webview-control` L7) se respeta por construcción: Rust pide, la UI crea con su rect. La reversión es de la *decisión* (no auto-crear), no del *principio* (geometría de la UI).
+
+- **L6** **A1-A3 hechos** (unidad auto-open): `EmbedSessions::wait_for_first_view` (Condvar + contador de cierres; notifica `reserve`, y `forget`/`drain` SIEMPRE — para una tool que espera, «esta vista no está» y «no hay nada» son el mismo no); `WebviewDriver::ensure_view` requerido (sin default — los fakes siguen honestos); `EmbedDriver` emite `embed-need-view` con el AppHandle que ya retenía y espera; `call_tool` asegura vista sólo cuando `views()` está vacío, `list_targets` nunca espera; `NO_VIEW_ERROR` nombra las dos causas (panel cerrado / tool desactivada) y manda preguntar al humano. App.vue: `subscribeEmbedNeedView` → `openBrowserPane()` (abre drawer, activa pestaña browser existente o la crea; BrowserTool intacto — su mount activo ya crea la vista con el rect real). 340 tests (10 nuevos), clippy 1 preexistente, `npm run build` verde.
