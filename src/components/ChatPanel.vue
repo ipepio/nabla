@@ -25,6 +25,8 @@ import ThemeToggle from "@/components/chat/ThemeToggle.vue";
 import ChatHeader from "@/components/chat/ChatHeader.vue";
 import Composer from "@/components/chat/Composer.vue";
 import MessageBubble from "@/components/chat/MessageBubble.vue";
+import { draftKeyFor, usePromptDraft } from "@/components/chat/use-prompt-draft";
+import { useThrottledText } from "@/components/chat/use-throttled-text";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -87,8 +89,6 @@ interface StatusAlert {
   text: string;
 }
 
-const prompt = ref("");
-
 /**
  * The click has been taken but pi has not accepted it yet: session creation plus
  * the first RPC round-trip. It is a synchronous latch (set before the first
@@ -122,6 +122,29 @@ const currentSession = computed<SessionDto | null>(() => {
 });
 
 /**
+ * P2 of `chat-polish.md`: where this panel's unsent text is persisted. A session
+ * has its own draft; the state before the first send has no session yet (it is
+ * created when the prompt is handed to pi), so it is keyed by workspace instead —
+ * that is what brings back a prompt typed in a workspace and left unsent.
+ */
+const draftKey = computed<string | null>(() =>
+  draftKeyFor(
+    currentSession.value?.sessionId ?? null,
+    props.workspace?.id ?? null,
+  ),
+);
+
+/**
+ * S2/P2: the composer's text *is* the draft of what it addresses. The composable
+ * restores on a key change (session or workspace switch), saves ~300 ms after the
+ * last keystroke and forgets the draft on `clear()`, which is what sending and
+ * queueing call. Nothing here surfaces a storage failure: the feature degrades to
+ * "not persisted" and the composer keeps working.
+ */
+const draft = usePromptDraft(() => draftKey.value);
+const prompt = draft.text;
+
+/**
  * The buffer of the session on screen. Everything below — transcript, streaming
  * tail, tools, status — is read from here, which is why selecting another
  * session is instant and why a session that was off screen still shows its
@@ -140,6 +163,23 @@ const streamingText = computed(() => buffer.value?.streamingText ?? "");
  */
 const streamingReasoning = computed(() => buffer.value?.streamingReasoning ?? "");
 const liveMessageId = computed(() => buffer.value?.liveMessageId);
+
+/**
+ * P1 of `chat-polish.md`: the live tail is parsed at most every ~120 ms instead
+ * of once per delta. Everything that renders the *streaming* bubble reads this
+ * value — never the raw buffer field — so what is painted and what is throttled
+ * can never disagree.
+ *
+ * The commit at turn end needs no special case here: `flushStreaming` clears
+ * `streamingText` in the same tick it appends the committed message, and the
+ * composable publishes a tail that stopped extending what it had painted
+ * immediately (see `use-throttled-text.ts`). The committed message is rendered
+ * from its own text, so the final words on screen never wait for this throttle.
+ */
+const liveText = useThrottledText(
+  streamingText,
+  () => liveMessageId.value ?? null,
+);
 const transcriptLoading = computed(() =>
   isTranscriptLoading(currentSession.value?.sessionId ?? null),
 );
@@ -505,7 +545,9 @@ function timeLabel(at: string | null): string {
 const transcriptSignature = computed(() =>
   [
     transcript.value.length,
-    streamingText.value.length,
+    // The painted tail, not the buffer's: the follow tracks what grew on screen,
+    // so it steps with the throttle instead of once per delta.
+    liveText.value.length,
     streamingReasoning.value.length,
     tools.value.length,
     errorText.value?.length ?? 0,
@@ -729,6 +771,8 @@ async function handleSelectModel(choice: { provider: string; model: string }) {
 async function handleSend() {
   const text = prompt.value.trim();
   if (text === "") return;
+  // The key the text was typed under, before a send can create its session.
+  const originKey = draftKey.value;
   // S3: with the queue preference on, a prompt typed while the agent works is
   // queued instead of dropped. The guard used to return here for both cases,
   // which silently discarded what the human had just typed — the toggle said
@@ -745,11 +789,11 @@ async function handleSend() {
     if (current === null) return;
     if (isSessionSpawning(current.sessionId)) {
       enqueuePrompt(current.sessionId, text, current.workspaceId);
-      prompt.value = "";
+      draft.clear(originKey);
       return;
     }
     await sendUserTurn(current.sessionId, current.workspaceId, text);
-    prompt.value = "";
+    draft.clear(originKey);
   } catch (cause) {
     // The composer keeps the text: a prompt that never left is still the
     // human's to resend.
@@ -780,7 +824,8 @@ function handleQueue() {
   // prompt is addressable the moment the turn ends — even if the human has
   // moved to another workspace by then.
   enqueuePrompt(current.sessionId, text, current.workspaceId);
-  prompt.value = "";
+  // P2: a queued prompt is not unsent either, so the session's draft goes too.
+  draft.clear();
 }
 
 /**
@@ -1033,11 +1078,11 @@ onUnmounted(() => {
                not merely collapsed — for this turn and for every stored one. -->
           <MessageBubble
             v-if="
-              streamingText !== '' ||
+              liveText !== '' ||
               (showReasoning && streamingReasoning !== '')
             "
             role="assistant"
-            :text="streamingText"
+            :text="liveText"
             :reasoning="
               showReasoning && streamingReasoning !== ''
                 ? streamingReasoning
