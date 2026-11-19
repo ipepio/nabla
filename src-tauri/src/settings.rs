@@ -3,8 +3,16 @@
 // the DB is for what the app accumulates." Settings load whole, write whole.
 // Unknown fields are tolerated (forward-compatible) so older builds still parse
 // files written by newer ones.
+//
+// The permission modes also live here, in two pieces: the preference the human
+// sets (`Settings::permission_mode`) and the decision table that documents what
+// each mode allows (`decide`). The enforcement is the pi extension in
+// `resources/nabla-permissions.ts`, which carries its own copy of that table —
+// the mode reaches it through `<data_dir>/permissions.json`, never through the
+// spawn's environment (L4 of `permission-modes.md`: env is fixed at spawn time,
+// so a mode baked into it could not change without restarting the session).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +52,14 @@ pub struct Settings {
     /// instead of being rejected. An absent field means `true`.
     #[serde(default = "default_true")]
     pub queue_messages: bool,
+    /// S1/S2 of `permission-modes.md`: what the agent may do without asking,
+    /// `"read"` | `"write"` | `"yolo"`. Kept as the raw string the file holds,
+    /// like `language`: an unrecognized value is never rewritten here and reads
+    /// as `"write"` (`Settings::mode`), which is the fail-safe direction (L4).
+    /// An absent field (a file written before this preference existed) means
+    /// `"write"`.
+    #[serde(default = "default_permission_mode")]
+    pub permission_mode: String,
     /// S5 of `tool-drawer-and-mcp.md`: which drawer tools are active, by tool id
     /// (`files`, `changes`, `terminal`, `browser`). Files and Changes ship on; the
     /// two tools that reach outside the app (a real shell, a driven browser) are
@@ -85,6 +101,13 @@ pub fn default_tools() -> Vec<String> {
     vec!["files".to_string(), "changes".to_string()]
 }
 
+/// S6 of `permission-modes.md`: write is the default, so a fresh install (and a
+/// settings file written before the preference existed) keeps today's behaviour
+/// for files and starts asking before commands — the intended change of S6.
+fn default_permission_mode() -> String {
+    PermissionMode::Write.as_str().to_string()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -97,6 +120,7 @@ impl Default for Settings {
             hidden_models: Vec::new(),
             show_reasoning: default_true(),
             queue_messages: default_true(),
+            permission_mode: default_permission_mode(),
             enabled_tools: default_tools(),
         }
     }
@@ -125,6 +149,168 @@ impl std::fmt::Display for SettingsError {
 }
 
 impl std::error::Error for SettingsError {}
+
+// ── permission modes (S1-S6 of `permission-modes.md`) ──────────────────────
+//
+// The ENFORCEMENT of these modes is the pi extension in
+// `resources/nabla-permissions.ts`; what lives here is the preference the human
+// sets and the decision table that documents the contract the extension mirrors
+// (its own copy, because a TypeScript file loaded by pi cannot call Rust). The
+// items below therefore have no in-process caller: they are the table's written
+// form plus its tests, which is why the dead-code lint is silenced item by item
+// here and nowhere else.
+
+/// S1 of `permission-modes.md`: the three permission modes the human picks from
+/// the chat header. `read` only inspects, `write` edits files and asks before a
+/// command, `yolo` asks nothing (and says so, S5).
+///
+/// `Default` is `Write` (S6) and is also what an unknown stored value reads as:
+/// a typo, a truncated write or a value from another build must never degrade
+/// into `yolo` (L4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PermissionMode {
+    Read,
+    #[default]
+    Write,
+    Yolo,
+}
+
+impl PermissionMode {
+    /// Parses one mode word. `None` for anything else, so a caller that must not
+    /// guess (the command that persists the human's choice) can reject it.
+    pub fn parse(raw: &str) -> Option<PermissionMode> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "read" => Some(PermissionMode::Read),
+            "write" => Some(PermissionMode::Write),
+            "yolo" => Some(PermissionMode::Yolo),
+            _ => None,
+        }
+    }
+
+    /// The word the settings file, the projection and the UI all use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PermissionMode::Read => "read",
+            PermissionMode::Write => "write",
+            PermissionMode::Yolo => "yolo",
+        }
+    }
+}
+
+/// What one tool call may do under one mode (S3-S5). `Allow` permits it, `Block`
+/// vetoes it with the reason the model reads (pi turns it into the tool's error
+/// text), and `Ask` hands the decision to the human through the extension's
+/// `ctx.ui.confirm`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // contract mirror: the decision is enforced by the pi extension
+pub enum PermissionDecision {
+    Allow,
+    Block(String),
+    Ask,
+}
+
+/// L3 of `permission-modes.md`: the tools that only inspect, free in every mode.
+#[allow(dead_code)] // contract mirror: read by `decide`, which is itself a mirror
+pub const FREE_TOOLS: &[&str] = &["read", "grep", "find", "ls"];
+
+/// L3: the tools that run a command: blocked in `read`, asked in `write`.
+#[allow(dead_code)] // contract mirror
+pub const SHELL_TOOLS: &[&str] = &["bash", "powershell"];
+
+/// L3: the tools that write a file: blocked in `read`, allowed in `write`.
+#[allow(dead_code)] // contract mirror
+pub const FILE_TOOLS: &[&str] = &["edit", "write"];
+
+/// S3: the veto text for `read` mode. The model reads it as the failed tool's
+/// error, so it has to say what happened, why, and where the human changes it.
+/// The pi extension carries the same wording: this is the contract it mirrors.
+#[allow(dead_code)] // contract mirror: the extension prints this same text
+pub fn read_mode_reason(tool: &str) -> String {
+    format!(
+        "Nabla is in \"read\" mode, so {tool} was blocked and nothing was executed or \
+         written. Read mode only allows inspecting (read, grep, find, ls). The human \
+         set this mode with the permission chip in the chat header and can change it \
+         there; tell them what you need instead of retrying the same call."
+    )
+}
+
+/// S4: the veto text for a command the human did not approve in `write` mode.
+#[allow(dead_code)] // contract mirror: the extension prints this same text
+pub fn command_denied_reason(tool: &str) -> String {
+    format!(
+        "The human did not approve that {tool} command, so it was not run. Do not \
+         retry it as is: ask what to do differently, or propose a step that does not \
+         need the command."
+    )
+}
+
+/// S3-S5: the decision table, as the loaded extension implements it.
+///
+/// `Allow` and `Block` are the whole truth for `read` and `yolo`; `Ask` is what
+/// `write` mode answers for a command, and only the extension can turn it into a
+/// question (the chip reads this table to stay honest about what each mode does).
+/// A tool this build does not name is never gated in v1 (L3): the browser bridge
+/// and the MCP tools reach outside the workspace and are decided in their own
+/// feature, so blocking them here would claim a decision nobody made.
+#[allow(dead_code)] // contract mirror: tests pin the table the extension implements
+pub fn decide(mode: PermissionMode, tool: &str) -> PermissionDecision {
+    let tool = tool.trim();
+    if FREE_TOOLS.contains(&tool) {
+        return PermissionDecision::Allow;
+    }
+    match mode {
+        PermissionMode::Yolo => PermissionDecision::Allow,
+        PermissionMode::Read => {
+            if SHELL_TOOLS.contains(&tool) || FILE_TOOLS.contains(&tool) {
+                PermissionDecision::Block(read_mode_reason(tool))
+            } else {
+                PermissionDecision::Allow
+            }
+        }
+        PermissionMode::Write => {
+            if SHELL_TOOLS.contains(&tool) {
+                PermissionDecision::Ask
+            } else {
+                PermissionDecision::Allow
+            }
+        }
+    }
+}
+
+impl Settings {
+    /// S2/L4: the mode the file holds, with an unknown value reading as `write`
+    /// (never `yolo`): a hand edit that is not one of the three words must not
+    /// uncage the agent.
+    pub fn mode(&self) -> PermissionMode {
+        PermissionMode::parse(&self.permission_mode).unwrap_or_default()
+    }
+}
+
+/// L4: where the loaded pi extension reads the current mode. `<data_dir>` is the
+/// same absolute directory the spawn forwards as `NABLA_DATA_DIR`, so the file
+/// and the reader can only agree.
+pub fn permissions_projection_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("permissions.json")
+}
+
+/// S2/L4: writes `{"mode":"<mode>"}` for the extension to read on its next tool
+/// call. Called at boot and on every change, which is what makes a mode switch
+/// affect the very next call without restarting the session.
+///
+/// Atomic like the settings file: temp file, then rename, so a reader never sees
+/// a half-written projection (and falls back to `write` for no reason).
+pub fn write_permission_projection(data_dir: &Path, mode: PermissionMode) -> SettingsResult<()> {
+    let path = permissions_projection_path(data_dir);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| SettingsError::Io(e.to_string()))?;
+    }
+    let body = serde_json::json!({ "mode": mode.as_str() });
+    let json = serde_json::to_string(&body).map_err(|e| SettingsError::Parse(e.to_string()))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json).map_err(|e| SettingsError::Io(e.to_string()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| SettingsError::Io(e.to_string()))?;
+    Ok(())
+}
 
 pub type SettingsResult<T> = Result<T, SettingsError>;
 
@@ -594,6 +780,184 @@ mod tests {
             !cfg.0.exists(),
             "a rejected request writes no settings file"
         );
+    }
+
+    // ── permission modes (S1-S6 of `permission-modes.md`) ────────────────────
+
+    // S6: write is the default, so a settings file written before this
+    // preference existed (or a fresh install) keeps today's behaviour for files.
+    #[test]
+    fn permission_mode_defaults_to_write() {
+        let s = Settings::default();
+        assert_eq!(s.permission_mode, "write");
+        assert_eq!(s.mode(), PermissionMode::Write);
+
+        // camelCase on the wire, so `types.ts` mirrors this key.
+        let json = serde_json::to_value(Settings::default()).expect("serialize");
+        assert_eq!(json["permissionMode"], serde_json::json!("write"));
+    }
+
+    // The settings header rule + S6: an older file loads as write, and every
+    // other key survives.
+    #[test]
+    fn settings_file_without_permission_mode_loads_as_write() {
+        let cfg = TempCfg::new("pre_permission_mode");
+        std::fs::write(
+            &cfg.0,
+            r#"{"theme":"light","piBinary":"pi","provider":"nan","model":"glm5.3"}"#,
+        )
+        .expect("write fixture");
+        let s = load(&cfg.0).expect("an older settings file must load");
+        assert_eq!(s.theme, "light");
+        assert_eq!(s.permission_mode, "write");
+        assert_eq!(s.mode(), PermissionMode::Write);
+    }
+
+    // S2: the mode is a preference like the others — saved and read back
+    // unchanged, so the chip reflects what the file holds on mount.
+    #[test]
+    fn permission_mode_round_trips() {
+        let cfg = TempCfg::new("permission_mode_roundtrip");
+        for mode in [PermissionMode::Read, PermissionMode::Write, PermissionMode::Yolo] {
+            let s = Settings {
+                permission_mode: mode.as_str().to_string(),
+                ..Settings::default()
+            };
+            save(&cfg.0, &s).expect("save");
+            let loaded = load(&cfg.0).expect("load");
+            assert_eq!(loaded.mode(), mode, "{mode:?} must survive the file");
+            assert_eq!(loaded.permission_mode, mode.as_str());
+        }
+    }
+
+    // L4/fail-safe: a value this build does not know reads as `write`, never as
+    // `yolo` — a typo in the file must not uncage the agent.
+    #[test]
+    fn an_unknown_permission_mode_reads_as_write() {
+        let cfg = TempCfg::new("unknown_permission_mode");
+        std::fs::write(
+            &cfg.0,
+            r#"{"theme":"dark","piBinary":"pi","permissionMode":"lectura"}"#,
+        )
+        .expect("write fixture");
+        let s = load(&cfg.0).expect("load");
+        assert_eq!(s.mode(), PermissionMode::Write);
+    }
+
+    // L3: the four read-only tools are free in every mode — a read mode that
+    // also blocked `read` would leave the agent unable to look at anything.
+    #[test]
+    fn decide_allows_the_free_tools_in_every_mode() {
+        for mode in [PermissionMode::Read, PermissionMode::Write, PermissionMode::Yolo] {
+            for tool in ["read", "grep", "find", "ls"] {
+                assert_eq!(
+                    decide(mode, tool),
+                    PermissionDecision::Allow,
+                    "{tool} in {mode:?}"
+                );
+            }
+        }
+    }
+
+    // S3: read mode blocks every tool that touches the disk or runs a command,
+    // and the reason the model reads names the mode and where to change it.
+    #[test]
+    fn decide_blocks_the_acting_tools_in_read_mode() {
+        for tool in ["bash", "edit", "write", "powershell"] {
+            match decide(PermissionMode::Read, tool) {
+                PermissionDecision::Block(reason) => {
+                    assert!(reason.contains("read"), "{tool}: {reason}");
+                    assert!(reason.contains(tool), "{tool}: {reason}");
+                    assert!(
+                        reason.contains("chat header"),
+                        "the reason must say where the mode is changed: {reason}"
+                    );
+                }
+                other => panic!("{tool} in read mode must be blocked, got {other:?}"),
+            }
+        }
+    }
+
+    // S4: write mode allows file edits and asks before running a command.
+    #[test]
+    fn decide_asks_for_shell_tools_and_allows_file_edits_in_write_mode() {
+        for tool in ["edit", "write"] {
+            assert_eq!(decide(PermissionMode::Write, tool), PermissionDecision::Allow);
+        }
+        for tool in ["bash", "powershell"] {
+            assert_eq!(decide(PermissionMode::Write, tool), PermissionDecision::Ask);
+        }
+    }
+
+    // S5: yolo asks nothing and blocks nothing.
+    #[test]
+    fn decide_allows_everything_in_yolo_mode() {
+        for tool in [
+            "bash",
+            "powershell",
+            "edit",
+            "write",
+            "read",
+            "grep",
+            "find",
+            "ls",
+            "nabla-browser_navigate",
+        ] {
+            assert_eq!(
+                decide(PermissionMode::Yolo, tool),
+                PermissionDecision::Allow,
+                "{tool}"
+            );
+        }
+    }
+
+    // L3: v1 gates three tool families, not every tool that exists: a tool this
+    // build does not know (the browser bridge) is never blocked by this gate.
+    #[test]
+    fn decide_leaves_unknown_tools_alone_in_every_mode() {
+        for mode in [PermissionMode::Read, PermissionMode::Write, PermissionMode::Yolo] {
+            for tool in ["nabla-browser_navigate", "some_future_tool"] {
+                assert_eq!(decide(mode, tool), PermissionDecision::Allow, "{tool} in {mode:?}");
+            }
+        }
+    }
+
+    // The mode reaches a live child by file (L4), so the projection is written
+    // where the extension reads it and is rewritten on every change.
+    #[test]
+    fn write_permission_projection_writes_the_mode_the_extension_reads() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "nabla_permissions_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Deliberately missing: the writer creates it, like the data dir.
+        assert!(!dir.exists());
+
+        write_permission_projection(&dir, PermissionMode::Read).expect("write projection");
+        let path = permissions_projection_path(&dir);
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("permissions.json")
+        );
+        let raw = std::fs::read_to_string(&path).expect("read projection");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&raw).expect("json"),
+            serde_json::json!({ "mode": "read" })
+        );
+
+        // A change overwrites the same file: the extension reads it per call.
+        write_permission_projection(&dir, PermissionMode::Yolo).expect("rewrite projection");
+        let raw = std::fs::read_to_string(&path).expect("read projection");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&raw).expect("json"),
+            serde_json::json!({ "mode": "yolo" })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

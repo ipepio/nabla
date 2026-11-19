@@ -8,6 +8,7 @@
 // the panel owns, and `toggleTheme` asks the panel for the next one (S4: the
 // theme is applied by `src/lib/theme.ts` only).
 import { MoreHorizontalIcon, PanelRightOpenIcon } from "@lucide/vue";
+import PermissionModeChip from "@/components/chat/PermissionModeChip.vue";
 import ThemeToggle from "@/components/chat/ThemeToggle.vue";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -53,6 +54,11 @@ const emit = defineEmits<{
     >
       <PanelRightOpenIcon />
     </Button>
+
+    <!-- Permission mode (S1 of `permission-modes.md`): the mode the agent is
+         obeying, one click away from the next one. The chip persists the choice
+         itself, so the header stays presentation plus one seam call. -->
+    <PermissionModeChip />
 
     <!-- Theme switch: the icon names the *target* palette (sun = light), and
          the panel persists the new mode in settings.json. Shared with the

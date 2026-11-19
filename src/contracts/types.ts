@@ -220,7 +220,25 @@ export interface AppSettings {
    * by the registry, so enabling a future tool early changes nothing.
    */
   enabledTools: string[];
+  /**
+   * S1/S6 of `odd/tasks/permission-modes.md`: the mode the agent obeys, mirrored
+   * from `Settings.permission_mode`. Rust defaults it to `"write"` and reads an
+   * unknown value as `"write"` too, so nothing here may assume `"yolo"`.
+   */
+  permissionMode: PermissionMode;
 }
+
+/**
+ * S1 of `odd/tasks/permission-modes.md`: the three modes, exactly as the file
+ * and the pi extension spell them.
+ *
+ *   `read`  only inspects: `bash`, `powershell`, `edit` and `write` are blocked
+ *   `write` edits files, and ASKS before running a command
+ *   `yolo`  asks nothing at all
+ *
+ * Mirrors `PermissionMode` in `src-tauri/src/settings.rs`.
+ */
+export type PermissionMode = "read" | "write" | "yolo";
 
 /**
  * What `start_session` returns: the registered session, the pi session file it

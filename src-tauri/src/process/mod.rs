@@ -12,6 +12,11 @@
 // - Kill is cross-platform: a whole process group on Unix (`libc::kill(-pid)`),
 //   `taskkill /T` on Windows (S5, fixes the Unix-only defect of Stark
 //   `process_manager.rs:409`).
+// - The child is loaded with Nabla's own extensions (`nabla-ask`, the permission
+//   gate) and never inherits the terminal harness's. The permission gate reads
+//   the current mode from `<data_dir>/permissions.json` through the
+//   `NABLA_DATA_DIR` variable: env is fixed at spawn time, so the MODE is never
+//   in it (L4 of `permission-modes.md`).
 //
 // Wire references (read-only clones):
 // - /tmp/nabla-pi-desktops.vYixxw/FaqFirebase/src/main/pi-rpc-manager.ts
@@ -301,6 +306,15 @@ pub struct ProcessManager {
     /// (`agent-question-bridge.md`, S2). `None` when it could not be
     /// materialized: sessions still work, they just cannot ask anything.
     ask_extension: Option<PathBuf>,
+    /// The permission gate (`permission-modes.md`, M2). `None` when it could not
+    /// be materialized: sessions start the same, and their tools run UNGATED —
+    /// that is the failure mode this field makes visible to the caller (see
+    /// `lib.rs`, which reports it once at boot).
+    permissions_extension: Option<PathBuf>,
+    /// The absolute app data dir the gate reads its projection from (L4). `None`
+    /// means the child never receives `NABLA_DATA_DIR`, so the gate cannot read
+    /// any mode and falls back to `write` on every call — never to `yolo`.
+    data_dir: Option<PathBuf>,
 }
 
 impl ProcessManager {
@@ -314,6 +328,8 @@ impl ProcessManager {
             timeouts,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             ask_extension: None,
+            permissions_extension: None,
+            data_dir: None,
         }
     }
 
@@ -322,6 +338,23 @@ impl ProcessManager {
     /// the agent has no way to ask the human anything (S1, S2).
     pub fn with_ask_extension(mut self, path: PathBuf) -> ProcessManager {
         self.ask_extension = Some(path);
+        self
+    }
+
+    /// Loads the permission gate into every child this manager spawns (`-e`),
+    /// next to the question extension. Without it every tool call runs ungated
+    /// (`permission-modes.md`, M2).
+    pub fn with_permissions_extension(mut self, path: PathBuf) -> ProcessManager {
+        self.permissions_extension = Some(path);
+        self
+    }
+
+    /// Tells every child which absolute data dir holds `permissions.json`, so
+    /// the gate can read the mode on each tool call (L4). The MODE is never
+    /// forwarded: a spawn-time environment could not change without restarting
+    /// the session, which is exactly what S2 forbids.
+    pub fn with_data_dir(mut self, path: PathBuf) -> ProcessManager {
+        self.data_dir = Some(path);
         self
     }
 
@@ -391,7 +424,11 @@ impl ProcessManager {
             provider,
             model,
             cwd,
-            self.ask_extension.as_deref(),
+            SpawnLayout {
+                ask_extension: self.ask_extension.as_deref(),
+                permissions_extension: self.permissions_extension.as_deref(),
+                data_dir: self.data_dir.as_deref(),
+            },
         )
         .spawn() {
             Ok(child) => child,
@@ -783,6 +820,18 @@ struct SessionProcess {
     exit: Arc<ExitSignal>,
 }
 
+/// What a child needs to find Nabla's own extensions and the data dir the
+/// permission gate reads its projection from (L4 of `permission-modes.md`).
+/// Bundled in one value so `spawn_args`/`build_command` stay readable instead of
+/// carrying three more positional `Option`s each.
+#[derive(Debug, Clone, Copy, Default)]
+struct SpawnLayout<'a> {
+    ask_extension: Option<&'a Path>,
+    permissions_extension: Option<&'a Path>,
+    /// Absolute `<data_dir>`; the MODE itself is never part of it.
+    data_dir: Option<&'a Path>,
+}
+
 /// Arguments of the pi RPC invocation. Mirror: Stark `process_manager.rs`
 /// (steps 3 wrongly pin provider/model for every project, so only the two flags
 /// Nabla needs are kept) and `pi-rpc-manager.ts` `buildPiArgs`.
@@ -793,15 +842,16 @@ struct SessionProcess {
 /// knows what it is and what it can (and cannot) do; the text is versioned in
 /// `resources/nabla-system-prompt.md` and embedded at compile time.
 ///
-/// `ask_extension` is the materialized `nabla-ask.ts` (see
-/// `materialize_ask_extension`): `--no-extensions` turns off discovery, and `-e`
-/// loads exactly the extensions Nabla needs back in — the built-in MCP support
-/// and this one.
+/// `layout.ask_extension` is the materialized `nabla-ask.ts` (see
+/// `materialize_ask_extension`) and `layout.permissions_extension` the
+/// materialized `nabla-permissions.ts` (`materialize_permissions_extension`):
+/// `--no-extensions` turns off discovery, and `-e` loads exactly the extensions
+/// Nabla needs back in — the built-in MCP support and these two.
 fn spawn_args(
     session_file: &Path,
     provider: &str,
     model: &str,
-    ask_extension: Option<&Path>,
+    layout: SpawnLayout<'_>,
 ) -> Vec<String> {
     let mut args = vec![
         "--mode".to_string(),
@@ -820,9 +870,16 @@ fn spawn_args(
         "-e".to_string(),
         "builtin:mcp".to_string(),
     ];
-    if let Some(path) = ask_extension {
+    if let Some(path) = layout.ask_extension {
         // S1/S2 of `agent-question-bridge.md`: the three ask tools exist only
         // because this extension is loaded (`-e` survives `--no-extensions`).
+        args.push("-e".to_string());
+        args.push(path.to_string_lossy().to_string());
+    }
+    if let Some(path) = layout.permissions_extension {
+        // M2 of `permission-modes.md`: the gate. Without this flag the agent's
+        // tools run ungated, which is the one failure this feature must make
+        // loud instead of silent.
         args.push("-e".to_string());
         args.push(path.to_string_lossy().to_string());
     }
@@ -839,6 +896,11 @@ const NABLA_SYSTEM_PROMPT: &str = include_str!("../../../resources/nabla-system-
 /// S2), embedded at build time like the identity above.
 const ASK_EXTENSION_SOURCE: &str = include_str!("../../../resources/nabla-ask.ts");
 
+/// The first-party pi extension that gates every tool call by the human's
+/// permission mode (`permission-modes.md`, M2), embedded the same way.
+const PERMISSIONS_EXTENSION_SOURCE: &str =
+    include_str!("../../../resources/nabla-permissions.ts");
+
 /// Writes the embedded extension into `<data_dir>/extensions/nabla-ask.ts` and
 /// answers its absolute path, which is what `-e` receives at spawn.
 ///
@@ -847,12 +909,34 @@ const ASK_EXTENSION_SOURCE: &str = include_str!("../../../resources/nabla-ask.ts
 /// plain restart touches nothing. The returned path always exists when this
 /// succeeds.
 pub fn materialize_ask_extension(data_dir: &Path) -> std::io::Result<PathBuf> {
+    materialize_extension(data_dir, "nabla-ask.ts", ASK_EXTENSION_SOURCE)
+}
+
+/// Writes the permission gate into `<data_dir>/extensions/nabla-permissions.ts`
+/// and answers its absolute path, with the same content-idempotent rule as the
+/// question extension above. On failure the session's tools are UNGATED (there
+/// is no gate to load), so the caller must report it rather than ignore it.
+pub fn materialize_permissions_extension(data_dir: &Path) -> std::io::Result<PathBuf> {
+    materialize_extension(
+        data_dir,
+        "nabla-permissions.ts",
+        PERMISSIONS_EXTENSION_SOURCE,
+    )
+}
+
+/// The one materializer both extensions use: `extensions/<name>` under the data
+/// dir, rewritten only when the embedded bytes differ.
+fn materialize_extension(
+    data_dir: &Path,
+    name: &str,
+    source: &str,
+) -> std::io::Result<PathBuf> {
     let dir = data_dir.join("extensions");
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join("nabla-ask.ts");
+    let path = dir.join(name);
     let current = std::fs::read_to_string(&path).ok();
-    if current.as_deref() != Some(ASK_EXTENSION_SOURCE) {
-        std::fs::write(&path, ASK_EXTENSION_SOURCE)?;
+    if current.as_deref() != Some(source) {
+        std::fs::write(&path, source)?;
     }
     Ok(path)
 }
@@ -911,10 +995,10 @@ fn build_command(
     provider: &str,
     model: &str,
     cwd: &Path,
-    ask_extension: Option<&Path>,
+    layout: SpawnLayout<'_>,
 ) -> Command {
     let mut command = Command::new(pi_binary);
-    command.args(spawn_args(session_file, provider, model, ask_extension));
+    command.args(spawn_args(session_file, provider, model, layout));
     command.current_dir(cwd);
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
@@ -922,6 +1006,13 @@ fn build_command(
     command.env_clear();
     for (name, value) in forwarded_env(std::env::vars()) {
         command.env(name, value);
+    }
+    if let Some(dir) = layout.data_dir {
+        // L4 of `permission-modes.md`: the gate reads `<data_dir>/permissions.json`
+        // on every tool call, so a mode change affects the very next call of a
+        // live session. Only the DIRECTORY travels: the mode itself never does,
+        // because the environment is fixed at spawn time.
+        command.env("NABLA_DATA_DIR", dir);
     }
     #[cfg(unix)]
     {
@@ -1238,14 +1329,22 @@ printf 'exited\n' >> '@MARKER@'
     // (S7), so pi can never fall back to the provider it would pick on its own.
     // B1 of `agent-question-bridge.md`: the question extension is loaded with a
     // second `-e`, next to the built-in MCP support, because `--no-extensions`
-    // leaves pi without any way to ask the human anything.
+    // leaves pi without any way to ask the human anything. M2 of
+    // `permission-modes.md`: the permission gate is the third `-e`, loaded right
+    // after it — a gate nobody loads is a gate that blocks nothing.
     #[test]
     fn spawn_args_match_the_pi_rpc_invocation() {
         let args = spawn_args(
             Path::new("/tmp/sessions/1-1700000000.jsonl"),
             "nan",
             "deepseek-v4-flash",
-            Some(Path::new("/tmp/nabla/extensions/nabla-ask.ts")),
+            SpawnLayout {
+                ask_extension: Some(Path::new("/tmp/nabla/extensions/nabla-ask.ts")),
+                permissions_extension: Some(Path::new(
+                    "/tmp/nabla/extensions/nabla-permissions.ts",
+                )),
+                data_dir: Some(Path::new("/tmp/nabla")),
+            },
         );
         assert_eq!(
             args,
@@ -1263,6 +1362,8 @@ printf 'exited\n' >> '@MARKER@'
                 "builtin:mcp".to_string(),
                 "-e".to_string(),
                 "/tmp/nabla/extensions/nabla-ask.ts".to_string(),
+                "-e".to_string(),
+                "/tmp/nabla/extensions/nabla-permissions.ts".to_string(),
                 "--append-system-prompt".to_string(),
                 NABLA_SYSTEM_PROMPT.to_string(),
             ]
@@ -1274,10 +1375,16 @@ printf 'exited\n' >> '@MARKER@'
     }
 
     // Without a materialized extension the session still has to start: the agent
-    // simply has no ask tools, and the flag list must not carry a dangling `-e`.
+    // simply has no ask tools and no gate, and the flag list must not carry a
+    // dangling `-e`.
     #[test]
     fn spawn_args_omit_the_extra_flag_when_no_extension_was_materialized() {
-        let args = spawn_args(Path::new("/tmp/1.jsonl"), "nan", "m", None);
+        let args = spawn_args(
+            Path::new("/tmp/1.jsonl"),
+            "nan",
+            "m",
+            SpawnLayout::default(),
+        );
         // Only the built-in MCP support is loaded back: one `-e` pair, no second.
         assert_eq!(
             args.iter().filter(|arg| *arg == "-e").count(),
@@ -1380,6 +1487,106 @@ printf 'exited\n' >> '@MARKER@'
         assert_eq!(
             std::fs::read_to_string(&path).expect("read back"),
             ASK_EXTENSION_SOURCE
+        );
+    }
+
+    // M2: the gate is embedded next to the question extension, and a stale copy
+    // under the data dir is replaced (an app update must not keep an old gate).
+    #[test]
+    fn materialize_permissions_extension_writes_the_embedded_source_idempotently() {
+        let scratch = Scratch::new("permissions_extension");
+        let path = materialize_permissions_extension(&scratch.dir).expect("materialize");
+        assert_eq!(
+            path,
+            scratch.dir.join("extensions").join("nabla-permissions.ts")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            PERMISSIONS_EXTENSION_SOURCE
+        );
+        std::fs::write(&path, "// stale gate\n").expect("write stale copy");
+        let again = materialize_permissions_extension(&scratch.dir).expect("rematerialize");
+        assert_eq!(again, path);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            PERMISSIONS_EXTENSION_SOURCE,
+            "a stale gate must be replaced by the embedded one"
+        );
+    }
+
+    // M2: the gate is only a gate if it really reads the mode per call, asks
+    // before a command, and never degrades to `yolo` when it cannot read the
+    // projection (L4: the fail-safe direction is `write`).
+    #[test]
+    fn the_permissions_extension_reads_the_mode_on_every_tool_call() {
+        for needle in [
+            "pi.on(\"tool_call\"",
+            "NABLA_DATA_DIR",
+            "permissions.json",
+            "ctx.hasUI",
+            "ctx.ui.confirm(",
+        ] {
+            assert!(
+                PERMISSIONS_EXTENSION_SOURCE.contains(needle),
+                "the gate must contain `{needle}`"
+            );
+        }
+        // The three modes and the four tools S3 names, spelled out.
+        for word in ["\"read\"", "\"write\"", "\"yolo\""] {
+            assert!(PERMISSIONS_EXTENSION_SOURCE.contains(word), "{word}");
+        }
+        for tool in ["bash", "powershell", "edit", "write"] {
+            assert!(PERMISSIONS_EXTENSION_SOURCE.contains(tool), "{tool}");
+        }
+        // L4: a read failure answers `write`, never `yolo`.
+        assert!(
+            !PERMISSIONS_EXTENSION_SOURCE.contains("return \"yolo\""),
+            "an unreadable projection must never fall back to yolo"
+        );
+        // The sibling-preflight effect is documented where it can be read.
+        assert!(PERMISSIONS_EXTENSION_SOURCE.contains("preflight"));
+    }
+
+    // L4: the child learns WHERE the projection is (`NABLA_DATA_DIR`), never WHAT
+    // the mode is — an environment is fixed at spawn time, so a mode in it could
+    // not change without restarting the session (S2).
+    #[test]
+    fn build_command_forwards_the_data_dir_and_never_the_mode() {
+        let command = build_command(
+            "pi",
+            Path::new("/tmp/1.jsonl"),
+            "nan",
+            "m",
+            Path::new("/tmp"),
+            SpawnLayout {
+                ask_extension: None,
+                permissions_extension: Some(Path::new(
+                    "/data/extensions/nabla-permissions.ts",
+                )),
+                data_dir: Some(Path::new("/data")),
+            },
+        );
+        let envs: Vec<(String, String)> = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().to_string(),
+                    value
+                        .map(|value| value.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        let data_dir = envs
+            .iter()
+            .find(|(name, _)| name == "NABLA_DATA_DIR")
+            .expect("the child must learn where the projection lives");
+        assert_eq!(data_dir.1, "/data");
+        assert!(
+            !envs
+                .iter()
+                .any(|(name, _)| name.to_uppercase().contains("PERMISSION")),
+            "the mode itself must never travel in the environment: {envs:?}"
         );
     }
 

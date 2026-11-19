@@ -47,6 +47,28 @@ pub fn run() {
                     None
                 }
             };
+            // M2 of `permission-modes.md`: the permission gate is written the same
+            // way, from the source embedded in this binary. Not fatal either, but
+            // this is the one failure that must be loud: without the gate every
+            // tool call of every session runs UNGATED (no blocking, no asking).
+            let permissions_extension = match process::materialize_permissions_extension(&data_dir)
+            {
+                Ok(path) => Some(path),
+                Err(err) => {
+                    eprintln!(
+                        "could not materialize the permission gate: {err} — every session's \
+                         tools will run WITHOUT any permission check"
+                    );
+                    None
+                }
+            };
+            // L4 of `permission-modes.md`: the gate reads the current mode from
+            // `<data_dir>/permissions.json` on every tool call, so the projection
+            // has to exist before the first child does. A failure is not fatal —
+            // the gate falls back to `write` when it cannot read — but it is said.
+            if let Err(err) = commands::sync_permission_projection(&config_dir, &data_dir) {
+                eprintln!("could not write the permission projection: {err}");
+            }
             let store = Store::open(&data_dir.join("nabla.db"))?;
             // S9: the first launch seeds the user's home directory as the default
             // workspace. `app.path()` is Tauri's resolver; `std::env::home_dir`
@@ -70,6 +92,15 @@ pub fn run() {
                 Some(path) => runtime.with_ask_extension(path),
                 None => runtime,
             };
+            // ... and with the permission gate, plus the absolute data dir it
+            // reads its projection from (M2, L4). The MODE is never forwarded:
+            // an environment is fixed at spawn time, so it could not change
+            // without restarting the session.
+            let runtime = match permissions_extension {
+                Some(path) => runtime.with_permissions_extension(path),
+                None => runtime,
+            };
+            let runtime = runtime.with_data_dir(data_dir.clone());
             // S1/S3 of `pi-cli-bridge.md`: the interactive CLI sessions emit
             // their `{ cliSessionId, stream, line?, exitCode? }` payload on
             // `pi-cli`, the same one-way bridge the runtime uses.
@@ -193,6 +224,11 @@ pub fn run() {
             commands::list_sessions,
             commands::get_settings,
             commands::save_settings,
+            // S1/S2 of `permission-modes.md`: the chat header's chip reads and
+            // writes the mode, and a write reaches a live session through the
+            // projection file the loaded gate reads on every tool call.
+            commands::get_permission_mode,
+            commands::set_permission_mode,
             // S2 of `settings-dialog.md`: the dialog shows the preferences path
             // and opens that file with the system editor.
             commands::config_file_path,

@@ -18,6 +18,7 @@ import type {
   McpServerSummary,
   ModelInfo,
   ModelOption,
+  PermissionMode,
   PiAuthStatus,
   PiCliEvent,
   PiCliResult,
@@ -97,9 +98,33 @@ export function listSessions(workspaceId: number): Promise<SessionSummary[]> {
 export function getSettings(): Promise<AppSettings> {
   return invoke<AppSettings>("get_settings");
 }
-
 export function saveSettings(settings: AppSettings): Promise<AppSettings> {
   return invoke<AppSettings>("save_settings", { settings });
+}
+
+/**
+ * S2 of `odd/tasks/permission-modes.md`: the mode the agent is obeying right
+ * now, read from `settings.json`. An absent key or a value this build does not
+ * know answers `"write"` (the fail-safe default), so the caller never has to
+ * interpret an empty string.
+ */
+export function getPermissionMode(): Promise<PermissionMode> {
+  return invoke<PermissionMode>("get_permission_mode");
+}
+
+/**
+ * S2: sets the mode the human picked in the chat header. Rust persists it in
+ * `settings.json` with the existing atomic write and rewrites the projection the
+ * loaded pi extension reads on every tool call, which is what makes the change
+ * reach a LIVE session: the very next tool call obeys it, with no restart and no
+ * new spawn. The answer is what the file now holds, so the chip renders the
+ * stored value instead of its own guess.
+ *
+ * A word that is not one of the three rejects before anything is written: the
+ * app never picks a permission level the human did not choose.
+ */
+export function setPermissionMode(mode: PermissionMode): Promise<PermissionMode> {
+  return invoke<PermissionMode>("set_permission_mode", { mode });
 }
 
 /**

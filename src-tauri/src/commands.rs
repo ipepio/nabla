@@ -19,7 +19,7 @@ use crate::providers::{
     ProviderSummary,
 };
 use crate::rpc::{AgentEvent, RuntimeStatus, UiAnswer};
-use crate::settings::{self, Settings};
+use crate::settings::{self, PermissionMode, Settings};
 use crate::shell::{self, ShellSession, ShellSessions, ShellSink};
 use crate::store::{ProviderStatusRow, SessionNew, SessionRow, Store, StoreResult, Workspace};
 use crate::workspace::{FsEntry, FsPreview, GitEntry};
@@ -73,7 +73,9 @@ fn display_err<E: std::fmt::Display>(err: E) -> String {
 }
 
 /// Path of the user-editable preferences file inside a config directory.
-fn settings_file(config_dir: &Path) -> PathBuf {
+/// `pub(crate)` because the setup hook resolves it once at boot to project the
+/// permission mode for the loaded pi extension (`permission-modes.md`, L4).
+pub(crate) fn settings_file(config_dir: &Path) -> PathBuf {
     config_dir.join("settings.json")
 }
 
@@ -432,7 +434,90 @@ pub fn save_settings(
     crate::settings::save(&path, &settings).map_err(display_err)?;
     // Return what the file actually holds, not what was sent: the caller sees
     // the persisted shape (round-tripped through defaults/normalization).
-    crate::settings::load(&path).map_err(display_err)
+    let saved = crate::settings::load(&path).map_err(display_err)?;
+    // S2 of `permission-modes.md`: this file is one of the ways the mode changes,
+    // so the projection the loaded gate reads follows it here too (L4) instead of
+    // only on the dedicated command below.
+    crate::settings::write_permission_projection(&state.data_dir, saved.mode())
+        .map_err(display_err)?;
+    Ok(saved)
+}
+
+// ── permission modes seam (S1-S6 of `permission-modes.md`) ─────────────────
+
+/// S1/S2: the mode the app is in, read from `settings.json`. An absent key (a
+/// file written before this preference existed) or a value this build does not
+/// know answers `write`, the fail-safe default of S6.
+fn permission_mode_for(config_dir: &Path) -> Result<String, String> {
+    let settings = settings::load(&settings_file(config_dir)).map_err(display_err)?;
+    Ok(settings.mode().as_str().to_string())
+}
+
+/// S1/S2: persists one mode and rewrites the projection the loaded extension
+/// reads on every tool call (L4). That rewrite is what makes a change reach a
+/// LIVE session: the environment was fixed at spawn and is never consulted, so
+/// the next tool call already obeys the new mode without a restart.
+///
+/// A word that is not one of the three is rejected before anything is written:
+/// guessing here would silently pick a permission level on the human's behalf.
+fn set_permission_mode_for(
+    config_dir: &Path,
+    data_dir: &Path,
+    mode: &str,
+) -> Result<String, String> {
+    let parsed = PermissionMode::parse(mode).ok_or_else(|| {
+        format!(
+            "unknown permission mode: {mode:?} (expected \"read\", \"write\" or \"yolo\")"
+        )
+    })?;
+    let path = settings_file(config_dir);
+    let mut settings = settings::load(&path).map_err(display_err)?;
+    settings.permission_mode = parsed.as_str().to_string();
+    settings::save(&path, &settings).map_err(display_err)?;
+    settings::write_permission_projection(data_dir, parsed).map_err(display_err)?;
+    Ok(parsed.as_str().to_string())
+}
+
+/// L4: writes `<data_dir>/permissions.json` from whatever the settings file
+/// holds. Called at boot, before any child exists, so the gate reads a real mode
+/// from its very first tool call.
+///
+/// A settings file that does not parse still refreshes the projection, with the
+/// fail-safe `write`: leaving an older — possibly `yolo` — projection behind
+/// would let a broken file uncage the agent.
+pub fn sync_permission_projection(
+    config_dir: &Path,
+    data_dir: &Path,
+) -> Result<PermissionMode, String> {
+    match settings::load(&settings_file(config_dir)) {
+        Ok(settings) => {
+            let mode = settings.mode();
+            settings::write_permission_projection(data_dir, mode).map_err(display_err)?;
+            Ok(mode)
+        }
+        Err(err) => {
+            settings::write_permission_projection(data_dir, PermissionMode::Write)
+                .map_err(display_err)?;
+            Err(display_err(err))
+        }
+    }
+}
+
+/// S1/S2: the current mode, for the chip in the chat header.
+#[tauri::command]
+pub fn get_permission_mode(state: State<'_, AppState>) -> Result<String, String> {
+    permission_mode_for(&state.config_dir)
+}
+
+/// S1/S2: the human's new mode. Persisted in `settings.json` with the existing
+/// atomic write, projected for the live gate, and answered as what the file now
+/// holds — so the chip renders the stored value instead of its own guess.
+#[tauri::command]
+pub fn set_permission_mode(
+    state: State<'_, AppState>,
+    mode: String,
+) -> Result<String, String> {
+    set_permission_mode_for(&state.config_dir, &state.data_dir, &mode)
 }
 
 // ── configuration file seam (S2 of `settings-dialog.md`) ────────────────────
@@ -2497,6 +2582,129 @@ mod tests {
         settings::save(&path, &custom).expect("save custom settings");
         ensure_config_file(&path).expect("keep the existing file");
         assert_eq!(settings::load(&path).expect("load"), custom);
+    }
+
+    // ── permission modes (S1/S2 of `permission-modes.md`) ───────────────────
+
+    /// The mode the loaded gate would read on its next tool call.
+    fn projected_mode(data_dir: &Path) -> String {
+        let raw = std::fs::read_to_string(settings::permissions_projection_path(data_dir))
+            .expect("read the projection");
+        serde_json::from_str::<serde_json::Value>(&raw).expect("projection json")["mode"]
+            .as_str()
+            .expect("mode is a string")
+            .to_string()
+    }
+
+    // S2/L4: setting the mode persists it in `settings.json` AND rewrites the
+    // projection the loaded gate reads on every tool call. The second half is
+    // what makes a change reach a live session instead of the next spawn.
+    #[test]
+    fn set_permission_mode_persists_and_projects() {
+        let fixture = SessionFixture::new("permission_mode");
+        let config_dir = fixture.config_dir();
+        let data_dir = fixture.path("data");
+        assert_eq!(
+            permission_mode_for(&config_dir).expect("read"),
+            "write",
+            "S6: write is the default before anything is written"
+        );
+
+        assert_eq!(
+            set_permission_mode_for(&config_dir, &data_dir, "read").expect("set read"),
+            "read",
+            "the command answers what the file now holds"
+        );
+        assert_eq!(permission_mode_for(&config_dir).expect("read"), "read");
+        assert_eq!(
+            settings::load(&settings_file(&config_dir))
+                .expect("load")
+                .permission_mode,
+            "read"
+        );
+        assert_eq!(projected_mode(&data_dir), "read");
+
+        // The switch of a LIVE session: the very next call reads the new file.
+        assert_eq!(
+            set_permission_mode_for(&config_dir, &data_dir, "yolo").expect("set yolo"),
+            "yolo"
+        );
+        assert_eq!(projected_mode(&data_dir), "yolo");
+    }
+
+    // S1/S2: a word that is not one of the three is rejected before anything is
+    // written — guessing here would pick a permission level for the human — and
+    // a rejected change leaves both files exactly as they were.
+    #[test]
+    fn set_permission_mode_rejects_an_unknown_word_and_writes_nothing() {
+        let fixture = SessionFixture::new("permission_mode_bad");
+        let config_dir = fixture.config_dir();
+        let data_dir = fixture.path("data");
+        set_permission_mode_for(&config_dir, &data_dir, "read").expect("set read");
+        let settings_before = std::fs::read_to_string(settings_file(&config_dir)).expect("settings");
+
+        for bad in ["", "lectura", "yolo!", "read mode"] {
+            let err = set_permission_mode_for(&config_dir, &data_dir, bad).expect_err("reject");
+            assert!(
+                err.contains("unknown permission mode"),
+                "{bad:?} must be rejected with a reason: {err}"
+            );
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(settings_file(&config_dir)).expect("settings"),
+            settings_before,
+            "a rejected mode rewrites nothing"
+        );
+        assert_eq!(projected_mode(&data_dir), "read");
+    }
+
+    // L4: the projection is refreshed from the file at boot, and a settings file
+    // that does not parse leaves the fail-safe `write` behind instead of an older,
+    // possibly permissive projection.
+    #[test]
+    fn sync_permission_projection_falls_back_to_write_when_settings_are_broken() {
+        let fixture = SessionFixture::new("permission_sync");
+        let config_dir = fixture.config_dir();
+        let data_dir = fixture.path("data");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        // A previous run left yolo behind; the file is now unreadable.
+        settings::write_permission_projection(&data_dir, PermissionMode::Yolo)
+            .expect("seed projection");
+        std::fs::write(settings_file(&config_dir), "{ not json").expect("write broken settings");
+
+        assert!(
+            sync_permission_projection(&config_dir, &data_dir).is_err(),
+            "a broken settings file is reported, not hidden"
+        );
+        assert_eq!(
+            projected_mode(&data_dir),
+            "write",
+            "a broken file must never leave the agent uncaged"
+        );
+    }
+
+    // L4: booting from a real file projects the mode it holds, so the first tool
+    // call of the first session already obeys the human's choice.
+    #[test]
+    fn sync_permission_projection_reads_the_stored_mode() {
+        let fixture = SessionFixture::new("permission_sync_ok");
+        let config_dir = fixture.config_dir();
+        let data_dir = fixture.path("data");
+        settings::save(
+            &settings_file(&config_dir),
+            &Settings {
+                permission_mode: "read".to_string(),
+                ..Settings::default()
+            },
+        )
+        .expect("save settings");
+
+        assert_eq!(
+            sync_permission_projection(&config_dir, &data_dir).expect("project"),
+            PermissionMode::Read
+        );
+        assert_eq!(projected_mode(&data_dir), "read");
     }
 
     // ── providers (S1-S4 of `providers-pane.md`) ────────────────────────────
