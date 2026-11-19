@@ -956,6 +956,39 @@ function handleRemoveQueued(index: number) {
 }
 
 /**
+ * S5 of `turn-continuity.md`: continues the turn the human stopped (or one that
+ * was cut short), after the notice inside that turn.
+ *
+ * This is a *new* turn, not a re-run of the previous prompt: the message says the
+ * previous turn did not finish and asks the agent to pick up where it stopped, so
+ * the transcript shows what was asked instead of silently repeating work the
+ * agent already did. It goes through `sendUserTurn`, which is the only path a
+ * human turn is recorded by — and whose own re-open path covers a session whose
+ * pi is no longer live, so there is no second way to reach a child here.
+ *
+ * Guarded like every other send: one prompt at a time, and never while the agent
+ * is still working (the notice only exists on a turn that already ended).
+ */
+async function handleContinue(): Promise<void> {
+  const current = currentSession.value;
+  if (current === null) return;
+  if (agentWorking.value || sending.value || starting.value) return;
+  sending.value = true;
+  panelError.value = null;
+  try {
+    await sendUserTurn(
+      current.sessionId,
+      current.workspaceId,
+      t("chat.turn.continuePrompt"),
+    );
+  } catch (cause) {
+    panelError.value = commandErrorMessage(cause);
+  } finally {
+    sending.value = false;
+  }
+}
+
+/**
  * S3: answers one pending question, which is what unblocks the agent's turn.
  *
  * The question leaves the composer slot only once the line really reached the
@@ -1294,11 +1327,13 @@ onUnmounted(() => {
             :tools="group.tools"
             :answer="group.answer"
             :live="group.live"
+            :interruption="group.interruption"
             :live-text="liveText"
             :live-reasoning="streamingReasoning"
             :live-message-id="liveMessageId"
             :live-tools="group.liveTools"
             :show-reasoning="showReasoning"
+            @continue="handleContinue"
           />
 
           <!-- S3 of `agent-question-bridge.md`: a question the agent is blocked

@@ -47,6 +47,80 @@ pub enum RuntimeStatus {
     Crashed,
 }
 
+/// Why one assistant message stopped (S3 of `turn-continuity.md`).
+///
+/// pi's own vocabulary, verbatim (`docs/message-types.md`): `pending`,
+/// `stop`, `length`, `toolUse`, `error`, `aborted`, `deferred`. The reason is
+/// pi's, not Nabla's, so a word this build does not know becomes `Unknown` and
+/// still crosses the bridge: a newer pi must degrade to "a reason nobody
+/// announces" instead of making the whole `turn_end` frame undecodable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopReason {
+    Pending,
+    Stop,
+    Length,
+    ToolUse,
+    Error,
+    Aborted,
+    Deferred,
+    /// A word from a pi newer than this build, kept exactly as it arrived.
+    Unknown(String),
+}
+
+impl StopReason {
+    /// Decodes one wire word. Total by design: nothing here can fail.
+    pub fn from_wire(word: &str) -> StopReason {
+        match word {
+            "pending" => StopReason::Pending,
+            "stop" => StopReason::Stop,
+            "length" => StopReason::Length,
+            "toolUse" => StopReason::ToolUse,
+            "error" => StopReason::Error,
+            "aborted" => StopReason::Aborted,
+            "deferred" => StopReason::Deferred,
+            other => StopReason::Unknown(other.to_string()),
+        }
+    }
+
+    /// The word pi put on the wire; `Unknown` echoes its own.
+    pub fn as_wire(&self) -> &str {
+        match self {
+            StopReason::Pending => "pending",
+            StopReason::Stop => "stop",
+            StopReason::Length => "length",
+            StopReason::ToolUse => "toolUse",
+            StopReason::Error => "error",
+            StopReason::Aborted => "aborted",
+            StopReason::Deferred => "deferred",
+            StopReason::Unknown(word) => word,
+        }
+    }
+
+    /// The reason an assistant message carries, or `None` when it carries none
+    /// (or carries something that is not a word).
+    pub fn from_message(message: &Value) -> Option<StopReason> {
+        message
+            .get("stopReason")
+            .and_then(Value::as_str)
+            .map(StopReason::from_wire)
+    }
+}
+
+/// Serde writes the wire word, so a reason stays one string on the bridge.
+impl Serialize for StopReason {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_wire())
+    }
+}
+
+/// And reads one: decoding never rejects a word (`StopReason::from_wire`).
+impl<'de> Deserialize<'de> for StopReason {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let word = String::deserialize(deserializer)?;
+        Ok(StopReason::from_wire(&word))
+    }
+}
+
 /// One progressive slice of a message while pi streams it.
 /// Mirror: `ipc-contracts.ts:476-495` `PiMessageUpdateEvent.assistantMessageEvent`
 /// (`type`, `contentIndex`, `delta`). Nabla keeps the discriminator plus the two
@@ -136,6 +210,22 @@ pub enum AgentEvent {
         message: Value,
         #[serde(default, rename = "toolResults")]
         tool_results: Vec<Value>,
+        /// Why the turn ended, lifted out of `message.stopReason` while the frame
+        /// is decoded (S3 of `turn-continuity.md`): absent on a raw pi frame,
+        /// present on everything Nabla forwards.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "stopReason"
+        )]
+        stop_reason: Option<StopReason>,
+        /// pi's own explanation for an `error` stop, lifted the same way.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "errorMessage"
+        )]
+        error_message: Option<String>,
     },
     /// Synthetic Nabla event: a lifecycle transition, carrying the stderr tail
     /// only when the process died (mirrors `PiStatus.error`, see
@@ -241,6 +331,30 @@ pub fn encode_ui_response(request_id: &str, answer: &UiAnswer) -> String {
 /// would put a card in the chat that nobody could ever answer (S4 non-goals).
 fn is_dialog_ui_method(method: &str) -> bool {
     matches!(method, "select" | "confirm" | "input" | "editor")
+}
+
+/// Lifts the end-of-turn report out of `turn_end`'s `message` (S3 of
+/// `turn-continuity.md`).
+///
+/// The message stays whole and untouched — it is pi's shape, not ours — but the
+/// reason it ended becomes typed fields beside it, so the webview reads
+/// `{ stopReason, errorMessage }` instead of poking into a passthrough object.
+/// One place, one rule: every frame Nabla forwards has gone through here.
+fn with_turn_report(mut event: AgentEvent) -> AgentEvent {
+    if let AgentEvent::TurnEnd {
+        message,
+        stop_reason,
+        error_message,
+        ..
+    } = &mut event
+    {
+        *stop_reason = StopReason::from_message(message);
+        *error_message = message
+            .get("errorMessage")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    event
 }
 
 /// One answer to an `extension_ui_request`, exactly as the webview sends it
@@ -410,7 +524,7 @@ impl FrameCodec {
                 {
                     return Some(Frame::Event(AgentEvent::Other { kind }));
                 }
-                Some(Frame::Event(event))
+                Some(Frame::Event(with_turn_report(event)))
             }
             // A type we do not model yet: keep the name, drop the payload.
             Err(_) => Some(Frame::Event(AgentEvent::Other { kind })),
@@ -862,12 +976,118 @@ mod tests {
         let Frame::Event(AgentEvent::TurnEnd {
             message,
             tool_results,
+            stop_reason,
+            error_message,
         }) = &frames[1]
         else {
             panic!("expected turn_end, got {:?}", frames[1]);
         };
         assert_eq!(message, &json!({"role": "assistant"}));
         assert!(tool_results.is_empty());
+        // S3 of `turn-continuity.md`: a turn_end that reports no reason adds no
+        // field, and the message alone is still passed through.
+        assert_eq!(stop_reason, &None);
+        assert_eq!(error_message, &None);
+    }
+
+    // S3 of `turn-continuity.md`: why a turn ended already travels in
+    // `message.stopReason`; the codec used to drop it with the passthrough
+    // message. Each fixture is one word pi sends — including one Nabla does not
+    // model, which must degrade to a typed value instead of demoting the frame
+    // to `Other` and losing the turn.
+    #[test]
+    fn turn_end_projects_the_stop_reason_out_of_the_message() {
+        for word in ["aborted", "length", "error", "stop", "a_reason_from_the_future"] {
+            let mut codec = FrameCodec::new();
+            let line = format!(
+                concat!(
+                    r#"{{"type":"turn_end","message":{{"role":"assistant","#,
+                    r#""stopReason":"{}"}},"toolResults":[]}}"#,
+                    "\n"
+                ),
+                word
+            );
+            let frames = codec.push_bytes(line.as_bytes());
+            assert_eq!(frames.len(), 1);
+            let Frame::Event(event) = &frames[0] else {
+                panic!("expected turn_end for {word:?}, got {:?}", frames[0]);
+            };
+            assert!(
+                matches!(event, AgentEvent::TurnEnd { .. }),
+                "an unmodeled stop reason must not demote the frame to `Other`: {event:?}"
+            );
+            let wire = serde_json::to_value(event).expect("turn_end serializes");
+            assert_eq!(
+                wire["stopReason"],
+                json!(word),
+                "the reason pi sent reaches the webview verbatim"
+            );
+            assert_eq!(
+                wire["message"],
+                json!({"role": "assistant", "stopReason": word}),
+                "the message still travels whole, reason included"
+            );
+        }
+    }
+
+    #[test]
+    fn turn_end_carries_the_error_message_when_pi_sends_one() {
+        let mut codec = FrameCodec::new();
+        let line = concat!(
+            r#"{"type":"turn_end","message":{"role":"assistant","stopReason":"error","#,
+            r#""errorMessage":"provider refused the request"},"toolResults":[]}"#,
+            "\n"
+        );
+        let frames = codec.push_bytes(line.as_bytes());
+        let Frame::Event(event) = &frames[0] else {
+            panic!("expected turn_end, got {:?}", frames[0]);
+        };
+        let wire = serde_json::to_value(event).expect("turn_end serializes");
+        assert_eq!(wire["stopReason"], json!("error"));
+        assert_eq!(wire["errorMessage"], json!("provider refused the request"));
+    }
+
+    #[test]
+    fn turn_end_without_a_reported_reason_omits_both_fields() {
+        // A turn that ended on its own announces nothing (S3): an absent field
+        // says "pi did not report a reason", and it is never `null` on the wire.
+        let mut codec = FrameCodec::new();
+        let frames = codec.push_bytes(
+            b"{\"type\":\"turn_end\",\"message\":{\"role\":\"assistant\"},\"toolResults\":[]}\n",
+        );
+        let Frame::Event(event) = &frames[0] else {
+            panic!("expected turn_end, got {:?}", frames[0]);
+        };
+        let wire = serde_json::to_value(event).expect("turn_end serializes");
+        assert!(
+            wire.get("stopReason").is_none() && wire.get("errorMessage").is_none(),
+            "nothing is invented for a turn pi reported no reason for: {wire}"
+        );
+    }
+
+    #[test]
+    fn stop_reason_round_trips_every_documented_word() {
+        for (word, reason) in [
+            ("pending", StopReason::Pending),
+            ("stop", StopReason::Stop),
+            ("length", StopReason::Length),
+            ("toolUse", StopReason::ToolUse),
+            ("error", StopReason::Error),
+            ("aborted", StopReason::Aborted),
+            ("deferred", StopReason::Deferred),
+            ("word_from_the_future", StopReason::Unknown("word_from_the_future".into())),
+        ] {
+            assert_eq!(StopReason::from_wire(word), reason);
+            assert_eq!(reason.as_wire(), word);
+            assert_eq!(
+                serde_json::to_value(&reason).expect("serializes"),
+                json!(word)
+            );
+            assert_eq!(
+                serde_json::from_value::<StopReason>(json!(word)).expect("decodes"),
+                reason
+            );
+        }
     }
 
     #[test]

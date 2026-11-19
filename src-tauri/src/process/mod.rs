@@ -37,8 +37,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value};
 
 use crate::rpc::{
-    AgentEvent, Frame, FrameCodec, RpcResponse, RuntimeStatus, UiAnswer, STARTUP_PROBE_COMMAND,
-    STARTUP_PROBE_ID, encode_ui_response,
+    AgentEvent, Frame, FrameCodec, RpcResponse, RuntimeStatus, StopReason, UiAnswer,
+    STARTUP_PROBE_COMMAND, STARTUP_PROBE_ID, encode_ui_response,
 };
 
 /// Startup attempts per `spawn()`: the initial try plus one retry, used ONLY
@@ -66,6 +66,15 @@ pub struct Timeouts {
     pub kill_grace: Duration,
     /// Deadline for a request's correlated response.
     pub response: Duration,
+    /// Grace for a stopped turn to settle after `abort` (S2 of
+    /// `turn-continuity.md`) before the child is killed. Two seconds: pi closes
+    /// an aborted turn in-process (it marks the run aborted, unwinds its loop
+    /// and answers the request), so nothing here waits on a model or on a tool
+    /// to finish. It is long enough for a child that is flushing its frames
+    /// through a busy pipe and short enough that a stuck one cannot hold the
+    /// stop, whose kill fallback already takes up to `stop_grace + kill_grace`
+    /// (2.5 s) on top of it.
+    pub abort_grace: Duration,
 }
 
 impl Default for Timeouts {
@@ -76,6 +85,7 @@ impl Default for Timeouts {
             stop_grace: Duration::from_millis(1500),
             kill_grace: Duration::from_millis(1000),
             response: Duration::from_secs(60),
+            abort_grace: Duration::from_secs(2),
         }
     }
 }
@@ -96,6 +106,20 @@ pub enum StartupOutcome {
     // cancellable start exists.
     #[allow(dead_code)]
     Aborted,
+}
+
+/// What one graceful stop ended up doing (S2 of `turn-continuity.md`), so the
+/// caller can tell a session that survived from one that had to be killed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortOutcome {
+    /// pi closed the turn on its own: nothing was killed and the session is
+    /// still alive and addressable.
+    Settled,
+    /// pi did not settle within `abort_grace`: the child was stopped exactly as
+    /// a stop always did before this feature.
+    Killed,
+    /// Nothing was running under the key: nothing to abort and nothing to kill.
+    NotRunning,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +213,48 @@ impl ExitSignal {
     }
 }
 
+/// Settlement latch of one session's current run (S2 of `turn-continuity.md`).
+///
+/// A stop asks pi to `abort` and then waits here instead of killing the child.
+/// pi is what fires it, and it fires on any of the three frames that mean the
+/// run this stop asked about is over:
+///
+/// - `turn_end` with `stopReason: "aborted"` — the turn closed on pi's terms,
+///   carrying the reason the UI announces;
+/// - a successful `abort` response — pi answers that request only once the
+///   session is idle (`docs/rpc-commands.md`), which also covers a stop with no
+///   turn in flight;
+/// - the child's exit — a dead child has nothing left to settle.
+///
+/// It is reset before every stop, so only the settlement of *this* stop can
+/// release it.
+#[derive(Default)]
+struct TurnSettled {
+    fired: Mutex<bool>,
+    settled: Condvar,
+}
+
+impl TurnSettled {
+    fn fire(&self) {
+        *lock(&self.fired) = true;
+        self.settled.notify_all();
+    }
+
+    fn reset(&self) {
+        *lock(&self.fired) = false;
+    }
+
+    /// True when it fired within `timeout`.
+    fn wait(&self, timeout: Duration) -> bool {
+        let guard = lock(&self.fired);
+        let (guard, _) = self
+            .settled
+            .wait_timeout_while(guard, timeout, |fired| !*fired)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard
+    }
+}
+
 /// Locks without panicking: a poisoned lock in a background thread must not turn
 /// into a dead session the host cannot supervise.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -232,17 +298,40 @@ fn set_status(
     next
 }
 
+/// One decoded frame, delivered to the handles that answer for its session.
+/// Bundled so the decode path takes one argument instead of eight (a new handle
+/// is added in one place, not at every call site).
+struct FrameRouting<'a> {
+    /// Registry key of the session these frames belong to.
+    key: &'a str,
+    /// The only bridge from a pi process to the webview (S6).
+    sink: &'a EventSink,
+    /// Correlated waiters of the requests still in flight (R2).
+    pending: &'a Mutex<HashMap<String, mpsc::SyncSender<RpcResponse>>>,
+    /// The startup probe's answer latched: the child is live.
+    ready: &'a AtomicBool,
+    /// Startup outcome of this child, for `await_startup`.
+    startup: &'a mpsc::Sender<StartupSignal>,
+    /// Bounded stderr tail, reported when the child dies (S4).
+    stderr_tail: &'a Mutex<VecDeque<String>>,
+    /// Latch a stop waits on instead of killing (S2 of `turn-continuity.md`).
+    settled: &'a TurnSettled,
+}
+
 /// Routes one decoded frame: responses to their waiting request (or the startup
-/// probe), events to the sink, undecodable lines to the stderr tail.
-fn dispatch_frame(
-    frame: Frame,
-    key: &str,
-    sink: &EventSink,
-    pending: &Mutex<HashMap<String, mpsc::SyncSender<RpcResponse>>>,
-    ready: &AtomicBool,
-    startup: &mpsc::Sender<StartupSignal>,
-    stderr_tail: &Mutex<VecDeque<String>>,
-) {
+/// probe), events to the sink, undecodable lines to the stderr tail — and it is
+/// also where a stop learns that pi closed the turn it asked to abort (S2 of
+/// `turn-continuity.md`).
+fn dispatch_frame(frame: Frame, routing: &FrameRouting<'_>) {
+    let FrameRouting {
+        key,
+        sink,
+        pending,
+        ready,
+        startup,
+        stderr_tail,
+        settled,
+    } = *routing;
     match frame {
         Frame::Response(response) => {
             if response.id.as_deref() == Some(STARTUP_PROBE_ID) {
@@ -251,6 +340,14 @@ fn dispatch_frame(
                 ready.store(true, Ordering::SeqCst);
                 let _ = startup.send(StartupSignal::Ready);
                 return;
+            }
+            // A successful `abort` answer means pi is idle again (S2 of
+            // `turn-continuity.md`): it is the settlement signal of a stop whose
+            // turn had no `turn_end` of its own. Only success settles anything —
+            // a refused abort leaves the run going, so the stop must fall through
+            // to the kill instead of claiming a clean close.
+            if response.success && response.command.as_deref() == Some("abort") {
+                settled.fire();
             }
             // Correlation is the only consumer of responses in Nabla: a stale
             // answer (timeout already fired) has nobody left to tell.
@@ -261,7 +358,20 @@ fn dispatch_frame(
                 let _ = waiter.send(response);
             }
         }
-        Frame::Event(event) => sink(key, &stamp_session(event, key)),
+        Frame::Event(event) => {
+            // A turn pi closed because it was aborted is the settlement a stop
+            // waits for; it is emitted before `agent_end` and `agent_settled`.
+            if matches!(
+                event,
+                AgentEvent::TurnEnd {
+                    stop_reason: Some(StopReason::Aborted),
+                    ..
+                }
+            ) {
+                settled.fire();
+            }
+            sink(key, &stamp_session(event, key))
+        }
         Frame::InvalidLine { reason, .. } => {
             push_stderr(stderr_tail, format!("undecodable pi stdout line: {reason}"));
         }
@@ -415,6 +525,9 @@ impl ProcessManager {
         let ready = Arc::new(AtomicBool::new(false));
         let stderr_tail = Arc::new(Mutex::new(VecDeque::<String>::new()));
         let exit = Arc::new(ExitSignal::new());
+        // S2 of `turn-continuity.md`: the latch a stop waits on. It belongs to the
+        // child, so a stop that settles never has to kill it.
+        let settled = Arc::new(TurnSettled::default());
         let pending: Arc<Mutex<HashMap<String, mpsc::SyncSender<RpcResponse>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
@@ -498,10 +611,20 @@ impl ProcessManager {
             let ready = Arc::clone(&ready);
             let stderr_tail = Arc::clone(&stderr_tail);
             let startup = startup_tx.clone();
+            let settled = Arc::clone(&settled);
             thread::spawn(move || {
                 let mut pipe = pipe;
                 let mut codec = FrameCodec::new();
                 let mut chunk = [0u8; 8192];
+                let routing = FrameRouting {
+                    key: &key_owned,
+                    sink: &sink,
+                    pending: &pending,
+                    ready: &ready,
+                    startup: &startup,
+                    stderr_tail: &stderr_tail,
+                    settled: &settled,
+                };
                 loop {
                     let filled = match pipe.read(&mut chunk) {
                         Ok(0) => break,
@@ -512,28 +635,12 @@ impl ProcessManager {
                         }
                     };
                     for frame in codec.push_bytes(&chunk[..filled]) {
-                        dispatch_frame(
-                            frame,
-                            &key_owned,
-                            &sink,
-                            &pending,
-                            &ready,
-                            &startup,
-                            &stderr_tail,
-                        );
+                        dispatch_frame(frame, &routing);
                     }
                 }
                 // A last line without its newline still belongs to the stream.
                 for frame in codec.finish() {
-                    dispatch_frame(
-                        frame,
-                        &key_owned,
-                        &sink,
-                        &pending,
-                        &ready,
-                        &startup,
-                        &stderr_tail,
-                    );
+                    dispatch_frame(frame, &routing);
                 }
             });
         }
@@ -548,6 +655,7 @@ impl ProcessManager {
             let stderr_tail = Arc::clone(&stderr_tail);
             let pending = Arc::clone(&pending);
             let exit = Arc::clone(&exit);
+            let settled = Arc::clone(&settled);
             thread::spawn(move || {
                 let code = child.wait().ok().and_then(|status| status.code());
                 // Nobody can answer a pending request once the child is gone.
@@ -582,6 +690,10 @@ impl ProcessManager {
                     );
                 }
                 exit.mark(code);
+                // A dead child settles nothing any more: releasing a stop that is
+                // waiting on it here is what keeps a crash from costing the whole
+                // abort grace.
+                settled.fire();
                 let _ = startup_tx.send(StartupSignal::Exited);
             });
         }
@@ -598,6 +710,7 @@ impl ProcessManager {
                     stopping,
                     stderr_tail: Arc::clone(&stderr_tail),
                     exit,
+                    settled,
                 });
                 lock(&self.sessions).insert(key.to_string(), session);
                 set_status(&self.sink, key, &status, RuntimeStatus::Ready, None);
@@ -757,6 +870,56 @@ impl ProcessManager {
         Ok(())
     }
 
+    /// S2 of `turn-continuity.md`: stops the current turn through pi's own
+    /// `abort`, so the turn lands in the transcript with its own stop reason
+    /// instead of dying with the process.
+    ///
+    /// Order, and every step matters:
+    ///
+    /// 1. Reset the settlement latch, so only this stop can release it.
+    /// 2. Write the `abort` frame — one correlated request, like every other
+    ///    command; pi answers it only once the session is idle
+    ///    (`docs/rpc-commands.md`), which is the settlement signal of a stop with
+    ///    no turn in flight.
+    /// 3. Wait up to `abort_grace` (2 s) for the latch: `turn_end` with
+    ///    `stopReason: "aborted"`, the successful `abort` answer, or the child's
+    ///    exit. Two seconds because pi closes an aborted turn in-process — no
+    ///    model call, no tool wait — so the grace only covers flushing its
+    ///    frames; the kill fallback below them costs up to 2.5 s more, and a stop
+    ///    that never returned would be worse than a kill.
+    /// 4. On settlement the child is *not* touched: it keeps its transcript, its
+    ///    registry entry and its stdin, and reads `Ready` again. That is the
+    ///    point of S2 — a stop is a pause, not the end of the session.
+    /// 5. On timeout, or on a child that died while waiting, fall through to
+    ///    `stop_and_wait`: today's kill, unchanged.
+    ///
+    /// Idempotent like `stop_and_wait`: a key with no child is nothing to abort
+    /// and nothing to kill.
+    pub fn abort_and_wait(&self, key: &str) -> Result<AbortOutcome, ProcessError> {
+        let Some(session) = lock(&self.sessions).get(key).cloned() else {
+            return Ok(AbortOutcome::NotRunning);
+        };
+        session.settled.reset();
+        let encoded = lock(&session.codec).encode_request("abort", Map::new());
+        if session.stdin.send(StdinMsg::Line(encoded.line)).is_err() {
+            // stdin is gone: the child cannot settle anything any more, so the
+            // only honest answer is the kill path (which also unregisters it).
+            self.stop_and_wait(key)?;
+            return Ok(AbortOutcome::Killed);
+        }
+        if !session.settled.wait(self.timeouts.abort_grace)
+            || session.exit.wait(Duration::from_millis(0))
+        {
+            // No settlement in time, or the child left while we waited: kill it
+            // exactly as a stop always did.
+            self.stop_and_wait(key)?;
+            return Ok(AbortOutcome::Killed);
+        }
+        // The turn closed on pi's terms: the session stays alive and idle.
+        set_status(&self.sink, key, &session.status, RuntimeStatus::Ready, None);
+        Ok(AbortOutcome::Settled)
+    }
+
     /// Status of a live session, `None` when nothing is running under `key`.
     pub fn status(&self, key: &str) -> Option<SessionSnapshot> {
         let session = lock(&self.sessions).get(key).cloned()?;
@@ -818,6 +981,9 @@ struct SessionProcess {
     stopping: Arc<AtomicBool>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     exit: Arc<ExitSignal>,
+    /// Settlement latch of the current run: what `abort_and_wait` waits on
+    /// instead of killing the child (S2 of `turn-continuity.md`).
+    settled: Arc<TurnSettled>,
 }
 
 /// What a child needs to find Nabla's own extensions and the data dir the
@@ -1094,7 +1260,7 @@ fn run_taskkill(pid: u32, force: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::AgentEvent;
+    use crate::rpc::{AgentEvent, StopReason};
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
@@ -1212,6 +1378,7 @@ mod tests {
             stop_grace: Duration::from_millis(800),
             kill_grace: Duration::from_millis(400),
             response: Duration::from_secs(5),
+            abort_grace: Duration::from_millis(600),
         }
     }
 
@@ -1265,6 +1432,50 @@ done
 printf 'exited\n' >> '@MARKER@'
 "#;
 
+    /// A child that honours `abort` the way pi documents it: it closes the turn
+    /// with `stopReason:"aborted"`, ends the run, settles, answers the request —
+    /// and keeps reading stdin, which is the whole point of S2 (the session
+    /// survives the stop).
+    const FAKE_PI_ABORT: &str = r#"#!/bin/sh
+printf '%s\n' "$@" >> '@ARGS@'
+printf 'attempt\n' >> '@ATTEMPTS@'
+printf '%s\n' '{"type":"response","id":"__startup_probe__","command":"get_state","success":true,"data":{}}'
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"prompt"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+      printf '%s\n' '{"type":"agent_start"}'
+      printf '%s\n' '{"type":"turn_start"}'
+      printf '%s\n' '{"type":"message_update","message":{"role":"assistant"},"assistantMessageEvent":{"type":"text_delta","delta":"working","contentIndex":0}}'
+      printf '{"type":"response","id":"%s","command":"prompt","success":true,"data":null}\n' "$id"
+      ;;
+    *'"type":"abort"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+      printf '%s\n' "$line" >> '@ABORTED@'
+      printf '%s\n' '{"type":"turn_end","message":{"role":"assistant","stopReason":"aborted"},"toolResults":[]}'
+      printf '%s\n' '{"type":"agent_end","messages":[],"willRetry":false}'
+      printf '%s\n' '{"type":"agent_settled","aborted":true}'
+      printf '{"type":"response","id":"%s","command":"abort","success":true}\n' "$id"
+      ;;
+  esac
+done
+printf 'exited\n' >> '@MARKER@'
+"#;
+
+    /// A child that ignores `abort` completely: it records that the request
+    /// arrived and emits nothing else, so only the bounded wait and the kill can
+    /// end the stop.
+    const FAKE_PI_ABORT_DEAF: &str = r#"#!/bin/sh
+printf 'attempt\n' >> '@ATTEMPTS@'
+printf '%s\n' '{"type":"response","id":"__startup_probe__","command":"get_state","success":true,"data":{}}'
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"abort"'*) printf '%s\n' "$line" >> '@ABORTED@' ;;
+  esac
+done
+printf 'exited\n' >> '@MARKER@'
+"#;
+
     #[cfg(unix)]
     fn write_script(scratch: &Scratch, name: &str, attempts: &Path, marker: &Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -1274,11 +1485,14 @@ printf 'exited\n' >> '@MARKER@'
         let args_log = path.with_extension("args");
         // And every script that answers a question logs the lines it read here.
         let answers_log = path.with_extension("answers");
+        // Every script that receives `abort` logs the request line here.
+        let aborted_log = path.with_extension("aborted");
         let script = body
             .replace("@ATTEMPTS@", &attempts.display().to_string())
             .replace("@MARKER@", &marker.display().to_string())
             .replace("@ARGS@", &args_log.display().to_string())
-            .replace("@ANSWERS@", &answers_log.display().to_string());
+            .replace("@ANSWERS@", &answers_log.display().to_string())
+            .replace("@ABORTED@", &aborted_log.display().to_string());
         std::fs::write(&path, script).expect("write fake pi");
         let mut perms = std::fs::metadata(&path).expect("stat fake pi").permissions();
         perms.set_mode(0o755);
@@ -1297,6 +1511,12 @@ printf 'exited\n' >> '@MARKER@'
     #[cfg(unix)]
     fn recorded_answers(scratch: &Scratch, name: &str) -> Vec<String> {
         recorded_lines(&scratch.path(name).with_extension("answers"), "answers")
+    }
+
+    /// Abort request lines the fake engine received, in arrival order.
+    #[cfg(unix)]
+    fn recorded_aborts(scratch: &Scratch, name: &str) -> Vec<String> {
+        recorded_lines(&scratch.path(name).with_extension("aborted"), "aborts")
     }
 
     /// Lines a fake engine wrote to its side log, waiting for the child to flush.
@@ -1875,6 +2095,175 @@ printf 'exited\n' >> '@MARKER@'
             events.iter().any(|(key, event)| key == "s1"
                 && matches!(event, AgentEvent::ProcessExit { code: Some(0), .. })),
             "synthetic process_exit with a clean code: {events:#?}"
+        );
+    }
+
+    // S2 of `turn-continuity.md`: a stop goes through pi's own `abort` and waits
+    // for the turn to settle, so the session — and the turn it just closed —
+    // survive instead of dying with the pipe.
+    #[cfg(unix)]
+    #[test]
+    fn abort_settles_the_turn_and_keeps_the_session_alive() {
+        let scratch = Scratch::new("abort_settles");
+        let attempts = scratch.path("attempts");
+        let marker = scratch.path("marker");
+        let script = write_script(&scratch, "fake-pi.sh", &attempts, &marker, FAKE_PI_ABORT);
+        let collected = Arc::new(Collected::default());
+        let manager = ProcessManager::with_timeouts(collected.sink(), test_timeouts());
+
+        let report = manager
+            .spawn(
+                "s1",
+                script.to_str().unwrap(),
+                &scratch.path("s1.jsonl"),
+                TEST_PROVIDER,
+                TEST_MODEL,
+                &scratch.dir,
+            )
+            .expect("spawn");
+        assert_eq!(report.outcome, StartupOutcome::Ready, "stderr: {:?}", report.stderr_tail);
+
+        // A turn really is running, so the abort has something to close.
+        let prompt = manager
+            .send("s1", "prompt", {
+                let mut map = Map::new();
+                map.insert("message".to_string(), json!("hi"));
+                map
+            })
+            .expect("prompt response");
+        assert!(prompt.success);
+        assert_eq!(manager.status("s1").map(|s| s.status), Some(RuntimeStatus::Running));
+
+        let started = Instant::now();
+        let outcome = manager.abort_and_wait("s1").expect("abort");
+        let waited = started.elapsed();
+
+        assert_eq!(outcome, AbortOutcome::Settled, "pi closed the turn itself");
+        assert!(
+            waited < test_timeouts().abort_grace,
+            "a settled abort returns inside the grace instead of waiting it out: {waited:?}"
+        );
+        // S2: the session survives, addressable, with no kill behind the stop.
+        assert!(
+            manager.contains("s1"),
+            "a settled stop must not unregister the session"
+        );
+        assert_eq!(
+            manager.status("s1").map(|s| s.status),
+            Some(RuntimeStatus::Ready),
+            "the process is idle again, not stopped"
+        );
+        let events = collected.snapshot();
+        assert!(
+            !events
+                .iter()
+                .any(|(_, event)| matches!(event, AgentEvent::ProcessExit { .. })),
+            "nothing was killed, so nothing exited: {events:#?}"
+        );
+        // The turn ended through the protocol, with the reason the UI needs.
+        assert!(
+            events.iter().any(|(key, event)| key == "s1"
+                && matches!(event, AgentEvent::TurnEnd { stop_reason: Some(StopReason::Aborted), .. })),
+            "the aborted turn is forwarded with its reason: {events:#?}"
+        );
+        // The request reached the child as the protocol's own frame, once, with
+        // our id and no empty payload fields.
+        let aborts = recorded_aborts(&scratch, "fake-pi.sh");
+        assert_eq!(aborts.len(), 1, "exactly one abort frame: {aborts:?}");
+        let frame: Value = serde_json::from_str(&aborts[0]).expect("one JSON line");
+        assert_eq!(frame["type"], json!("abort"));
+        assert_eq!(
+            frame["id"],
+            json!("2"),
+            "the id is ours, minted like every other request"
+        );
+        assert_eq!(
+            frame.as_object().map(Map::len),
+            Some(2),
+            "nothing but the type and the id travels: {}",
+            aborts[0]
+        );
+
+        // And the session still takes work: the same child answers a new turn.
+        let again = manager
+            .send("s1", "prompt", {
+                let mut map = Map::new();
+                map.insert("message".to_string(), json!("again"));
+                map
+            })
+            .expect("the session must stay usable after a settled stop");
+        assert!(again.success);
+        assert_eq!(attempts_count(&attempts), 1, "the stop never respawned the child");
+        manager.stop_all();
+    }
+
+    // S2: the fallback is today's behaviour, unchanged. A child that ignores the
+    // abort is killed after the bounded wait, unregistered, and reported Stopped
+    // with its synthetic exit — exactly what a stop did before this feature.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_never_settles_is_killed_after_the_grace() {
+        let scratch = Scratch::new("abort_deaf");
+        let attempts = scratch.path("attempts");
+        let marker = scratch.path("marker");
+        let script = write_script(&scratch, "fake-pi.sh", &attempts, &marker, FAKE_PI_ABORT_DEAF);
+        let collected = Arc::new(Collected::default());
+        let manager = ProcessManager::with_timeouts(collected.sink(), test_timeouts());
+
+        let report = manager
+            .spawn(
+                "s1",
+                script.to_str().unwrap(),
+                &scratch.path("s1.jsonl"),
+                TEST_PROVIDER,
+                TEST_MODEL,
+                &scratch.dir,
+            )
+            .expect("spawn");
+        assert_eq!(report.outcome, StartupOutcome::Ready, "stderr: {:?}", report.stderr_tail);
+
+        let started = Instant::now();
+        let outcome = manager.abort_and_wait("s1").expect("abort");
+        let waited = started.elapsed();
+
+        assert_eq!(outcome, AbortOutcome::Killed, "a child that never settles is killed");
+        assert!(
+            waited >= test_timeouts().abort_grace,
+            "the abort is given its whole grace before the kill: {waited:?}"
+        );
+        assert_eq!(
+            recorded_aborts(&scratch, "fake-pi.sh").len(),
+            1,
+            "the abort was really sent before the kill"
+        );
+        assert!(
+            !manager.contains("s1"),
+            "a killed session is no longer registered"
+        );
+        assert_eq!(manager.status("s1"), None);
+        let events = collected.wait_for("stopped status", |events| {
+            statuses(events).contains(&RuntimeStatus::Stopped)
+        });
+        assert!(
+            events.iter().any(|(key, event)| key == "s1"
+                && matches!(event, AgentEvent::ProcessExit { code: Some(0), .. })),
+            "the kill still reports the synthetic exit: {events:#?}"
+        );
+    }
+
+    // S2 keeps `stop_and_wait`'s contract on this new path too: a stop for a key
+    // nothing runs under is nothing to abort and nothing to kill, not an error.
+    #[test]
+    fn abort_without_a_session_reports_nothing_running() {
+        let collected = Arc::new(Collected::default());
+        let manager = ProcessManager::with_timeouts(collected.sink(), test_timeouts());
+        assert_eq!(
+            manager.abort_and_wait("ghost").expect("idempotent"),
+            AbortOutcome::NotRunning
+        );
+        assert!(
+            collected.snapshot().is_empty(),
+            "nothing to stop, nothing announced"
         );
     }
 

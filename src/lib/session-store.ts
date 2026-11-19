@@ -25,7 +25,7 @@ import {
   startSession,
   subscribeAgentEvents,
 } from "../contracts/commands";
-import type { AgentEvent, RuntimeStatus } from "../contracts/agent-events";
+import type { AgentEvent, RuntimeStatus, StopReason } from "../contracts/agent-events";
 import type {
   PreviewMessage,
   SessionDto,
@@ -91,12 +91,38 @@ export interface ChatMessage {
   /** The turn's reasoning, absent when pi streamed none. */
   reasoning?: string;
   /**
+   * Why this turn did not end on its own, when it did not (S3 of
+   * `turn-continuity.md`): `aborted`, `length` or `error`, with pi's own
+   * explanation when it sent one.
+   *
+   * It belongs to the turn, not to one of its steps or chips, so the panel can
+   * say so beside the exchange and offer to continue it. UI-only state like
+   * `reasoning`: nothing about it is persisted, and a transcript recovered from
+   * pi's file or from the stored preview carries none.
+   */
+  interruption?: TurnInterruption;
+  /**
    * Present when this entry is a question the agent asked and the human
    * answered (or cancelled), rather than a line of dialogue (S3 of
    * `agent-question-bridge.md`). The panel renders it as the settled card, so
    * the exchange stays in the conversation after the request is gone.
    */
   question?: SettledQuestion;
+}
+
+/**
+ * Why one turn was cut short (S3 of `turn-continuity.md`), as pi reported it.
+ *
+ * Only the reasons that mean "this turn did not end on its own" are kept: a
+ * normal `stop` or `toolUse`, pi's `pending` placeholder and its own `deferred`
+ * queueing announce nothing, and neither does a word from a pi newer than this
+ * build — an unknown reason is never guessed into an alarming notice.
+ */
+export interface TurnInterruption {
+  /** pi's word: `aborted` | `length` | `error`. */
+  stopReason: StopReason;
+  /** What pi said went wrong, for an `error` stop; `null` when it said nothing. */
+  errorMessage: string | null;
 }
 
 /**
@@ -525,6 +551,58 @@ function flushStreaming(sessionId: string, buffer: SessionBuffer): void {
 }
 
 /**
+ * S3 of `turn-continuity.md`: the reasons that mean the turn did not end on its
+ * own, and are therefore announced. `stop` and `toolUse` are a normal turn
+ * (`toolUse` merely hands the turn to its next step), `pending` is pi's own
+ * placeholder for a message still being written and `deferred` is its queueing.
+ * A reason from a newer pi is not guessed into a notice either.
+ */
+function isInterruption(stopReason: StopReason): boolean {
+  return (
+    stopReason === "aborted" || stopReason === "length" || stopReason === "error"
+  );
+}
+
+/**
+ * S3/S4: records why the turn that just ended stopped, so the panel can say it
+ * inside that turn and offer to continue it.
+ *
+ * It is attached to the turn, never to a step or a chip: the turn it belongs to
+ * is the human line that opened it (`buffer.turnId`), which is still there when
+ * the cut turn wrote nothing at all — the empty assistant turn is exactly the
+ * case this notice exists for. A turn with no opening line (the agent resumed on
+ * its own) hangs it on the step that did land; a turn that produced neither gets
+ * no notice, because there is nothing on screen to put it beside.
+ */
+function recordInterruption(
+  buffer: SessionBuffer,
+  stopReason: StopReason | undefined,
+  errorMessage: string | undefined,
+): void {
+  if (stopReason === undefined || !isInterruption(stopReason)) return;
+  const interruption: TurnInterruption = {
+    stopReason,
+    errorMessage:
+      errorMessage === undefined || errorMessage === "" ? null : errorMessage,
+  };
+  const opener =
+    buffer.turnId === null
+      ? undefined
+      : buffer.transcript.find((message) => message.id === buffer.turnId);
+  if (opener !== undefined) {
+    opener.interruption = interruption;
+    return;
+  }
+  for (let index = buffer.transcript.length - 1; index >= 0; index -= 1) {
+    const message = buffer.transcript[index];
+    if (message !== undefined && message.role === "assistant") {
+      message.interruption = interruption;
+      return;
+    }
+  }
+}
+
+/**
  * Pushes one human turn into the transcript and returns its id. Called from the
  * direct send path and from the queue once a prompt is actually handed to pi.
  */
@@ -943,6 +1021,31 @@ function pushTool(
   });
 }
 
+/**
+ * Closes the turn that just ended: the streaming tail becomes a message, the
+ * preview is snapshotted, the drawer is told there was activity and the next
+ * queued prompt may go out. `turn_end` and `agent_end` both close a turn, so
+ * both come through here; only `turn_end` carries the reason the turn ended.
+ */
+function finishTurn(sessionId: string, buffer: SessionBuffer): void {
+  // Belt to the `done` slice above: a stream that ends without one still lands
+  // in the transcript instead of vanishing.
+  flushStreaming(sessionId, buffer);
+  // The finished turn is exactly what an open will paint next time, so the
+  // snapshot is taken here and nowhere else: after the flush, the buffer is the
+  // whole conversation including this turn's reasoning.
+  snapshotPreview(sessionId, buffer);
+  // A finished turn is activity the drawer must see: bump the generation so the
+  // session list re-reads and the row moves up now, instead of waiting for the
+  // next poll tick.
+  sessionGeneration.value += 1;
+  // S3: a finished turn releases the next queued prompt, so nothing ever talks
+  // to pi while it is working. Flushing first keeps the conversation in order:
+  // the answer lands above the next question. This is one of the two drains; the
+  // other is the process becoming live (see `drainQueue`).
+  drainQueue(sessionId, buffer);
+}
+
 /** Applies one forwarded pi event to the buffer of the session it belongs to. */
 function applyEvent(sessionId: string, event: AgentEvent): void {
   const buffer = ensureBuffer(sessionId);
@@ -1015,23 +1118,14 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
       return;
     }
     case "turn_end":
+      // S3 of `turn-continuity.md`: the turn that just ended may have been cut,
+      // and pi sends the reason with it. Recorded as the turn closes, so the
+      // notice and its button are part of that turn from the start.
+      recordInterruption(buffer, event.stopReason, event.errorMessage);
+      finishTurn(sessionId, buffer);
+      return;
     case "agent_end":
-      // Belt to the `done` slice above: a stream that ends without one still
-      // lands in the transcript instead of vanishing.
-      flushStreaming(sessionId, buffer);
-      // The finished turn is exactly what an open will paint next time, so the
-      // snapshot is taken here and nowhere else: after the flush, the buffer is
-      // the whole conversation including this turn's reasoning.
-      snapshotPreview(sessionId, buffer);
-      // A finished turn is activity the drawer must see: bump the generation so
-      // the session list re-reads and the row moves up now, instead of waiting
-      // for the next poll tick.
-      sessionGeneration.value += 1;
-      // S3: a finished turn releases the next queued prompt, so nothing ever
-      // talks to pi while it is working. Flushing first keeps the conversation
-      // in order: the answer lands above the next question. This is one of the
-      // two drains; the other is the process becoming live (see `drainQueue`).
-      drainQueue(sessionId, buffer);
+      finishTurn(sessionId, buffer);
       return;
     case "process_status": {
       const previous = buffer.status;
@@ -1420,6 +1514,22 @@ export function recordSessionStatus(
     // blocked on an answer that can never arrive, so each one settles as
     // cancelled instead of disappearing.
     buffer.busy = false;
+    clearQuestions(sessionId, buffer);
+  } else if (buffer.busy) {
+    // S2 of `turn-continuity.md`: the stop settled and the session survived (a
+    // stop is a pause, not a kill), so no `process_status` transition will lower
+    // the spinner. This function only runs for a transition the human asked for,
+    // so the reason is not in doubt — it was stopped by hand — and the turn that
+    // ends here is still a turn: it says "you stopped this turn" and offers to
+    // continue it, even when pi closed the run without a `turn_end` of its own
+    // (a retry or a compaction ends the run before any turn).
+    buffer.busy = false;
+    flushStreaming(sessionId, buffer);
+    recordInterruption(buffer, "aborted", undefined);
+    // The open questions die with the turn that asked them: pi aborted the tool
+    // call that was waiting, so an answer can no longer reach it. Settling them
+    // as cancelled is the same rule the stopped-process path follows, and it is
+    // what gives the composer back instead of leaving a card nobody can close.
     clearQuestions(sessionId, buffer);
   }
   markLive(sessionId, status);

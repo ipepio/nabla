@@ -15,7 +15,12 @@
 // line opens a turn and everything after it belongs to that turn — so a restored
 // conversation and a live one are read the same way, and the stamped ids only
 // confirm where a step belongs (S5: no new persisted state).
-import type { ChatMessage, SettledQuestion, ToolEntry } from "@/lib/session-store";
+import type {
+  ChatMessage,
+  SettledQuestion,
+  ToolEntry,
+  TurnInterruption,
+} from "@/lib/session-store";
 
 /** One step of a human turn: what pi did once before its next step. */
 export interface TurnStep {
@@ -61,6 +66,12 @@ export interface TurnGroup {
    * live turn has them: once it ends they become a step inside the disclosure.
    */
   liveTools: ToolEntry[];
+  /**
+   * Why this turn did not end on its own (S3 of `turn-continuity.md`), or `null`
+   * for a turn that ended normally. The store hangs it on one of the turn's own
+   * messages; this is where it becomes a property of the turn the panel renders.
+   */
+  interruption: TurnInterruption | null;
 }
 
 /** A group that starts with no human line above its first step. */
@@ -97,6 +108,9 @@ export function deriveTurnGroups(
       tools: [],
       live: id === liveTurnId,
       liveTools: [],
+      // The opening line is where the store hangs the reason when the cut turn
+      // produced nothing of its own, so it is read first.
+      interruption: opening?.interruption ?? null,
     };
     groups.push(group);
     groupsById.set(id, group);
@@ -173,6 +187,14 @@ export function deriveTurnGroups(
       ...group.liveTools,
     ];
     if (group.live) continue;
+    // S3 of `turn-continuity.md`: the reason belongs to the turn, so it comes
+    // from any of its messages — the opening line above, or the step that landed
+    // when the turn had no opening line of its own.
+    group.interruption ??=
+      group.steps.reduce<TurnInterruption | null>(
+        (found, step) => found ?? step.message?.interruption ?? null,
+        null,
+      );
     // S2: the answer is the last thing the turn said in words. A live turn has
     // none yet — its answer is still streaming and the panel paints that.
     for (let index = group.steps.length - 1; index >= 0; index -= 1) {

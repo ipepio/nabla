@@ -21,8 +21,14 @@ import ReasoningBlock from "@/components/chat/ReasoningBlock.vue";
 import ToolChips from "@/components/chat/ToolChips.vue";
 import ToolSummary from "@/components/chat/ToolSummary.vue";
 import type { TurnStep } from "@/components/chat/turn-groups";
+import { Button } from "@/components/ui/button";
 import { t } from "@/lib/i18n";
-import type { ChatMessage, SettledQuestion, ToolEntry } from "@/lib/session-store";
+import type {
+  ChatMessage,
+  SettledQuestion,
+  ToolEntry,
+  TurnInterruption,
+} from "@/lib/session-store";
 
 const props = defineProps<{
   /** The turn's id; keys the disclosure's DOM id. */
@@ -51,7 +57,16 @@ const props = defineProps<{
   liveTools?: ToolEntry[];
   /** The "show reasoning" preference: off means the blocks are not rendered. */
   showReasoning: boolean;
+  /**
+   * Why this turn did not end on its own (S3 of `turn-continuity.md`), or `null`
+   * for a turn that ended normally. The store reads it from pi's own
+   * `stopReason`, so nothing here is inferred.
+   */
+  interruption: TurnInterruption | null;
 }>();
+
+/** S5: the human decided to continue the turn that was cut short. */
+const emit = defineEmits<{ (e: "continue"): void }>();
 
 /** What the collapsed line counts: the step it opens to (S1, S4). */
 const stepsLabel = computed(() =>
@@ -88,6 +103,32 @@ function intermediateTextOf(step: TurnStep): string | null {
 const liveReasoningText = computed(() => props.liveReasoning ?? "");
 const liveChipList = computed(() => (props.live ? (props.liveTools ?? []) : []));
 const liveAnswerText = computed(() => (props.live ? (props.liveText ?? "") : ""));
+
+/**
+ * S3/S4 of `turn-continuity.md`: the line a cut turn says about itself, or
+ * `null` for a turn that ended on its own.
+ *
+ * Three reasons are announced, each in its own words — the human stopped it, the
+ * answer ran out of room, or something failed, with pi's own explanation when it
+ * sent one. `stop`, `toolUse`, `pending` and `deferred` are a normal turn and say
+ * nothing, and a reason this build does not know is not guessed into a notice.
+ */
+const notice = computed<string | null>(() => {
+  const interruption = props.interruption;
+  if (interruption === null) return null;
+  switch (interruption.stopReason) {
+    case "aborted":
+      return t("chat.turn.aborted");
+    case "length":
+      return t("chat.turn.length");
+    case "error":
+      return interruption.errorMessage === null
+        ? t("chat.turn.errorUnknown")
+        : t("chat.turn.error", { message: interruption.errorMessage });
+    default:
+      return null;
+  }
+});
 </script>
 
 <template>
@@ -165,5 +206,24 @@ const liveAnswerText = computed(() => (props.live ? (props.liveText ?? "") : "")
       role="assistant"
       :text="answer.text"
     />
+
+    <!-- S3/S4 of `turn-continuity.md`: the turn did not end on its own, so it
+         says why, inside its own group and without alarmism. S5: the one action
+         that makes sense is to continue where it stopped, which is a new turn and
+         not a re-run of the prompt above. -->
+    <div
+      v-if="notice !== null"
+      class="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2"
+    >
+      <p class="min-w-0 text-xs text-muted-foreground">{{ notice }}</p>
+      <Button
+        variant="outline"
+        size="xs"
+        class="shrink-0"
+        @click="emit('continue')"
+      >
+        {{ t("chat.turn.continue") }}
+      </Button>
+    </div>
   </div>
 </template>

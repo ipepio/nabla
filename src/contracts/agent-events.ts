@@ -21,6 +21,23 @@ export type RuntimeStatus =
   | "crashed";
 
 /**
+ * Why one assistant message stopped, as pi reports it in
+ * `message.stopReason` (S3 of `turn-continuity.md`). Mirrors `StopReason` in
+ * `src-tauri/src/rpc/mod.rs`, which is total: a word a newer pi introduces still
+ * arrives here (widening this union instead of breaking the frame).
+ */
+export type KnownStopReason =
+  | "pending"
+  | "stop"
+  | "length"
+  | "toolUse"
+  | "error"
+  | "aborted"
+  | "deferred";
+
+export type StopReason = KnownStopReason | (string & {});
+
+/**
  * One progressive slice of a streamed message. Mirrors `AssistantMessageEvent`:
  * `type` is pi's own wire discriminator ("text_delta" | "thinking_delta" |
  * "start" | "done" | "error", kept verbatim), `delta` is absent on non-delta
@@ -75,7 +92,20 @@ export type AgentEvent =
       isError: boolean;
     }
   | { type: "turn_start" }
-  | { type: "turn_end"; message: unknown; toolResults: unknown[] }
+  | {
+      type: "turn_end";
+      message: unknown;
+      toolResults: unknown[];
+      /**
+       * Why the turn ended, lifted out of `message.stopReason` by the codec (S3
+       * of `turn-continuity.md`). Absent when pi reported no reason — never
+       * `null` on the wire — and absent-there means "a turn that ended on its
+       * own", not "unknown".
+       */
+      stopReason?: StopReason;
+      /** pi's own explanation, carried by an `error` stop. */
+      errorMessage?: string;
+    }
   | {
       /**
        * S2 of `agent-question-bridge.md`: an extension is asking the human a

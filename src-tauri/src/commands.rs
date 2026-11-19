@@ -1015,7 +1015,12 @@ pub fn answer_ui_request(
         .map_err(display_err)
 }
 
-/// Stops the session's pi process, waiting for it to exit (S4).
+/// Stops the session's pi process (S4).
+///
+/// S2 of `turn-continuity.md`: this asks pi to `abort` and waits for the turn to
+/// settle, so the turn lands in the transcript with its own stop reason and the
+/// session survives the stop. Only a child that does not settle is killed (that
+/// wait and its bound live in `ProcessManager::abort_and_wait`).
 #[tauri::command]
 pub fn stop_session(
     state: State<'_, AppState>,
@@ -1025,7 +1030,8 @@ pub fn stop_session(
     ensure_session_in_workspace(&state.store, workspace_id, session_id)?;
     state
         .runtime
-        .stop_and_wait(&session_id.to_string())
+        .abort_and_wait(&session_id.to_string())
+        .map(|_| ())
         .map_err(display_err)
 }
 
@@ -1135,8 +1141,11 @@ fn delete_session_core(
         .map_err(display_err)?
         .ok_or_else(|| unknown_session(&session_id.to_string()))?;
 
-    // Best effort: `stop_and_wait` is idempotent, so a session that was never
-    // started (or already stopped) is not an error — the row still has to go.
+    // Best effort, and deliberately the hard stop: the transcript is archived and
+    // the index row dropped, so the child must really be gone (S2 of
+    // `turn-continuity.md` covers the human's stop, not a delete).
+    // `stop_and_wait` is idempotent, so a session that was never started (or
+    // already stopped) is not an error — the row still has to go.
     let _ = runtime.stop_and_wait(&session_id.to_string());
 
     archive_session_file(data_dir, Path::new(&row.pi_session_path)).map_err(|err| {
@@ -2842,6 +2851,7 @@ done
             stop_grace: Duration::from_millis(800),
             kill_grace: Duration::from_millis(400),
             response: Duration::from_secs(5),
+            abort_grace: Duration::from_millis(600),
         }
     }
 
