@@ -75,6 +75,11 @@ async function copyText() {
       :text="reasoning"
       :live="reasoningLive"
     />
+    <!-- Immediately under the reasoning block, the turn's other piece of folded
+         context: its tool activity, one collapsed row (see `ToolSummary`). The
+         slot is empty for a turn that called no tool and for a live turn, whose
+         chips render expanded below the transcript instead. -->
+    <slot name="tools" />
     <AssistantText v-if="text !== ''" :text="text" />
   </div>
 </template>

@@ -202,6 +202,8 @@
   "chat.tool.running": "en marcha",
   "chat.tool.done": "hecho",
   "chat.tool.failed": "falló",
+  "chat.tools.summary": "{count} acciones",
+  "chat.tools.failures": "fallos: {count}",
   "chat.reasoning.label": "Razonamiento",
   "chat.code.label": "código",
   "chat.code.copy": "Copiar código",

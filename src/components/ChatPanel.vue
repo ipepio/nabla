@@ -10,12 +10,8 @@
 // session's buffer. Switching sessions (S4) is therefore a pure view change:
 // nothing here starts, stops or resets a process, and the previous session keeps
 // running and keeps accumulating events off screen.
-import type { Component } from "vue";
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import {
-  CheckIcon,
-  CircleAlertIcon,
-  LoaderIcon,
   PanelRightOpenIcon,
   WrenchIcon,
   XIcon,
@@ -27,10 +23,11 @@ import Composer from "@/components/chat/Composer.vue";
 import MessageBubble from "@/components/chat/MessageBubble.vue";
 import QuestionCard from "@/components/chat/QuestionCard.vue";
 import QuestionPrompt from "@/components/chat/QuestionPrompt.vue";
+import ToolChips from "@/components/chat/ToolChips.vue";
+import ToolSummary from "@/components/chat/ToolSummary.vue";
 import { draftKeyFor, usePromptDraft } from "@/components/chat/use-prompt-draft";
 import { useThrottledText } from "@/components/chat/use-throttled-text";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
@@ -161,7 +158,48 @@ const buffer = computed<SessionBuffer | null>(() =>
   sessionBuffer(currentSession.value?.sessionId ?? null),
 );
 const transcript = computed(() => buffer.value?.transcript ?? []);
+/**
+ * Every tool call of the session, oldest first, each one stamped with the turn
+ * it belongs to (`ToolEntry.turnId`). No longer cleared per turn: that is what
+ * lets a finished turn keep its chips while the turn in progress owns the live
+ * area.
+ */
 const tools = computed<ToolEntry[]>(() => buffer.value?.tools ?? []);
+
+/** One turn's tool calls, keyed by the id of the turn (see `toolsForTurn`). */
+const toolsByTurn = computed<Map<string, ToolEntry[]>>(() => {
+  const groups = new Map<string, ToolEntry[]>();
+  for (const entry of tools.value) {
+    const group = groups.get(entry.turnId);
+    if (group === undefined) groups.set(entry.turnId, [entry]);
+    else group.push(entry);
+  }
+  return groups;
+});
+
+/**
+ * The chips of the turn a committed message belongs to, empty when the turn
+ * called no tool. The message id *is* the turn id (`ensureLiveMessageId`), so a
+ * finished turn's chips are found from the message that renders them — that is
+ * the whole attribution: no positional guess, no cross-referencing of two lists.
+ */
+function toolsForTurn(messageId: string): ToolEntry[] {
+  return toolsByTurn.value.get(messageId) ?? [];
+}
+
+/**
+ * The chips of the turn that is not in the transcript yet — the one running
+ * right now — rendered expanded under the live answer, exactly as before.
+ *
+ * A turn whose message never reached the transcript (pi called a tool and
+ * streamed no text at all) stays here instead of vanishing: an unfinished turn
+ * is the informative moment, so its chips stay visible rather than being folded
+ * under a message that does not exist.
+ */
+const liveTools = computed<ToolEntry[]>(() => {
+  const committed = new Set(transcript.value.map((message) => message.id));
+  return tools.value.filter((entry) => !committed.has(entry.turnId));
+});
 const streamingText = computed(() => buffer.value?.streamingText ?? "");
 /**
  * The reasoning still streaming for the turn in progress. Rendered by the same
@@ -548,6 +586,8 @@ const workspaceName = computed(() => props.workspace?.name ?? "Nabla");
 const turns = computed(
   () => transcript.value.filter((message) => message.role === "user").length,
 );
+/** Cumulative for the session: the chips are no longer dropped per turn, so
+ * "steps so far" keeps counting the whole conversation. */
 const steps = computed(() => tools.value.length);
 
 /**
@@ -716,39 +756,6 @@ watch(
  */
 function bubbleRole(role: TranscriptRole): "user" | "assistant" {
   return role === "user" ? "user" : "assistant";
-}
-
-function toolIcon(state: ToolEntry["state"]): Component {
-  switch (state) {
-    case "running":
-      return LoaderIcon;
-    case "done":
-      return CheckIcon;
-    case "error":
-      return CircleAlertIcon;
-  }
-}
-
-function toolBadgeVariant(state: ToolEntry["state"]): "secondary" | "outline" | "destructive" {
-  switch (state) {
-    case "running":
-      return "secondary";
-    case "done":
-      return "outline";
-    case "error":
-      return "destructive";
-  }
-}
-
-function toolStateLabel(state: ToolEntry["state"]): string {
-  switch (state) {
-    case "running":
-      return t("chat.tool.running");
-    case "done":
-      return t("chat.tool.done");
-    case "error":
-      return t("chat.tool.failed");
-  }
 }
 
 /**
@@ -1320,7 +1327,20 @@ onUnmounted(() => {
               :at="timeLabel(message.at)"
               :reasoning="showReasoning ? message.reasoning : undefined"
               :message-id="message.id"
-            />
+            >
+              <!-- Point 1: the chips of a turn that is already committed fold
+                   into one collapsed row inside that turn, right under its
+                   reasoning block — the natural neighbour, both being folded
+                   context above the answer. The turn in progress keeps its
+                   chips expanded below the transcript (see `liveTools`). -->
+              <template #tools>
+                <ToolSummary
+                  v-if="toolsForTurn(message.id).length > 0"
+                  :turn-id="message.id"
+                  :tools="toolsForTurn(message.id)"
+                />
+              </template>
+            </MessageBubble>
           </template>
 
           <!-- S3 of `agent-question-bridge.md`: a question the agent is blocked
@@ -1360,16 +1380,11 @@ onUnmounted(() => {
             reasoning-live
           />
 
-          <div v-if="tools.length > 0" class="flex flex-wrap gap-2">
-            <Badge
-              v-for="tool in tools"
-              :key="tool.toolCallId"
-              :variant="toolBadgeVariant(tool.state)"
-            >
-              <component :is="toolIcon(tool.state)" />
-              {{ tool.toolName }} · {{ toolStateLabel(tool.state) }}
-            </Badge>
-          </div>
+          <!-- The turn in progress shows its chips expanded and inline: a
+               running tool is the informative moment, so it is never folded
+               behind a summary. Once the turn lands in the transcript they
+               collapse into its own row (see `ToolSummary`). -->
+          <ToolChips v-if="liveTools.length > 0" :tools="liveTools" />
         </div>
       </ScrollArea>
 

@@ -41,6 +41,16 @@ export interface ToolEntry {
   toolCallId: string;
   toolName: string;
   state: "running" | "done" | "error";
+  /**
+   * The turn this call belongs to: the id of the message it is rendered with.
+   *
+   * Stamped at tool start from `ensureLiveMessageId`, which is the same id the
+   * turn flushes into, so a tool that started before any text still ends up
+   * attributed to the message the turn produces. The panel groups by it: the
+   * turn still running shows its chips expanded, and a committed turn folds
+   * them into one collapsed row next to its own content.
+   */
+  turnId: string;
 }
 
 /**
@@ -853,6 +863,29 @@ function findTool(buffer: SessionBuffer, toolCallId: string) {
   return buffer.tools.find((entry) => entry.toolCallId === toolCallId);
 }
 
+/**
+ * Appends one tool chip, attributed to the turn it was called in.
+ *
+ * The attribution is the whole point of this function: `ensureLiveMessageId` is
+ * the only place a turn id is minted, so a chip can never be unattributed — a
+ * tool that starts before its turn streamed any text mints the id here and the
+ * turn's message then reuses it (`flushStreaming`).
+ */
+function pushTool(
+  sessionId: string,
+  buffer: SessionBuffer,
+  toolCallId: string,
+  toolName: string,
+  state: ToolEntry["state"],
+): void {
+  buffer.tools.push({
+    toolCallId,
+    toolName,
+    state,
+    turnId: ensureLiveMessageId(sessionId, buffer),
+  });
+}
+
 /** Applies one forwarded pi event to the buffer of the session it belongs to. */
 function applyEvent(sessionId: string, event: AgentEvent): void {
   const buffer = ensureBuffer(sessionId);
@@ -898,20 +931,12 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
       return;
     }
     case "tool_execution_start":
-      buffer.tools.push({
-        toolCallId: event.toolCallId,
-        toolName: event.toolName,
-        state: "running",
-      });
+      pushTool(sessionId, buffer, event.toolCallId, event.toolName, "running");
       return;
     case "tool_execution_update": {
       const entry = findTool(buffer, event.toolCallId);
       if (entry === undefined) {
-        buffer.tools.push({
-          toolCallId: event.toolCallId,
-          toolName: event.toolName,
-          state: "running",
-        });
+        pushTool(sessionId, buffer, event.toolCallId, event.toolName, "running");
       } else {
         entry.state = "running";
       }
@@ -920,11 +945,13 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
     case "tool_execution_end": {
       const entry = findTool(buffer, event.toolCallId);
       if (entry === undefined) {
-        buffer.tools.push({
-          toolCallId: event.toolCallId,
-          toolName: event.toolName,
-          state: event.isError ? "error" : "done",
-        });
+        pushTool(
+          sessionId,
+          buffer,
+          event.toolCallId,
+          event.toolName,
+          event.isError ? "error" : "done",
+        );
       } else {
         entry.state = event.isError ? "error" : "done";
       }
@@ -984,14 +1011,10 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
       return;
     }
     default:
-      // A fresh turn starts with no tool chips: the list describes the turn in
-      // progress, not a running log, or a long session becomes a wall of badges.
-      if (
-        event.type === "other" &&
-        (event.kind === "turn_start" || event.kind === "agent_start")
-      ) {
-        buffer.tools = [];
-      }
+      // A fresh turn no longer discards the previous one's chips: each entry
+      // carries its `turnId`, so the panel folds a finished turn's chips into
+      // one collapsed row with that turn instead of losing them. Only the turn
+      // in progress keeps a wall of badges, which is where it is informative.
       return;
   }
 }
