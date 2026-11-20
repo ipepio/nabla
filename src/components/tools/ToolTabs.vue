@@ -83,6 +83,35 @@ const available = computed<ToolDefinition[]>(() =>
 );
 
 /**
+ * The app-wide singleton tools that already have a pane somewhere in the drawer.
+ *
+ * Read through the dock (`tabPanes`), never from the model's internals: a tool that
+ * is open in another tab is not something the chooser may offer, because a second
+ * pane would be a second page or process the human cannot tell apart from the
+ * first. The rule itself is the dock's (`setTabTool`); this only stops the human
+ * from clicking something that would be refused.
+ */
+const openElsewhere = computed<ToolDefinition[]>(() =>
+  available.value.filter(
+    (tool) =>
+      tool.appWide === true &&
+      tabs.value.some((tab) =>
+        tabPanes(tab).some((instance) => instance.toolId === tool.id),
+      ),
+  ),
+);
+
+/** What an empty tab may actually start: the enabled tools minus the taken ones. */
+const offered = computed<ToolDefinition[]>(() =>
+  available.value.filter((tool) => !openElsewhere.value.includes(tool)),
+);
+
+/** The names of the tools that are open elsewhere, for the one line that says so. */
+const openElsewhereLabels = computed<string>(() =>
+  openElsewhere.value.map((tool) => t(tool.labelKey)).join(", "),
+);
+
+/**
  * The tabs are reconciled here because this is the only place that knows both
  * inputs: the active workspace and the enabled tools. `immediate` covers the drawer
  * being reopened after the human flipped a switch while it was collapsed.
@@ -201,9 +230,9 @@ function start(tabId: string, toolId: ToolDefinition["id"]): void {
           <p class="text-center text-xs font-medium text-muted-foreground">
             {{ t("tools.tabs.chooseTool") }}
           </p>
-          <template v-if="available.length > 0">
+          <template v-if="offered.length > 0">
             <Button
-              v-for="tool in available"
+              v-for="tool in offered"
               :key="tool.id"
               variant="outline"
               size="xs"
@@ -214,6 +243,14 @@ function start(tabId: string, toolId: ToolDefinition["id"]): void {
               {{ t(tool.labelKey) }}
             </Button>
           </template>
+          <!-- Enabled, but with a pane in another tab: the reason is said out
+               loud instead of leaving an empty chooser that looks broken. -->
+          <p
+            v-else-if="available.length > 0"
+            class="text-center text-xs text-muted-foreground"
+          >
+            {{ t("tools.tabs.singletonOpen", { tools: openElsewhereLabels }) }}
+          </p>
           <p v-else class="text-center text-xs text-muted-foreground">
             {{ t("tools.tabs.noTools") }}
           </p>

@@ -81,6 +81,17 @@ export interface ToolDefinition {
    * the whole point of the tab strip.
    */
   singleton?: boolean;
+  /**
+   * At most one pane in the WHOLE drawer, across every tab. A different fact from
+   * `singleton`, and strictly stronger in practice: a tool that owns one page or
+   * one process cannot be duplicated by opening another tab, because a second pane
+   * would be a second one nobody can tell apart from the first.
+   *
+   * The rule is enforced in `dock.ts` (`setTabTool`), which is the only place that
+   * can see every tab at once; the chooser only stops offering the tool once a
+   * pane of it already exists.
+   */
+  appWide?: boolean;
   /** The context a fresh pane starts with, normally derived from the workspace. */
   defaultContext(workspace: WorkspaceInfo | null): ToolContext;
 }
@@ -127,9 +138,11 @@ export const TOOLS: readonly ToolDefinition[] = [
     labelKey: "tools.browser.label",
     icon: GlobeIcon,
     component: BrowserTool,
-    // A pane owns a launched browser session; a second pane would launch a
-    // second Chromium for the same workspace.
+    // A pane owns one page and one session; a second pane — in this tab OR in
+    // another one — would be a second page the human cannot tell apart from the
+    // first, and the agent could not say which one it drove.
     singleton: true,
+    appWide: true,
     defaultContext: (): ToolContext => ({}),
   },
 ];

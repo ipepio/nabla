@@ -441,6 +441,7 @@
   "tools.tabs.empty": "No hay ninguna pestaña abierta. Usa + para abrir una.",
   "tools.tabs.chooseTool": "Elige una herramienta",
   "tools.tabs.noTools": "No hay ninguna herramienta activada. Activa una en Ajustes → Herramientas.",
+  "tools.tabs.singletonOpen": "{tools} ya está abierto en otra pestaña. Ve a esa pestaña en vez de abrir una segunda.",
   "tools.dock.chooseFolder": "Elige la carpeta que muestra este panel",
   "tools.dock.changeFolder": "Cambiar carpeta: {path}",
   "tools.dock.close": "Cerrar el panel",

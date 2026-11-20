@@ -40,6 +40,13 @@
 // `splitPane`, `closePane`, `setContextPath`, `focusPane`, `applyDock`. No component
 // builds a `Pane` by hand, so there is exactly one place that can break the depth
 // cap, the pane cap or the singleton rule.
+//
+// THE TWO SINGLETON RULES live here and nowhere else: `singleton` is one pane per
+// TAB, and `appWide` is one pane in the WHOLE drawer. Both are checked where the
+// panes are created — `setTabTool` for a new pane, `splitPane` for a split —
+// because this module is the only thing that can see every tab at once. A caller
+// that needs to know which tab holds an app-wide tool asks
+// `tabHoldingAppWideTool` instead of walking the list itself.
 import { ref } from "vue";
 import type { WorkspaceInfo } from "@/contracts/types";
 import type { MessageKey } from "@/lib/i18n";
@@ -265,9 +272,27 @@ export function closeTab(id: string): void {
 }
 
 /**
+ * The tab holding a pane of one tool, or `undefined` when no tab does.
+ *
+ * This is the app-wide half of the singleton rule: a pane of a `singleton` tool is
+ * unique inside its tab, while a pane of an `appWide` tool is unique in the whole
+ * drawer. The agent path (`App.vue`) uses this to ACTIVATE the tab that already
+ * holds the browser instead of opening a second pane; the chooser uses it to stop
+ * offering a tool that is already open elsewhere.
+ */
+export function tabHoldingAppWideTool(toolId: ToolId): DockTab | undefined {
+  return tabs.value.find((tab) =>
+    tabPanes(tab).some((instance) => instance.toolId === toolId),
+  );
+}
+
+/**
  * Starts a tool in an EMPTY tab: the empty area becomes the tab's single pane.
  * Refused for a tab that already holds a layout (a running tool is not replaced
- * silently; close it or close the tab) and for an id the registry does not ship.
+ * silently; close it or close the tab), for an id the registry does not ship, and
+ * for an `appWide` tool that already has a pane in ANY tab — the pane would be a
+ * second copy of the same page or process, and the human must be sent to the tab
+ * that holds it (which is what `tabHoldingAppWideTool` answers).
  */
 export function setTabTool(
   tabId: string,
@@ -276,7 +301,16 @@ export function setTabTool(
 ): boolean {
   const tab = tabById(tabId);
   if (tab === undefined || tab.layout !== null) return false;
-  if (toolById(toolId) === undefined) return false;
+  const definition = toolById(toolId);
+  if (definition === undefined) return false;
+  // The app-wide rule, checked against every tab. The tab being filled is empty,
+  // so it cannot be the one holding it: a second pane is the only way this fires.
+  if (
+    definition.appWide === true &&
+    tabHoldingAppWideTool(toolId) !== undefined
+  ) {
+    return false;
+  }
   const instance = makeInstance(toolId, workspace);
   replaceTab(tab.id, { ...tab, layout: { kind: "leaf", instance } });
   activeTabId.value = tab.id;
