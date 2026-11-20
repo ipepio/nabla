@@ -356,6 +356,21 @@ pub fn permissions_projection_path(data_dir: &Path) -> PathBuf {
     data_dir.join("permissions.json")
 }
 
+/// Writes `body` to `path` atomically: a temp file in the same directory, then a
+/// rename over the target, so a reader never sees a half-written file.
+///
+/// One helper because every JSON store Nabla owns writes this way (L4 of
+/// `permission-modes.md` for the projection, and the settings file itself); a
+/// second copy of it is exactly how one of them would end up non-atomic.
+pub(crate) fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, path)
+}
+
 /// S2/L4: writes `{"mode":"<mode>"}` for the extension to read on its next tool
 /// call. Called at boot and on every change, which is what makes a mode switch
 /// affect the very next call without restarting the session.
@@ -364,15 +379,9 @@ pub fn permissions_projection_path(data_dir: &Path) -> PathBuf {
 /// a half-written projection (and falls back to `write` for no reason).
 pub fn write_permission_projection(data_dir: &Path, mode: PermissionMode) -> SettingsResult<()> {
     let path = permissions_projection_path(data_dir);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| SettingsError::Io(e.to_string()))?;
-    }
     let body = serde_json::json!({ "mode": mode.as_str() });
     let json = serde_json::to_string(&body).map_err(|e| SettingsError::Parse(e.to_string()))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).map_err(|e| SettingsError::Io(e.to_string()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| SettingsError::Io(e.to_string()))?;
-    Ok(())
+    write_atomic(&path, &json).map_err(|e| SettingsError::Io(e.to_string()))
 }
 
 pub type SettingsResult<T> = Result<T, SettingsError>;
@@ -390,14 +399,8 @@ pub fn load(path: &Path) -> SettingsResult<Settings> {
 
 /// Saves settings atomically: write temp file, then rename over the target.
 pub fn save(path: &Path, settings: &Settings) -> SettingsResult<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| SettingsError::Io(e.to_string()))?;
-    }
     let json = serde_json::to_string_pretty(settings).map_err(|e| SettingsError::Parse(e.to_string()))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).map_err(|e| SettingsError::Io(e.to_string()))?;
-    std::fs::rename(&tmp, path).map_err(|e| SettingsError::Io(e.to_string()))?;
-    Ok(())
+    write_atomic(path, &json).map_err(|e| SettingsError::Io(e.to_string()))
 }
 
 /// S2 of `model-visibility.md`: the `"<provider>/<modelId>"` key of one hidden

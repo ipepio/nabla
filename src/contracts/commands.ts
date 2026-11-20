@@ -7,6 +7,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { AgentEventEnvelope } from "./agent-events";
 import type {
+  AgentsConfig,
   AppSettings,
   EmbedNavEvent,
   FsEntry,
@@ -816,6 +817,30 @@ export function subagentSessions(
     workspaceId,
     parentSessionId,
   });
+}
+
+/**
+ * S1 of `odd/tasks/agent-profiles.md`: the subagent profiles, read from Nabla's
+ * own `<data dir>/agents.json`. A missing file answers the off state — master
+ * switch off, no profiles — and never an error, because that is what a fresh
+ * install is.
+ */
+export function getAgentsConfig(): Promise<AgentsConfig> {
+  return invoke<AgentsConfig>("get_agents_config");
+}
+
+/**
+ * S1/S3/S6: persists the profiles with the same atomic write and the same
+ * camelCase contract as `settings.json`. Rust validates first (name present and
+ * unique, description present, a known effort, a model that can be a model id) and
+ * rejects with a message that names the profile, so the dialog shows exactly what
+ * the human has to fix instead of writing a file the extension would have to
+ * guess about.
+ *
+ * The answer is what the file now holds, not what was sent.
+ */
+export function saveAgentsConfig(config: AgentsConfig): Promise<AgentsConfig> {
+  return invoke<AgentsConfig>("save_agents_config", { config });
 }
 
 /**

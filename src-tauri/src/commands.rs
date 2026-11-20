@@ -206,6 +206,35 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
     settings::load(&settings_path(&state)).map_err(display_err)
 }
 
+// ── subagent profiles seam (S1, S3, S6 of `agent-profiles.md`) ──────────────
+
+/// S1: the profile store is Nabla's, beside `settings.json` and
+/// `permissions.json`, never a file inside the project.
+fn agents_path(state: &AppState) -> PathBuf {
+    crate::agents::config_path(&state.data_dir)
+}
+
+/// S1/S3: the profiles as the file holds them. A missing file is the off state
+/// (master switch off, no profiles), so a fresh install opens the dialog on
+/// nothing enabled instead of on an error.
+#[tauri::command]
+pub fn get_agents_config(state: State<'_, AppState>) -> Result<crate::agents::AgentsConfig, String> {
+    crate::agents::load(&agents_path(&state)).map_err(display_err)
+}
+
+/// S1/S6: validates and writes the profiles atomically, then answers what the
+/// file actually holds — the same contract `save_settings` honours, so the
+/// dialog renders the persisted shape instead of its own guess.
+#[tauri::command]
+pub fn save_agents_config(
+    state: State<'_, AppState>,
+    config: crate::agents::AgentsConfig,
+) -> Result<crate::agents::AgentsConfig, String> {
+    let path = agents_path(&state);
+    crate::agents::save(&path, &config).map_err(display_err)?;
+    crate::agents::load(&path).map_err(display_err)
+}
+
 // ── model selector seam (S7) ────────────────────────────────────────────────
 
 /// One choice of the model selector (S7): the id pi is spawned with and the

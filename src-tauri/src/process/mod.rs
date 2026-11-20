@@ -423,6 +423,11 @@ pub struct ProcessManager {
     permissions_extension: Option<PathBuf>,
     /// The subagent helpers (`subagent-helpers.md`, H2). `None` when it could not
     /// be materialized: every session still works, it simply cannot delegate.
+    ///
+    /// S3/S8 of `agent-profiles.md`: holding the path is not the same as loading
+    /// it. Whether a spawn loads it is decided per spawn from
+    /// `<data_dir>/agents.json` (`agents::extension_for_spawn`), so the materialized
+    /// file can exist with the gate closed.
     subagents_extension: Option<PathBuf>,
     /// The absolute app data dir the gate reads its projection from (L4). `None`
     /// means the child never receives `NABLA_DATA_DIR`, so the gate cannot read
@@ -466,6 +471,10 @@ impl ProcessManager {
     /// Loads the subagent helpers into every child this manager spawns (`-e`),
     /// next to the question extension and the gate (`subagent-helpers.md`, H2).
     /// Without it a session has no way to delegate.
+    ///
+    /// S3 of `agent-profiles.md`: this only makes the helpers AVAILABLE. Each
+    /// spawn still asks `agents.json` whether the human opened the gate, and with
+    /// it closed the flag never reaches pi's argv.
     pub fn with_subagents_extension(mut self, path: PathBuf) -> ProcessManager {
         self.subagents_extension = Some(path);
         self
@@ -542,6 +551,16 @@ impl ProcessManager {
         let pending: Arc<Mutex<HashMap<String, mpsc::SyncSender<RpcResponse>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
+        // S3/S8 of `agent-profiles.md`: the delegation gate is decided HERE, per
+        // spawn, from the file on disk — never cached at boot, so the switch the
+        // human flipped a second ago is the one this session obeys. A session
+        // that is already running keeps what it started with: pi loads `-e` once
+        // and has no way to unload an extension.
+        let delegation = delegation_for_spawn(
+            self.data_dir.as_deref(),
+            self.subagents_extension.as_deref(),
+        );
+
         let mut child = match build_command(
             pi_binary,
             session_file,
@@ -550,8 +569,9 @@ impl ProcessManager {
             SpawnLayout {
                 ask_extension: self.ask_extension.as_deref(),
                 permissions_extension: self.permissions_extension.as_deref(),
-                subagents_extension: self.subagents_extension.as_deref(),
+                subagents_extension: delegation.extension.as_deref(),
                 data_dir: self.data_dir.as_deref(),
+                delegating: delegation.routing_table,
             },
         )
         .spawn() {
@@ -1020,10 +1040,36 @@ pub struct SessionModel<'a> {
 struct SpawnLayout<'a> {
     ask_extension: Option<&'a Path>,
     permissions_extension: Option<&'a Path>,
-    /// The subagent helpers (`subagent-helpers.md`, H2).
+    /// The subagent helpers (`subagent-helpers.md`, H2), ALREADY decided for this
+    /// spawn: `None` when the master switch of `agent-profiles.md` is off or no
+    /// profile is enabled (S3, S8).
     subagents_extension: Option<&'a Path>,
     /// Absolute `<data_dir>`; the MODE itself is never part of it.
     data_dir: Option<&'a Path>,
+    /// S7: whether the delegating routing table joins the system prompt. Same
+    /// decision as the extension, so the two can never disagree.
+    delegating: bool,
+}
+
+/// S3/S7/S8 of `agent-profiles.md`: what one spawn takes from the profile store.
+#[derive(Debug, Clone, Default)]
+struct Delegation {
+    /// The helpers to load, or `None` for no delegation tools at all.
+    extension: Option<PathBuf>,
+    /// Whether the routing table joins the system prompt.
+    routing_table: bool,
+}
+
+/// Reads `<data_dir>/agents.json` at spawn time and answers what this child
+/// gets. The read is fresh on purpose (S3): a cached decision would keep a gate
+/// the human closed open, or a gate they opened shut, for the life of the app.
+fn delegation_for_spawn(data_dir: Option<&Path>, materialized: Option<&Path>) -> Delegation {
+    let config = crate::agents::config_for_spawn(data_dir);
+    Delegation {
+        extension: materialized
+            .and_then(|path| crate::agents::extension_for_spawn(&config, path)),
+        routing_table: crate::agents::routing_table_enabled(&config),
+    }
 }
 
 /// Arguments of the pi RPC invocation. Mirror: Stark `process_manager.rs`
@@ -1088,18 +1134,50 @@ fn spawn_args(
         // H2 of `subagent-helpers.md`: the four delegation tools. Without this
         // flag the agent simply cannot delegate — nothing else breaks, which is
         // why the caller reports a failed materialization instead of failing the
-        // start.
+        // start. S3 of `agent-profiles.md`: the caller only passes this when the
+        // human opened the gate, so a closed gate means no `run_agent` at all.
         args.push("-e".to_string());
         args.push(path.to_string_lossy().to_string());
     }
     args.push("--append-system-prompt".to_string());
-    args.push(NABLA_SYSTEM_PROMPT.to_string());
+    // S7/S8 of `agent-profiles.md`: with the gate closed this is the identity
+    // byte for byte; open, it carries the routing table that tells the model
+    // which profile answers which question.
+    args.push(compose_system_prompt(layout.delegating));
     args
 }
 
 /// The Nabla identity, embedded at build time from the versioned markdown file
 /// so it never depends on a runtime path or a packaged resource.
 const NABLA_SYSTEM_PROMPT: &str = include_str!("../../../resources/nabla-system-prompt.md");
+
+/// S7 of `agent-profiles.md`: the delegating routing table is part of the same
+/// versioned file, between these two markers, so it can never drift from the
+/// identity that introduces it.
+const DELEGATING_OPEN: &str = "<!-- nabla:delegating:start -->";
+const DELEGATING_CLOSE: &str = "<!-- nabla:delegating:end -->";
+
+/// The system prompt of one spawn.
+///
+/// S7: the routing table only travels when the human opened the gate. S8: with
+/// the gate closed the answer is the identity exactly as the file holds it before
+/// the marker — the same bytes every session received before delegation existed.
+pub(crate) fn compose_system_prompt(delegating: bool) -> String {
+    let Some((identity, rest)) = NABLA_SYSTEM_PROMPT.split_once(DELEGATING_OPEN) else {
+        // A hand edit that dropped the marker: the identity is used whole instead
+        // of inventing a split nobody wrote.
+        return NABLA_SYSTEM_PROMPT.to_string();
+    };
+    if !delegating {
+        return identity.to_string();
+    }
+    let section = rest
+        .split_once(DELEGATING_CLOSE)
+        .map_or(rest, |(section, _)| section);
+    // One blank line between the identity and the section, whichever way the
+    // markers are spaced in the file.
+    format!("{identity}\n{}", section.trim_start())
+}
 
 /// The first-party pi extension that gives the agent its three ask tools (S1,
 /// S2), embedded at build time like the identity above.
@@ -1607,7 +1685,9 @@ printf 'exited\n' >> '@MARKER@'
     // `permission-modes.md`: the permission gate is the third `-e`, loaded right
     // after it — a gate nobody loads is a gate that blocks nothing. H2 of
     // `subagent-helpers.md`: the subagent helpers are the fourth, because a
-    // session that cannot be loaded with them cannot delegate at all.
+    // session that cannot be loaded with them cannot delegate at all — and S7 of
+    // `agent-profiles.md`: that fourth entry and the routing table only travel
+    // when the human opened the delegation gate.
     #[test]
     fn spawn_args_match_the_pi_rpc_invocation() {
         let args = spawn_args(
@@ -1626,6 +1706,7 @@ printf 'exited\n' >> '@MARKER@'
                     "/tmp/nabla/extensions/nabla-subagents.ts",
                 )),
                 data_dir: Some(Path::new("/tmp/nabla")),
+                delegating: true,
             },
         );
         assert_eq!(
@@ -1653,7 +1734,9 @@ printf 'exited\n' >> '@MARKER@'
                 "-e".to_string(),
                 "/tmp/nabla/extensions/nabla-subagents.ts".to_string(),
                 "--append-system-prompt".to_string(),
-                NABLA_SYSTEM_PROMPT.to_string(),
+                // S7 of `agent-profiles.md`: with the gate open the identity
+                // carries the routing table.
+                compose_system_prompt(true),
             ]
         );
         // The identity actually says who we are: it is not an empty placeholder.
@@ -1688,7 +1771,7 @@ printf 'exited\n' >> '@MARKER@'
             "the MCP flag rides with its own -e: {args:?}"
         );
         // The identity is the last flag pair either way.
-        assert_eq!(args.last(), Some(&NABLA_SYSTEM_PROMPT.to_string()));
+        assert_eq!(args.last(), Some(&compose_system_prompt(false)));
         // S2 of `composer-inputs.md`: no level chosen means no flag at all, so pi
         // keeps its own `defaultThinkingLevel` instead of receiving a word this
         // build could not validate.
@@ -1698,14 +1781,142 @@ printf 'exited\n' >> '@MARKER@'
         );
     }
 
+    // S8 of `agent-profiles.md`: with the gate closed the invocation is today's,
+    // exactly — the helpers exist on disk and are simply not loaded, and the
+    // prompt is the identity with no routing table.
+    #[test]
+    fn spawn_args_with_the_gate_closed_are_the_invocation_without_delegation() {
+        let args = spawn_args(
+            Path::new("/tmp/1.jsonl"),
+            SessionModel {
+                provider: "nan",
+                model: "m",
+                thinking: None,
+            },
+            SpawnLayout {
+                ask_extension: Some(Path::new("/d/nabla-ask.ts")),
+                permissions_extension: Some(Path::new("/d/nabla-permissions.ts")),
+                // The helpers were materialized; this spawn decided not to load
+                // them, which is the whole point of the gate.
+                subagents_extension: None,
+                data_dir: Some(Path::new("/d")),
+                delegating: false,
+            },
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--mode".to_string(),
+                "rpc".to_string(),
+                "--session".to_string(),
+                "/tmp/1.jsonl".to_string(),
+                "--provider".to_string(),
+                "nan".to_string(),
+                "--model".to_string(),
+                "m".to_string(),
+                "--no-extensions".to_string(),
+                "-e".to_string(),
+                "builtin:mcp".to_string(),
+                "-e".to_string(),
+                "/d/nabla-ask.ts".to_string(),
+                "-e".to_string(),
+                "/d/nabla-permissions.ts".to_string(),
+                "--append-system-prompt".to_string(),
+                compose_system_prompt(false),
+            ]
+        );
+    }
+
+    // S3/S7: opening the gate adds exactly one `-e` pair and one prompt section,
+    // at the same positions every other extension and the identity already have.
+    #[test]
+    fn opening_the_gate_adds_only_the_helpers_and_the_routing_table() {
+        let layout = |subagents: Option<&'static Path>, delegating: bool| SpawnLayout {
+            ask_extension: Some(Path::new("/d/nabla-ask.ts")),
+            permissions_extension: Some(Path::new("/d/nabla-permissions.ts")),
+            subagents_extension: subagents,
+            data_dir: Some(Path::new("/d")),
+            delegating,
+        };
+        let model = SessionModel {
+            provider: "nan",
+            model: "m",
+            thinking: None,
+        };
+        let closed = spawn_args(Path::new("/tmp/1.jsonl"), model, layout(None, false));
+        let open = spawn_args(
+            Path::new("/tmp/1.jsonl"),
+            model,
+            layout(Some(Path::new("/d/nabla-subagents.ts")), true),
+        );
+
+        assert_eq!(
+            open.len(),
+            closed.len() + 2,
+            "one flag and one path, and nothing else: {open:?} vs {closed:?}"
+        );
+        assert_eq!(open[open.len() - 4], "-e");
+        assert_eq!(open[open.len() - 3], "/d/nabla-subagents.ts");
+        assert_eq!(open.last(), Some(&compose_system_prompt(true)));
+        // The flags before that pair are the same ones the closed spawn used.
+        assert_eq!(
+            open[..open.len() - 4],
+            closed[..closed.len() - 2],
+            "only the helpers flag is new: {open:?} vs {closed:?}"
+        );
+    }
+
+    // S7/S8: the composition itself, both ways. Closed is the identity byte for
+    // byte — the file before the marker, which is what every session received
+    // before delegation existed — and open is that same text plus one section.
+    #[test]
+    fn compose_system_prompt_is_gated_by_the_master_switch() {
+        let (identity, _) = NABLA_SYSTEM_PROMPT
+            .split_once(DELEGATING_OPEN)
+            .expect("the routing table lives behind its marker");
+        let closed = compose_system_prompt(false);
+        assert_eq!(
+            closed, identity,
+            "S8: closed, the prompt is the bytes before the marker"
+        );
+        assert!(
+            closed.ends_with("Be direct and concise.\n"),
+            "S8: no trailing drift either: {closed:?}"
+        );
+        assert!(!closed.contains("## Delegating"));
+        assert!(!closed.contains("nabla:delegating"));
+
+        let open = compose_system_prompt(true);
+        assert!(
+            open.starts_with(&closed),
+            "open is the same identity plus a section"
+        );
+        assert!(open.contains("## Delegating"));
+        // Phrase checks run on the whitespace-flattened text, so re-wrapping the
+        // markdown can never break them.
+        let flat = open.split_whitespace().collect::<Vec<_>>().join(" ");
+        // S7: the four questions, one line each.
+        for role in ["explorer", "researcher", "worker", "judge"] {
+            assert!(flat.contains(role), "S7 routes through `{role}`: {flat}");
+        }
+        // S7: the thresholds and the two judges of different families.
+        assert!(flat.contains("more than one read batch"));
+        assert!(flat.contains("different model families"));
+        // S7: the honest limits.
+        assert!(flat.contains("cannot ask the person anything"));
+        assert!(flat.contains("cannot delegate further"));
+        assert!(flat.contains("at most 4 children"));
+        // The markers are for the split, never for the model.
+        assert!(!open.contains("<!--"), "{open}");
+    }
+
     // The browser pane became drivable when the MCP server landed, and this
     // prompt went on claiming the opposite for long enough that the agent
     // answered "no puedo ver esa pestaña" while ten `nabla-browser` tools were
     // connected in the same session. The prompt is the only place that can draw
     // the line between "the drawer is the human's" and "this one tab is yours".
     #[test]
-    fn the_identity_tells_the_agent_it_can_drive_the_browser_pane() {
-        assert!(
+    fn the_identity_tells_the_agent_it_can_drive_the_browser_pane() {        assert!(
             NABLA_SYSTEM_PROMPT.contains("nabla-browser"),
             "without the server name the agent cannot find its browser tools"
         );
@@ -1849,6 +2060,8 @@ printf 'exited\n' >> '@MARKER@'
     // extension is loaded, and the two facts the feature would be dishonest
     // without — no recursion, and the permission gate applied to the child's
     // allowlist (H1.1: the parent's `tool_call` hook never sees a child).
+    // S1 of `agent-profiles.md`: and the profiles are Nabla's file, never a
+    // markdown convention inside the project.
     #[test]
     fn the_subagents_extension_registers_the_four_tools() {
         for tool in [
@@ -1881,6 +2094,36 @@ printf 'exited\n' >> '@MARKER@'
         // reach for the ask dialogs the question bridge owns.
         assert!(!SUBAGENTS_EXTENSION_SOURCE.contains("ctx.ui.select("));
         assert!(!SUBAGENTS_EXTENSION_SOURCE.contains("ctx.ui.input("));
+    }
+
+    // S1 of `agent-profiles.md`: the defect this feature exists to fix. The
+    // extension read `<cwd>/<CONFIG_DIR_NAME>/agents`, i.e. `.pi/agents` inside
+    // the project, and parsed frontmatter from it. Profiles are Nabla's now: one
+    // JSON file under the data dir, and nothing else.
+    #[test]
+    fn the_subagents_extension_reads_nablas_profile_store_and_not_the_project() {
+        for needle in ["agents.json", "loadProfiles", "raw.enabled === true"] {
+            assert!(
+                SUBAGENTS_EXTENSION_SOURCE.contains(needle),
+                "the extension must read Nabla's store: `{needle}` is missing"
+            );
+        }
+        // The read-from-the-project path and its parser are gone, not disabled.
+        for gone in [
+            "splitFrontmatter",
+            "readdirSync",
+            "fieldTools",
+            "`${join(cwd, CONFIG_DIR_NAME, \"agents\")}",
+        ] {
+            assert!(
+                !SUBAGENTS_EXTENSION_SOURCE.contains(gone),
+                "`{gone}` belongs to the retired `.pi/agents` reader"
+            );
+        }
+        // S3: with nothing enabled, the answer is honest and points at Settings.
+        assert!(SUBAGENTS_EXTENSION_SOURCE.contains("Settings → Subagents"));
+        // S6: the model resolution order, in the order the spec names.
+        assert!(SUBAGENTS_EXTENSION_SOURCE.contains("definition.model || store.defaultModel"));
     }
 
     // H2: the extension is embedded and written at boot, so `-e` always points at
@@ -1928,6 +2171,7 @@ printf 'exited\n' >> '@MARKER@'
                 )),
                 subagents_extension: None,
                 data_dir: Some(Path::new("/data")),
+                delegating: false,
             },
         );
         let envs: Vec<(String, String)> = command
@@ -2691,5 +2935,168 @@ printf 'exited\n' >> '@MARKER@'
         assert_eq!(manager.live_ids(), vec!["s2".to_string()]);
         manager.stop_all();
         assert!(manager.live_ids().is_empty(), "a stopped session is not live");
+    }
+
+    // ── the master gate (S3, S8 of `agent-profiles.md`) ──────────────────────
+
+    /// Writes the profile store the spawn reads: the master switch plus one
+    /// profile. Only those two booleans decide the `-e` list and the prompt
+    /// section, so only those two are written here.
+    #[cfg(unix)]
+    fn write_agents_json(dir: &Path, enabled: bool, profile_enabled: bool) {
+        let body = serde_json::json!({
+            "enabled": enabled,
+            "profiles": [{
+                "name": "explorer",
+                "description": "where it is",
+                "tools": ["read"],
+                "instructions": "Find things.",
+                "enabled": profile_enabled,
+            }],
+        });
+        std::fs::write(dir.join("agents.json"), body.to_string()).expect("write agents.json");
+    }
+
+    /// The `--append-system-prompt` value the child received, rebuilt from the
+    /// argv the fake engine logged (one argument per line, so the prompt is every
+    /// line from the flag on). `None` when the flag never reached the child.
+    #[cfg(unix)]
+    fn spawned_prompt(args: &[String]) -> Option<String> {
+        let at = args.iter().position(|arg| arg == "--append-system-prompt")?;
+        Some(args.get(at + 1..)?.join("\n"))
+    }
+
+    // S8: with the master switch off the spawn is exactly today's — no helper
+    // extension in `-e` and no routing table in the prompt. Asserted on the
+    // child's own argv, not on the builder.
+    #[cfg(unix)]
+    #[test]
+    fn the_master_switch_off_spawns_without_any_delegation() {
+        let scratch = Scratch::new("agents_off");
+        let attempts = scratch.path("attempts");
+        let marker = scratch.path("marker");
+        let script = write_script(&scratch, "fake-pi.sh", &attempts, &marker, FAKE_PI);
+        let collected = Arc::new(Collected::default());
+        let helpers = scratch.path("nabla-subagents.ts");
+        write_agents_json(&scratch.dir, false, true);
+        let manager = ProcessManager::with_timeouts(collected.sink(), test_timeouts())
+            .with_subagents_extension(helpers.clone())
+            .with_data_dir(scratch.dir.clone());
+
+        let report = manager
+            .spawn(
+                "s1",
+                script.to_str().unwrap(),
+                &scratch.path("s1.jsonl"),
+                SessionModel {
+                    provider: TEST_PROVIDER,
+                    model: TEST_MODEL,
+                    thinking: None,
+                },
+                &scratch.dir,
+            )
+            .expect("spawn");
+        assert_eq!(report.outcome, StartupOutcome::Ready, "stderr: {:?}", report.stderr_tail);
+
+        let args = recorded_args(&scratch, "fake-pi.sh");
+        let helper_arg = helpers.to_string_lossy().to_string();
+        assert!(
+            !args.contains(&helper_arg),
+            "S3/S8: the master switch off must not load the helpers: {args:?}"
+        );
+        let prompt = spawned_prompt(&args).expect("--append-system-prompt still reaches pi");
+        assert!(
+            !prompt.contains("## Delegating"),
+            "S7/S8: no routing table without the master switch: {prompt}"
+        );
+        manager.stop_all();
+    }
+
+    // S3/S7: switched on with one enabled profile, the helpers are loaded and the
+    // routing table joins the prompt — the other half of the same decision.
+    #[cfg(unix)]
+    #[test]
+    fn the_master_switch_on_loads_the_helpers_and_the_routing_table() {
+        let scratch = Scratch::new("agents_on");
+        let attempts = scratch.path("attempts");
+        let marker = scratch.path("marker");
+        let script = write_script(&scratch, "fake-pi.sh", &attempts, &marker, FAKE_PI);
+        let collected = Arc::new(Collected::default());
+        let helpers = scratch.path("nabla-subagents.ts");
+        write_agents_json(&scratch.dir, true, true);
+        let manager = ProcessManager::with_timeouts(collected.sink(), test_timeouts())
+            .with_subagents_extension(helpers.clone())
+            .with_data_dir(scratch.dir.clone());
+
+        let report = manager
+            .spawn(
+                "s1",
+                script.to_str().unwrap(),
+                &scratch.path("s1.jsonl"),
+                SessionModel {
+                    provider: TEST_PROVIDER,
+                    model: TEST_MODEL,
+                    thinking: None,
+                },
+                &scratch.dir,
+            )
+            .expect("spawn");
+        assert_eq!(report.outcome, StartupOutcome::Ready, "stderr: {:?}", report.stderr_tail);
+
+        let args = recorded_args(&scratch, "fake-pi.sh");
+        let helper_arg = helpers.to_string_lossy().to_string();
+        let at = args
+            .iter()
+            .position(|arg| *arg == helper_arg)
+            .unwrap_or_else(|| panic!("S3: an enabled profile loads the helpers: {args:?}"));
+        assert_eq!(args.get(at - 1).map(String::as_str), Some("-e"));
+        let prompt = spawned_prompt(&args).expect("--append-system-prompt still reaches pi");
+        assert!(
+            prompt.contains("## Delegating"),
+            "S7: the routing table only exists when the master switch is on: {prompt}"
+        );
+        manager.stop_all();
+    }
+
+    // S3: switched on with no enabled profile there is nothing to offer, so the
+    // helpers stay out of the spawn and the prompt stays today's: a tool the
+    // model cannot use is worse than no tool at all.
+    #[cfg(unix)]
+    #[test]
+    fn the_master_switch_on_without_enabled_profiles_spawns_without_delegation() {
+        let scratch = Scratch::new("agents_no_profiles");
+        let attempts = scratch.path("attempts");
+        let marker = scratch.path("marker");
+        let script = write_script(&scratch, "fake-pi.sh", &attempts, &marker, FAKE_PI);
+        let collected = Arc::new(Collected::default());
+        let helpers = scratch.path("nabla-subagents.ts");
+        write_agents_json(&scratch.dir, true, false);
+        let manager = ProcessManager::with_timeouts(collected.sink(), test_timeouts())
+            .with_subagents_extension(helpers.clone())
+            .with_data_dir(scratch.dir.clone());
+
+        let report = manager
+            .spawn(
+                "s1",
+                script.to_str().unwrap(),
+                &scratch.path("s1.jsonl"),
+                SessionModel {
+                    provider: TEST_PROVIDER,
+                    model: TEST_MODEL,
+                    thinking: None,
+                },
+                &scratch.dir,
+            )
+            .expect("spawn");
+        assert_eq!(report.outcome, StartupOutcome::Ready, "stderr: {:?}", report.stderr_tail);
+
+        let args = recorded_args(&scratch, "fake-pi.sh");
+        assert!(
+            !args.contains(&helpers.to_string_lossy().to_string()),
+            "S3: nothing to offer means no helpers: {args:?}"
+        );
+        let prompt = spawned_prompt(&args).expect("--append-system-prompt still reaches pi");
+        assert!(!prompt.contains("## Delegating"), "{prompt}");
+        manager.stop_all();
     }
 }

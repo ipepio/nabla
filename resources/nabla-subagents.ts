@@ -19,13 +19,28 @@
  * WHY THE ALLOWLIST IS THE PERMISSION GATE (H1.1): the parent's `tool_call` hook
  * never sees a child's tool calls — each `createAgentSession` builds a private
  * extension runtime. So the gate cannot be inherited at run time; it is applied
- * here, when the child's tool list is built: the definition's `tools` is
+ * here, when the child's tool list is built: the profile's `tools` is
  * intersected with the human's permission mode, read from the same
  * `<NABLA_DATA_DIR>/permissions.json` projection `nabla-permissions.ts` reads, on
  * every run. In `read` mode the shell and file-writing tools are removed from
  * the list, and a tool that is not in the list does not exist for the child
  * (H1.2). The mode is read per child, so switching the chip affects the next
  * delegation without restarting anything.
+ *
+ * WHERE THE PROFILES COME FROM (S1 of `agent-profiles.md`): `<NABLA_DATA_DIR>/`
+ * `agents.json` — the single file Settings → Subagents writes. Never a markdown
+ * file inside the project: `.pi/agents/*.md` is pi's convention, and profiles are
+ * Nabla's. The store is read on every tool call, so a profile the human enables,
+ * disables or edits reaches the next delegation without a restart. Only profiles
+ * with `enabled: true` are offered; when there is none, every tool answers that
+ * honestly and points at Settings instead of failing (S3).
+ *
+ * WHETHER THIS EXTENSION EXISTS AT ALL is the host's decision, not ours (S3):
+ * with the master switch off, or with no enabled profile, the spawn never passes
+ * this file to `-e`, so `run_agent` does not exist for the model. A session that
+ * is already running keeps what it started with — pi loads an extension once and
+ * has no way to unload it — so the master switch is re-read by the host at the
+ * next spawn and never here.
  *
  * NO RECURSION (S5): our own four tool names are removed from every child's list,
  * so a child can never delegate again. Children also start clean (H1.4): no
@@ -65,7 +80,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 /** The four tools this extension registers. Also the recursion strip list (S5). */
@@ -92,22 +107,6 @@ const SHELL_TOOLS: readonly string[] = ["bash", "powershell"];
 const FILE_TOOLS: readonly string[] = ["edit", "write"];
 
 /**
- * What a definition that names no `tools` gets: the same set the human's own
- * session has by default, so the gate — not a missing list — decides what a child
- * may do. `read` mode then leaves only the inspecting tools.
- */
-const DEFAULT_TOOLS: readonly string[] = [
-  "read",
-  "grep",
-  "find",
-  "ls",
-  "bash",
-  "powershell",
-  "edit",
-  "write",
-];
-
-/**
  * One model this session can use, as the session's own registry holds it. Named
  * through the registry instead of importing pi-ai's `Model` here: the child is
  * built with exactly the object the parent's registry resolved, so a definition
@@ -129,19 +128,32 @@ const EFFORTS: readonly string[] = [
 /** The four states the host reads out of the manifest (H3.3). */
 type ChildStatus = "queued" | "running" | "done" | "failed";
 
-/** One agent definition from `.pi/agents/*.md` (S4). */
-interface AgentDefinition {
+/**
+ * One profile of `<NABLA_DATA_DIR>/agents.json`, as the Settings dialog stores it
+ * (S1, S2 of `agent-profiles.md`). Mirrors `AgentProfile` in
+ * `src-tauri/src/agents.rs` field by field; Rust validates before it writes, so
+ * this is a reader only.
+ */
+interface AgentProfile {
   name: string;
   description: string;
-  /** The allowlist the definition asks for, before the permission gate. */
+  /** The child's allowlist, before the permission gate. Empty means no tools. */
   tools: string[];
-  /** `provider/model`, resolved against this session's models when provided. */
-  model?: string;
-  /** A thinking level, when the definition asks for one. */
-  effort?: string;
-  /** The markdown body: the child's system prompt. */
-  body: string;
-  path: string;
+  /** `provider/model` or a bare id, resolved against this session's models. */
+  model?: string | null;
+  /** A thinking level, when the profile asks for one. */
+  effort?: string | null;
+  /** The child's whole system prompt. */
+  instructions: string;
+  enabled: boolean;
+}
+
+/** The profile store, filtered down to what a delegation may use. */
+interface ProfileStore {
+  /** S6, second level of the model resolution order. */
+  defaultModel?: string;
+  /** Only the profiles with `enabled: true`, in file order. */
+  profiles: AgentProfile[];
 }
 
 /** One child of this session, as the tools and the manifest report it. */
@@ -176,151 +188,105 @@ interface ManifestEntry {
   parentSessionPath: string | null;
 }
 
-// ── frontmatter (S4) ────────────────────────────────────────────────────────
+// ── the profile store (S1, S3, S6 of `agent-profiles.md`) ────────────────────
 
 /**
- * Splits a definition into its frontmatter fields and its body.
+ * Reads `<NABLA_DATA_DIR>/agents.json` — the one file Settings → Subagents writes
+ * — and answers the profiles this session may actually use.
  *
- * Deliberately not a YAML parser: the convention is flat `key: value` lines, an
- * optional `- item` list, and nothing nested. A file with no frontmatter is a
- * body with no fields, which is a definition missing a name and a tool list — the
- * caller reports it by name instead of failing on a parse nobody can debug.
+ * Read on every tool call, so an edit or a switch change reaches the next
+ * delegation without restarting anything. A missing file, an unreadable one or a
+ * body that does not parse is an empty store, never an exception: the tools then
+ * answer honestly that there is nothing to delegate to (S3), which is what a
+ * fresh install looks like.
  */
-function splitFrontmatter(text: string): {
-  fields: Map<string, string | string[]>;
-  body: string;
-} {
-  const fields = new Map<string, string | string[]>();
-  const opening = /^---[ \t]*\r?\n/.exec(text);
-  if (!opening) return { fields, body: text };
-  const rest = text.slice(opening[0].length);
-  const closing = /(?:^|\r?\n)---[ \t]*(?=\r?\n|$)/.exec(rest);
-  if (!closing) return { fields, body: text };
-  const raw = rest.slice(0, closing.index);
-  const body = rest
-    .slice(closing.index + closing[0].length)
-    .replace(/^\r?\n/, "");
-
-  let lastKey: string | undefined;
-  for (const line of raw.split(/\r?\n/)) {
-    if (line.trim() === "" || line.trim().startsWith("#")) continue;
-    const item = /^\s*-\s+(.*)$/.exec(line);
-    if (item && lastKey) {
-      const current = fields.get(lastKey);
-      const values = Array.isArray(current) ? current : current ? [current] : [];
-      values.push(unquote(item[1]));
-      fields.set(lastKey, values);
-      continue;
-    }
-    const pair = /^([A-Za-z0-9_-]+)[ \t]*:[ \t]*(.*)$/.exec(line);
-    if (!pair) continue;
-    lastKey = pair[1].toLowerCase();
-    const value = pair[2].trim();
-    fields.set(lastKey, value === "" ? [] : unquote(value));
+function loadProfiles(): ProfileStore {
+  const dir = dataDir();
+  if (!dir) return { profiles: [] };
+  let raw: string;
+  try {
+    raw = readFileSync(join(dir, "agents.json"), "utf8");
+  } catch {
+    return { profiles: [] };
   }
-  return { fields, body };
-}
-
-/** Strips one layer of matching surrounding quotes; leaves anything else as is. */
-function unquote(value: string): string {
-  const trimmed = value.trim();
-  if (trimmed.length >= 2) {
-    const first = trimmed[0];
-    if ((first === '"' || first === "'") && trimmed.endsWith(first)) {
-      return trimmed.slice(1, -1);
-    }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { profiles: [] };
   }
-  return trimmed;
-}
-
-/** One frontmatter field as text. A list folds into its first value. */
-function fieldText(
-  fields: Map<string, string | string[]>,
-  key: string,
-): string | undefined {
-  const value = fields.get(key);
-  if (typeof value === "string") {
-    return value.trim() === "" ? undefined : value.trim();
+  if (typeof parsed !== "object" || parsed === null) return { profiles: [] };
+  const config = parsed as {
+    modelDefault?: unknown;
+    profiles?: unknown;
+  };
+  const entries: unknown[] = Array.isArray(config.profiles) ? config.profiles : [];
+  const profiles: AgentProfile[] = [];
+  for (const entry of entries) {
+    const profile = normalizeProfile(entry);
+    // S3: a profile nobody enabled is not offered, and the host already decided
+    // whether this extension exists at all.
+    if (profile && profile.enabled) profiles.push(profile);
   }
-  if (Array.isArray(value)) {
-    const first = value.find((entry) => entry.trim() !== "");
-    return first?.trim();
-  }
-  return undefined;
+  const defaultModel =
+    typeof config.modelDefault === "string" && config.modelDefault.trim() !== ""
+      ? config.modelDefault.trim()
+      : undefined;
+  return { defaultModel, profiles };
 }
 
 /**
- * The tool names of a definition: comma- or space-separated on one line, or a
- * `- item` list, both used in the wild by the reference convention (S4).
+ * One entry of the store, or `undefined` when it is not a profile at all (not an
+ * object, no usable name). A field of the wrong type is dropped instead of
+ * coerced: a profile is configuration, and guessing it would run a child with
+ * settings the human never wrote.
  */
-function fieldTools(fields: Map<string, string | string[]>): string[] {
-  const raw = fields.get("tools");
-  const parts: string[] = [];
-  const push = (value: string) => {
-    for (const piece of value.split(/[,\s]+/)) {
-      if (piece.trim() !== "") parts.push(piece.trim());
-    }
+function normalizeProfile(entry: unknown): AgentProfile | undefined {
+  if (typeof entry !== "object" || entry === null) return undefined;
+  const raw = entry as Record<string, unknown>;
+  const name = typeof raw.name === "string" ? raw.name.trim() : "";
+  if (name === "") return undefined;
+  const tools = Array.isArray(raw.tools)
+    ? raw.tools
+        .filter((tool): tool is string => typeof tool === "string")
+        .map((tool) => tool.trim())
+        .filter((tool) => tool !== "")
+    : [];
+  return {
+    name,
+    description: typeof raw.description === "string" ? raw.description.trim() : "",
+    tools,
+    model: typeof raw.model === "string" ? raw.model.trim() : undefined,
+    effort: typeof raw.effort === "string" ? raw.effort.trim().toLowerCase() : undefined,
+    instructions: typeof raw.instructions === "string" ? raw.instructions.trim() : "",
+    enabled: raw.enabled === true,
   };
-  if (typeof raw === "string") push(raw);
-  else if (Array.isArray(raw)) raw.forEach(push);
-  // Duplicates would only make the allowlist noisy; order is kept.
-  return [...new Set(parts)];
 }
 
-/** Reads `.pi/agents/*.md` under the session's cwd, sorted by name (S4). */
-function loadAgents(cwd: string): AgentDefinition[] {
-  const dir = join(cwd, CONFIG_DIR_NAME, "agents");
-  let files: string[];
-  try {
-    files = readdirSync(dir).filter((file) => file.toLowerCase().endsWith(".md"));
-  } catch {
-    // No directory is not an error: a workspace without agent definitions simply
-    // has nothing to delegate to, and `run_agent` says exactly that.
-    return [];
-  }
-  const definitions: AgentDefinition[] = [];
-  for (const file of files.sort()) {
-    const path = join(dir, file);
-    let text: string;
-    try {
-      text = readFileSync(path, "utf8");
-    } catch {
-      continue;
-    }
-    const { fields, body } = splitFrontmatter(text);
-    // The file name is the fallback name, so a definition that forgot the field
-    // is still addressable by what the human called the file.
-    const fallback = file.replace(/\.md$/i, "");
-    const name = fieldText(fields, "name") ?? fallback;
-    definitions.push({
-      name: name.toLowerCase(),
-      description: fieldText(fields, "description") ?? "",
-      tools: fieldTools(fields),
-      model: fieldText(fields, "model"),
-      effort: fieldText(fields, "effort"),
-      body: body.trim(),
-      path,
-    });
-  }
-  return definitions.sort((a, b) => a.name.localeCompare(b.name));
-}
-
-/** The list `run_agent` prints when the name does not match (like `resolve_view`). */
-function availableAgents(definitions: AgentDefinition[], cwd: string): string {
-  if (definitions.length === 0) {
-    return (
-      `there are no agent definitions under ${join(cwd, CONFIG_DIR_NAME, "agents")}: ` +
-      `add a markdown file with \`name\`, \`description\` and \`tools\` frontmatter, ` +
-      `then delegate again`
-    );
-  }
-  return definitions
-    .map((definition) =>
-      definition.description
-        ? `${definition.name} (${definition.description})`
-        : definition.name,
+/**
+ * The list `run_agent` prints when the name does not match (like
+ * `resolve_view`): the profiles the human enabled, with what each is for.
+ */
+function describeProfiles(profiles: AgentProfile[]): string {
+  return profiles
+    .map((profile) =>
+      profile.description
+        ? `${profile.name} (${profile.description})`
+        : profile.name,
     )
     .join(", ");
+}
+
+/**
+ * S3: what every tool answers when nothing is enabled. It names the place the
+ * human fixes it instead of failing silently or pretending the feature exists.
+ */
+function noProfilesText(): string {
+  return (
+    "No subagent profile is enabled, so there is nothing to delegate to. Turn on " +
+    "the profiles you want in Settings → Subagents (and the master switch, if it " +
+    "is off), then try again."
+  );
 }
 
 // ── the permission gate, applied to the allowlist (H1.1, H1.2, S5) ──────────
@@ -346,16 +312,15 @@ function currentMode(): "read" | "write" | "yolo" {
 }
 
 /**
- * The child's real allowlist: the definition's tools, minus our own four (no
+ * The child's real allowlist: the profile's tools, minus our own four (no
  * recursion), minus the shell and file-writing families when the human is in
- * `read` mode. An empty result is refused by the caller — a child with no tools
- * could not do the task, so spawning one would be a lie.
+ * `read` mode. An empty result is refused by the caller — a profile that lists no
+ * tool (or only ones the mode blocks) would give the child nothing to work with,
+ * so spawning it would be a lie.
  */
-function childAllowlist(definition: AgentDefinition): string[] {
-  const declared =
-    definition.tools.length > 0 ? definition.tools : [...DEFAULT_TOOLS];
+function childAllowlist(definition: AgentProfile): string[] {
   const blocked = currentMode() === "read" ? [...SHELL_TOOLS, ...FILE_TOOLS] : [];
-  return declared.filter(
+  return definition.tools.filter(
     (tool) => !OWN_TOOLS.includes(tool) && !blocked.includes(tool),
   );
 }
@@ -377,7 +342,7 @@ function dataDir(): string | undefined {
  * `<cwd>/.pi/subagent-sessions` — and simply publishes no manifest, because the
  * host it would publish to is not running.
  */
-function childSessionDir(parent: ParentRef, cwd: string): string {
+function childSessionDir(cwd: string): string {
   const dir = dataDir();
   if (dir) return join(dir, "sessions", "subagents");
   return join(cwd, CONFIG_DIR_NAME, "subagent-sessions");
@@ -572,17 +537,18 @@ export default function nablaSubagents(pi: ExtensionAPI) {
     name: "run_agent",
     label: "Run Agent",
     description:
-      "Delegate one task to a specialized agent and wait for its answer. " +
-      "Agents are markdown definitions in `.pi/agents/*.md` of this workspace " +
-      "(frontmatter: name, description, tools, optional model and effort). The " +
-      "child runs as a separate pi session in this same process, with only the " +
-      "tools its definition lists and the human's permission mode allows, and " +
-      "writes its own session file, so the human can watch it in Nabla's sidebar. " +
-      "This tool BLOCKS until the child finishes, then returns the child's final " +
-      "message. The child cannot delegate further and cannot ask the human " +
-      "anything: what it needs must be in `task`. At most 4 children may run at " +
-      "once. Call it several times in one turn to run agents in parallel.",
-    promptSnippet: "Delegate one task to a markdown-defined agent and wait for it",
+      "Delegate one task to a specialized agent profile and wait for its answer. " +
+      "Profiles are configured by the person in Nabla's Settings → Subagents " +
+      "(name, description, tools, optional model and effort, instructions); only " +
+      "the enabled ones exist. The child runs as a separate pi session in this " +
+      "same process, with only the tools its profile lists and the human's " +
+      "permission mode allows, and writes its own session file, so the human can " +
+      "watch it in Nabla's sidebar. This tool BLOCKS until the child finishes, " +
+      "then returns the child's final message. The child cannot delegate further " +
+      "and cannot ask the human anything: what it needs must be in `task`. At " +
+      "most 4 children may run at once. Call it several times in one turn to run " +
+      "agents in parallel.",
+    promptSnippet: "Delegate one task to a configured agent profile and wait for it",
     promptGuidelines: [
       "run_agent blocks until the child answers: give it one self-contained task, not a conversation.",
       "run_agent children cannot ask the human anything — put every decision they need in the task.",
@@ -590,7 +556,7 @@ export default function nablaSubagents(pi: ExtensionAPI) {
     parameters: Type.Object({
       agent: Type.String({
         description:
-          "The agent definition to run, as its file name or its `name` frontmatter (e.g. `review`).",
+          "The agent profile to run, by its name as configured in Settings → Subagents (e.g. `explorer`).",
       }),
       task: Type.String({
         description:
@@ -599,24 +565,34 @@ export default function nablaSubagents(pi: ExtensionAPI) {
       name: Type.Optional(
         Type.String({
           description:
-            "A name for this run, used by agent_status, agent_cancel and agent_send_message. Defaults to the agent name, suffixed when taken.",
+            "A name for this run, used by agent_status, agent_cancel and agent_send_message. Defaults to the profile name, suffixed when taken.",
         }),
       ),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const parent = parentRefOf(ctx);
       rememberParent(parent);
-      const definitions = loadAgents(ctx.cwd);
+      // S1/S3: the profile store is Nabla's file, read fresh, and only its
+      // enabled profiles count.
+      const store = loadProfiles();
+      if (store.profiles.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: noProfilesText() }],
+          details: { agent: params.agent, sessionPath: null, status: "failed" },
+        };
+      }
       const wanted = String(params.agent ?? "").trim().toLowerCase();
-      const definition = definitions.find((entry) => entry.name === wanted);
+      const definition = store.profiles.find(
+        (entry) => entry.name.toLowerCase() === wanted,
+      );
       if (!definition) {
         return {
           content: [
             {
               type: "text" as const,
               text:
-                `No agent named \`${params.agent}\`. Available agents: ` +
-                `${availableAgents(definitions, ctx.cwd)}.`,
+                `No agent profile named \`${params.agent}\`. Enabled profiles: ` +
+                `${describeProfiles(store.profiles)}.`,
             },
           ],
           details: { agent: params.agent, sessionPath: null, status: "failed" },
@@ -648,27 +624,33 @@ export default function nablaSubagents(pi: ExtensionAPI) {
             {
               type: "text" as const,
               text:
-                `The agent \`${definition.name}\` asks only for tools the current ` +
-                `"${mode}" permission mode blocks, so the child would have nothing ` +
-                `to work with and was not started. Ask the human to switch the ` +
-                `permission chip, or edit the definition's \`tools\` frontmatter.`,
+                `The profile \`${definition.name}\` would give the child no tools ` +
+                `under the current "${mode}" permission mode` +
+                (definition.tools.length === 0
+                  ? " (it lists none)"
+                  : ` (it lists ${definition.tools.join(", ")})`) +
+                `, so the child was not started. Give it at least one tool the ` +
+                `mode allows, in Settings → Subagents.`,
             },
           ],
           details: { agent: definition.name, sessionPath: null, status: "failed" },
         };
       }
 
-      const model = resolveModel(ctx, definition.model);
-      if (definition.model && !model) {
+      // S6: the model resolution order is the profile's own model, then the
+      // store's default, then this session's model (`undefined` below).
+      const askedModel = definition.model || store.defaultModel;
+      const model = resolveModel(ctx, askedModel);
+      if (askedModel && !model) {
         return {
           content: [
             {
               type: "text" as const,
               text:
-                `The agent \`${definition.name}\` asks for model ` +
-                `\`${definition.model}\`, which this session cannot reach. Fix the ` +
-                `definition's \`model\` frontmatter (or remove it to use this ` +
-                `session's model) and try again.`,
+                `The profile \`${definition.name}\` asks for model ` +
+                `\`${askedModel}\`, which this session cannot reach. Fix that ` +
+                `profile's model in Settings → Subagents (or leave it empty to ` +
+                `use this session's model) and try again.`,
             },
           ],
           details: { agent: definition.name, sessionPath: null, status: "failed" },
@@ -680,10 +662,10 @@ export default function nablaSubagents(pi: ExtensionAPI) {
             {
               type: "text" as const,
               text:
-                `The agent \`${definition.name}\` asks for effort ` +
+                `The profile \`${definition.name}\` asks for effort ` +
                 `\`${definition.effort}\`, which is not a thinking level pi has ` +
-                `(${EFFORTS.join(", ")}). Fix the definition's \`effort\` ` +
-                `frontmatter and try again.`,
+                `(${EFFORTS.join(", ")}). Fix that profile's effort in Settings → ` +
+                `Subagents and try again.`,
             },
           ],
           details: { agent: definition.name, sessionPath: null, status: "failed" },
@@ -691,7 +673,7 @@ export default function nablaSubagents(pi: ExtensionAPI) {
       }
 
       const name = params.name ? uniqueName(params.name) : uniqueName(definition.name);
-      const sessionDir = childSessionDir(parent, ctx.cwd);
+      const sessionDir = childSessionDir(ctx.cwd);
       const sessionPath = join(sessionDir, `${randomUUID()}.jsonl`);
       const child: Child = {
         name,
@@ -709,10 +691,10 @@ export default function nablaSubagents(pi: ExtensionAPI) {
         // H1.3: the child's JSONL is ours to place, so the host can index it
         // before the child has written a single line.
         const sessionManager = SessionManager.open(sessionPath, sessionDir, ctx.cwd);
-        // H1.4 + S4: a clean child whose system prompt is exactly the definition
-        // body. No extension of the parent's is inherited (a gate that runs in
-        // the parent cannot run here — H1.1), no skill or template surprises the
-        // definition's author.
+        // H1.4 + S4: a clean child whose system prompt is exactly the profile's
+        // `instructions`. No extension of the parent's is inherited (a gate that
+        // runs in the parent cannot run here — H1.1), no skill or template
+        // surprises the profile's author.
         const resourceLoader = new DefaultResourceLoader({
           cwd: ctx.cwd,
           agentDir: getAgentDir(),
@@ -721,7 +703,8 @@ export default function nablaSubagents(pi: ExtensionAPI) {
           noPromptTemplates: true,
           noThemes: true,
           noContextFiles: true,
-          systemPrompt: definition.body === "" ? undefined : definition.body,
+          systemPrompt:
+            definition.instructions === "" ? undefined : definition.instructions,
         });
         await resourceLoader.reload();
         const created = await createAgentSession({
@@ -738,8 +721,10 @@ export default function nablaSubagents(pi: ExtensionAPI) {
                 | "max")
             : undefined,
           // H1.2: a tool that is not listed does not exist for the child. Our own
-          // four are stripped from the list AND denied, so a definition that names
+          // four are stripped from the list AND denied, so a profile that names
           // `run_agent` cannot recurse (S5).
+          // S6 of `agent-profiles.md`: `model` is the resolved profile/default one,
+          // and `undefined` means "this session's model".
           tools: allowlist,
           excludeTools: ["mcp__*", ...OWN_TOOLS],
           resourceLoader,
@@ -910,14 +895,19 @@ export default function nablaSubagents(pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const parent = parentRefOf(ctx);
       rememberParent(parent);
+      // S3: with nothing enabled there is no profile to list and no run to
+      // describe, so the honest answer is the one that points at Settings.
+      const store = loadProfiles();
       if (children.length === 0) {
         return {
           content: [
             {
               type: "text" as const,
               text:
-                "This session has not started any subagent yet. Use run_agent " +
-                `with one of: ${availableAgents(loadAgents(ctx.cwd), ctx.cwd)}.`,
+                store.profiles.length === 0
+                  ? noProfilesText()
+                  : "This session has not started any subagent yet. Use run_agent " +
+                    `with one of: ${describeProfiles(store.profiles)}.`,
             },
           ],
           details: { children: [] },

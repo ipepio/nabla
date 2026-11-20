@@ -361,6 +361,45 @@ export interface SubagentSession {
 export type SubagentStatus = "queued" | "running" | "done" | "failed" | "unknown";
 
 /**
+ * One subagent profile, as the human configures it in Settings → Subagents (S1,
+ * S2 of `odd/tasks/agent-profiles.md`). Mirrors `AgentProfile` in
+ * `src-tauri/src/agents.rs` field by field.
+ *
+ * The store is Nabla's own `<data dir>/agents.json`, never a file inside the
+ * project. `tools` is the child's allowlist as configured — an empty list is a
+ * real answer ("no tools"), not "the defaults". `model` is `provider/model` or a
+ * bare model id, resolved against the session's authenticated registry at run
+ * time; `effort` is one of pi's thinking levels; `instructions` is the child's
+ * whole system prompt.
+ */
+export interface AgentProfile {
+  name: string;
+  description: string;
+  tools: string[];
+  model: string | null;
+  effort: string | null;
+  instructions: string;
+  /** S3: a profile ships off, and only enabled profiles are offered. */
+  enabled: boolean;
+}
+
+/**
+ * The whole profile store (S1, S3, S6 of `agent-profiles.md`). Mirrors
+ * `AgentsConfig` in `src-tauri/src/agents.rs`.
+ *
+ * `enabled` is the master switch: off, the subagent extension is never loaded,
+ * so `run_agent` does not exist for the model. `modelDefault` is the second level
+ * of the model resolution order, between a profile's own model and the parent
+ * session's. A missing file is this shape with everything off — which is what a
+ * fresh install reads as.
+ */
+export interface AgentsConfig {
+  enabled: boolean;
+  modelDefault: string | null;
+  profiles: AgentProfile[];
+}
+
+/**
  * One message of the preview the app keeps for a session: the newest turns as it
  * last streamed them, so opening a session paints before pi boots. Mirrors
  * `PreviewMessage` in `src-tauri/src/commands.rs`.

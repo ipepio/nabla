@@ -1,3 +1,4 @@
+mod agents;
 mod cli;
 mod commands;
 // The embedded browser: one child webview per view, added to the main window.
@@ -67,6 +68,9 @@ pub fn run() {
             };
             // H2 of `subagent-helpers.md`: the delegation helpers are written the
             // same way. Not fatal: without them a session simply cannot delegate.
+            // S3 of `agent-profiles.md`: writing them here does not load them —
+            // every spawn asks `agents.json` whether the human opened the gate, so
+            // the switch only has to be on when the NEXT session starts.
             let subagents_extension = match process::materialize_subagents_extension(&data_dir) {
                 Ok(path) => Some(path),
                 Err(err) => {
@@ -257,6 +261,11 @@ pub fn run() {
             commands::list_sessions,
             commands::get_settings,
             commands::save_settings,
+            // S1/S3/S6 of `agent-profiles.md`: the subagent profiles are Nabla's
+            // own file, and the spawn reads it fresh to decide whether a session
+            // can delegate at all.
+            commands::get_agents_config,
+            commands::save_agents_config,
             // S1/S2 of `permission-modes.md`: the chat header's chip reads and
             // writes the mode, and a write reaches a live session through the
             // projection file the loaded gate reads on every tool call.
