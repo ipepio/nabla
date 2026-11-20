@@ -35,6 +35,7 @@ import {
   saveSettings,
   sessionStatus,
   setSessionModel,
+  setSessionThinkingLevel,
   stopSession,
 } from "@/contracts/commands";
 import type {
@@ -884,6 +885,18 @@ async function handleSelectModel(choice: { provider: string; model: string }) {
           model: live.id,
         });
       }
+      // The effort follows the model. pi's clamp never lifts "off" — it is a
+      // level every model supports — so a session that started on a
+      // non-reasoning model would carry "off" onto a model that reasons, and
+      // the human would find their agent muted without touching anything.
+      // Re-applying the persisted preference right after the switch lets pi
+      // clamp it to the new model's own range: the preference follows the
+      // model, and "off" survives only where the model truly has no reasoning.
+      await setSessionThinkingLevel(
+        session.workspaceId,
+        Number(session.sessionId),
+        current.thinkingLevel,
+      );
     } catch (cause) {
       panelError.value = commandErrorMessage(cause);
     }
