@@ -96,7 +96,7 @@ onMounted(async () => {
   <Button
     variant="outline"
     size="xs"
-    class="text-muted-foreground"
+    class="min-w-0 shrink text-muted-foreground"
     :title="hint"
     :aria-label="switchLabel"
     :aria-busy="saving"
@@ -105,6 +105,10 @@ onMounted(async () => {
     @click="cycle"
   >
     <TriangleAlertIcon v-if="mode === 'yolo'" class="size-3 shrink-0" />
-    {{ label }}
+    <!-- `truncate` is the safety net, not the design: the label is one word per
+         mode, and the sentence lives in the tooltip. Without this, a locale that
+         writes a longer word would push the send button out of the card again —
+         that is exactly how yolo's old sentence broke the row. -->
+    <span class="truncate">{{ label }}</span>
   </Button>
 </template>
