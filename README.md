@@ -75,8 +75,16 @@ index, never a second copy. To start from zero: quit Nabla and remove that folde
 
 ## Turning capabilities on
 
-Two features ship **off** and are enabled deliberately, because both leave your
-machine:
+A fresh install starts with everything optional **off**. That is the intended
+baseline, not a missing feature:
+
+| Capability | Default | Where |
+| --- | --- | --- |
+| Web search | off | Settings → Web search |
+| Subagents | off (no `agents.json` until you configure one) | Settings → Subagents |
+| Permission mode | `write` — edits allowed, commands ask | the chip in the composer |
+
+The two features ship off because both leave your machine:
 
 - **Web search** — Settings → Web search. A SearXNG instance you name, or any public
   one if you leave the field empty. The agent gets titles, urls and snippets; the page
