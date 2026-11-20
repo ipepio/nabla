@@ -34,6 +34,9 @@ pnpm install
 pnpm tauri dev
 ```
 
+`pnpm dev` starts only the frontend and takes no arguments (any argument, like
+`pnpm dev tauri`, exits with a hint); the desktop app is `pnpm tauri dev`.
+
 The first build compiles the whole Rust dependency tree; expect several minutes.
 Later runs are fast. If `cargo` is not found, load the toolchain in that shell:
 `source "$HOME/.cargo/env"`.
