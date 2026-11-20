@@ -37,9 +37,19 @@
 //
 // SINGLE WRITER — every mutation of the model goes through a function here: the
 // host renders `tabs`/`activeTabId` and calls `addTab`, `closeTab`, `setTabTool`,
-// `splitPane`, `closePane`, `setContextPath`, `focusPane`, `applyDock`. No component
-// builds a `Pane` by hand, so there is exactly one place that can break the depth
-// cap, the pane cap or the singleton rule.
+// `startToolInTab`, `openTool`, `splitPane`, `closePane`, `setContextPath`,
+// `focusPane`, `applyDock`. No component builds a `Pane` by hand, so there is
+// exactly one place that can break the depth cap, the pane cap or the singleton
+// rule.
+//
+// RECONCILE BEFORE WRITE — `applyDock` is the only thing that can empty the drawer,
+// and it runs on the host's inputs (the active workspace and the enabled tools),
+// which arrive ASYNCHRONOUSLY: the drawer mounts before either is known. A creation
+// path that writes first and lets that reconcile run afterwards can have its tab
+// cleared the moment the workspace settles. So the creation paths reconcile first
+// (`openTool`) and `setTabTool` refuses to write into a drawer that is not current
+// for the workspace it is being given: a tab may only be born in a drawer that
+// already agrees about where it lives.
 //
 // THE TWO SINGLETON RULES live here and nowhere else: `singleton` is one pane per
 // TAB, and `appWide` is one pane in the WHOLE drawer. Both are checked where the
@@ -107,6 +117,11 @@ export const focusedId = ref<string | null>(null);
 
 /** The workspace the current tabs were built for (see `applyDock`). */
 const layoutWorkspace = ref<string | null>(null);
+
+/** The key `applyDock` stores for a workspace: the folder, or `null` for none. */
+function workspaceKey(workspace: WorkspaceInfo | null): string | null {
+  return workspace?.path ?? null;
+}
 
 /** Instance ids are local and monotonic: stable keys for Vue, nothing durable. */
 let instanceSequence = 0;
@@ -276,9 +291,13 @@ export function closeTab(id: string): void {
  *
  * This is the app-wide half of the singleton rule: a pane of a `singleton` tool is
  * unique inside its tab, while a pane of an `appWide` tool is unique in the whole
- * drawer. The agent path (`App.vue`) uses this to ACTIVATE the tab that already
- * holds the browser instead of opening a second pane; the chooser uses it to stop
- * offering a tool that is already open elsewhere.
+ * drawer. The agent path (`App.vue`, through `openTool`) uses this to ACTIVATE the
+ * tab that already holds the browser instead of opening a second pane, and the
+ * chooser uses it to send the human to that tab instead of refusing the click.
+ *
+ * It only ever sees tabs of the drawer this module is current for: `applyDock`
+ * clears them on a workspace change and `setTabTool` refuses a write into a stale
+ * one, so a pane counted here is a pane the panel draws.
  */
 export function tabHoldingAppWideTool(toolId: ToolId): DockTab | undefined {
   return tabs.value.find((tab) =>
@@ -289,10 +308,11 @@ export function tabHoldingAppWideTool(toolId: ToolId): DockTab | undefined {
 /**
  * Starts a tool in an EMPTY tab: the empty area becomes the tab's single pane.
  * Refused for a tab that already holds a layout (a running tool is not replaced
- * silently; close it or close the tab), for an id the registry does not ship, and
- * for an `appWide` tool that already has a pane in ANY tab — the pane would be a
- * second copy of the same page or process, and the human must be sent to the tab
- * that holds it (which is what `tabHoldingAppWideTool` answers).
+ * silently; close it or close the tab), for an id the registry does not ship, for
+ * a drawer that is not current for `workspace` (see below), and for an `appWide`
+ * tool that already has a pane in ANY tab — the pane would be a second copy of the
+ * same page or process, and the human must be sent to the tab that holds it (which
+ * is what `tabHoldingAppWideTool` answers, and what `startToolInTab` does).
  */
 export function setTabTool(
   tabId: string,
@@ -303,6 +323,13 @@ export function setTabTool(
   if (tab === undefined || tab.layout !== null) return false;
   const definition = toolById(toolId);
   if (definition === undefined) return false;
+  // The tab must be born in the drawer that is CURRENT for its workspace. Writing
+  // into a stale one is what made a pane unreachable: the pending reconcile (a
+  // workspace that settled, a settings list that arrived) cleared the tab after
+  // the fact, and until it ran the pane held an app-wide tool the panel never
+  // drew. `openTool` and the chooser reconcile first, so this only answers a
+  // caller that skipped it — and for that caller, refusing beats writing anyway.
+  if (layoutWorkspace.value !== workspaceKey(workspace)) return false;
   // The app-wide rule, checked against every tab. The tab being filled is empty,
   // so it cannot be the one holding it: a second pane is the only way this fires.
   if (
@@ -316,6 +343,79 @@ export function setTabTool(
   activeTabId.value = tab.id;
   focusedId.value = instance.id;
   return true;
+}
+
+/**
+ * Starts one tool in an EMPTY tab on the HUMAN's behalf (a click in the chooser),
+ * and does what the app-wide rule asks instead of only saying no: when the tool
+ * already lives in another tab of the drawer, THAT tab is activated and the empty
+ * tab the chooser belongs to goes away, because the request "show me the browser"
+ * is already satisfied. A second pane is never created, so 45e9a1d's invariant
+ * holds no matter how many tabs the human opens.
+ *
+ * Answers `true` when the tool is on screen afterwards.
+ */
+export function startToolInTab(
+  tabId: string,
+  toolId: ToolId,
+  workspace: WorkspaceInfo | null,
+): boolean {
+  const tab = tabById(tabId);
+  if (tab === undefined) return false;
+  if (toolById(toolId)?.appWide === true) {
+    const holder = tabHoldingAppWideTool(toolId);
+    if (holder !== undefined && holder.id !== tab.id) {
+      activateTab(holder.id);
+      // The chooser only exists in an empty tab, and an empty tab left behind is
+      // litter that offers nothing the tab on screen does not already show.
+      if (tab.layout === null) closeTab(tab.id);
+      return true;
+    }
+  }
+  return setTabTool(tabId, toolId, workspace);
+}
+
+/**
+ * The one entry point for "open this tool for `workspace`" when the caller has no
+ * tab in mind — the agent's `embed-need-view` path in `App.vue`.
+ *
+ * It RECONCILES FIRST and writes second, and that ordering is the whole point: the
+ * reconcile that a workspace change (or a settings list that just arrived) triggers
+ * would otherwise run after the write and clear the tab that was just created —
+ * leaving the drawer open, empty, and the request silently lost. Reconciling first
+ * also means the app-wide lookup below can only see panes the panel draws, and that
+ * the tab is created in a drawer that is already current for its workspace, so any
+ * later reconcile with the same inputs is a no-op.
+ *
+ * An app-wide tool that already lives in the drawer is REVEALED, never duplicated;
+ * otherwise one new empty tab becomes the tool. Answers the tab showing the tool, or
+ * `null` when the registry does not ship it (nothing is left behind in that case).
+ */
+export function openTool(
+  toolId: ToolId,
+  workspace: WorkspaceInfo | null,
+  enabled: readonly string[],
+): string | null {
+  // The same inputs the host reconciles on, applied NOW instead of after this
+  // write. A pending workspace switch therefore clears the drawer BEFORE the tab
+  // exists, which is the only ordering in which a new tab cannot be wiped.
+  applyDock(workspace, enabled);
+  const definition = toolById(toolId);
+  if (definition === undefined) return null;
+  if (definition.appWide === true) {
+    const holder = tabHoldingAppWideTool(toolId);
+    if (holder !== undefined) {
+      activateTab(holder.id);
+      return holder.id;
+    }
+  }
+  const tabId = addTab();
+  if (!startToolInTab(tabId, toolId, workspace)) {
+    // Nothing was started: no empty tab is left behind as the trace of the failure.
+    closeTab(tabId);
+    return null;
+  }
+  return tabId;
 }
 
 /**
@@ -440,12 +540,15 @@ export function focusPane(instanceId: string): void {
  *
  * It deliberately does NOT open anything: the drawer starts empty and stays as
  * empty as the human left it (the request: "mi idea es que el drawer esté vacío").
+ *
+ * A creation path that must not be erased by this call runs it FIRST — see
+ * `openTool` — so that "reconcile" and "write" can never race.
  */
 export function applyDock(
   workspace: WorkspaceInfo | null,
   enabled: readonly string[],
 ): void {
-  const key = workspace?.path ?? null;
+  const key = workspaceKey(workspace);
   if (layoutWorkspace.value !== key) {
     layoutWorkspace.value = key;
     tabs.value = [];

@@ -24,8 +24,10 @@
 //     its own navigation. There is no limit on tabs;
 //  2. the EMPTY TAB body — the tool chooser. A new tab is an empty area, and
 //     starting a tool there turns it into the tab's single pane. The chooser is
-//     built from `visibleTools`, i.e. the tools the human enabled in Settings
-//     (S5), never a hardcoded list;
+//     built from the enabled tools (S5), never a hardcoded list. An app-wide tool
+//     that already lives in another tab stays in the list and JUMPs to that tab
+//     (`startToolInTab`): not offering it made the click look refused, and made a
+//     pane the panel did not draw impossible to reach.
 //  3. reconciling the model with reality (`applyDock`): a new active workspace
 //     clears the tabs, a disabled tool closes its panes;
 //  4. the "no tabs" empty state, which is what the drawer shows before the first
@@ -56,7 +58,8 @@ import {
   addTab,
   applyDock,
   closeTab,
-  setTabTool,
+  startToolInTab,
+  tabHoldingAppWideTool,
   tabPanes,
   tabTitleKey,
   tabs,
@@ -83,33 +86,17 @@ const available = computed<ToolDefinition[]>(() =>
 );
 
 /**
- * The app-wide singleton tools that already have a pane somewhere in the drawer.
+ * Whether an app-wide tool already has a pane in another tab of this drawer.
  *
- * Read through the dock (`tabPanes`), never from the model's internals: a tool that
- * is open in another tab is not something the chooser may offer, because a second
- * pane would be a second page or process the human cannot tell apart from the
- * first. The rule itself is the dock's (`setTabTool`); this only stops the human
- * from clicking something that would be refused.
+ * Read through the dock (`tabHoldingAppWideTool`), never by walking the model
+ * here: the dock is the layer that knows which panes exist and which of them this
+ * panel draws, and the chooser must not disagree with what `startToolInTab` will
+ * do. A tool held in another tab is still offered — clicking it goes there.
  */
-const openElsewhere = computed<ToolDefinition[]>(() =>
-  available.value.filter(
-    (tool) =>
-      tool.appWide === true &&
-      tabs.value.some((tab) =>
-        tabPanes(tab).some((instance) => instance.toolId === tool.id),
-      ),
-  ),
-);
-
-/** What an empty tab may actually start: the enabled tools minus the taken ones. */
-const offered = computed<ToolDefinition[]>(() =>
-  available.value.filter((tool) => !openElsewhere.value.includes(tool)),
-);
-
-/** The names of the tools that are open elsewhere, for the one line that says so. */
-const openElsewhereLabels = computed<string>(() =>
-  openElsewhere.value.map((tool) => t(tool.labelKey)).join(", "),
-);
+function heldElsewhere(tool: ToolDefinition): DockTab | undefined {
+  if (tool.appWide !== true) return undefined;
+  return tabHoldingAppWideTool(tool.id);
+}
 
 /**
  * The tabs are reconciled here because this is the only place that knows both
@@ -134,9 +121,9 @@ function tabLabel(tab: DockTab): string {
   return tab.title ?? t(tabTitleKey(tab));
 }
 
-/** Starts one enabled tool in an empty tab (the model refuses a busy one). */
+/** Starts one enabled tool in an empty tab (the dock routes an already-open one). */
 function start(tabId: string, toolId: ToolDefinition["id"]): void {
-  setTabTool(tabId, toolId, props.workspace);
+  startToolInTab(tabId, toolId, props.workspace);
 }
 </script>
 
@@ -230,27 +217,33 @@ function start(tabId: string, toolId: ToolDefinition["id"]): void {
           <p class="text-center text-xs font-medium text-muted-foreground">
             {{ t("tools.tabs.chooseTool") }}
           </p>
-          <template v-if="offered.length > 0">
+          <template v-if="available.length > 0">
             <Button
-              v-for="tool in offered"
+              v-for="tool in available"
               :key="tool.id"
               variant="outline"
               size="xs"
               class="w-full justify-start"
+              :title="
+                heldElsewhere(tool) !== undefined
+                  ? t('tools.tabs.openElsewhere')
+                  : undefined
+              "
               @click="start(tab.id, tool.id)"
             >
               <component :is="tool.icon" />
-              {{ t(tool.labelKey) }}
+              <span class="truncate">{{ t(tool.labelKey) }}</span>
+              <!-- An app-wide tool that is already open: one pane exists in the
+                   drawer, and clicking this goes to it instead of duplicating it
+                   (`startToolInTab`). Saying so is what makes it actionable. -->
+              <span
+                v-if="heldElsewhere(tool) !== undefined"
+                class="ms-auto shrink-0 text-[10px] text-muted-foreground"
+              >
+                {{ t("tools.tabs.openElsewhere") }}
+              </span>
             </Button>
           </template>
-          <!-- Enabled, but with a pane in another tab: the reason is said out
-               loud instead of leaving an empty chooser that looks broken. -->
-          <p
-            v-else-if="available.length > 0"
-            class="text-center text-xs text-muted-foreground"
-          >
-            {{ t("tools.tabs.singletonOpen", { tools: openElsewhereLabels }) }}
-          </p>
           <p v-else class="text-center text-xs text-muted-foreground">
             {{ t("tools.tabs.noTools") }}
           </p>

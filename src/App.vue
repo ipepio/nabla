@@ -10,19 +10,13 @@ import AppSidebar from "./components/AppSidebar.vue";
 import ChatPanel from "./components/ChatPanel.vue";
 import ResizableAside from "./components/ResizableAside.vue";
 import ToolTabs from "./components/tools/ToolTabs.vue";
-import {
-  activateTab,
-  addTab,
-  setTabTool,
-  tabPanes,
-  tabs,
-} from "./components/tools/dock";
+import { openTool } from "./components/tools/dock";
 import { Button } from "./components/ui/button";
 import { SidebarInset, SidebarProvider } from "./components/ui/sidebar";
 import { subscribeEmbedNeedView } from "./contracts/commands";
 import type { WorkspaceInfo } from "./contracts/types";
 import { t } from "./lib/i18n";
-import { isToolEnabled } from "./lib/preferences";
+import { enabledTools, isToolEnabled } from "./lib/preferences";
 
 const activeWorkspace = ref<WorkspaceInfo | null>(null);
 // Right tools drawer (S6): collapsed by default; the chat header and the empty
@@ -49,20 +43,13 @@ async function openBrowserPane(): Promise<void> {
   // own rect on mount, and an element that is still hidden measures nothing.
   await nextTick();
 
-  // A tab that already holds a browser pane is activated, not duplicated: the
-  // pane is a singleton, and only the drawn tab builds a view.
-  const existing = tabs.value.find((tab) =>
-    tabPanes(tab).some((instance) => instance.toolId === "browser"),
-  );
-  if (existing !== undefined) {
-    activateTab(existing.id);
-    return;
-  }
-
-  // No browser pane anywhere: one empty tab becomes the browser, and the pane's
-  // own active mount creates the view with its measured rect (BrowserTool.vue).
-  const tab = addTab();
-  setTabTool(tab, "browser", activeWorkspace.value);
+  // One call, in the dock, does the whole thing: it reconciles the layout for the
+  // workspace the tab is built for (so the reconcile a settling workspace or a
+  // settings list triggers a moment later finds the drawer already current and
+  // cannot wipe the tab), then reveals the existing browser pane or creates it.
+  // That ordering is the fix for the reported bug — the drawer opened with no tab
+  // because this write used to land in a layout the next reconcile discarded.
+  openTool("browser", activeWorkspace.value, enabledTools.value);
 }
 
 /** The `embed-need-view` unsubscribe, once the listener is up. */

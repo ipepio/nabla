@@ -441,7 +441,7 @@
   "tools.tabs.empty": "No tab is open. Use + to open one.",
   "tools.tabs.chooseTool": "Choose a tool",
   "tools.tabs.noTools": "No tool is enabled. Turn one on in Settings → Tools.",
-  "tools.tabs.singletonOpen": "{tools} is already open in another tab. Go to that tab instead of opening a second one.",
+  "tools.tabs.openElsewhere": "open in another tab — click to go there",
   "tools.dock.chooseFolder": "Choose the folder this pane shows",
   "tools.dock.changeFolder": "Change folder: {path}",
   "tools.dock.close": "Close pane",
