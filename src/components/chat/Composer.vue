@@ -194,6 +194,46 @@ const commandsBySession = new Map<string, SessionCommand[]>();
  * has already been sent; the source badge still says where each command came from.
  */
 const lastCommandsByWorkspace = new Map<number, SessionCommand[]>();
+
+/** Where a workspace's remembered command list survives a restart. */
+const COMMANDS_KEY_PREFIX = "nabla.commands.";
+
+/**
+ * The remembered list of one workspace, loading it from storage on first use.
+ *
+ * In memory only, a fresh launch had nothing to offer until a session had already
+ * answered — so `/` looked broken exactly when a human opens the app and starts
+ * typing. The list is a snapshot of what pi reported last time; the badge on each
+ * command still says where it came from, and a live session replaces it.
+ */
+function rememberedCommands(workspaceId: number): SessionCommand[] {
+  const known = lastCommandsByWorkspace.get(workspaceId);
+  if (known !== undefined) return known;
+  try {
+    const raw = window.localStorage.getItem(`${COMMANDS_KEY_PREFIX}${workspaceId}`);
+    const parsed = raw === null ? [] : (JSON.parse(raw) as SessionCommand[]);
+    const commands = Array.isArray(parsed) ? parsed : [];
+    lastCommandsByWorkspace.set(workspaceId, commands);
+    return commands;
+  } catch {
+    // Unreadable or unavailable storage: no list, never an error.
+    lastCommandsByWorkspace.set(workspaceId, []);
+    return [];
+  }
+}
+
+/** Remembers a workspace's command list, in memory and across restarts. */
+function rememberCommands(workspaceId: number, commands: SessionCommand[]): void {
+  lastCommandsByWorkspace.set(workspaceId, commands);
+  try {
+    window.localStorage.setItem(
+      `${COMMANDS_KEY_PREFIX}${workspaceId}`,
+      JSON.stringify(commands),
+    );
+  } catch {
+    // Full or disabled storage: this launch still has the in-memory copy.
+  }
+}
 /** The workspace path of the session, resolved once for the `@` walk. */
 let workspacePath: { id: number; path: string } | null = null;
 /** Bumped per request, so a slow answer cannot overwrite a newer list. */
@@ -270,20 +310,20 @@ async function commandsFor(workspaceId: number): Promise<SessionCommand[]> {
   if (sessionId !== null) {
     const cached = commandsBySession.get(sessionId);
     if (cached !== undefined) {
-      lastCommandsByWorkspace.set(workspaceId, cached);
+      rememberCommands(workspaceId, cached);
       return cached;
     }
     try {
       const commands = await sessionCommands(workspaceId, Number(sessionId));
       commandsBySession.set(sessionId, commands);
-      lastCommandsByWorkspace.set(workspaceId, commands);
+      rememberCommands(workspaceId, commands);
       return commands;
     } catch {
       // A session that cannot answer yet is not a reason to close the list: the
       // remembered one is offered below.
     }
   }
-  return lastCommandsByWorkspace.get(workspaceId) ?? [];
+  return rememberedCommands(workspaceId);
 }
 
 /** The source badge of a command: pi's own word, translated when this build knows it. */
