@@ -1,13 +1,23 @@
 /**
  * nabla-subagents — the Nabla subagent helpers (odd/tasks/subagent-helpers.md, H2).
  *
- * Four tools that let a session delegate work to an autonomous child session:
+ * Five tools that let a session delegate work to an autonomous child session:
  *
  *   run_agent          → create a child pi session, run one task, answer with its
  *                        final message (blocking: the parent waits, like any tool)
+ *   run_agents         → launch up to four children at once, wait for all of them
+ *                        to settle, and answer with one summary per child (S5 of
+ *                        `agent-profiles.md`: dual judgment costs one wait, not two)
  *   agent_status       → this session's children and their state
  *   agent_cancel       → abort a running child
  *   agent_send_message → steer a running child with one more instruction
+ *
+ * ONE SPAWN PATH (S5): `run_agent` and `run_agents` differ only in how many
+ * children they ask for and how they word the answer. Both validate through
+ * `prepareDelegation` and create through `spawnChild`, into the same per-session
+ * registry, so `agent_status` and `agent_cancel` address a batch's children
+ * exactly like a single run's, and a batch child is indistinguishable in the
+ * manifest from a `run_agent` child.
  *
  * The child is NOT a second process. `createAgentSession` (pi's own SDK, the
  * pattern H1 verified) builds an in-process agent with its own tool runner, so
@@ -42,9 +52,11 @@
  * has no way to unload it — so the master switch is re-read by the host at the
  * next spawn and never here.
  *
- * NO RECURSION (S5): our own four tool names are removed from every child's list,
- * so a child can never delegate again. Children also start clean (H1.4): no
- * extensions are loaded, so there is nothing else to recurse into.
+ * NO RECURSION (S5): our own five tool names — `run_agent`, `run_agents` and the
+ * three helpers — are removed from every child's list, so a child can never
+ * delegate again, neither one at a time nor in a batch. Children also start
+ * clean (H1.4): no extensions are loaded, so there is nothing else to recurse
+ * into.
  *
  * NO QUESTIONS TO THE HUMAN (S6): a child is an autonomous worker. It has no ask
  * tools (they come from `nabla-ask`, an extension the child does not load) and
@@ -83,9 +95,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-/** The four tools this extension registers. Also the recursion strip list (S5). */
+/** The five tools this extension registers. Also the recursion strip list (S5). */
 const OWN_TOOLS: readonly string[] = [
   "run_agent",
+  "run_agents",
   "agent_status",
   "agent_cancel",
   "agent_send_message",
@@ -97,6 +110,21 @@ const OWN_TOOLS: readonly string[] = [
  * chat can saturate it.
  */
 const MAX_CHILDREN = 4;
+
+/**
+ * S5 of `agent-profiles.md`: how many profiles ONE `run_agents` call launches.
+ * Kept apart from `MAX_CHILDREN` on purpose — the session cap is what the human's
+ * chat can sustain, this one is what a single call is allowed to ask for — even
+ * though both are four today.
+ */
+const MAX_BATCH = 4;
+
+/**
+ * How much of a child's final answer a batch summary quotes. Enough for the
+ * parent (and the human's card) to recognise what the child found, never the
+ * whole file: the session path is always there for the rest.
+ */
+const EXCERPT_CHARS = 400;
 
 /**
  * L3 of `permission-modes.md`: the tool families the gate knows by name. `read`
@@ -167,6 +195,44 @@ interface Child {
   endedAt: string | null;
   /** The in-process session; absent once it settled (it is disposed then). */
   session?: Awaited<ReturnType<typeof createAgentSession>>["session"];
+}
+
+/**
+ * How one child ended, as the shared spawn path reports it. `status` is the
+ * child's own state; `failure` says how a failed child failed, so each caller can
+ * word it honestly: `spawn` the session could not even be built, `run` its last
+ * turn ended in an error, `empty` it finished without saying anything.
+ */
+interface ChildResult {
+  child: Child;
+  status: "done" | "failed";
+  failure?: "spawn" | "run" | "empty";
+  /** The child's final message; empty when it produced none. */
+  text: string;
+  /** The technical reason of a failed child. */
+  reason?: string;
+}
+
+/** Everything one spawn needs: what the caller already validated, nothing else. */
+interface SpawnRequest {
+  ctx: ExtensionContext;
+  parent: ParentRef;
+  definition: AgentProfile;
+  model: SessionModel | undefined;
+  allowlist: string[];
+  /** Already unique in this session; the caller allocates it. */
+  name: string;
+  task: string;
+  /** The parent's abort: when it fires, the child stops too. */
+  signal: AbortSignal | undefined;
+  /** Progress while the child runs, throttled by the spawn path itself. */
+  onTool: ((child: Child, lastTool: string) => void) | undefined;
+}
+
+/** One entry of `run_agents`' `agents` array, after validation. */
+interface BatchEntry {
+  agent: string;
+  task: string;
 }
 
 /** The parent's identity, as far as the host needs it (H2, the manifest key). */
@@ -267,6 +333,110 @@ function normalizeProfile(entry: unknown): AgentProfile | undefined {
  * The list `run_agent` prints when the name does not match (like
  * `resolve_view`): the profiles the human enabled, with what each is for.
  */
+/**
+ * A name free in this session, following the same suffix rule for both spawning
+ * tools: `review`, then `review-2`, … so one session can run the same profile
+ * twice without `agent_cancel` becoming a guess. `taken` carries the caller's own
+ * claims too, which is what keeps a batch's names apart before any of them is
+ * registered.
+ */
+function pickName(base: string, taken: (candidate: string) => boolean): string {
+  const clean = base.trim() === "" ? "agent" : base.trim();
+  if (!taken(clean)) return clean;
+  for (let suffix = 2; ; suffix += 1) {
+    const candidate = `${clean}-${suffix}`;
+    if (!taken(candidate)) return candidate;
+  }
+}
+
+/**
+ * S5: the `agents` array as the model sent it, or the sentence that says what is
+ * wrong with it. The boundaries live here and not in the schema on purpose: a
+ * schema `maxItems` rejection carries pi's own wording, while a refusal can name
+ * the entry the model has to fix.
+ */
+function readBatch(raw: unknown): { refusal: string } | { entries: BatchEntry[] } {
+  if (!Array.isArray(raw)) {
+    return {
+      refusal:
+        "`agents` must be an array of `{ agent, task }` entries, so nothing was " +
+        `started. Pass between 1 and ${MAX_BATCH} of them.`,
+    };
+  }
+  const entries: unknown[] = raw;
+  if (entries.length === 0) {
+    return {
+      refusal:
+        "`agents` was empty, so nothing was started. Pass between 1 and " +
+        `${MAX_BATCH} \`{ agent, task }\` entries; for a single task, run_agent ` +
+        "is enough.",
+    };
+  }
+  if (entries.length > MAX_BATCH) {
+    return {
+      refusal:
+        `\`agents\` has ${entries.length} entries, and at most ${MAX_BATCH} agents ` +
+        `run at once, so nothing was started. Split them into two calls of at ` +
+        `most ${MAX_BATCH}.`,
+    };
+  }
+  const seen = new Map<string, number>();
+  const batch: BatchEntry[] = [];
+  for (let index = 0; index < entries.length; index += 1) {
+    const position = index + 1;
+    const entry = entries[index] as { agent?: unknown; task?: unknown } | null;
+    if (typeof entry !== "object" || entry === null) {
+      return {
+        refusal:
+          `Entry ${position} of \`agents\` is not a \`{ agent, task }\` object, so ` +
+          `nothing was started.`,
+      };
+    }
+    const agent = typeof entry.agent === "string" ? entry.agent.trim() : "";
+    const task = typeof entry.task === "string" ? entry.task.trim() : "";
+    if (agent === "") {
+      return {
+        refusal:
+          `Entry ${position} of \`agents\` names no agent profile, so nothing was ` +
+          `started. Every entry needs the profile to run and the task to give it.`,
+      };
+    }
+    if (task === "") {
+      return {
+        refusal:
+          `Entry ${position} of \`agents\` (\`${agent}\`) has an empty \`task\`, so ` +
+          `nothing was started. A child cannot be asked what to do later: put the ` +
+          `whole task in it.`,
+      };
+    }
+    const previous = seen.get(agent.toLowerCase());
+    if (previous !== undefined) {
+      return {
+        refusal:
+          `Entries ${previous} and ${position} of \`agents\` both run \`${agent}\`, ` +
+          `so nothing was started. Each entry of one batch must name a different ` +
+          `profile: every child needs its own name for agent_status and ` +
+          `agent_cancel. Run the same profile in a second call, where its name ` +
+          `gets a suffix automatically.`,
+      };
+    }
+    seen.set(agent.toLowerCase(), position);
+    batch.push({ agent, task });
+  }
+  return { entries: batch };
+}
+
+/**
+ * The first lines of a child's answer, ending in an ellipsis when there is more:
+ * a batch summary recognises the work without copying three transcripts into the
+ * parent's context.
+ */
+function excerpt(text: string): string {
+  const clean = text.trim();
+  if (clean.length <= EXCERPT_CHARS) return clean;
+  return `${clean.slice(0, EXCERPT_CHARS).trimEnd()}…`;
+}
+
 function describeProfiles(profiles: AgentProfile[]): string {
   return profiles
     .map((profile) =>
@@ -312,7 +482,7 @@ function currentMode(): "read" | "write" | "yolo" {
 }
 
 /**
- * The child's real allowlist: the profile's tools, minus our own four (no
+ * The child's real allowlist: the profile's tools, minus our own five (no
  * recursion), minus the shell and file-writing families when the human is in
  * `read` mode. An empty result is refused by the caller — a profile that lists no
  * tool (or only ones the mode blocks) would give the child nothing to work with,
@@ -490,14 +660,8 @@ export default function nablaSubagents(pi: ExtensionAPI) {
    * taken (`review`, `review-2`) so one session can run the same agent twice
    * without `agent_cancel` becoming a guess.
    */
-  const uniqueName = (base: string): string => {
-    const clean = base.trim() === "" ? "agent" : base.trim();
-    if (!named(clean)) return clean;
-    for (let suffix = 2; ; suffix += 1) {
-      const candidate = `${clean}-${suffix}`;
-      if (!named(candidate)) return candidate;
-    }
-  };
+  const uniqueName = (base: string): string =>
+    pickName(base, (candidate) => Boolean(named(candidate)));
 
   /** One line per child, the shape every status answer shares. */
   const describe = (child: Child): string =>
@@ -510,6 +674,213 @@ export default function nablaSubagents(pi: ExtensionAPI) {
     manifestError = undefined;
     return note;
   };
+
+  /**
+   * The checks every delegation runs before a child exists: the profile's real
+   * allowlist under the human's permission mode, the three-level model resolution
+   * (S6 of `agent-profiles.md`) and its effort. A refusal is a sentence the model
+   * reads, never an exception — nothing has been created, and the fix is in
+   * Settings.
+   *
+   * Shared by `run_agent` and `run_agents` so the same profile cannot be validated
+   * two different ways depending on which tool asked for it.
+   */
+  function prepareDelegation(
+    ctx: Pick<ExtensionContext, "modelRegistry">,
+    store: ProfileStore,
+    definition: AgentProfile,
+  ): { refusal: string } | { allowlist: string[]; model: SessionModel | undefined } {
+    const allowlist = childAllowlist(definition);
+    if (allowlist.length === 0) {
+      const mode = currentMode();
+      return {
+        refusal:
+          `The profile \`${definition.name}\` would give the child no tools ` +
+          `under the current "${mode}" permission mode` +
+          (definition.tools.length === 0
+            ? " (it lists none)"
+            : ` (it lists ${definition.tools.join(", ")})`) +
+          `, so the child was not started. Give it at least one tool the ` +
+          `mode allows, in Settings → Subagents.`,
+      };
+    }
+
+    // S6: the model resolution order is the profile's own model, then the store's
+    // default, then this session's model (`undefined` below).
+    const askedModel = definition.model || store.defaultModel;
+    const model = resolveModel(ctx, askedModel);
+    if (askedModel && !model) {
+      return {
+        refusal:
+          `The profile \`${definition.name}\` asks for model ` +
+          `\`${askedModel}\`, which this session cannot reach. Fix that ` +
+          `profile's model in Settings → Subagents (or leave it empty to ` +
+          `use this session's model) and try again.`,
+      };
+    }
+    if (definition.effort && !EFFORTS.includes(definition.effort.toLowerCase())) {
+      return {
+        refusal:
+          `The profile \`${definition.name}\` asks for effort ` +
+          `\`${definition.effort}\`, which is not a thinking level pi has ` +
+          `(${EFFORTS.join(", ")}). Fix that profile's effort in Settings → ` +
+          `Subagents and try again.`,
+      };
+    }
+    return { allowlist, model };
+  }
+
+  /**
+   * The one spawn path (S5): an already-validated request becomes a child with its
+   * own JSONL, its own name and its own tool list, and the promise settles when
+   * that child settles.
+   *
+   * It never throws — every ending, including a session that cannot even be built,
+   * comes back as a `ChildResult` — which is what lets a batch keep the other
+   * children's work when one of them fails.
+   */
+  async function spawnChild(request: SpawnRequest): Promise<ChildResult> {
+    const { ctx, parent, definition, model, allowlist, name, task, signal, onTool } =
+      request;
+    const sessionDir = childSessionDir(ctx.cwd);
+    const sessionPath = join(sessionDir, `${randomUUID()}.jsonl`);
+    const child: Child = {
+      name,
+      agent: definition.name,
+      sessionPath,
+      status: "queued",
+      startedAt: null,
+      endedAt: null,
+    };
+    // Registered and published before the first await, so `agent_status`, the cap
+    // checks and every child of a batch see each other at once.
+    children.push(child);
+    publish(parent);
+
+    let session: Child["session"];
+    try {
+      // H1.3: the child's JSONL is ours to place, so the host can index it
+      // before the child has written a single line.
+      const sessionManager = SessionManager.open(sessionPath, sessionDir, ctx.cwd);
+      // H1.4 + S4: a clean child whose system prompt is exactly the profile's
+      // `instructions`. No extension of the parent's is inherited (a gate that
+      // runs in the parent cannot run here — H1.1), no skill or template
+      // surprises the profile's author.
+      const resourceLoader = new DefaultResourceLoader({
+        cwd: ctx.cwd,
+        agentDir: getAgentDir(),
+        noExtensions: true,
+        noSkills: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        noContextFiles: true,
+        systemPrompt:
+          definition.instructions === "" ? undefined : definition.instructions,
+      });
+      await resourceLoader.reload();
+      const created = await createAgentSession({
+        cwd: ctx.cwd,
+        model,
+        thinkingLevel: definition.effort
+          ? (definition.effort.toLowerCase() as
+              | "off"
+              | "minimal"
+              | "low"
+              | "medium"
+              | "high"
+              | "xhigh"
+              | "max")
+          : undefined,
+        // H1.2: a tool that is not listed does not exist for the child. Our own
+        // five are stripped from the list AND denied, so a profile that names
+        // `run_agent` or `run_agents` cannot recurse (S5).
+        // S6 of `agent-profiles.md`: `model` is the resolved profile/default one,
+        // and `undefined` means "this session's model".
+        tools: allowlist,
+        excludeTools: ["mcp__*", ...OWN_TOOLS],
+        resourceLoader,
+        sessionManager,
+      });
+      session = created.session;
+      child.session = session;
+      child.status = "running";
+      child.startedAt = nowIso();
+      publish(parent);
+
+      // Brief progress, the shape Nabla's tool card already renders: the last
+      // tool the child used, without copying its conversation anywhere. The
+      // caller decides the words; this path only throttles them.
+      let lastUpdate = 0;
+      const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+        if (event.type !== "tool_execution_start") return;
+        if (!onTool) return;
+        const at = Date.now();
+        if (at - lastUpdate < 250) return;
+        lastUpdate = at;
+        onTool(child, event.toolName);
+      });
+
+      // The parent's tool call being aborted (the human pressed stop) must stop
+      // the child too: an orphan child in-process would keep burning tokens. A
+      // batch passes the same signal to every child, so one abort ends them all.
+      const onAbort = () => {
+        void session?.abort().catch(() => undefined);
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        // `expandPromptTemplates: false`: the task is data, never a command or
+        // a template — a child must not be steerable by what the parent writes.
+        await session.prompt(task, { expandPromptTemplates: false });
+      } finally {
+        signal?.removeEventListener("abort", onAbort);
+        unsubscribe();
+      }
+
+      const outcome = finalText(session);
+      child.status = outcome.failed ? "failed" : "done";
+      child.endedAt = nowIso();
+      publish(parent);
+
+      if (outcome.failed) {
+        return {
+          child,
+          status: "failed",
+          failure: "run",
+          text: outcome.text,
+          reason: outcome.reason,
+        };
+      }
+      // A child that finished without saying anything has nothing to report, so
+      // both callers word it as a failure instead of an empty success. The
+      // manifest is deliberately not rewritten here: it recorded `done` when the
+      // child settled, exactly as it did before the batch tool existed, and
+      // changing that is not this task's decision to make.
+      if (outcome.text === "") {
+        child.status = "failed";
+        return { child, status: "failed", failure: "empty", text: "" };
+      }
+      return { child, status: "done", text: outcome.text };
+    } catch (err) {
+      // A failure to even build the child is the child's failure, reported as
+      // one: the model must not read a spawn error as "the task is done".
+      child.status = "failed";
+      child.endedAt = nowIso();
+      publish(parent);
+      const detail = err instanceof Error ? err.message : String(err);
+      return { child, status: "failed", failure: "spawn", text: "", reason: detail };
+    } finally {
+      // Dispose only when the run is over: while it is captured by an awaited
+      // `prompt`, `child.session` must stay addressable for agent_cancel.
+      if (child.status !== "running" && child.status !== "queued") {
+        try {
+          child.session?.dispose();
+        } catch {
+          // Disposal is bookkeeping: a child that already settled stays settled.
+        }
+        child.session = undefined;
+      }
+    }
+  }
 
   /**
    * S6 has no exceptions, but a child that outlives its parent would: the run is
@@ -546,8 +917,9 @@ export default function nablaSubagents(pi: ExtensionAPI) {
       "watch it in Nabla's sidebar. This tool BLOCKS until the child finishes, " +
       "then returns the child's final message. The child cannot delegate further " +
       "and cannot ask the human anything: what it needs must be in `task`. At " +
-      "most 4 children may run at once. Call it several times in one turn to run " +
-      "agents in parallel.",
+      "most 4 children may run at once. For several independent tasks at the " +
+      "same time, prefer run_agents: it launches up to 4 children in parallel " +
+      "and waits for all of them in one call.",
     promptSnippet: "Delegate one task to a configured agent profile and wait for it",
     promptGuidelines: [
       "run_agent blocks until the child answers: give it one self-contained task, not a conversation.",
@@ -616,136 +988,27 @@ export default function nablaSubagents(pi: ExtensionAPI) {
         };
       }
 
-      const allowlist = childAllowlist(definition);
-      if (allowlist.length === 0) {
-        const mode = currentMode();
+      const ready = prepareDelegation(ctx, store, definition);
+      if ("refusal" in ready) {
         return {
-          content: [
-            {
-              type: "text" as const,
-              text:
-                `The profile \`${definition.name}\` would give the child no tools ` +
-                `under the current "${mode}" permission mode` +
-                (definition.tools.length === 0
-                  ? " (it lists none)"
-                  : ` (it lists ${definition.tools.join(", ")})`) +
-                `, so the child was not started. Give it at least one tool the ` +
-                `mode allows, in Settings → Subagents.`,
-            },
-          ],
-          details: { agent: definition.name, sessionPath: null, status: "failed" },
-        };
-      }
-
-      // S6: the model resolution order is the profile's own model, then the
-      // store's default, then this session's model (`undefined` below).
-      const askedModel = definition.model || store.defaultModel;
-      const model = resolveModel(ctx, askedModel);
-      if (askedModel && !model) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text:
-                `The profile \`${definition.name}\` asks for model ` +
-                `\`${askedModel}\`, which this session cannot reach. Fix that ` +
-                `profile's model in Settings → Subagents (or leave it empty to ` +
-                `use this session's model) and try again.`,
-            },
-          ],
-          details: { agent: definition.name, sessionPath: null, status: "failed" },
-        };
-      }
-      if (definition.effort && !EFFORTS.includes(definition.effort.toLowerCase())) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text:
-                `The profile \`${definition.name}\` asks for effort ` +
-                `\`${definition.effort}\`, which is not a thinking level pi has ` +
-                `(${EFFORTS.join(", ")}). Fix that profile's effort in Settings → ` +
-                `Subagents and try again.`,
-            },
-          ],
+          content: [{ type: "text" as const, text: ready.refusal }],
           details: { agent: definition.name, sessionPath: null, status: "failed" },
         };
       }
 
       const name = params.name ? uniqueName(params.name) : uniqueName(definition.name);
-      const sessionDir = childSessionDir(ctx.cwd);
-      const sessionPath = join(sessionDir, `${randomUUID()}.jsonl`);
-      const child: Child = {
+      // One child, awaited: the shared spawn path is the same one a batch uses,
+      // so this tool's answer is unchanged while the path is not duplicated.
+      const result = await spawnChild({
+        ctx,
+        parent,
+        definition,
+        model: ready.model,
+        allowlist: ready.allowlist,
         name,
-        agent: definition.name,
-        sessionPath,
-        status: "queued",
-        startedAt: null,
-        endedAt: null,
-      };
-      children.push(child);
-      publish(parent);
-
-      let session: Child["session"];
-      try {
-        // H1.3: the child's JSONL is ours to place, so the host can index it
-        // before the child has written a single line.
-        const sessionManager = SessionManager.open(sessionPath, sessionDir, ctx.cwd);
-        // H1.4 + S4: a clean child whose system prompt is exactly the profile's
-        // `instructions`. No extension of the parent's is inherited (a gate that
-        // runs in the parent cannot run here — H1.1), no skill or template
-        // surprises the profile's author.
-        const resourceLoader = new DefaultResourceLoader({
-          cwd: ctx.cwd,
-          agentDir: getAgentDir(),
-          noExtensions: true,
-          noSkills: true,
-          noPromptTemplates: true,
-          noThemes: true,
-          noContextFiles: true,
-          systemPrompt:
-            definition.instructions === "" ? undefined : definition.instructions,
-        });
-        await resourceLoader.reload();
-        const created = await createAgentSession({
-          cwd: ctx.cwd,
-          model,
-          thinkingLevel: definition.effort
-            ? (definition.effort.toLowerCase() as
-                | "off"
-                | "minimal"
-                | "low"
-                | "medium"
-                | "high"
-                | "xhigh"
-                | "max")
-            : undefined,
-          // H1.2: a tool that is not listed does not exist for the child. Our own
-          // four are stripped from the list AND denied, so a profile that names
-          // `run_agent` cannot recurse (S5).
-          // S6 of `agent-profiles.md`: `model` is the resolved profile/default one,
-          // and `undefined` means "this session's model".
-          tools: allowlist,
-          excludeTools: ["mcp__*", ...OWN_TOOLS],
-          resourceLoader,
-          sessionManager,
-        });
-        session = created.session;
-        child.session = session;
-        child.status = "running";
-        child.startedAt = nowIso();
-        publish(parent);
-
-        // Brief progress, the shape Nabla's tool card already renders: the last
-        // tool the child used, without copying its conversation anywhere.
-        let lastTool = "";
-        let lastUpdate = 0;
-        const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
-          if (event.type !== "tool_execution_start") return;
-          lastTool = event.toolName;
-          const at = Date.now();
-          if (at - lastUpdate < 250) return;
-          lastUpdate = at;
+        task: String(params.task ?? ""),
+        signal,
+        onTool: (child, lastTool) => {
           onUpdate?.({
             content: [
               { type: "text" as const, text: `${name} is running (last tool: ${lastTool})` },
@@ -753,125 +1016,344 @@ export default function nablaSubagents(pi: ExtensionAPI) {
             details: {
               agent: definition.name,
               name,
-              sessionPath,
+              sessionPath: child.sessionPath,
               status: "running",
               lastTool,
             },
           });
-        });
+        },
+      });
+      const { child } = result;
 
-        // The parent's tool call being aborted (the human pressed stop) must stop
-        // the child too: an orphan child in-process would keep burning tokens.
-        const onAbort = () => {
-          void session?.abort().catch(() => undefined);
-        };
-        signal?.addEventListener("abort", onAbort, { once: true });
-        try {
-          // `expandPromptTemplates: false`: the task is data, never a command or
-          // a template — a child must not be steerable by what the parent writes.
-          await session.prompt(String(params.task ?? ""), {
-            expandPromptTemplates: false,
-          });
-        } finally {
-          signal?.removeEventListener("abort", onAbort);
-          unsubscribe();
-        }
-
-        const outcome = finalText(session);
-        child.status = outcome.failed ? "failed" : "done";
-        child.endedAt = nowIso();
-        publish(parent);
-
-        if (outcome.failed) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text:
-                  `${name} (${definition.name}) failed: ${outcome.reason}. Its ` +
-                  `session file is ${sessionPath}${outcome.text ? `, and its last ` +
-                    `words were:\n\n${outcome.text}` : ""}.${manifestNote()}`,
-              },
-            ],
-            details: {
-              agent: definition.name,
-              name,
-              sessionPath,
-              status: child.status,
-              error: outcome.reason,
-            },
-          };
-        }
-        if (outcome.text === "") {
-          child.status = "failed";
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text:
-                  `${name} (${definition.name}) finished without a final message, ` +
-                  `so there is nothing to report. Its session file is ${sessionPath}; ` +
-                  `read it to see what it did.${manifestNote()}`,
-              },
-            ],
-            details: {
-              agent: definition.name,
-              name,
-              sessionPath,
-              status: child.status,
-            },
-          };
-        }
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `${outcome.text}${manifestNote()}`,
-            },
-          ],
-          details: {
-            agent: definition.name,
-            name,
-            sessionPath,
-            status: child.status,
-          },
-        };
-      } catch (err) {
-        // A failure to even build the child is the child's failure, reported as
-        // one: the model must not read a spawn error as "the task is done".
-        child.status = "failed";
-        child.endedAt = nowIso();
-        publish(parent);
-        const detail = err instanceof Error ? err.message : String(err);
+      if (result.failure === "run") {
         return {
           content: [
             {
               type: "text" as const,
               text:
-                `${name} (${definition.name}) could not run: ${detail}. Its ` +
-                `session file is ${sessionPath}.${manifestNote()}`,
+                `${name} (${definition.name}) failed: ${result.reason}. Its ` +
+                `session file is ${child.sessionPath}${result.text ? `, and its last ` +
+                  `words were:\n\n${result.text}` : ""}.${manifestNote()}`,
             },
           ],
           details: {
             agent: definition.name,
             name,
-            sessionPath,
+            sessionPath: child.sessionPath,
             status: child.status,
-            error: detail,
+            error: result.reason,
           },
         };
-      } finally {
-        // Dispose only when the run is over: while it is captured by an awaited
-        // `prompt`, `child.session` must stay addressable for agent_cancel.
-        if (child.status !== "running" && child.status !== "queued") {
-          try {
-            child.session?.dispose();
-          } catch {
-            // Disposal is bookkeeping: a child that already settled stays settled.
-          }
-          child.session = undefined;
-        }
       }
+      if (result.failure === "spawn") {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `${name} (${definition.name}) could not run: ${result.reason}. Its ` +
+                `session file is ${child.sessionPath}.${manifestNote()}`,
+            },
+          ],
+          details: {
+            agent: definition.name,
+            name,
+            sessionPath: child.sessionPath,
+            status: child.status,
+            error: result.reason,
+          },
+        };
+      }
+      if (result.failure === "empty") {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `${name} (${definition.name}) finished without a final message, ` +
+                `so there is nothing to report. Its session file is ` +
+                `${child.sessionPath}; read it to see what it did.${manifestNote()}`,
+            },
+          ],
+          details: {
+            agent: definition.name,
+            name,
+            sessionPath: child.sessionPath,
+            status: child.status,
+          },
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `${result.text}${manifestNote()}`,
+          },
+        ],
+        details: {
+          agent: definition.name,
+          name,
+          sessionPath: child.sessionPath,
+          status: child.status,
+        },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "run_agents",
+    label: "Run Agents",
+    description:
+      "Delegate several tasks AT THE SAME TIME: up to 4 agent profiles, all " +
+      "launched concurrently and awaited together, so two judges cost one wait " +
+      "instead of two. Each child is a separate pi session in this same process " +
+      "with its own profile, its own session file and its own name, using only the " +
+      "tools its profile lists and the human's permission mode allows; the human " +
+      "can watch each one in Nabla's sidebar. This tool returns ONE result once " +
+      "every child has settled: each child's name, its state (done or failed), a " +
+      "short excerpt of its answer, and the reason when it failed — a batch where " +
+      "one child failed still carries the other children's work. Children cannot " +
+      "delegate further and cannot ask the human anything: every decision they " +
+      "need must be in their own `task`.",
+    promptSnippet: "Run up to 4 agent profiles concurrently and wait for all of them",
+    promptGuidelines: [
+      "run_agents runs its children concurrently: use it instead of calling run_agent several times when the tasks are independent.",
+      "Every entry of one batch must name a different profile, and every task must be self-contained: a child cannot ask the human anything.",
+      "The answer summarises every child, including the failed ones: read the failure reasons before retrying anything.",
+    ],
+    parameters: Type.Object({
+      agents: Type.Array(
+        Type.Object({
+          agent: Type.String({
+            description:
+              "The agent profile to run, by its name as configured in Settings → Subagents (e.g. `judge`). Different in every entry of one batch.",
+          }),
+          task: Type.String({
+            description:
+              "The whole task for that child: what to do, where, and what to answer with. It cannot ask follow-up questions.",
+          }),
+        }),
+        {
+          description:
+            "1 to 4 agents to run at the same time. Each entry needs its own profile and its own self-contained task.",
+        },
+      ),
+    }),
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const parent = parentRefOf(ctx);
+      rememberParent(parent);
+
+      // S5: the batch itself, before anything is created. A refusal names the
+      // entry to fix instead of failing the whole call on pi's schema wording.
+      const batch = readBatch(params.agents);
+      if ("refusal" in batch) {
+        return {
+          content: [{ type: "text" as const, text: batch.refusal }],
+          details: { agents: [], status: "failed" },
+        };
+      }
+
+      const store = loadProfiles();
+      if (store.profiles.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: noProfilesText() }],
+          details: { agents: [], status: "failed" },
+        };
+      }
+
+      // Every entry is resolved before a single child is created, so a batch is
+      // never half-launched: one unusable entry refuses the batch and names it.
+      const prepared: {
+        entry: BatchEntry;
+        definition: AgentProfile;
+        allowlist: string[];
+        model: SessionModel | undefined;
+      }[] = [];
+      for (let index = 0; index < batch.entries.length; index += 1) {
+        const position = index + 1;
+        const entry = batch.entries[index];
+        const definition = store.profiles.find(
+          (candidate) => candidate.name.toLowerCase() === entry.agent.toLowerCase(),
+        );
+        if (!definition) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  `Entry ${position} of \`agents\` names \`${entry.agent}\`, which ` +
+                  `is not an enabled profile, so the batch was not started. ` +
+                  `Enabled profiles: ${describeProfiles(store.profiles)}.`,
+              },
+            ],
+            details: { agents: [], status: "failed" },
+          };
+        }
+        const ready = prepareDelegation(ctx, store, definition);
+        if ("refusal" in ready) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Entry ${position} of \`agents\`: ${ready.refusal}`,
+              },
+            ],
+            details: { agents: [], status: "failed" },
+          };
+        }
+        prepared.push({ entry, definition, allowlist: ready.allowlist, model: ready.model });
+      }
+
+      // The same session cap run_agent honours, checked synchronously before any
+      // child exists, so two batches in one assistant message cannot overshoot it.
+      const busy = running();
+      if (busy.length + prepared.length > MAX_CHILDREN) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `This session already has ${busy.length} ` +
+                `${busy.length === 1 ? "child" : "children"} running ` +
+                `(${busy.map(describe).join("; ")}), so a batch of ` +
+                `${prepared.length} would exceed the cap of ${MAX_CHILDREN} ` +
+                `children at once, and nothing was started. Wait for one to ` +
+                `finish, or cancel one with agent_cancel, then try again.`,
+            },
+          ],
+          details: { agents: [], status: "failed" },
+        };
+      }
+
+      // Names are allocated before the first spawn so none of the batch's
+      // children can collide, and each one is addressable by agent_status.
+      const planned: string[] = [];
+      const launched = prepared.map((item) => {
+        const name = pickName(
+          item.definition.name,
+          (candidate) => Boolean(named(candidate)) || planned.includes(candidate),
+        );
+        planned.push(name);
+        return { ...item, name };
+      });
+
+      const total = launched.length;
+      const settledLabels: string[] = [];
+      const announce = (text: string) => {
+        onUpdate?.({
+          content: [{ type: "text" as const, text }],
+          details: {
+            agents: launched.map((item) => ({ name: item.name, agent: item.definition.name })),
+            total,
+            settled: settledLabels.length,
+          },
+        });
+      };
+      // Honest movement only: how many were started and how many have settled.
+      // The children's internals are not streamed here — that is what the
+      // session files and agent_status are for.
+      announce(
+        `Launching ${total} ${total === 1 ? "agent" : "agents"} at the same time: ` +
+          `${launched.map((item) => `${item.name} (${item.definition.name})`).join(", ")}.`,
+      );
+
+      // S5: concurrent, not sequential. All of them are launched first, then
+      // awaited together, and a rejection is turned into that child's failure so
+      // it can never discard the others' work.
+      const outcomes = await Promise.allSettled(
+        launched.map(async (item) => {
+          const result = await spawnChild({
+            ctx,
+            parent,
+            definition: item.definition,
+            model: item.model,
+            allowlist: item.allowlist,
+            name: item.name,
+            task: item.entry.task,
+            signal,
+            onTool: undefined,
+          });
+          settledLabels.push(`${result.child.name} ${result.status}`);
+          announce(
+            `${settledLabels.length} of ${total} agents settled — ` +
+              `${settledLabels.join(", ")}.`,
+          );
+          return result;
+        }),
+      );
+
+      const results: ChildResult[] = outcomes.map((outcome, index) => {
+        if (outcome.status === "fulfilled") return outcome.value;
+        // `spawnChild` reports every ending as a result; this branch exists so a
+        // defect there could not swallow the rest of the batch.
+        const item = launched[index];
+        const detail =
+          outcome.reason instanceof Error
+            ? outcome.reason.message
+            : String(outcome.reason);
+        return {
+          child: {
+            name: item.name,
+            agent: item.definition.name,
+            sessionPath: "",
+            status: "failed",
+            startedAt: null,
+            endedAt: null,
+          },
+          status: "failed",
+          failure: "spawn",
+          text: "",
+          reason: detail,
+        };
+      });
+
+      const done = results.filter((result) => result.status === "done").length;
+      const failed = results.length - done;
+      const lines: string[] = [
+        `${total === 1 ? "1 agent" : `${total} agents`} ran concurrently: ` +
+          `${done} finished` +
+          (failed > 0 ? `, ${failed} failed` : "") +
+          ".",
+      ];
+      for (const result of results) {
+        const child = result.child;
+        lines.push("");
+        lines.push(`**${child.name}** (${child.agent}) — ${result.status}`);
+        if (result.failure === "spawn") {
+          lines.push(`Could not run: ${result.reason}.`);
+        } else if (result.failure === "run") {
+          lines.push(`Failed: ${result.reason}.`);
+        } else if (result.failure === "empty") {
+          lines.push(
+            "Finished without a final message, so there is nothing to report from it.",
+          );
+        } else {
+          lines.push(excerpt(result.text));
+        }
+        if ((result.failure === "run" || result.failure === "spawn") && result.text !== "") {
+          lines.push("", `Its last words were: ${excerpt(result.text)}`);
+        }
+        lines.push(
+          child.sessionPath === ""
+            ? "No session file was published for it."
+            : `Session file: ${child.sessionPath}`,
+        );
+      }
+
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") + manifestNote() }],
+        details: {
+          agents: results.map((result) => ({
+            name: result.child.name,
+            agent: result.child.agent,
+            sessionPath: result.child.sessionPath === "" ? null : result.child.sessionPath,
+            status: result.status,
+            failure: result.failure ?? null,
+            error: result.reason ?? null,
+            excerpt: excerpt(result.text),
+          })),
+        },
+      };
     },
   });
 
