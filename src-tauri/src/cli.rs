@@ -1871,6 +1871,15 @@ exit 0
                 .iter()
                 .any(|line| line == "started")
         });
+        // The line and the marker are two separate writes in the fake child: it
+        // prints, then appends. Waiting for the line and asserting the marker
+        // immediately is an ordering race the whole suite can win by being busy —
+        // it flaked exactly once, under load. Poll the marker instead of assuming
+        // the second write already happened.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
         assert!(marker.exists(), "the fake child must have run at all");
 
         let started = Instant::now();
