@@ -499,9 +499,13 @@ impl Store {
     pub fn list_sessions(&self, workspace_id: i64) -> StoreResult<Vec<SessionRow>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
+            // Children of a chat are not sessions of their own in this list: they
+            // belong nested under the chat that delegated them (H4 of
+            // `subagent-helpers.md`). Listing them here painted every subagent
+            // twice — once as a top-level row, once indented under its parent.
             "SELECT id, workspace_id, pi_session_path, title, model, started_at, updated_at,
                     parent_session_id
-             FROM sessions WHERE workspace_id = ?1
+             FROM sessions WHERE workspace_id = ?1 AND parent_session_id IS NULL
              ORDER BY updated_at DESC, id DESC",
         )?;
         let rows = stmt
@@ -846,6 +850,32 @@ mod tests {
         assert_eq!(store.list_provider_status().expect("list").len(), 1);
 
         assert_eq!(user_version(&store), 5, "v5 is the migration contract");
+    }
+
+    // H4 of `subagent-helpers.md`: a child is not a top-level session. Listing the
+    // workspace must not paint every subagent twice — once as its own row, once
+    // nested under the chat that delegated it.
+    #[test]
+    fn list_sessions_hides_children_of_a_chat() {
+        let db = TempDb::new("children_hidden");
+        let store = Store::open(&db.0).expect("open");
+        let ws = ws_new(&store, "/tmp/proj-children");
+        let parent = store
+            .upsert_session(&session_new(ws.id, "/sessions/parent.jsonl"))
+            .expect("insert parent");
+        store
+            .ensure_child_session(&ChildSessionNew {
+                parent: &parent,
+                pi_session_path: "/sessions/child.jsonl",
+                title: "research",
+                started_at: "2026-11-20T10:00:00Z",
+                updated_at: "2026-11-20T10:00:00Z",
+            })
+            .expect("index the child");
+
+        let listed = store.list_sessions(ws.id).expect("list");
+        assert_eq!(listed.len(), 1, "only the chat that delegated is listed: {listed:#?}");
+        assert_eq!(listed[0].id, parent.id);
     }
 
     // v4: the preview table is additive. Workspaces, sessions and the provider
@@ -1730,10 +1760,19 @@ mod tests {
             })
             .expect("re-ensure");
         assert_eq!(again.id, first.id, "the same file reuses its row");
+        // The workspace list holds the chat that delegated, and only it: a child
+        // lives nested under its parent, never as a top-level session. The
+        // no-duplicate guarantee this test is about now reads from the parent's
+        // own children.
         assert_eq!(
             store.list_sessions(ws.id).expect("list").len(),
-            2,
-            "one parent and one child, never a duplicate"
+            1,
+            "only the delegating chat is a session of the workspace"
+        );
+        assert_eq!(
+            store.child_sessions(parent.id).expect("children").len(),
+            1,
+            "the child is indexed once, under its parent"
         );
 
         // A manifest that renamed the run repairs the title in place.
