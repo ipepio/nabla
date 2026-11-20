@@ -412,5 +412,7 @@
   "tools.browser.controlError": "Could not run that action in the page: {message}",
   "tools.browser.layoutError": "Could not place the browser view: {message}",
   "tools.browser.syncError": "The address bar cannot follow the page: {message}",
-  "tools.browser.agentNote": "The agent drives this view through the nabla-browser MCP tools: it navigates, reads and clicks in the page you are looking at."
+  "tools.browser.agentNote": "The agent drives this view through the nabla-browser MCP tools: it navigates, reads and clicks in the page you are looking at.",
+  "chat.composer.nextSession": "next session",
+  "chat.composer.nextSessionHint": "No session is running: the model and effort apply to the next session that starts."
 }

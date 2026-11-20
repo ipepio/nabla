@@ -412,5 +412,7 @@
   "tools.browser.controlError": "No se pudo ejecutar esa acción en la página: {message}",
   "tools.browser.layoutError": "No se pudo colocar la vista de navegador: {message}",
   "tools.browser.syncError": "La barra de direcciones no puede seguir la página: {message}",
-  "tools.browser.agentNote": "El agente conduce esta vista con las tools MCP de nabla-browser: navega, lee y pulsa en la página que estás viendo."
+  "tools.browser.agentNote": "El agente conduce esta vista con las tools MCP de nabla-browser: navega, lee y pulsa en la página que estás viendo.",
+  "chat.composer.nextSession": "próxima sesión",
+  "chat.composer.nextSessionHint": "No hay sesión en marcha: el modelo y el effort se aplican a la próxima sesión que arranque."
 }

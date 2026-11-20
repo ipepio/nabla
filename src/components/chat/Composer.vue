@@ -111,6 +111,13 @@ const props = withDefaults(
     /** A session exists, so stop is meaningful. */
     canStop: boolean;
     /**
+     * Nothing is live: the model and effort these pickers choose describe the
+     * NEXT session, not a running one. The silent persist-only path of a model
+     * pick is indistinguishable from a live switch unless the row says so —
+     * a gap the maintainer walked straight into during QA.
+     */
+    nextSessionOnly: boolean;
+    /**
      * Ceiling for the card, chosen by the caller from `src/lib/layout.ts`: the
      * empty state keeps `COMPOSER_MAX_WIDTH`, the conversation state may use the
      * wider `CONVERSATION_COMPOSER_MAX_WIDTH`. Only the ceiling moves — the floor
@@ -663,6 +670,17 @@ function chooseModel(provider: string, model: string) {
              permission chip — the two controls that shape the next turn. It
              renders the level pi CONFIRMED, not the one the UI asked for. -->
         <ComposerEffort />
+
+        <!-- Not a control: the quiet word that says what the two pickers beside
+             it describe when nothing is live. Muted on purpose — it is context,
+             not an alert. -->
+        <span
+          v-if="nextSessionOnly"
+          class="shrink-0 text-[11px] leading-none text-muted-foreground"
+          :title="t('chat.composer.nextSessionHint')"
+        >
+          {{ t("chat.composer.nextSession") }}
+        </span>
 
         <!-- Provider → model: one trigger naming the current pair (provider as
              a muted prefix), and one menu where each provider row opens its own
