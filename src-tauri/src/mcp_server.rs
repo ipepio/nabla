@@ -37,6 +37,7 @@ use serde_json::{json, Value};
 use tauri::Emitter;
 
 use crate::embed::EmbedError;
+use crate::websearch::{self, SearchGateway, SearchHit};
 
 /// The name pi will see in `tools/list` sources and in its own tool names
 /// (`mcp__nabla-browser__navigate`).
@@ -143,7 +144,11 @@ pub struct Endpoint {
 /// work, and errors as JSON-RPC codes. Tool *failures* are different from
 /// protocol errors on purpose: a bad selector is a normal outcome the model must
 /// read, so it travels as `isError`, never as a transport failure.
-pub fn dispatch(driver: &dyn WebviewDriver, request: &Value) -> Option<Value> {
+pub fn dispatch(
+    driver: &dyn WebviewDriver,
+    search: &dyn SearchGateway,
+    request: &Value,
+) -> Option<Value> {
     let id = request.get("id").cloned();
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     let params = request.get("params").cloned().unwrap_or(Value::Null);
@@ -165,7 +170,7 @@ pub fn dispatch(driver: &dyn WebviewDriver, request: &Value) -> Option<Value> {
         }
         "ping" => Some(json!({})),
         "tools/list" => Some(json!({ "tools": tool_catalog() })),
-        "tools/call" => return Some(call_tool(driver, &id, &params)),
+        "tools/call" => return Some(call_tool(driver, search, &id, &params)),
         _ => None,
     };
 
@@ -187,18 +192,33 @@ pub fn dispatch(driver: &dyn WebviewDriver, request: &Value) -> Option<Value> {
 /// `list_targets` is the tool whose *answer* is the registry: an empty list is a
 /// valid reply, not a failure, so it never asks for a pane.
 ///
+/// `web_search` is the second tool that never resolves a view, and the only one
+/// that is answered before the registry is read at all: it searches a SearXNG
+/// instance and needs nothing from the browser (`web-search.md`, S4), so asking
+/// the app for a pane would open a window nobody wanted.
+///
 /// A tool that hits a view which disappeared under it (the human closed the pane
 /// between resolving and using it, or a registry entry outlived its webview) asks
 /// for a pane once and retries once — see the block below the resolution, and
 /// [`reopen`] for why a NAMED view never triggers that ask. A view that goes away
 /// twice, or a pane nobody opens, answers [`NO_VIEW_ERROR`]: the platform's own
 /// words would read to the model as a broken app.
-fn call_tool(driver: &dyn WebviewDriver, id: &Value, params: &Value) -> Value {
+fn call_tool(
+    driver: &dyn WebviewDriver,
+    search: &dyn SearchGateway,
+    id: &Value,
+    params: &Value,
+) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     if !TOOL_NAMES.contains(&name) {
         return error(id, -32602, &format!("unknown tool `{name}`"));
     }
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+    // `web_search` is answered before anything looks for a view: it needs no
+    // browser, so it must never `ensure_view` (S4 of `web-search.md`).
+    if name == WEB_SEARCH {
+        return web_search_result(search, id, &arguments);
+    }
     let asked_view = arguments.get("viewId").and_then(Value::as_str);
 
     let mut views = driver.views();
@@ -535,7 +555,7 @@ fn targets_text(views: &[LiveView]) -> String {
 /// Every tool this server offers, in catalog order. Kept as data so a name that
 /// is listed but not dispatched (or the reverse) fails a test instead of the
 /// model's next call.
-const TOOL_NAMES: [&str; 10] = [
+const TOOL_NAMES: [&str; 11] = [
     "navigate",
     "eval",
     "get_url",
@@ -545,8 +565,15 @@ const TOOL_NAMES: [&str; 10] = [
     "back",
     "forward",
     "reload",
+    // The one tool that needs no view, listed last before the registry itself:
+    // `list_targets` is the tool whose answer is the view list.
+    "web_search",
     "list_targets",
 ];
+
+/// S3 of `web-search.md`: the tool name. A constant because the catalog, the
+/// dispatch and the tests must all spell it the same way.
+const WEB_SEARCH: &str = "web_search";
 
 /// The catalog. The schemas are what the model sees, so every field is
 /// described: a bare `{"type":"object"}` makes the model guess.
@@ -707,6 +734,27 @@ fn tool_catalog() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "web_search",
+            "description": "Search the web through a SearXNG instance and return titles, urls and \
+                            snippets. It does NOT open or render a page: the snippet is what the \
+                            search engine kept, so a page's real content still needs `navigate` \
+                            and `eval` in the browser view. It needs no browser view of its own.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to search for, in the words a person would type."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many results to return, 1 to 10. Defaults to 5."
+                    }
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
             "name": "list_targets",
             "description": "List the open browser views, one `id (url)` per line. Use it when a call \
                             needs a `viewId`. An empty list is a normal answer: it means no view is \
@@ -720,10 +768,109 @@ fn tool_catalog() -> Vec<Value> {
     ]
 }
 
+// ── `web_search` (S3/S4 of `web-search.md`) ────────────────────────────────
+
+/// S4: the answer when the human has not enabled the tool. It says what happened,
+/// that nothing was searched, and whose move it is — the same honesty the no-view
+/// error carries for the browser tools.
+const WEB_SEARCH_OFF: &str = "Web search is off in Settings, so nothing was searched. Tell the \
+     human they can enable it there.";
+
+/// S4: the dispatcher's half of `web_search`. No view, no driver, no pane: the
+/// search needs nothing from the browser, so it is answered before anything looks
+/// at the registry.
+///
+/// The order of the decisions is the order of the requirements: is it on at all;
+/// are the arguments usable; which instance (the human's, or the public list); and
+/// the failure of each path says who can fix it.
+fn web_search_result(search: &dyn SearchGateway, id: &Value, arguments: &Value) -> Value {
+    // S4: read through the gateway, never a constant — the switch in the dialog is
+    // the only thing that decides, and it applies to the very next call.
+    if !search.enabled() {
+        return tool_result(id, WEB_SEARCH_OFF, true);
+    }
+    let Some(query) = arguments
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+    else {
+        return error(id, -32602, "web_search needs a `query` argument");
+    };
+    // An absent `limit` takes the default; anything present but not a whole number
+    // is a broken request, not a search with a guess behind it.
+    let limit = match arguments.get("limit") {
+        None | Some(Value::Null) => websearch::DEFAULT_LIMIT,
+        Some(value) => match value.as_u64() {
+            Some(number) => websearch::clamp_limit(number as usize),
+            None => return error(id, -32602, "web_search `limit` must be a whole number"),
+        },
+    };
+
+    match run_search(search, query, limit) {
+        Ok(hits) => tool_result(id, &websearch::format_hits(query, &hits), false),
+        Err(reason) => tool_result(id, &reason, true),
+    }
+}
+
+/// S4: one search, with the instance policy in one place.
+///
+/// A configured instance is used and nothing else: the human chose it, so a silent
+/// fallback would hide a broken setting behind results from somewhere they never
+/// named. With no instance configured the public list is walked in order and the
+/// first answer wins; if none answers, the error says that a configured instance
+/// is the fix, which is the truth rather than "try again".
+fn run_search(
+    search: &dyn SearchGateway,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchHit>, String> {
+    let instance = search.instance();
+    if !instance.is_empty() {
+        return search
+            .searcher(&instance)
+            .search(query, limit)
+            .map_err(|reason| configured_instance_failure(&instance, &reason));
+    }
+
+    let mut failures: Vec<String> = Vec::new();
+    for candidate in websearch::public_instances() {
+        match search.searcher(candidate).search(query, limit) {
+            Ok(hits) => return Ok(hits),
+            Err(reason) => failures.push(format!("{candidate}: {reason}")),
+        }
+    }
+    Err(public_instances_failure(&failures))
+}
+
+/// S4: the failure of the instance the human chose. No alternative was tried, and
+/// the message says so — otherwise the model reads "search failed" and retries
+/// the same broken url.
+fn configured_instance_failure(instance: &str, reason: &str) -> String {
+    format!(
+        "web search failed at the instance configured in Settings ({instance}): {reason}. \
+         No other instance was tried, because the human chose that one; tell them the \
+         instance did not answer the JSON search, and that they can point Settings > Web \
+         search at another one."
+    )
+}
+
+/// S4: every public candidate failed. Public instances are unreliable by nature —
+/// they rate-limit or block the JSON API — so the answer names the fix instead of
+/// inviting a retry of the same list.
+fn public_instances_failure(failures: &[String]) -> String {
+    format!(
+        "no public SearXNG instance answered the search ({}). Public instances \
+         rate-limit or block the JSON API, so the fix is a configured instance: tell \
+         the human to put the url of their own SearXNG in Settings > Web search. \
+         Nothing was found, so cite no result.",
+        failures.join("; ")
+    )
+}
+
 /// A `tools/call` result. `isError` is how MCP reports a tool that ran but failed,
 /// which is a different thing from a broken request.
-fn tool_result(id: &Value, text: &str, is_error: bool) -> Value {
-    json!({
+fn tool_result(id: &Value, text: &str, is_error: bool) -> Value {    json!({
         "jsonrpc": "2.0",
         "id": id,
         "result": {
@@ -941,6 +1088,7 @@ impl Default for RegistrationGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::websearch::Searcher;
     use std::collections::VecDeque;
     use std::io::{Read, Write};
     use std::sync::Mutex;
@@ -1100,6 +1248,127 @@ mod tests {
         }
     }
 
+    // ── the `web_search` seam, scripted ───────────────────────────────────
+
+    /// What the fake gateway and the searchers it hands out share: the scripted
+    /// answers, and the record of what was asked.
+    ///
+    /// `searcher()` is the only way the dispatcher can obtain something that could
+    /// send a request, so counting those calls is what proves these tests stay
+    /// offline — no instance is contacted, at any point.
+    #[derive(Default)]
+    struct SearchScript {
+        /// One answer per attempt, in order; the last one repeats.
+        answers: Mutex<VecDeque<Result<Vec<SearchHit>, String>>>,
+        /// Every instance the dispatcher asked a searcher for, in order.
+        asked: Mutex<Vec<String>>,
+        /// Every (query, limit) a searcher was actually run with.
+        calls: Mutex<Vec<(String, usize)>>,
+    }
+
+    struct FakeSearch {
+        enabled: bool,
+        instance: String,
+        script: Arc<SearchScript>,
+    }
+
+    impl FakeSearch {
+        /// A fresh install: off, no instance, nothing asked.
+        fn off() -> FakeSearch {
+            FakeSearch {
+                enabled: false,
+                instance: String::new(),
+                script: Arc::default(),
+            }
+        }
+
+        /// On, with the instance the human typed in Settings.
+        fn configured(instance: &str) -> FakeSearch {
+            FakeSearch {
+                enabled: true,
+                instance: instance.to_string(),
+                script: Arc::default(),
+            }
+        }
+
+        /// On, with no instance: the public-list path.
+        fn any_public() -> FakeSearch {
+            FakeSearch {
+                enabled: true,
+                instance: String::new(),
+                script: Arc::default(),
+            }
+        }
+
+        fn answering(
+            self,
+            answers: impl IntoIterator<Item = Result<Vec<SearchHit>, String>>,
+        ) -> FakeSearch {
+            *self.script.answers.lock().unwrap() = answers.into_iter().collect();
+            self
+        }
+
+        /// The instances the dispatcher asked a searcher for, in order: the
+        /// attempts, one per instance tried.
+        fn asked(&self) -> Vec<String> {
+            self.script.asked.lock().unwrap().clone()
+        }
+
+        /// The (query, limit) each attempt was run with.
+        fn calls(&self) -> Vec<(String, usize)> {
+            self.script.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl SearchGateway for FakeSearch {
+        fn enabled(&self) -> bool {
+            self.enabled
+        }
+
+        fn instance(&self) -> String {
+            self.instance.clone()
+        }
+
+        fn searcher(&self, instance: &str) -> Box<dyn Searcher> {
+            self.script.asked.lock().unwrap().push(instance.to_string());
+            Box::new(ScriptedSearcher {
+                script: self.script.clone(),
+            })
+        }
+    }
+
+    /// One attempt. It answers from the script and records what it was asked; it
+    /// cannot build a request at all, which is the point.
+    struct ScriptedSearcher {
+        script: Arc<SearchScript>,
+    }
+
+    impl Searcher for ScriptedSearcher {
+        fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, String> {
+            self.script
+                .calls
+                .lock()
+                .unwrap()
+                .push((query.to_string(), limit));
+            let mut answers = self.script.answers.lock().unwrap();
+            if answers.len() > 1 {
+                answers.pop_front().expect("a queued answer")
+            } else {
+                answers
+                    .front()
+                    .cloned()
+                    .unwrap_or_else(|| Err("the fake has no answer left".to_string()))
+            }
+        }
+    }
+
+    /// The dispatcher as the view tools see it: a gateway that reads OFF, so no
+    /// test can reach the network by accident. The `web_search` tests call
+    /// `super::dispatch` with their own scripted gateway.
+    fn dispatch(driver: &dyn WebviewDriver, request: &Value) -> Option<Value> {
+        super::dispatch(driver, &crate::websearch::NoSearch, request)
+    }
+
     fn request(method: &str, params: Value) -> Value {
         json!({ "jsonrpc": "2.0", "id": 7, "method": method, "params": params })
     }
@@ -1171,7 +1440,264 @@ mod tests {
         for name in ["get_url", "get_title", "back", "forward", "reload", "list_targets"] {
             assert_eq!(required(name), json!([]), "{name} takes no mandatory argument");
         }
+
+        // S3 of `web-search.md`: the search tool declares the one thing it cannot
+        // run without, and its description says what it does NOT do — the model
+        // must not read a snippet as the page.
+        assert_eq!(required("web_search"), json!(["query"]));
+        let search = tools
+            .iter()
+            .find(|tool| tool["name"] == "web_search")
+            .expect("web_search is in the catalog");
+        let description = search["description"].as_str().expect("a description");
+        for claim in ["titles, urls and snippets", "does NOT open", "navigate", "eval"] {
+            assert!(description.contains(claim), "missing {claim:?}: {description}");
+        }
+        assert_eq!(
+            search["inputSchema"]["properties"]["limit"]["type"],
+            "integer",
+            "`limit` is a number, not a string"
+        );
     }
+
+    // ── `web_search` (S3/S4 of `web-search.md`) ───────────────────────────────
+
+    fn search_request(arguments: Value) -> Value {
+        request(
+            "tools/call",
+            json!({ "name": "web_search", "arguments": arguments }),
+        )
+    }
+
+    fn two_hits() -> Vec<SearchHit> {
+        vec![
+            SearchHit {
+                title: "Rust".to_string(),
+                url: "https://rust-lang.org/".to_string(),
+                snippet: "A language.".to_string(),
+            },
+            SearchHit {
+                title: "Docs".to_string(),
+                url: "https://doc.rust-lang.org/".to_string(),
+                snippet: "The book.".to_string(),
+            },
+        ]
+    }
+
+    // S4: a tool that is off says so, and searches nothing. The setting is read
+    // through the gateway, so the answer follows the file, not a constant.
+    #[test]
+    fn web_search_off_answers_the_settings_error_and_searches_nothing() {
+        let driver = FakeDriver::one();
+        let search = FakeSearch::off().answering([Ok(two_hits())]);
+
+        let answer = super::dispatch(&driver, &search, &search_request(json!({ "query": "rust" })))
+            .expect("answer");
+
+        assert_eq!(answer["result"]["isError"], true);
+        assert_eq!(
+            answer_text(&answer),
+            "Web search is off in Settings, so nothing was searched. Tell the human they can \
+             enable it there."
+        );
+        assert!(
+            search.asked().is_empty(),
+            "nothing may be searched while the tool is off: {:?}",
+            search.asked()
+        );
+        assert!(search.calls().is_empty(), "no instance was asked at all");
+    }
+
+    // S3: the instance the human configured is the one used, with the query and
+    // the limit it was asked for.
+    #[test]
+    fn web_search_uses_the_configured_instance_and_formats_its_hits() {
+        let driver = FakeDriver::one();
+        let search = FakeSearch::configured("https://searx.example").answering([Ok(two_hits())]);
+
+        let answer = super::dispatch(
+            &driver,
+            &search,
+            &search_request(json!({ "query": "rust lang", "limit": 7 })),
+        )
+        .expect("answer");
+
+        assert_eq!(answer["result"]["isError"], false, "{}", answer_text(&answer));
+        assert_eq!(
+            answer_text(&answer),
+            "Rust\nhttps://rust-lang.org/\nA language.\n\nDocs\nhttps://doc.rust-lang.org/\nThe book."
+        );
+        assert_eq!(search.asked(), vec!["https://searx.example".to_string()]);
+        assert_eq!(search.calls(), vec![("rust lang".to_string(), 7)]);
+    }
+
+    // S3: a configured instance that fails is answered, never replaced with
+    // another one: the human chose it, and silently searching elsewhere would
+    // hide a broken setting.
+    #[test]
+    fn a_failing_configured_instance_is_surfaced_without_fallback() {
+        let driver = FakeDriver::one();
+        let search = FakeSearch::configured("https://searx.example")
+            .answering([Err("HTTP 429: the instance is rate-limiting requests".to_string())]);
+
+        let answer =
+            super::dispatch(&driver, &search, &search_request(json!({ "query": "rust" })))
+                .expect("answer");
+
+        assert_eq!(answer["result"]["isError"], true);
+        let text = answer_text(&answer);
+        assert!(text.contains("https://searx.example"), "names the instance: {text}");
+        assert!(text.contains("HTTP 429"), "keeps the reason: {text}");
+        assert!(text.contains("Settings"), "says where the fix is: {text}");
+        assert_eq!(
+            search.asked(),
+            vec!["https://searx.example".to_string()],
+            "exactly one attempt, on the chosen instance"
+        );
+    }
+
+    // S3: with no instance configured, the public list is walked IN ORDER and the
+    // first answer wins — the second candidate here.
+    #[test]
+    fn an_empty_instance_walks_the_public_list_in_order() {
+        let driver = FakeDriver::one();
+        let search = FakeSearch::any_public().answering([
+            Err("HTTP 403: the instance refuses the JSON API".to_string()),
+            Ok(two_hits()),
+        ]);
+
+        let answer =
+            super::dispatch(&driver, &search, &search_request(json!({ "query": "rust" })))
+                .expect("answer");
+
+        assert_eq!(answer["result"]["isError"], false, "{}", answer_text(&answer));
+        let public = crate::websearch::public_instances();
+        assert_eq!(
+            search.asked(),
+            public[..2].to_vec(),
+            "the first candidate, then the second, in list order"
+        );
+        assert_eq!(search.calls().len(), 2, "one attempt per candidate, no more");
+    }
+
+    // S3/S4: when every public instance fails, the answer says what the fix is
+    // (a configured instance) instead of leaving the model to retry a list.
+    #[test]
+    fn every_public_instance_failing_names_the_configured_instance_as_the_fix() {
+        let driver = FakeDriver::one();
+        let search = FakeSearch::any_public().answering([Err(
+            "HTTP 429: the instance is rate-limiting requests".to_string(),
+        )]);
+
+        let answer =
+            super::dispatch(&driver, &search, &search_request(json!({ "query": "rust" })))
+                .expect("answer");
+
+        assert_eq!(answer["result"]["isError"], true);
+        let text = answer_text(&answer);
+        assert_eq!(
+            search.asked().len(),
+            crate::websearch::public_instances().len(),
+            "every candidate was tried exactly once"
+        );
+        assert!(text.contains("public SearXNG instance"), "{text}");
+        assert!(text.contains("configured instance"), "names the fix: {text}");
+        assert!(text.contains("Settings"), "says where: {text}");
+        assert!(text.contains("HTTP 429"), "keeps the reasons: {text}");
+    }
+
+    // S3: `limit` is clamped into 1..=10 before it reaches the searcher, and a
+    // missing one takes the documented default.
+    #[test]
+    fn the_limit_is_clamped_before_the_instance_is_asked() {
+        let driver = FakeDriver::one();
+        for (asked, expected) in [(json!(0), 1), (json!(1), 1), (json!(10), 10), (json!(99), 10)] {
+            let search = FakeSearch::configured("https://searx.example").answering([Ok(two_hits())]);
+            super::dispatch(
+                &driver,
+                &search,
+                &search_request(json!({ "query": "rust", "limit": asked })),
+            )
+            .expect("answer");
+            assert_eq!(
+                search.calls(),
+                vec![("rust".to_string(), expected)],
+                "limit {asked} clamps to {expected}"
+            );
+        }
+
+        let search = FakeSearch::configured("https://searx.example").answering([Ok(two_hits())]);
+        super::dispatch(&driver, &search, &search_request(json!({ "query": "rust" })))
+            .expect("answer");
+        assert_eq!(
+            search.calls(),
+            vec![("rust".to_string(), crate::websearch::DEFAULT_LIMIT)]
+        );
+    }
+
+    // S3: the argument shapes are refused the way the other tools refuse theirs —
+    // as a protocol error, before an instance is contacted.
+    #[test]
+    fn web_search_refuses_a_missing_query_and_a_bad_limit() {
+        let driver = FakeDriver::one();
+        for arguments in [
+            json!({}),
+            json!({ "query": "" }),
+            json!({ "query": "   " }),
+            json!({ "query": 7 }),
+            json!({ "query": "rust", "limit": "many" }),
+            json!({ "query": "rust", "limit": 2.5 }),
+            json!({ "query": "rust", "limit": -3 }),
+        ] {
+            let search = FakeSearch::configured("https://searx.example").answering([Ok(two_hits())]);
+            let answer = super::dispatch(&driver, &search, &search_request(arguments.clone()))
+                .expect("answer");
+            assert_eq!(answer["error"]["code"], -32602, "{arguments}");
+            assert!(
+                search.asked().is_empty(),
+                "a refused call contacts no instance: {arguments}"
+            );
+        }
+    }
+
+    // S4: `web_search` is not a browser tool. It needs no view, so it never asks
+    // the app to open a pane, and nothing about it touches the driver.
+    #[test]
+    fn web_search_never_asks_for_a_browser_view() {
+        let driver = FakeDriver::opening(vec![LiveView {
+            id: "embed-7".to_string(),
+            url: "about:blank".to_string(),
+        }]);
+        let search = FakeSearch::configured("https://searx.example").answering([Ok(two_hits())]);
+
+        let answer =
+            super::dispatch(&driver, &search, &search_request(json!({ "query": "rust" })))
+                .expect("answer");
+
+        assert_eq!(answer["result"]["isError"], false, "{}", answer_text(&answer));
+        assert_eq!(driver.asks(), 0, "search opens no pane");
+        assert!(driver.views().is_empty(), "and creates no view");
+        assert!(driver.navigated.lock().unwrap().is_empty());
+        assert!(driver.evaluated.lock().unwrap().is_empty());
+    }
+
+    // S5: no hits is a successful answer with the honest no-results line, not an
+    // error the model would retry differently.
+    #[test]
+    fn web_search_answers_an_empty_result_list_as_a_normal_result() {
+        let driver = FakeDriver::one();
+        let search = FakeSearch::configured("https://searx.example").answering([Ok(Vec::new())]);
+
+        let answer =
+            super::dispatch(&driver, &search, &search_request(json!({ "query": "ñandú zzz" })))
+                .expect("answer");
+
+        assert_eq!(answer["result"]["isError"], false);
+        let text = answer_text(&answer);
+        assert!(text.contains("no results"), "{text}");
+        assert!(text.contains("ñandú zzz"), "names the query: {text}");
+    }
+
 
     // S5: the tool reaches the view the human is looking at without the model
     // having to name it, which is the common case (one pane, one view).
@@ -2024,7 +2550,12 @@ mod tests {
     fn the_endpoint_requires_its_token_and_answers_json_over_http() {
         let driver = Arc::new(FakeDriver::one());
         let token = new_token();
-        let endpoint = start(driver, token.clone()).expect("bind a local port");
+        let endpoint = start(
+            driver,
+            Arc::new(crate::websearch::NoSearch),
+            token.clone(),
+        )
+        .expect("bind a local port");
         assert!(endpoint.url.starts_with("http://127.0.0.1:"));
 
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }).to_string();
@@ -2206,6 +2737,7 @@ mod tests {
 /// file because the binding is thin and splitting it would hide that.
 pub fn start(
     driver: Arc<dyn WebviewDriver>,
+    search: Arc<dyn SearchGateway>,
     token: String,
 ) -> Result<Endpoint, String> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
@@ -2214,7 +2746,7 @@ pub fn start(
         url: format!("http://127.0.0.1:{port}/mcp"),
         token,
     };
-    serve(listener, driver, endpoint.token.clone())?;
+    serve(listener, driver, search, endpoint.token.clone())?;
     Ok(endpoint)
 }
 
@@ -2326,10 +2858,12 @@ impl WebviewDriver for EmbedDriver {
     }
 }
 
-/// What one request needs to be answered: the driver, this run's token, and the
-/// session id MCP clients expect to see echoed after the handshake.
+/// What one request needs to be answered: the driver, the search gateway, this
+/// run's token, and the session id MCP clients expect to see echoed after the
+/// handshake.
 struct ServerState {
     driver: Arc<dyn WebviewDriver>,
+    search: Arc<dyn SearchGateway>,
     token: String,
     session_id: String,
 }
@@ -2342,6 +2876,7 @@ struct ServerState {
 fn serve(
     listener: TcpListener,
     driver: Arc<dyn WebviewDriver>,
+    search: Arc<dyn SearchGateway>,
     token: String,
 ) -> Result<(), String> {
     listener
@@ -2350,6 +2885,7 @@ fn serve(
     let session_id = format!("nabla-{}", &token[..16.min(token.len())]);
     let state = Arc::new(ServerState {
         driver,
+        search,
         token,
         session_id,
     });
@@ -2417,14 +2953,16 @@ async fn handle_post(
         Value::Array(messages) => {
             let answers: Vec<Value> = messages
                 .iter()
-                .filter_map(|message| dispatch(state.driver.as_ref(), message))
+                .filter_map(|message| {
+                    dispatch(state.driver.as_ref(), state.search.as_ref(), message)
+                })
                 .collect();
             if answers.is_empty() {
                 return accepted(&state);
             }
             json_response(StatusCode::OK, &Value::Array(answers), &state)
         }
-        message => match dispatch(state.driver.as_ref(), message) {
+        message => match dispatch(state.driver.as_ref(), state.search.as_ref(), message) {
             Some(answer) => json_response(StatusCode::OK, &answer, &state),
             None => accepted(&state),
         },

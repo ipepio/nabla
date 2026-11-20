@@ -123,7 +123,11 @@ import {
   setQueueMessages,
   setShowReasoning,
   setToolEnabled,
+  setWebSearchEnabled,
+  setWebSearchInstance,
   showReasoning,
+  webSearchEnabled,
+  webSearchInstance,
   type ToolPreferenceId,
 } from "@/lib/preferences";
 import { useI18n, type Locale, type MessageKey } from "@/lib/i18n";
@@ -513,6 +517,25 @@ const TOOL_SWITCHES: {
  */
 function handleToolToggle(id: ToolPreferenceId, next: boolean) {
   void setToolEnabled(id, next);
+}
+
+/**
+ * S3 of `web-search.md`: the agent's web search switch. The Rust default is off,
+ * and the pane says what the toggle does — the query leaves the machine for the
+ * instance.
+ */
+function handleWebSearchToggle(next: boolean) {
+  void setWebSearchEnabled(next);
+}
+
+/**
+ * S3: the instance url, written when the field is committed (blur or Enter)
+ * rather than per keystroke: a half-typed host is not a preference, and a save per
+ * character would rewrite `settings.json` a dozen times for one url.
+ */
+function handleWebSearchInstance(event: Event) {
+  const target = event.target as HTMLInputElement | null;
+  void setWebSearchInstance(target?.value ?? "");
 }
 
 /**
@@ -980,6 +1003,80 @@ watch(open, (isOpen) => {
                     aria-hidden="true"
                   />
                 </button>
+              </div>
+            </section>
+
+            <!-- S3 of `web-search.md`: the agent's web search. Its own block rather
+                 than a row of the drawer tools above: those are panels the human
+                 opens, this is a capability the agent calls, and the query leaves
+                 the machine — which the description says, in those words. The
+                 instance field belongs to the switch, so it sits right under it and
+                 stays useful while the switch is off (turning it on then needs no
+                 typing). -->
+            <section class="space-y-3">
+              <div class="min-w-0">
+                <h3 class="text-sm font-medium">
+                  {{ t("settings.general.webSearch") }}
+                </h3>
+                <p class="mt-0.5 text-xs text-muted-foreground">
+                  {{ t("settings.general.webSearch.description") }}
+                </p>
+              </div>
+
+              <div class="flex items-start justify-between gap-4">
+                <div class="min-w-0">
+                  <p class="text-sm">
+                    {{ t("settings.general.webSearch.enable") }}
+                  </p>
+                  <p class="mt-0.5 text-xs text-muted-foreground">
+                    {{ t("settings.general.webSearch.enable.description") }}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  :aria-checked="webSearchEnabled"
+                  :aria-label="t('settings.general.webSearch.enable')"
+                  :class="[
+                    'relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                    webSearchEnabled ? 'bg-primary' : 'bg-input',
+                  ]"
+                  @click="handleWebSearchToggle(!webSearchEnabled)"
+                >
+                  <span
+                    :class="[
+                      'size-4 rounded-full bg-background shadow-sm transition-transform',
+                      webSearchEnabled ? 'translate-x-4.5' : 'translate-x-0.5',
+                    ]"
+                    aria-hidden="true"
+                  />
+                </button>
+              </div>
+
+              <div class="space-y-1.5">
+                <label
+                  class="text-sm"
+                  for="settings-web-search-instance"
+                >
+                  {{ t("settings.general.webSearch.instance") }}
+                </label>
+                <Input
+                  id="settings-web-search-instance"
+                  :value="webSearchInstance"
+                  type="text"
+                  inputmode="url"
+                  autocomplete="off"
+                  spellcheck="false"
+                  class="h-8 text-sm"
+                  :placeholder="
+                    t('settings.general.webSearch.instance.placeholder')
+                  "
+                  :aria-label="t('settings.general.webSearch.instance')"
+                  @change="handleWebSearchInstance"
+                />
+                <p class="text-xs text-muted-foreground">
+                  {{ t("settings.general.webSearch.instance.hint") }}
+                </p>
               </div>
             </section>
 

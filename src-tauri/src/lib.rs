@@ -12,6 +12,9 @@ mod rpc;
 mod settings;
 mod shell;
 mod store;
+// `web_search`: the agent's web search, backed by a SearXNG instance the human
+// configures or, failing that, by any public one (`web-search.md`).
+mod websearch;
 mod workspace;
 
 use std::sync::Arc;
@@ -143,6 +146,10 @@ pub fn run() {
                     app.handle().clone(),
                     embeds.clone(),
                 )),
+                // S1 of `web-search.md`: the `web_search` tool reads its switch and
+                // its instance from `settings.json` on every call, so a change in
+                // the dialog reaches the next tool call instead of the next launch.
+                Arc::new(websearch::SettingsSearch::new(&config_dir)),
                 mcp_server::new_token(),
             )
             .ok();

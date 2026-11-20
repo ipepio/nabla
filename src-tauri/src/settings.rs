@@ -77,6 +77,20 @@ pub struct Settings {
     /// would impose reasoning nobody asked for on every fresh session.
     #[serde(default = "default_thinking_level")]
     pub thinking_level: String,
+    /// S1 of `web-search.md`: the agent's `web_search` tool. **Off** by default:
+    /// the query leaves this machine for a third-party server, so a network
+    /// capability is something the human turns on, never something an upgrade
+    /// grants. An absent field (a file written before this preference existed)
+    /// means off.
+    #[serde(default)]
+    pub web_search_enabled: bool,
+    /// S1: the SearXNG instance that answers `web_search`, as the human typed it
+    /// (a bare host is accepted; `websearch::normalize_instance` adds the
+    /// scheme). **Empty means "any public instance"**, which is the best-effort
+    /// path: public instances rate-limit or refuse the JSON API, so a configured
+    /// instance is the reliable one. Kept verbatim here, trimmed by the reader.
+    #[serde(default)]
+    pub web_search_instance: String,
 }
 
 /// S2/S3 of `chat-preferences-and-queue.md`: both chat toggles ship enabled, so
@@ -159,6 +173,10 @@ impl Default for Settings {
             permission_mode: default_permission_mode(),
             enabled_tools: default_tools(),
             thinking_level: default_thinking_level(),
+            // S1 of `web-search.md`: nothing reaches the network until the human
+            // asks for it, and no instance is preferred over any other.
+            web_search_enabled: false,
+            web_search_instance: String::new(),
         }
     }
 }
@@ -1084,6 +1102,68 @@ mod tests {
         let s = load(&cfg.0).expect("load");
         assert_eq!(s.thinking_level, "mucho", "the file keeps what was written");
         assert_eq!(s.thinking(), None, "but it names no level this build knows");
+    }
+
+    // ── web search (S1 of `web-search.md`) ──────────────────────────────────
+
+    // S1: a fresh install searches nothing. The tool is opt-in because the query
+    // leaves the machine, and "any public instance" is the empty preference.
+    #[test]
+    fn web_search_defaults_to_off_and_any_instance() {
+        let s = Settings::default();
+        assert!(!s.web_search_enabled, "S1: web search ships off");
+        assert_eq!(s.web_search_instance, "", "empty means any public instance");
+
+        // camelCase on the wire, so `types.ts` mirrors these keys.
+        let json = serde_json::to_value(Settings::default()).expect("serialize");
+        assert_eq!(json["webSearchEnabled"], serde_json::json!(false));
+        assert_eq!(json["webSearchInstance"], serde_json::json!(""));
+    }
+
+    // S1 + the settings header rule: a file written before the preference
+    // existed loads with the tool off and every other key intact.
+    #[test]
+    fn settings_file_without_web_search_loads_it_off() {
+        let cfg = TempCfg::new("pre_web_search");
+        std::fs::write(
+            &cfg.0,
+            r#"{"theme":"light","piBinary":"pi","provider":"nan","model":"glm5.3","language":"es"}"#,
+        )
+        .expect("write fixture");
+        let s = load(&cfg.0).expect("an older settings file must load");
+        assert_eq!(s.language, "es");
+        assert!(!s.web_search_enabled, "an absent preference means off");
+        assert_eq!(s.web_search_instance, "");
+    }
+
+    // S1: the toggle and the instance are preferences like the rest — written
+    // and read back unchanged, so a relaunch keeps the instance the human chose.
+    #[test]
+    fn web_search_round_trips() {
+        let cfg = TempCfg::new("web_search_roundtrip");
+        let s = Settings {
+            web_search_enabled: true,
+            web_search_instance: "https://searx.example".to_string(),
+            ..Settings::default()
+        };
+        save(&cfg.0, &s).expect("save");
+        let loaded = load(&cfg.0).expect("load");
+        assert!(loaded.web_search_enabled, "the tool stays on");
+        assert_eq!(loaded.web_search_instance, "https://searx.example");
+
+        // Turning it off is a real choice too, and the instance is not erased by
+        // it: the human can flip the switch back without retyping the url.
+        save(
+            &cfg.0,
+            &Settings {
+                web_search_enabled: false,
+                ..loaded
+            },
+        )
+        .expect("save");
+        let off = load(&cfg.0).expect("load");
+        assert!(!off.web_search_enabled);
+        assert_eq!(off.web_search_instance, "https://searx.example");
     }
 
     #[test]

@@ -100,6 +100,22 @@ export const DEFAULT_ENABLED_TOOLS: readonly string[] = ["files", "changes"];
  */
 export const enabledTools = ref<string[]>([...DEFAULT_ENABLED_TOOLS]);
 
+/**
+ * S1 of `odd/tasks/web-search.md`: the agent's `web_search` tool. Default `false`
+ * — the query leaves this machine for a third-party server, so the capability is
+ * opt-in, exactly like the Rust default for a fresh install and for a settings
+ * file written before the preference existed.
+ */
+export const webSearchEnabled = ref(false);
+
+/**
+ * S1: the SearXNG instance that answers the search, as typed. Empty (the default)
+ * means "any public instance", which is the best-effort path: public instances
+ * rate-limit or refuse the JSON API, so a configured one is the reliable choice.
+ * Kept verbatim — Rust normalizes a bare host when it builds the request.
+ */
+export const webSearchInstance = ref("");
+
 /** S5: whether one tool id is enabled right now. Unknown ids read as off. */
 export function isToolEnabled(id: string): boolean {
   return enabledTools.value.includes(id);
@@ -138,6 +154,10 @@ export function applyPreferences(settings: AppSettings | null): void {
   // file holds and what the selector must not quietly rewrite.
   const level = settings?.thinkingLevel?.trim() ?? "";
   thinkingLevel.value = level === "" ? DEFAULT_THINKING_LEVEL : level;
+  // S1 of `web-search.md`: an absent field reads as the documented default, which
+  // is OFF and no instance — never "on, anywhere" by omission.
+  webSearchEnabled.value = settings?.webSearchEnabled ?? false;
+  webSearchInstance.value = settings?.webSearchInstance ?? "";
 }
 
 /**
@@ -166,6 +186,27 @@ export async function setShowReasoning(next: boolean): Promise<void> {
 export async function setQueueMessages(next: boolean): Promise<void> {
   queueMessages.value = next;
   await persist({ queueMessages: next });
+}
+
+/**
+ * S1 of `web-search.md`: turns the agent's `web_search` tool on or off and
+ * persists the choice. Rust re-reads the file on the next tool call, so a flip
+ * here reaches the running session without a relaunch.
+ */
+export async function setWebSearchEnabled(next: boolean): Promise<void> {
+  webSearchEnabled.value = next;
+  await persist({ webSearchEnabled: next });
+}
+
+/**
+ * S1: stores the instance the human typed. Trimmed, because a stray space in a
+ * url is a typo nobody can see in the field; an empty value is a real choice (any
+ * public instance), never "keep the old one".
+ */
+export async function setWebSearchInstance(next: string): Promise<void> {
+  const trimmed = next.trim();
+  webSearchInstance.value = trimmed;
+  await persist({ webSearchInstance: trimmed });
 }
 
 /**
@@ -215,6 +256,8 @@ export function usePreferences() {
     queueMessages,
     enabledTools,
     thinkingLevel,
+    webSearchEnabled,
+    webSearchInstance,
     isToolEnabled,
     applyPreferences,
   };

@@ -240,6 +240,18 @@ export interface AppSettings {
    * guaranteed to be one of the levels this build knows.
    */
   thinkingLevel: ThinkingLevel;
+  /**
+   * S1 of `odd/tasks/web-search.md`: the agent's `web_search` tool. Rust defaults
+   * the field to `false`, so a settings file written before this preference
+   * existed — and a fresh install — searches nothing until the human turns it on.
+   */
+  webSearchEnabled: boolean;
+  /**
+   * S1: the SearXNG instance that answers `web_search`, as typed. Empty means
+   * "try any public instance", which is best effort: public instances rate-limit
+   * or refuse the JSON API.
+   */
+  webSearchInstance: string;
 }
 
 /**
