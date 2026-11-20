@@ -222,7 +222,6 @@
   "chat.errors.noWorkspace": "Elige un espacio antes de enviar un mensaje.",
   "chat.expandTools": "Abrir el panel de herramientas",
   "chat.moreActions": "Más acciones (sin conectar todavía)",
-  "chat.standardMode": "Modo estándar",
   "chat.turnsAndSteps": "{turns} turnos · {steps} pasos",
   "chat.composer.prompt": "Mensaje",
   "chat.composer.placeholder": "Describe lo que quieres construir, / comandos, @ archivos o sesiones",

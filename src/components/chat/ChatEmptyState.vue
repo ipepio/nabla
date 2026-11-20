@@ -1,12 +1,11 @@
 <script setup lang="ts">
 import { computed } from "vue";
 // Empty chat (spec S1): one brand image, an optional configurable hero line,
-// two inert mode/provider chips and the composer, centred in the panel.
+// provider chip and the composer, centred in the panel.
 //
 // Brand paths belong to `src/lib/brand.ts` (S3, ADR 0009): replacing the file in
 // `public/` re-brands the app without touching this component. The image is the
 // combined mark + wordmark asset, so the panel never renders two logos.
-import { ChevronDownIcon } from "@lucide/vue";
 import { useAppearance } from "@/lib/appearance";
 import { themedBrand } from "@/lib/brand";
 import { HERO } from "@/lib/hero";
@@ -51,19 +50,15 @@ defineProps<{
         </p>
       </div>
 
-      <!-- Both chips are deliberately inert: the mode is a seam, the provider
-           only reports what settings.json already says. -->
+      <!-- The provider chip is deliberately inert: it only reports what
+           settings.json already says. The mode chip that used to sit beside it
+           carried a single possible value, so it was removed — a control that
+           cannot change anything is noise. -->
       <div class="flex flex-wrap items-center justify-center gap-2">
         <span
           class="inline-flex items-center gap-1 rounded-full border border-border bg-card/60 px-2.5 py-1 text-xs text-muted-foreground"
         >
           {{ provider }}
-        </span>
-        <span
-          class="inline-flex items-center gap-1 rounded-full border border-border bg-card/60 px-2.5 py-1 text-xs text-muted-foreground"
-        >
-          {{ t("chat.standardMode") }}
-          <ChevronDownIcon class="size-3" />
         </span>
       </div>
 
