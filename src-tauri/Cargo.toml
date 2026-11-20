@@ -60,6 +60,16 @@ getrandom = "0.3"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+# The macOS default for dev builds is `split-debuginfo = "unpacked"`, which
+# makes rustc >= 1.88 emit per-codegen-unit objects (`*.rcgu.o`) with random
+# suffixes on every rebuild: they are never overwritten and never collected
+# (upstream rust-lang/rust#161824 — a case there grew 341 GB in 8 weeks). This
+# machine's target/ held 12 GB of them before the first `cargo clean`.
+# `packed` bundles debug info per artifact (the dSYM style Xcode uses) and does
+# not accumulate stray objects.
+[profile.dev]
+split-debuginfo = "packed"
+
 [profile.release]
 codegen-units = 1
 lto = true
