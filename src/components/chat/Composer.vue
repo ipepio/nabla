@@ -11,7 +11,7 @@
 // themselves live in `composer-completion.ts` (what is a trigger, what a pick
 // inserts) and in the two small components this card renders, so the wiring here
 // is only "what did the textarea just ask for, and what does that pick mean".
-import { computed, nextTick, ref } from "vue";
+import { computed, nextTick, onMounted, ref, watch } from "vue";
 import {
   ArrowUpIcon,
   CheckIcon,
@@ -650,6 +650,27 @@ function chooseModel(provider: string, model: string) {
   if (provider === props.providerId && model === props.modelId) return;
   emit("selectModel", { provider, model });
 }
+/**
+ * Warm the command list before anyone asks for it.
+ *
+ * The probe costs a couple of seconds and one throwaway pi child. Paying that
+ * while the panel is appearing is invisible; paying it on the first `/` is a
+ * visible wait, which is exactly what the maintainer felt. One warm-up per
+ * workspace per app run — the answer is cached in memory, nothing is persisted,
+ * and a live session still refreshes it when it can.
+ */
+function prewarmCommands(): void {
+  if (activeSession.value !== null) return;
+  const workspace = props.workspaceId;
+  if (workspace === null) return;
+  void commandsFor(workspace).catch(() => {});
+}
+
+onMounted(prewarmCommands);
+// A workspace switch is a new command list: warm that one too, before any caret
+// lands in the composer. Reading `props` here is safe — it is declared above.
+watch(() => props.workspaceId, prewarmCommands);
+
 </script>
 
 <template>
