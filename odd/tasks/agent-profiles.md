@@ -53,10 +53,10 @@ hoy: sin tools nuevas, sin sección de prompt, sin puntos de estado.
 
 | ID | Specs | Qué | Ruta | Commit |
 | --- | --- | --- | --- | --- |
-| U1 | S1, S3, S6 | `agents.json` + comandos Rust (lectura/escritura atómica, validación), `subagentsEnabled`, extensión leyendo de `NABLA_DATA_DIR`, retirada de `.pi/agents` | `src-tauri/src/*`, `resources/nabla-subagents.ts`, `src/contracts/*` | pending |
-| U2 | S2, S4, S6 | Ajustes → Subagentes: maestro, lista, editor, plantillas bajo demanda | `src/components/settings/*`, `src/lib/*` | pending |
-| U3 | S5 | `run_agents` paralelo, tope 4, un JSONL por hijo, espera a todos, resumen por hijo | `resources/nabla-subagents.ts` | pending |
-| U4 | S7 | Tabla de enrutado condicionada al maestro | `resources/nabla-system-prompt.md` + composición en Rust | pending |
+| U1 | S1, S3, S6 | `agents.json` + comandos Rust (lectura/escritura atómica, validación), `subagentsEnabled`, extensión leyendo de `NABLA_DATA_DIR`, retirada de `.pi/agents` | `src-tauri/src/*`, `resources/nabla-subagents.ts`, `src/contracts/*` | done (9fe063b) |
+| U2 | S2, S4, S6 | Ajustes → Subagentes: maestro, lista, editor, plantillas bajo demanda | `src/components/settings/*`, `src/lib/*` | done (d9bb13d) |
+| U3 | S5 | `run_agents` paralelo, tope 4, un JSONL por hijo, espera a todos, resumen por hijo | `resources/nabla-subagents.ts` | done (31139da) |
+| U4 | S7 | Tabla de enrutado condicionada al maestro | `resources/nabla-system-prompt.md` + composición en Rust | done (9fe063b) |
 
 ## Log
 
@@ -73,3 +73,4 @@ hoy: sin tools nuevas, sin sección de prompt, sin puntos de estado.
 - **L4** Decisión del orquestador aceptada por silencio: **un único `agents.json`**
   en lugar de un markdown por perfil, porque el editor es la interfaz y ya tenemos
   JSON + DTO + espejo TS; no se inventa un lenguaje de serialización nuevo.
+- **L5** **U1–U4 hechos**: `9fe063b` (almacén en `<data_dir>/agents.json`, gate leído en cada spawn, extensión leyendo de Nabla, tabla de enrutado condicionada; 450 tests), `31139da` (`run_agents` concurrente con `allSettled`, camino de spawn único compartido con `run_agent`, hijo nunca ve las cinco tools propias), y d9bb13d (Ajustes → Subagentes: maestro apagado, lista, editor, cinco plantillas redactadas y **apagadas**, un solo guardado con los errores de Rust literales; 74 claves i18n). **Desviaciones declaradas**: (a) un hijo cancelado se resume como `failed` porque el registro solo conoce cuatro estados y `agent_cancel` ya documenta así la cancelación — inventar un quinto estado en el resumen habría partido la verdad en dos sitios; (b) `resources/*.ts` está fuera de todo tsconfig por diseño, así que el comportamiento de la extensión depende del QA del humano. **QA manual pendiente**: encender el maestro, añadir `researcher` desde plantilla, encenderlo, delegar, y probar `run_agents` con dos jueces.
