@@ -9,7 +9,6 @@ import { computed } from "vue";
 import { useAppearance } from "@/lib/appearance";
 import { themedBrand } from "@/lib/brand";
 import { HERO } from "@/lib/hero";
-import { t } from "@/lib/i18n";
 
 // Theme-aware: the combined mark + wordmark asset follows the palette, so the
 // empty state never shows a white logo on a light background.
