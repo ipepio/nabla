@@ -1,36 +1,63 @@
 # subagent-helpers — coordinación de agentes visible donde ocurre
 
-Estado: **planificado**, sin rama ni código. Documento de planteamiento para P2 de P-001.
-Alcance: cuando un agente delega trabajo en otros agentes, Nabla lo muestra **en el chat que lo lanzó** — estado, hilo narrado, seguir en vivo, parar — en vez de una lista global descontextualizada.
+Estado: **diseñado tras recon** (H0 resuelto), sin rama ni código. P2 de P-001.
+Alcance: el agente delega en subagentes (extensión first-party nuestra, patrón de `pi-subagents-j0k3r` sin fork — MIT, estudiado como referencia), y Nabla muestra las **sesiones ligadas** al chat que las lanzó, abribles en vivo como Herdr abre sus agentes.
 
 ## Specs
 
-- **S1** «4 cerramos lo que hay ahora y planteamos P2» — este documento es el planteamiento, no una implementación. P1 (asistente de escritorio) se cierra con el lote actual.
-- **S2** La unidad es el **chat que delega**: los agentes que un turno lanza aparecen con tarjeta propia dentro de esa conversación, no en un panel global separado. Es la idea que la encuesta marcó como la mejor para P2 (gentle-shell-desktop: *Helpers*; gentle-shell: overlay *Agents*), y encaja en el drawer que ya existe.
-- **S3** Cada tarjeta muestra: rol/etiqueta, estado (en cola · trabajando · hecho · fallo), tiempo y **sus tools colapsadas** (el patrón que ya usamos por turno), con **Follow live** (ver su hilo mientras corre) y **Stop**.
-- **S4** Un subagente que necesita una decisión del padre la pide **como pregunta**, con el puente `ask_*` que ya tenemos: tarjeta en el chat, no un mensaje suelto en un log.
-- **S5** Nada de esto entra en P1: si el agente no puede delegar todavía, la feature no tiene sujeto. **La primera tarea es averiguar eso**, no diseñar UI.
+- **S1** «estudia esta extensión y la creamos propia (no forkees) la adaptamos a como necesitemos. La idea es ver las sesiones ligadas y poder abrirlas tipo en herdr» — extensión propia, adaptada; sesiones de subagentes **ligadas al chat padre y abribles**.
+- **S2** La unidad es el **chat que delega**: la tarjeta del subagente vive en el turno que lo lanzó (estado, progreso), y su sesión aparece **anidada** en la barra lateral bajo la padre — no en una lista global.
+- **S3** Abrir una sesión de subagente la muestra **en vivo y en solo lectura** (renderizador de transcript que ya existe, siguiendo el JSONL mientras crece). La interacción con el subagente (mandarle mensaje, continuar) va **por el chat padre** con las tools de la extensión, no escribiendo en su vista — la vista es para mirar, el mando sigue en la conversación.
+- **S4** Definiciones de agente en markdown en el workspace (`.pi/agents/*.md`, frontmatter: name/description/tools/model/effort) — misma convención que la referencia, para que definiciones existentes sirvan.
+- **S5** Seguridad: allowlist de tools por definición **+** nuestro gate de permisos (el niño corre en proceso dentro del pi padre; su `tool_call` pasa por el mismo hook — **verificar** en H1). Sin recursiones en v1. Límite de hijos paralelos.
+- **S6** Preguntas: los subagentes **no preguntan al humano** en v1 (son trabajadores autónomos con allowlist); el padre pregunta por el puente `ask_*` si hace falta una decisión.
 
-## Lo que NO sabemos (recon obligatoria antes de diseñar)
+## Hechos verificados (recon de `pi-subagents-j0k3r@1.6.1`, MIT)
 
-1. **¿pi tiene subagentes nativos?** En las sesiones de Nabla el agente ve `read`, `bash`, `edit`, `write` + MCP; no aparece ninguna tool de delegación. Hay que verificar en la doc de pi si existe un mecanismo nativo (tool `task`/`agent`, `--subagent`, extensión `builtin:*`) o si delegar es **una extensión que habría que construir**.
-2. **¿Cómo se observaría?** Si pi lanza hijos, ¿emite eventos RPC por ellos (inicio, salida, tools, fin) o solo el resultado final del padre? De esto depende toda la UI: tarjetas en vivo (eventos) o solo un resumen al terminar.
-3. **¿Son sesiones de pi o procesos propios?** Si son sesiones, la topología que ya tenemos (una por conversación) los absorbe; si son otra cosa, hay que decidir el modelo.
-4. **Coste/permisos**: un subagente hereda el modo de permiso del padre (lectura/escritura/yolo)? ¿O pide el suyo? Nuestra decisión previa de seguridad dice que la capa se monta **antes** de la autonomía, así que esto se decide aquí.
+- **No hay subagentes nativos en pi**: son una **extensión**, y el patrón es el SDK en proceso — `createAgentSession({cwd, model, thinkingLevel, tools})` dentro del proceso padre. Ni un proceso nuevo.
+- **El niño escribe su propio JSONL** (`nested_session_path`): un transcript de pi real, legible con la maquinaria de `session_transcript` que ya tenemos. Ésta es la pieza que hace barata la vista "tipo herdr".
+- **Observabilidad en vivo**: el SDK expone `session.subscribe(...)` dentro del proceso; la referencia suscribe y vuelca actividad a su SQLite con flush de 150-250 ms. Para el HOST, los enganches disponibles son: los eventos de tools del padre (`tool_execution_start/update/end` sobre `subagent_run` — **ya tipados en nuestro bridge**), el JSONL del niño (append mientras corre), y el polling de sus tools de estado.
+- **La referencia registra 8 tools** (run/continue/status/result/list/cancel/send_message/list_agents) y bloquea la tool hasta el fin en modo tarea, con `onUpdate` colando progreso en el tool result; `background` responde al momento. Sus detalles de tool result llevan `tasks` con estado y `live_activity`.
+- **Vinculación**: la referencia usa su propia SQLite (`transcript`, `thread_snapshot_json`, `result`, `nested_session_path`). Para Nabla **no la necesitamos**: el vínculo padre→niño se puede tomar del `details` del tool result del padre (lleva la ruta del JSONL del niño) — contrato de host más simple, sin base de datos nueva.
 
-## Fases propuestas (se afinan con el recon)
+## Diseño de la adaptación (lo que construimos)
 
-| ID | Tarea | Notas |
+```text
+pi padre (sesión del chat, ProcessManager, eventos → puente)
+ ├─ extensión nabla-subagents.ts (first-party, -e junto a nabla-ask)
+ │    ├─ run_agent(agent, task, {mode: task|background})  → createAgentSession(allowlist, model, effort)
+ │    ├─ agent_status / agent_cancel / agent_send_message (mínimo en v1)
+ │    └─ el niño: JSONL propio (nested_session_path), sin extensiones cargadas
+ ├─ tarjeta en el turno del padre: estado + progreso (onUpdate → tool_execution_update que ya tipamos)
+ └─ Rust: indexa los JSONL de niños con parent_session_id → sidebar anidada + transcript en vivo
+```
+
+- **Extensión propia** (`resources/nabla-subagents.ts`): menos tools que la referencia (run + status + cancel + send_message; continue y batch fuera de v1), mismas convenciones de definición.
+- **Vínculo**: capturar `nested_session_path` del tool result del padre → fila en el índice con `parent_session_id` (columna nueva, migración v5) → **sidebar anidada**.
+- **Vista**: transcript del niño con el renderizador existente (grupos por turno ya funcionan con cualquier JSONL de pi) + tail en vivo mientras `status = running`.
+- **Permisos**: el gate global ya corre en el proceso del padre; si el hook cubre a los niños (H1), el modo lectura/escritura/yolo aplica también a ellos por herencia real, no por configuración.
+
+## Verificaciones pendientes (H1, antes de implementar)
+
+1. ¿El hook `tool_call` de `nabla-permissions` intercepta las tools de una sesión SDK anidada? (decide si heredan permisos gratis)
+2. ¿`nested_session_path` es convención de pi (dónde vive el JSONL del niño exactamente) y viaja en el `details` del tool result — o hay que exponerla desde nuestra extensión?
+3. ¿Cómo importa una extensión el SDK (`loadPiSdkModule`)? Y qué opciones acepta `createAgentSession` (¿sink de eventos?).
+4. ¿El niño carga extensiones (nabla-ask) o arranca limpio? (S6 asume limpio)
+
+## Tasks (se refinan con H1)
+
+| ID | Tarea | Estado |
 | --- | --- | --- |
-| H0 | Recon: subagentes en pi (existencia, eventos, topología, permisos heredados) | bloquea el diseño; una sesión de explorador |
-| H1 | Modelo de datos: subagente ↔ chat que lo lanzó, estado y hilo | con lo que el recon permita observar |
-| H2 | Tarjetas de Helpers en el chat (estado, tools colapsadas, Follow, Stop) | reusa el agrupado por turno y el componente de chips |
-| H3 | Pregunta hijo→padre por el puente `ask_*` | ya construido; aquí solo se cablea |
-| H4 | Permisos heredados y su reflejo en la tarjeta | decisión de producto, no de UI |
+| H1 | Recon fino: las 4 verificaciones de arriba | pending |
+| H2 | Extensión `nabla-subagents.ts`: tools run/status/cancel/send_message + definiciones markdown | pending |
+| H3 | Rust: `parent_session_id` en el índice (migración v5), captura del vínculo desde el tool result, listado de hijos | pending |
+| H4 | UI: tarjeta en el turno (estado/progreso/abrir/parar) + sidebar anidada + vista de transcript en vivo solo-lectura | pending |
+| H5 | Verificación: cargo test + build + QA manual (delegar una tarea, ver la sesión ligada, abrirla en vivo, pararla) | pending |
 
 ## Log
 
-- **L1** Usuario (verbatim): «4 cerramos lo que hay ahora y planteamos P2, vale?».
-- **L2** Origen: encuesta de 10 repos. `gentle-shell-desktop` resuelve esto con una pestaña *Helpers* por chat («queued/running/done/failed, hilo narrado, Follow live, Stop, nunca una lista global»); `gentle-shell` con un overlay *Agents* (modelo, tokens, coste, hilo retenido, pregunta del hijo como diálogo). Nada se copia: el patrón es el que Nabla ya usa para turnos y chips.
-- **L3** Decisión de orden: antes de esta feature se cierran los pendientes de P1 (QA del lote, T4 screenshot si llega a doler).
-- **L4** Honestidad: hoy **no está demostrado que el agente pueda delegar** en Nabla. Construir tarjetas de subagentes sin subagentes sería teatro; por eso H0 va primero y puede reescribir todo lo demás.
+- **L1** Usuario (verbatim): «estudia esta extensión y la creamos propia (no forkees) la adaptamos a como necesitemos. La idea es ver las sesiones ligadas y poder abrirlas tipo en herdr … ¿Como adaptamos los sub agentes?».
+- **L2** Encuesta: Helpers por chat como mejor idea P2 (gentle-shell-desktop / gentle-shell).
+- **L3** Plan inicial con incógnitas (hoy resueltas por recon): la extensión de referencia NO forkea — es MIT, la estudiamos como patrón y escribimos la nuestra con menos superficie (4 tools vs 8) y **sin su SQLite**: el vínculo vive en el tool result del padre y en nuestro índice, no en una base nueva.
+- **L4** Dato de arquitectura que ordena todo: los niños corren **en proceso vía SDK** y escriben **JSONL de pi** — nuestro lector de transcripts y el renderizado por turnos sirven tal cual. La vista "tipo herdr" es una lectura de archivo, no un protocolo nuevo.
+- **L5** Decisiones v1: vista del niño **solo lectura** (mando por el chat padre, como pide S3); niños sin preguntas al humano (S6); sin recursiones; interacción por `agent_send_message` desde el padre.
