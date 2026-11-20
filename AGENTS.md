@@ -82,6 +82,8 @@ ODD documents in `odd/tasks/` are the tracking convention: `## Specs` (`S#` quot
 a `## Tasks` table with IDs, specs and commit per task, and a `## Log` of `L#` entries recording
 decisions and corrections. Keep them current; never rewrite a spec to match what you built.
 
-Runtime feature in progress: [odd/tasks/pi-runtime.md](odd/tasks/pi-runtime.md) — headless pi spawn, NDJSON
-RPC, event bridge. Its tasks R1–R5 are still pending, so no pi process is spawned in code today.
+Runtime shipped: [odd/tasks/pi-runtime.md](odd/tasks/pi-runtime.md) — headless pi spawn, NDJSON RPC,
+event bridge. Each session owns one supervised `pi` child, killed with the app; the binary is
+resolved by name from `PATH` (`piBinary` in `settings.json`). Features layered on it live in
+`odd/tasks/`: browser control over MCP, permission modes, subagent profiles.
 Foundation work shipped in [odd/tasks/nabla-foundation.md](odd/tasks/nabla-foundation.md).
