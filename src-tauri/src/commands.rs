@@ -2978,6 +2978,12 @@ pub async fn embed_create(
 
 /// Moves and resizes one view, in logical units. The UI calls this with the panel
 /// rect and on every resize, so the child webview covers exactly that rect.
+///
+/// The placement is ONE operation: position and size travel together, so the
+/// platform never holds a frame that is half of the rect the panel reserves (the
+/// black area a child webview paints when its frame and its layer disagree). The
+/// rect is normalized on the Rust side, once (`embed::place`): whole logical
+/// pixels, a size the platform accepts.
 #[tauri::command]
 pub fn embed_set_bounds(
     state: State<'_, AppState>,

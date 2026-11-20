@@ -23,9 +23,13 @@
 // resized, an ancestor scrolls, a sidebar transition animates. A ResizeObserver
 // on the body and on the pane root covers size changes; `resize` and a CAPTURE
 // `scroll` listener cover position-only and scrolling changes (`scroll` does not
-// bubble). All of them schedule one coalesced `embed_set_bounds` per ~30 ms, so a
-// drag asks Rust a few dozen times instead of a few hundred, and the last event
-// always wins.
+// bubble). All of them schedule ONE `embed_set_bounds` per animation FRAME, so a
+// drag or a live window resize asks Rust once per frame instead of once per event
+// burst, and the last frame wins. When the layout stops moving, one SETTLE pass
+// places the view once more whether or not the rect changed: the bridge call is
+// fire-and-forget (see `embed.rs`), so a placement the platform never applied is
+// otherwise never retried, and the native view keeps the old rect while the pane
+// believes it moved the view.
 //
 // WHO DRIVES IT — the app does, and only the app: Back, Forward, Reload (through
 // `embed_eval`) and the address bar (through `embed_navigate`). An agent cannot
@@ -110,8 +114,20 @@ const shown = computed(() => props.visible !== false);
  *  http(s) addresses Rust accepts, and a blank document until the human types. */
 const START_URL = "about:blank";
 
-/** One coalesced bounds update per this window while a drag or scroll runs. */
-const BOUNDS_THROTTLE_MS = 30;
+/**
+ * The fallback window when this webview has no `requestAnimationFrame`: one update
+ * per ~30 ms. It is a fallback, never the normal path — a coalescer keyed on a
+ * timer is exactly the "one update per event burst" shape that leaves a live
+ * resize on a stale rect.
+ */
+const BOUNDS_FALLBACK_MS = 30;
+
+/**
+ * How long the layout must stay still before the settle pass runs: long enough for
+ * the last frame of a drag or a window resize, short enough that the human never
+ * sees the view on the previous rect.
+ */
+const SETTLE_MS = 160;
 
 /**
  * A fallback that stays inside the url policy: the authority a human types
@@ -201,19 +217,34 @@ let disposed = false;
 /** The `embed-nav` unsubscribe, once the listener is up. */
 let unsubscribeNav: (() => void) | null = null;
 
-/** The pending coalesced bounds update, if any. */
-let boundsTimer: number | null = null;
-/** One `embed_set_bounds` at a time; a request during flight re-runs afterwards. */
-let boundsInFlight = false;
-let boundsAgain = false;
-
-/** The rect the platform was last told about; `null` before the first answer. */
-let appliedRect: {
+/**
+ * One rect of this pane, in viewport pixels (this webview's CSS pixels ARE the
+ * logical pixels the platform places the child webview in, so no conversion is
+ * involved: `embed.rs` normalizes it to whole units once).
+ */
+interface PaneRect {
   x: number;
   y: number;
   width: number;
   height: number;
-} | null = null;
+}
+
+/** The pending coalesced bounds update (one per animation frame), if any. */
+let frameHandle: number | null = null;
+/** Whether `frameHandle` came from `setTimeout` (this webview has no `rAF`). */
+let frameIsTimer = false;
+/** One `embed_set_bounds` at a time; a request during flight re-runs afterwards. */
+let boundsInFlight = false;
+let boundsAgain = false;
+/** The pending settle pass, if any (see `scheduleSettle`). */
+let settleTimer: number | null = null;
+
+/**
+ * The rect this pane HANDED to the bridge; `null` before the first one and after
+ * every teardown. Deliberately not called "applied": `embed_set_bounds` is
+ * fire-and-forget, so this is what was asked for, not what the platform did.
+ */
+let sentRect: PaneRect | null = null;
 
 let resizeObserver: ResizeObserver | null = null;
 
@@ -247,16 +278,12 @@ function nextFrame(): Promise<void> {
 }
 
 /**
- * The body rect in logical pixels, rounded to whole units (the platform places the
- * child webview on integer pixels and a fractional rect would drift). `null` when
- * there is nothing to cover: unmounted, or the pane is collapsed to zero.
+ * The body rect in logical pixels, rounded to whole units, so a sub-pixel wobble
+ * does not count as a move and the "nothing changed" check stays meaningful.
+ * `null` when there is nothing to cover: unmounted, or the pane is collapsed to
+ * zero.
  */
-function bodyRect(): {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-} | null {
+function bodyRect(): PaneRect | null {
   const element = bodyEl.value;
   if (element === null) return null;
   const rect = element.getBoundingClientRect();
@@ -302,7 +329,7 @@ function isDeadView(cause: unknown): boolean {
  * Clearing `viewId` is what heals the pane, and it heals three things at once: the
  * placeholder (`v-if="viewId === null && !creating"`) becomes visible again, so the
  * body stops reserving gray space for a webview nobody paints; the bounds loop
- * stops, because `syncBounds` returns early on a null id and the pending throttle
+ * stops, because `syncBounds` returns early on a null id and the pending frame
  * then finds nothing to place; and the toolbar controls go back to disabled instead
  * of calling into a dead id.
  *
@@ -321,7 +348,7 @@ function healDeadView(): void {
   if (viewId.value === null) return;
   viewId.value = null;
   // Nothing is known about the view that replaces this one.
-  appliedRect = null;
+  sentRect = null;
   status.value = null;
   if (disposed || !drawn.value || !shown.value) return;
   void createView();
@@ -342,13 +369,14 @@ async function syncBounds(): Promise<void> {
   const rect = bodyRect();
   // Collapsed: nothing to cover. The next resize brings a rect back.
   if (rect === null) return;
-  // Already there: a colour transition or a scroll that moved nothing must not
-  // cost a bridge call.
-  if (appliedRect !== null && sameRect(appliedRect, rect)) return;
+  // Already asked for: a colour transition or a scroll that moved nothing must
+  // not cost a bridge call. The settle pass clears this once, so the LAST rect of
+  // a gesture is always placed again even if this shortcut would have skipped it.
+  if (sentRect !== null && sameRect(sentRect, rect)) return;
   boundsInFlight = true;
   try {
     await embedSetBounds(id, rect.x, rect.y, rect.width, rect.height);
-    appliedRect = rect;
+    sentRect = rect;
   } catch (cause) {
     if (!disposed) {
       // A view that is gone is not a layout failure: healing it is what stops the
@@ -371,22 +399,83 @@ async function syncBounds(): Promise<void> {
 }
 
 /** Two rects describe the same rectangle, for the "nothing moved" shortcut. */
-function sameRect(
-  a: { x: number; y: number; width: number; height: number },
-  b: { x: number; y: number; width: number; height: number },
-): boolean {
+function sameRect(a: PaneRect, b: PaneRect): boolean {
   return (
     a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height
   );
 }
 
-/** Coalesces every layout signal into one update per throttle window. */
+/**
+ * Coalesces every layout signal into ONE update per animation frame, and arms the
+ * settle pass behind it.
+ *
+ * Per FRAME and not per event burst: a drag and a live window resize emit several
+ * events per frame, and a timer-keyed coalescer (the shape this pane had) drops
+ * every event that arrives while its timer runs — which is how the last frame of a
+ * resize reached the platform only if the timing happened to line up.
+ */
 function scheduleBounds(): void {
-  if (disposed || boundsTimer !== null) return;
-  boundsTimer = window.setTimeout(() => {
-    boundsTimer = null;
+  if (disposed) return;
+  scheduleFrame();
+  scheduleSettle();
+}
+
+/** Runs `syncBounds` on the next frame, at most one queued frame at a time. */
+function scheduleFrame(): void {
+  if (disposed || frameHandle !== null) return;
+  if (typeof requestAnimationFrame === "undefined") {
+    frameIsTimer = true;
+    frameHandle = window.setTimeout(runFrame, BOUNDS_FALLBACK_MS);
+    return;
+  }
+  frameIsTimer = false;
+  frameHandle = requestAnimationFrame(runFrame);
+}
+
+function runFrame(): void {
+  frameHandle = null;
+  void syncBounds();
+}
+
+/** Drops a queued frame; the next signal starts a new one. */
+function cancelFrame(): void {
+  if (frameHandle === null) return;
+  if (frameIsTimer) {
+    window.clearTimeout(frameHandle);
+  } else if (typeof cancelAnimationFrame !== "undefined") {
+    cancelAnimationFrame(frameHandle);
+  }
+  frameHandle = null;
+}
+
+/**
+ * The settle pass: one UNCONDITIONAL placement once the layout stops moving.
+ *
+ * `embed_set_bounds` is fire-and-forget across the bridge (`src-tauri/src/embed.rs`):
+ * the command answers as soon as the placement is queued, and the platform's own
+ * failures are logged inside the framework, never returned. So a placement that did
+ * not land is indistinguishable from one that did, nothing is left to re-schedule,
+ * and the native view keeps the previous rect while the pane believes it moved the
+ * view — the stale rectangle this pane used to show. One extra placement per
+ * settled layout is the only recovery that contract allows, and it costs a single
+ * call per gesture.
+ */
+function scheduleSettle(): void {
+  if (disposed) return;
+  if (settleTimer !== null) window.clearTimeout(settleTimer);
+  settleTimer = window.setTimeout(() => {
+    settleTimer = null;
+    // A transition burst is still moving the pane: let it finish first, so the
+    // settle pass places the FINAL rect and not one frame of the animation.
+    if (performance.now() < burstEnds) {
+      scheduleSettle();
+      return;
+    }
+    // Forgetting what was sent is what makes this pass unconditional: the rect may
+    // be exactly the one above, and that is the case this pass exists for.
+    sentRect = null;
     void syncBounds();
-  }, BOUNDS_THROTTLE_MS);
+  }, SETTLE_MS);
 }
 
 /**
@@ -408,7 +497,7 @@ function burstTick(): void {
   }
   scheduleBounds();
   if (performance.now() < burstEnds) {
-    burstTimer = window.setTimeout(burstTick, BOUNDS_THROTTLE_MS);
+    burstTimer = window.setTimeout(burstTick, BOUNDS_FALLBACK_MS);
   } else {
     burstTimer = null;
   }
@@ -456,6 +545,12 @@ function unwatchLayout(): void {
   if (burstTimer !== null) {
     window.clearTimeout(burstTimer);
     burstTimer = null;
+  }
+  // A queued frame or settle pass would measure a pane that is going away.
+  cancelFrame();
+  if (settleTimer !== null) {
+    window.clearTimeout(settleTimer);
+    settleTimer = null;
   }
 }
 
@@ -516,7 +611,7 @@ async function createView(): Promise<void> {
       return;
     }
     viewId.value = id;
-    appliedRect = rect;
+    sentRect = rect;
     syncAddress(await embedUrl(id).catch(() => START_URL));
     // The rect may have moved while the platform was building the webview.
     scheduleBounds();
@@ -535,7 +630,7 @@ async function closeView(): Promise<void> {
   const id = viewId.value;
   viewId.value = null;
   // The next view is created over a fresh rect, so nothing is known about it.
-  appliedRect = null;
+  sentRect = null;
   if (id === null) return;
   try {
     await embedClose(id);
@@ -652,7 +747,7 @@ async function revealView(): Promise<void> {
   if (id === null || disposed) return;
   // Unknown until the fresh rect is applied: the drawer's width survived, but the
   // chat column it shared the row with did not.
-  appliedRect = null;
+  sentRect = null;
   await nextTick();
   await nextFrame();
   if (disposed || viewId.value !== id || !shown.value) return;
@@ -692,8 +787,9 @@ watch(
       void closeView();
       return;
     }
-    // A timer left over from the hidden period would measure nothing useful.
-    appliedRect = null;
+    // Nothing queued from the hidden period would measure anything useful.
+    sentRect = null;
+    cancelFrame();
     void createView();
   },
   { flush: "post" },
@@ -738,10 +834,6 @@ onBeforeUnmount(() => {
   if (unsubscribeNav !== null) {
     unsubscribeNav();
     unsubscribeNav = null;
-  }
-  if (boundsTimer !== null) {
-    window.clearTimeout(boundsTimer);
-    boundsTimer = null;
   }
   const id = viewId.value;
   viewId.value = null;

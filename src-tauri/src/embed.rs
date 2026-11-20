@@ -57,7 +57,7 @@ use tauri::{Emitter, Manager, Url};
 #[cfg(desktop)]
 use tauri::webview::WebviewBuilder;
 #[cfg(desktop)]
-use tauri::{AppHandle, LogicalPosition, LogicalSize, WebviewUrl};
+use tauri::{AppHandle, LogicalPosition, LogicalSize, Rect, WebviewUrl};
 
 /// How many embedded browsers may exist at once. The pane shows one panel; four
 /// is room for a second look and a third without letting a stuck UI leak a
@@ -88,6 +88,15 @@ const EVAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A webview cannot have a zero size; a collapsed panel reports one.
 const MIN_EXTENT: f64 = 1.0;
+
+/// A placement in LOGICAL pixels, normalized once, as the platform receives it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placed {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
 
 /// One child webview in the registry.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -216,6 +225,35 @@ fn extent(value: f64) -> f64 {
         value
     } else {
         MIN_EXTENT
+    }
+}
+
+/// A coordinate rounded to the whole logical pixel the platform places the child
+/// webview on. A value that is not a finite number becomes 0 instead of reaching
+/// the platform as `NaN`, which it refuses as a whole placement.
+fn whole(value: f64) -> f64 {
+    if value.is_finite() {
+        value.round()
+    } else {
+        0.0
+    }
+}
+
+/// The rect a placement is actually made with: whole logical pixels and a size the
+/// platform accepts.
+///
+/// Rounding happens HERE, once, and not in the UI: the view is placed by a single
+/// call, and a fractional coordinate that one layer truncates while another rounds
+/// is a rect that lands a pixel away from the panel it reserves — and stays there,
+/// because the pane only re-sends a rect that CHANGED. A position may be negative
+/// (a panel scrolled partly off screen); only the size has a floor, which is what
+/// [`extent`] guarantees.
+pub fn place(x: f64, y: f64, width: f64, height: f64) -> Placed {
+    Placed {
+        x: whole(x),
+        y: whole(y),
+        width: extent(whole(width)),
+        height: extent(whole(height)),
     }
 }
 
@@ -455,6 +493,11 @@ impl EmbedSessions {
             None => DEFAULT_URL.to_string(),
         };
         let parsed = Url::parse(&initial).map_err(|err| EmbedError::InvalidUrl(err.to_string()))?;
+        // The placement is normalized once, by the same rule every later move uses
+        // (`place`): a creation rect that is one pixel off the panel it reserves
+        // is not corrected by any later resize, because the pane only re-sends a
+        // rect that changed.
+        let placed = place(x, y, width, height);
         let window = app
             .get_window(MAIN_WINDOW_LABEL)
             .ok_or_else(|| EmbedError::Create(format!("no window labelled {MAIN_WINDOW_LABEL}")))?;
@@ -488,8 +531,8 @@ impl EmbedSessions {
             builder,
             // A position may be negative (a panel scrolled partially off), only
             // the size has a floor the platform accepts.
-            LogicalPosition::new(x, y),
-            LogicalSize::new(extent(width), extent(height)),
+            LogicalPosition::new(placed.x, placed.y),
+            LogicalSize::new(placed.width, placed.height),
         ) {
             Ok(_webview) => Ok(view.id),
             Err(err) => {
@@ -501,6 +544,18 @@ impl EmbedSessions {
 
     /// Moves and resizes a view: the UI keeps it in sync with the panel rect and
     /// with every resize of that rect.
+    ///
+    /// ONE placement, not two: `Webview::set_position` and `Webview::set_size` are
+    /// two separate messages to the event loop, so every resize frame left the
+    /// platform holding the new position with the previous size — a child webview
+    /// whose frame is half of the new rect, which is exactly what WebKit paints as
+    /// an unpainted (black) area until the second message lands. `set_bounds`
+    /// places position and size together, and it is also the only call that keeps
+    /// the framework's own record of the rect (its auto-resize rates) in step with
+    /// the rect the pane measured.
+    ///
+    /// The rect is normalized once, in [`place`]: whole logical pixels, a size the
+    /// platform accepts, and `NaN`/infinite inputs kept away from it.
     pub fn set_bounds(
         &self,
         app: &AppHandle,
@@ -510,12 +565,13 @@ impl EmbedSessions {
         width: f64,
         height: f64,
     ) -> Result<(), EmbedError> {
+        let placed = place(x, y, width, height);
         let webview = self.webview(app, view_id)?;
         webview
-            .set_position(LogicalPosition::new(x, y))
-            .map_err(|err| EmbedError::Bounds(err.to_string()))?;
-        webview
-            .set_size(LogicalSize::new(extent(width), extent(height)))
+            .set_bounds(Rect {
+                position: LogicalPosition::new(placed.x, placed.y).into(),
+                size: LogicalSize::new(placed.width, placed.height).into(),
+            })
             .map_err(|err| EmbedError::Bounds(err.to_string()))
     }
 
@@ -760,6 +816,49 @@ mod tests {
         assert_eq!(extent(f64::NAN), MIN_EXTENT);
         // A position may be negative: only size is clamped by the caller.
         assert_eq!(extent(-1.0), MIN_EXTENT);
+    }
+
+    // ── placement ──────────────────────────────────────────────────────────
+    //
+    // What the platform is told, decided once: the UI measures a CSS rect, and a
+    // fractional one that one layer truncates while another rounds is a view that
+    // lands a pixel off the panel and STAYS there, because the pane only re-sends a
+    // rect that changed.
+
+    #[test]
+    fn place_rounds_a_fractional_rect_to_whole_logical_pixels() {
+        let placed = place(240.4, 88.5, 519.6, 402.5);
+        assert_eq!(placed.x, 240.0);
+        assert_eq!(placed.y, 89.0);
+        assert_eq!(placed.width, 520.0);
+        assert_eq!(placed.height, 403.0);
+        // A rect that is already whole is handed through untouched.
+        assert_eq!(place(0.0, 0.0, 800.0, 600.0).width, 800.0);
+    }
+
+    #[test]
+    fn place_never_hands_the_platform_a_size_below_one_pixel() {
+        // A collapsed panel (a hidden drawer, a zero-height body) reports 0 or a
+        // sub-pixel remainder; both become the one pixel the platform accepts.
+        for (width, height) in [(0.0, 0.0), (0.2, 0.4), (-40.0, -1.0)] {
+            let placed = place(10.0, 10.0, width, height);
+            assert_eq!(placed.width, MIN_EXTENT, "width from {width}");
+            assert_eq!(placed.height, MIN_EXTENT, "height from {height}");
+        }
+    }
+
+    #[test]
+    fn place_keeps_a_negative_position_and_answers_zero_for_a_non_finite_one() {
+        // A panel scrolled partly off the window keeps its negative origin: the
+        // platform clips it, and moving it to 0 would slide the page into view.
+        assert_eq!(place(-12.0, -40.0, 300.0, 200.0).x, -12.0);
+        assert_eq!(place(-12.0, -40.0, 300.0, 200.0).y, -40.0);
+
+        // `NaN` is not a placement: 0 is a coordinate the platform accepts, and the
+        // size floor still applies, so the view exists rather than vanishing.
+        let placed = place(f64::NAN, f64::INFINITY, f64::NAN, f64::NAN);
+        assert_eq!((placed.x, placed.y), (0.0, 0.0));
+        assert_eq!((placed.width, placed.height), (MIN_EXTENT, MIN_EXTENT));
     }
 
     // ── label allocation ───────────────────────────────────────────────────
