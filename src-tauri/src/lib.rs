@@ -81,6 +81,13 @@ pub fn run() {
             // envelope the TS contracts mirror (R4).
             let handle = app.handle().clone();
             let runtime = ProcessManager::new(Arc::new(move |session_id: &str, event: &AgentEvent| {
+                // The on-demand command probe is a child, not a session (its
+                // runtime key carries the reserved `probe:` prefix). Its
+                // lifecycle frames would reach the store as an unknown id and
+                // land in the drawer's live list, so they stop here.
+                if commands::is_probe_key(session_id) {
+                    return;
+                }
                 let envelope = AgentEventEnvelope {
                     session_id: session_id.to_string(),
                     event: event.clone(),
@@ -158,6 +165,9 @@ pub fn run() {
                 embeds,
                 mcp_endpoint,
                 mcp_registration: mcp_registration.clone(),
+                // One in-flight command probe per workspace, for the `/` list
+                // before any session exists.
+                probes: Arc::new(commands::CommandProbes::new()),
             });
             // S4 of `webview-control.md` (T3): the endpoint is written into pi's
             // global `mcp.json` so every session pi spawns already carries the
@@ -254,6 +264,9 @@ pub fn run() {
             // write, so the two can never disagree about the file).
             commands::set_session_model,
             commands::session_commands,
+            // The `/` list before a session exists: a short-lived pi that answers
+            // `get_commands` and is killed, so no snapshot has to be stored.
+            commands::workspace_commands,
             // S3 of `agent-question-bridge.md`: the human's answer to a question
             // the agent asked. It writes the protocol line to that session's
             // child, which is the only channel an `extension_ui_request` has.

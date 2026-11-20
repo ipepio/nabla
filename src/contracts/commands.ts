@@ -715,6 +715,24 @@ export function sessionCommands(
 }
 
 /**
+ * S3 of `odd/tasks/composer-inputs.md`: the commands a workspace offers, for the
+ * `/` completion **before any session exists**.
+ *
+ * Asked on demand, every app run: Rust spawns a short-lived pi for this
+ * workspace, asks it for `get_commands` and kills it, so the list is the
+ * workspace's current answer instead of a snapshot someone had to store. The
+ * probe never indexes a session, and a probe that cannot be made answers an
+ * empty list rather than rejecting — the completion then shows no list, which is
+ * the honest answer for "pi could not be asked". Concurrency is Rust's business:
+ * two callers for the same workspace share one child.
+ */
+export function workspaceCommands(
+  workspaceId: number,
+): Promise<SessionCommand[]> {
+  return invoke<SessionCommand[]>("workspace_commands", { workspaceId });
+}
+
+/**
  * S3 of `agent-question-bridge.md`: answers one question the session's agent is
  * blocking on. Rust writes the exact `extension_ui_response` line to that
  * child's stdin, pi resolves the extension's promise with the answer, and the

@@ -37,6 +37,7 @@ import {
   fsListDir,
   listWorkspaces,
   sessionCommands,
+  workspaceCommands,
 } from "@/contracts/commands";
 import {
   applySuggestion,
@@ -88,7 +89,7 @@ const props = withDefaults(
     /**
      * The workspace on screen, `null` before one is chosen. Both autocompletes
      * need it and neither needs a session: `@` lists the paths of this directory,
-     * and `/` falls back to the last command list this workspace ever answered.
+     * and `/` probes pi for this workspace's commands when no session is live.
      */
     workspaceId: number | null;
     /**
@@ -189,51 +190,24 @@ const textareaEl = ref<HTMLTextAreaElement | null>(null);
  */
 const commandsBySession = new Map<string, SessionCommand[]>();
 /**
- * The last command list each workspace answered, kept after its session is gone.
- * A list a few seconds stale beats an autocomplete that stays shut until a prompt
- * has already been sent; the source badge still says where each command came from.
- */
-const lastCommandsByWorkspace = new Map<number, SessionCommand[]>();
-
-/** Where a workspace's remembered command list survives a restart. */
-const COMMANDS_KEY_PREFIX = "nabla.commands.";
-
-/**
- * The remembered list of one workspace, loading it from storage on first use.
+ * The workspace's commands as this app run last saw them, from the on-demand
+ * probe (`workspace_commands`).
  *
- * In memory only, a fresh launch had nothing to offer until a session had already
- * answered — so `/` looked broken exactly when a human opens the app and starts
- * typing. The list is a snapshot of what pi reported last time; the badge on each
- * command still says where it came from, and a live session replaces it.
+ * In memory only, and deliberately so: a list kept across launches is a
+ * snapshot, and a snapshot is what the probe replaced. Cached for the run, keyed
+ * by workspace, because the probe costs a child's whole boot and a keystroke
+ * must never pay it twice. The first `/` of a launch waits for that boot (pi
+ * takes a second or two); after it, the list is instant. An empty answer is
+ * cached too — the alternative is a fresh child per keystroke against a pi that
+ * just said it has nothing.
  */
-function rememberedCommands(workspaceId: number): SessionCommand[] {
-  const known = lastCommandsByWorkspace.get(workspaceId);
-  if (known !== undefined) return known;
-  try {
-    const raw = window.localStorage.getItem(`${COMMANDS_KEY_PREFIX}${workspaceId}`);
-    const parsed = raw === null ? [] : (JSON.parse(raw) as SessionCommand[]);
-    const commands = Array.isArray(parsed) ? parsed : [];
-    lastCommandsByWorkspace.set(workspaceId, commands);
-    return commands;
-  } catch {
-    // Unreadable or unavailable storage: no list, never an error.
-    lastCommandsByWorkspace.set(workspaceId, []);
-    return [];
-  }
-}
-
-/** Remembers a workspace's command list, in memory and across restarts. */
-function rememberCommands(workspaceId: number, commands: SessionCommand[]): void {
-  lastCommandsByWorkspace.set(workspaceId, commands);
-  try {
-    window.localStorage.setItem(
-      `${COMMANDS_KEY_PREFIX}${workspaceId}`,
-      JSON.stringify(commands),
-    );
-  } catch {
-    // Full or disabled storage: this launch still has the in-memory copy.
-  }
-}
+const probedByWorkspace = new Map<number, SessionCommand[]>();
+/**
+ * The probe in flight, per workspace. Rust already shares one child between
+ * concurrent callers; this just keeps a burst of keystrokes from stacking a
+ * dozen IPC calls onto the same wait.
+ */
+const probingWorkspaces = new Map<number, Promise<SessionCommand[]>>();
 /** The workspace path of the session, resolved once for the `@` walk. */
 let workspacePath: { id: number; path: string } | null = null;
 /** Bumped per request, so a slow answer cannot overwrite a newer list. */
@@ -280,9 +254,10 @@ function handleInput(event: Event): void {
 async function refreshCompletion(text: string, caret: number): Promise<void> {
   const found = findCompletionTrigger(text, caret);
   // The workspace is what both lists need. A session only makes the command list
-  // *fresh*: paths come from the directory, and the commands fall back to what
-  // this workspace answered last. Gating on a session kept both shut until a
-  // prompt had already been sent — exactly when they are least useful.
+  // *fresh*: paths come from the directory, and with no session the commands come
+  // from a short-lived probe of this workspace. Gating on a session kept both
+  // shut until a prompt had already been sent — exactly when they are least
+  // useful.
   const workspace = activeSession.value?.workspaceId ?? props.workspaceId;
   if (workspace === null || found === null) {
     closeCompletion();
@@ -301,29 +276,59 @@ async function refreshCompletion(text: string, caret: number): Promise<void> {
 }
 
 /**
- * S3: the commands of one session. An answer that is not available (pi still
- * spawning, the session stopped, the bridge down) is "nothing to offer yet",
- * never an error: the list simply does not open.
+ * S3: the commands of one workspace. A live session is asked directly; with no
+ * session the app runs a short-lived probe (`workspace_commands`). An answer that
+ * is not available (pi still booting, no pi installed, the bridge down) is
+ * "nothing to offer yet", never an error: the list simply does not open, and the
+ * next `/` asks again.
  */
 async function commandsFor(workspaceId: number): Promise<SessionCommand[]> {
   const sessionId = activeSession.value?.sessionId ?? null;
   if (sessionId !== null) {
     const cached = commandsBySession.get(sessionId);
-    if (cached !== undefined) {
-      rememberCommands(workspaceId, cached);
-      return cached;
-    }
+    if (cached !== undefined) return cached;
     try {
       const commands = await sessionCommands(workspaceId, Number(sessionId));
       commandsBySession.set(sessionId, commands);
-      rememberCommands(workspaceId, commands);
       return commands;
     } catch {
-      // A session that cannot answer yet is not a reason to close the list: the
-      // remembered one is offered below.
+      // A session that cannot answer yet is not a reason to close the list. What
+      // the app already knows about this workspace is offered instead — and no
+      // second child is spawned while a session is live.
+      return probedByWorkspace.get(workspaceId) ?? [];
     }
   }
-  return rememberedCommands(workspaceId);
+  return probedCommands(workspaceId);
+}
+
+/**
+ * The commands of a workspace with no live session, from the on-demand probe.
+ *
+ * The probe spawns pi, asks `get_commands` and kills it, so the list is current
+ * instead of remembered; Rust answers an empty list when it cannot ask at all,
+ * and a rejected call degrades to the same empty list here. Nothing is written
+ * to storage: leaving the app is enough to forget the snapshot.
+ */
+async function probedCommands(workspaceId: number): Promise<SessionCommand[]> {
+  const known = probedByWorkspace.get(workspaceId);
+  if (known !== undefined) return known;
+  const running = probingWorkspaces.get(workspaceId);
+  if (running !== undefined) return running;
+  const probe = workspaceCommands(workspaceId)
+    .catch(() => {
+      // A bridge that cannot be reached is "no list", never a dialog: the
+      // human is typing, and `/` opening nothing is the honest answer.
+      return [] as SessionCommand[];
+    })
+    .then((commands) => {
+      probedByWorkspace.set(workspaceId, commands);
+      return commands;
+    })
+    .finally(() => {
+      probingWorkspaces.delete(workspaceId);
+    });
+  probingWorkspaces.set(workspaceId, probe);
+  return probe;
 }
 
 /** The source badge of a command: pi's own word, translated when this build knows it. */

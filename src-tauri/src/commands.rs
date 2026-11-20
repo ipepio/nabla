@@ -3,8 +3,9 @@
 // module, which reads and writes the store/settings owned by the app. Payloads
 // are camelCase so the TS contracts (T6) can mirror them field by field.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use tauri::State;
@@ -63,6 +64,10 @@ pub struct AppState {
     /// it for its whole life. The gate is what makes that window impossible, and
     /// it keeps the outcome afterwards instead of swallowing it.
     pub mcp_registration: Arc<RegistrationGate>,
+    /// The in-flight command probes, one per workspace: the guard that keeps a
+    /// workspace from ever owning two probe children at once. Per app instance,
+    /// never a process-wide static, so two stores can never share a slot.
+    pub probes: Arc<CommandProbes>,
 }
 
 // Errors cross the bridge as plain strings for now: StoreError and SettingsError
@@ -70,6 +75,13 @@ pub struct AppState {
 // arrive together with the runtime feature; nothing here freezes an error shape.
 fn display_err<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
+}
+
+/// A mutex whose lock is taken even when the guard was poisoned: the state
+/// behind these locks is replaced wholesale, so a poison flag left by an
+/// unrelated panic must not turn every later caller into a failure.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Path of the user-editable preferences file inside a config directory.
@@ -1275,6 +1287,268 @@ pub fn session_commands(
     session_commands_for(&state.runtime, &session_id.to_string())
 }
 
+// ── the on-demand command probe (a workspace, no session) ────────────────
+//
+// `/` needs a command list before any session exists, and a list kept from a
+// previous launch is a snapshot that can already be wrong. Instead of storing
+// one, the app now asks pi directly: a short-lived child boots, answers
+// `get_commands` and is killed. Nothing is indexed and nothing is remembered, so
+// the list is always this workspace's current answer.
+
+/// Reserved prefix of the runtime key a probe runs under.
+///
+/// Every session's runtime key is its index row id in decimal form
+/// (`session_id.to_string()`, S1 of `pi-runtime.md`), so a key that starts with
+/// this prefix can never belong to a session: the two spaces are disjoint by
+/// construction, not by luck. The prefix is also what tells the event sink in
+/// `lib.rs` that the child is not a session, so its `process_status` frames never
+/// reach the webview as an unknown session id.
+const PROBE_KEY_PREFIX: &str = "probe:";
+
+/// The runtime key one workspace's probe runs under.
+fn probe_key(workspace_id: i64) -> String {
+    format!("{PROBE_KEY_PREFIX}{workspace_id}")
+}
+
+/// Whether a runtime key names a probe instead of a session.
+pub fn is_probe_key(key: &str) -> bool {
+    key.starts_with(PROBE_KEY_PREFIX)
+}
+
+/// Name of the scratch transcript a probe is pointed at, inside the sessions
+/// directory. The leading dot keeps it out of anything that lists transcripts by
+/// name, and the word `probe` says plainly that it is not a session.
+fn probe_file_name(workspace_id: i64) -> String {
+    format!(".probe-{workspace_id}.jsonl")
+}
+
+/// The answer of one running probe, and the wait everyone else joins.
+///
+/// A slot lives exactly as long as its leader's [`ProbeTurn`]: the first answer
+/// published wins, so a leader that published and then unwound cannot replace it.
+struct ProbeSlot {
+    answer: Mutex<Option<Vec<SessionCommand>>>,
+    done: Condvar,
+}
+
+impl ProbeSlot {
+    fn new() -> ProbeSlot {
+        ProbeSlot {
+            answer: Mutex::new(None),
+            done: Condvar::new(),
+        }
+    }
+
+    /// Publishes the first answer and wakes every waiter. A later call changes
+    /// nothing — the first answer is the one every caller adopts.
+    fn settle(&self, commands: Vec<SessionCommand>) {
+        {
+            let mut answer = lock(&self.answer);
+            if answer.is_none() {
+                *answer = Some(commands);
+            }
+        }
+        self.done.notify_all();
+    }
+
+    /// Waits for the leader's answer instead of spawning a second child.
+    fn wait(&self) -> Vec<SessionCommand> {
+        let mut answer = lock(&self.answer);
+        while answer.is_none() {
+            answer = self
+                .done
+                .wait(answer)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        answer.clone().unwrap_or_default()
+    }
+}
+
+/// What a caller found when it asked for its turn at a workspace's probe.
+enum ProbeStart {
+    /// Nobody was probing this workspace: this caller spawns the child, owns the
+    /// cleanup and publishes its answer for whoever joins late.
+    Leader(ProbeTurn),
+    /// A probe was already running: no second child is spawned, and this caller
+    /// waits for that one's answer instead.
+    Follower(Arc<ProbeSlot>),
+}
+
+/// The leader's claim on one workspace's probe slot.
+///
+/// Dropping it always publishes an answer — an empty one when the leader never
+/// got that far — and always releases the slot, so a waiter can never hang and a
+/// later call never inherits a slot nobody will ever settle.
+struct ProbeTurn {
+    probes: Arc<CommandProbes>,
+    workspace_id: i64,
+    slot: Arc<ProbeSlot>,
+}
+
+impl ProbeTurn {
+    /// Publishes the answer every waiter adopts, then releases the slot.
+    fn settle(self, commands: Vec<SessionCommand>) -> Vec<SessionCommand> {
+        self.slot.settle(commands.clone());
+        commands
+    }
+}
+
+impl Drop for ProbeTurn {
+    fn drop(&mut self) {
+        // A no-op once `settle` ran: only the first answer is published.
+        self.slot.settle(Vec::new());
+        lock(&self.probes.slots).remove(&self.workspace_id);
+    }
+}
+
+/// The in-flight probes, one slot per workspace.
+///
+/// Held by `AppState` as an `Arc` so the leader's claim can travel with the work
+/// onto a worker thread and still release the slot on the way out.
+#[derive(Default)]
+pub struct CommandProbes {
+    slots: Mutex<HashMap<i64, Arc<ProbeSlot>>>,
+}
+
+impl CommandProbes {
+    pub fn new() -> CommandProbes {
+        CommandProbes::default()
+    }
+
+    /// Claims this workspace's slot, or finds the probe already running there.
+    /// The check and the insert happen under one lock, so two callers can never
+    /// both believe they are the leader.
+    fn begin(self: &Arc<Self>, workspace_id: i64) -> ProbeStart {
+        let mut slots = lock(&self.slots);
+        if let Some(slot) = slots.get(&workspace_id) {
+            return ProbeStart::Follower(Arc::clone(slot));
+        }
+        let slot = Arc::new(ProbeSlot::new());
+        slots.insert(workspace_id, Arc::clone(&slot));
+        ProbeStart::Leader(ProbeTurn {
+            probes: Arc::clone(self),
+            workspace_id,
+            slot,
+        })
+    }
+}
+
+/// One probe, start to finish: spawn a child, ask it for its commands, stop it,
+/// and remove the scratch transcript it was given.
+///
+/// A failure is an empty list, never an error: the composer asks this while
+/// someone is typing, so the only honest answer to "pi is not installed" or "the
+/// child died" is "no list right now". Nothing here writes the index — a probe is
+/// not a session, and a ghost row in the sidebar would be a defect.
+///
+/// The boot-time MCP registration is deliberately not awaited: the probe never
+/// prompts the agent, so the `nabla-browser` tools are irrelevant to a
+/// `get_commands` answer, and waiting would delay the `/` list by a round trip of
+/// `pi mcp` for nothing.
+fn probe_workspace_commands(
+    workspace: &Workspace,
+    config_dir: &Path,
+    data_dir: &Path,
+    runtime: &ProcessManager,
+) -> Vec<SessionCommand> {
+    let settings = match settings::load(&settings_file(config_dir)) {
+        Ok(settings) => settings,
+        // A preferences file this build cannot read is the app's problem, not a
+        // command list's: no list, never a dialog in front of a keystroke.
+        Err(_) => return Vec::new(),
+    };
+    let sessions_dir = data_dir.join(SESSIONS_DIR);
+    if std::fs::create_dir_all(&sessions_dir).is_err() {
+        return Vec::new();
+    }
+    let scratch = sessions_dir.join(probe_file_name(workspace.id));
+    // The file belongs to this probe alone. A previous attempt that died mid-way
+    // may have left one behind, so the probe always starts from nothing.
+    let _ = std::fs::remove_file(&scratch);
+
+    let key = probe_key(workspace.id);
+    // Read before the fields are moved into the spawn below.
+    let thinking = settings.thinking().map(str::to_string);
+    let spawn = SessionSpawn {
+        runtime: runtime.clone(),
+        key: key.clone(),
+        pi_binary: settings.pi_binary,
+        provider: settings.provider,
+        model: settings.model,
+        // The level is irrelevant to a command list, but it is what a session
+        // start passes, and the probe is a session start in everything but bookkeeping.
+        thinking,
+        pi_session_path: scratch.clone(),
+        workspace_path: PathBuf::from(&workspace.path),
+    };
+    // Runs to readiness inside `spawn`; a missing binary or a child that never
+    // gets there leaves the query below with nothing to ask, which is empty.
+    spawn.run();
+    let answer = session_commands_for(runtime, &key);
+    // The child must not outlive the question, and neither must its transcript.
+    let _ = runtime.stop_and_wait(&key);
+    let _ = std::fs::remove_file(&scratch);
+    answer.unwrap_or_default()
+}
+
+/// One workspace's command list, behind the in-flight guard.
+///
+/// Concurrent calls for the same workspace share ONE outcome: the leader spawns
+/// and publishes, every follower waits and returns exactly what the leader
+/// answered. That is what makes a keystroke-per-request `/` list cost one child
+/// per workspace, not one per character.
+fn workspace_commands_core(
+    probes: &Arc<CommandProbes>,
+    store: &Store,
+    config_dir: &Path,
+    data_dir: &Path,
+    runtime: &ProcessManager,
+    workspace_id: i64,
+) -> Result<Vec<SessionCommand>, String> {
+    // An id that is not indexed is a contract violation, not a probe failure, so
+    // it is reported instead of pretending the workspace has no commands. It also
+    // costs no child, which is why the guard is only claimed afterwards.
+    let workspace = workspace_by_id(store, workspace_id)?;
+    match probes.begin(workspace_id) {
+        ProbeStart::Follower(slot) => Ok(slot.wait()),
+        ProbeStart::Leader(turn) => {
+            let answer = probe_workspace_commands(&workspace, config_dir, data_dir, runtime);
+            Ok(turn.settle(answer))
+        }
+    }
+}
+
+/// The commands this workspace offers, asked of a short-lived pi that exists only
+/// for this question (S3 of `composer-inputs.md`, no session needed).
+///
+/// Nothing is persisted and no session row is created: the answer is this
+/// workspace's current list, or an empty one when pi could not be asked. `async`
+/// because the spawn's readiness probe is a blocking wait — it belongs on a
+/// worker thread, never on the IPC thread.
+#[tauri::command]
+pub async fn workspace_commands(
+    state: State<'_, AppState>,
+    workspace_id: i64,
+) -> Result<Vec<SessionCommand>, String> {
+    let probes = Arc::clone(&state.probes);
+    let store = state.store.clone();
+    let config_dir = state.config_dir.clone();
+    let data_dir = state.data_dir.clone();
+    let runtime = state.runtime.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        workspace_commands_core(
+            &probes,
+            &store,
+            &config_dir,
+            &data_dir,
+            &runtime,
+            workspace_id,
+        )
+    })
+    .await
+    .map_err(|err| format!("the command probe could not run: {err}"))?
+}
+
 /// Alias for a session, derived from its first prompt: the first line with
 /// whitespace collapsed, truncated on a word boundary. Deterministic and free,
 /// unlike a model-written summary; a session can later be renamed by hand.
@@ -1994,9 +2268,18 @@ pub fn load_session_preview(
 
 /// S5: ids with a live pi process, read from the runtime registry only. The
 /// list paints per-session state; it never opens anything (S2).
+///
+/// A command probe is a child in that registry but not a session, so its
+/// reserved key is filtered out: the drawer must never paint a row for a
+/// process that is about to die (see `PROBE_KEY_PREFIX`).
 #[tauri::command]
 pub fn live_session_ids(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    Ok(state.runtime.live_ids())
+    Ok(state
+        .runtime
+        .live_ids()
+        .into_iter()
+        .filter(|key| !is_probe_key(key))
+        .collect())
 }
 
 // ── pi CLI bridge (S1-S4 of `pi-cli-bridge.md`) ─────────────────────────────
@@ -3124,6 +3407,42 @@ while IFS= read -r line; do
 done
 "#;
 
+    /// A fake pi for the on-demand command probe: it records that it started and
+    /// its argv, creates the session file it was told to write (what pi itself
+    /// does), answers the startup probe, and answers `get_commands` after
+    /// `@DELAY@` whole seconds. Creating the scratch file is what makes the
+    /// "nothing survives the probe" assertions mean something.
+    const FAKE_PROBE_PI: &str = r#"#!/bin/sh
+printf '%s\n' "$@" >> '@ARGS@'
+printf 'attempt\n' >> '@ATTEMPTS@'
+session=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--session" ]; then session="$arg"; fi
+  prev="$arg"
+done
+if [ -n "$session" ]; then : > "$session"; fi
+printf '%s\n' '{"type":"response","id":"__startup_probe__","command":"get_state","success":true,"data":{}}'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '@LINES@'
+  id=`printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'`
+  case "$line" in
+    *'"type":"get_commands"'*)
+      sleep @DELAY@
+      printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_commands\",\"success\":true,\"data\":{\"commands\":[{\"name\":\"fix-tests\",\"description\":\"Fix failing tests\",\"source\":\"prompt\",\"sourceInfo\":{\"path\":\"/w/fix-tests.md\"}},{\"name\":\"skill:commit\",\"source\":\"skill\"}]}}" ;;
+    *)
+      printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"success\":true,\"data\":{}}" ;;
+  esac
+done
+"#;
+
+    /// A fake pi that dies before it is ever ready: the child a probe has to
+    /// survive without an error.
+    const FAKE_DEAD_PI: &str = r#"#!/bin/sh
+printf 'attempt\n' >> '@ATTEMPTS@'
+exit 1
+"#;
+
     /// Scratch fixture of the lifecycle tests, entirely in the system temp dir
     /// and removed on drop: the SQLite store, a config dir for settings.json,
     /// a workspace directory to spawn pi in, and the session files themselves.
@@ -3210,6 +3529,49 @@ done
             perms.set_mode(0o755);
             std::fs::set_permissions(&path, perms).expect("chmod fake pi");
             path
+        }
+
+        /// A fake pi for the command probe: answers `get_commands` after
+        /// `delay_secs` seconds, and creates the session file it was given.
+        #[cfg(unix)]
+        fn write_probe_pi(&self, name: &str, delay_secs: u64) -> std::path::PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.path(name);
+            let body = FAKE_PROBE_PI
+                .replace("@ARGS@", &path.with_extension("args").display().to_string())
+                .replace("@ATTEMPTS@", &self.path("attempts").display().to_string())
+                .replace("@LINES@", &path.with_extension("lines").display().to_string())
+                .replace("@DELAY@", &delay_secs.to_string());
+            std::fs::write(&path, body).expect("write probe pi");
+            let mut perms = std::fs::metadata(&path)
+                .expect("stat probe pi")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod probe pi");
+            path
+        }
+
+        /// A fake pi that dies before readiness, for the degraded probe path.
+        #[cfg(unix)]
+        fn write_dead_pi(&self, name: &str) -> std::path::PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.path(name);
+            let body = FAKE_DEAD_PI
+                .replace("@ATTEMPTS@", &self.path("attempts").display().to_string());
+            std::fs::write(&path, body).expect("write dead pi");
+            let mut perms = std::fs::metadata(&path)
+                .expect("stat dead pi")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod dead pi");
+            path
+        }
+
+        /// Where a probe of this fixture's workspace leaves its scratch file.
+        fn probe_scratch(&self) -> std::path::PathBuf {
+            self.dir
+                .join(SESSIONS_DIR)
+                .join(probe_file_name(self.workspace_id))
         }
     }
 
@@ -4637,5 +4999,266 @@ done
         // A relative path would silently open the shell in the app's own cwd.
         let err = terminal_cwd("relative/workspace").expect_err("a relative path is refused");
         assert!(err.contains("absolute"), "got: {err}");
+    }
+
+    // ── the on-demand command probe (a workspace, no session) ──────────────
+
+    // The reserved prefix is what makes a probe key impossible to confuse with a
+    // session key, and a session key impossible to mistake for a probe: the two
+    // spaces cannot meet, because one is always a decimal row id.
+    #[test]
+    fn a_probe_key_can_never_be_a_session_id() {
+        for workspace_id in [0, 1, 42, i64::MAX] {
+            let key = probe_key(workspace_id);
+            assert!(is_probe_key(&key), "the probe key carries the prefix: {key}");
+            assert!(
+                key.parse::<i64>().is_err(),
+                "a session key is a decimal row id, so this can never be one: {key}"
+            );
+            // ... and no session id reads as a probe.
+            assert!(!is_probe_key(&workspace_id.to_string()));
+        }
+        assert_eq!(probe_key(7), "probe:7");
+        assert_eq!(probe_file_name(7), ".probe-7.jsonl");
+    }
+
+    // The whole lifecycle: spawn once, ask `get_commands`, parse the answer, stop
+    // the child and delete the scratch transcript — and never a session row.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_answers_a_workspaces_commands_and_leaves_nothing_behind() {
+        let fixture = SessionFixture::new("probe_answers");
+        let script = fixture.write_probe_pi("probe-pi.sh", 0);
+        fixture.write_settings(&script);
+        let runtime = lifecycle_runtime();
+        let probes = Arc::new(CommandProbes::new());
+        // A transcript a previous run could have left behind: the probe owns the
+        // path, so it must not survive this one either.
+        std::fs::create_dir_all(fixture.probe_scratch().parent().expect("sessions dir"))
+            .expect("create sessions dir");
+        std::fs::write(fixture.probe_scratch(), "leftover").expect("write leftover");
+
+        let commands = workspace_commands_core(
+            &probes,
+            &fixture.store,
+            &fixture.config_dir(),
+            &fixture.dir,
+            &runtime,
+            fixture.workspace_id,
+        )
+        .expect("the probe answers");
+
+        let rows: Vec<(&str, Option<&str>, &str)> = commands
+            .iter()
+            .map(|command| {
+                (
+                    command.name.as_str(),
+                    command.description.as_deref(),
+                    command.source.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("fix-tests", Some("Fix failing tests"), "prompt"),
+                // An absent description stays absent instead of becoming a blank
+                // subtitle, and the source crosses verbatim.
+                ("skill:commit", None, "skill")
+            ],
+            "the answer is pi's own list"
+        );
+
+        // One child was spawned, and it was asked with the reserved key.
+        assert_eq!(process_attempts(&fixture), 1, "one probe, one child");
+        let stdin = recorded_stdin(&fixture, "probe-pi.sh");
+        assert!(
+            stdin
+                .iter()
+                .any(|line| line.contains("\"type\":\"get_commands\"")),
+            "the child is asked for its commands: {stdin:?}"
+        );
+
+        // A probe is not a session: no row, so no ghost in the sidebar.
+        assert!(
+            fixture
+                .store
+                .list_sessions(fixture.workspace_id)
+                .expect("list sessions")
+                .is_empty(),
+            "the probe must never index a session"
+        );
+        // Neither the scratch transcript nor the child survives the question.
+        assert!(
+            !fixture.probe_scratch().exists(),
+            "the scratch transcript is deleted: {}",
+            fixture.probe_scratch().display()
+        );
+        assert!(
+            runtime.live_ids().is_empty(),
+            "the probe child does not survive: {:?}",
+            runtime.live_ids()
+        );
+        runtime.stop_all();
+    }
+
+    // One probe per workspace at a time: the second caller joins the first one's
+    // child instead of starting its own, and adopts the same answer.
+    #[cfg(unix)]
+    #[test]
+    fn a_concurrent_probe_spawns_no_second_child() {
+        let fixture = SessionFixture::new("probe_concurrent");
+        // Slow enough that both callers are inside the probe at once.
+        let script = fixture.write_probe_pi("probe-pi.sh", 1);
+        fixture.write_settings(&script);
+        let runtime = lifecycle_runtime();
+        let probes = Arc::new(CommandProbes::new());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let answers = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let probes = Arc::clone(&probes);
+                let store = fixture.store.clone();
+                let config_dir = fixture.config_dir();
+                let data_dir = fixture.dir.clone();
+                let runtime = runtime.clone();
+                let barrier = Arc::clone(&barrier);
+                let workspace_id = fixture.workspace_id;
+                handles.push(scope.spawn(move || {
+                    // Both threads reach the guard together, from the same point.
+                    barrier.wait();
+                    workspace_commands_core(
+                        &probes,
+                        &store,
+                        &config_dir,
+                        &data_dir,
+                        &runtime,
+                        workspace_id,
+                    )
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("the probe thread panicked"))
+                .collect::<Vec<_>>()
+        });
+
+        for answer in &answers {
+            let commands = answer.as_ref().expect("a probe never errors here");
+            assert_eq!(
+                commands.len(),
+                2,
+                "both callers get the shared answer, got {commands:?}"
+            );
+        }
+        assert_eq!(&answers[0], &answers[1], "one outcome, shared");
+        assert_eq!(
+            process_attempts(&fixture),
+            1,
+            "a second concurrent call spawns no second child"
+        );
+        assert!(
+            fixture
+                .store
+                .list_sessions(fixture.workspace_id)
+                .expect("list sessions")
+                .is_empty(),
+            "no session row, ever"
+        );
+        assert!(!fixture.probe_scratch().exists(), "one cleanup for one probe");
+        assert!(runtime.live_ids().is_empty(), "no child survives");
+        runtime.stop_all();
+    }
+
+    // The composer asks this while someone is typing, so a probe that cannot be
+    // made is an empty list: never an error in front of a keystroke.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_without_a_pi_binary_answers_an_empty_list() {
+        let fixture = SessionFixture::new("probe_no_binary");
+        fixture.write_settings(Path::new("/nonexistent/nabla-test-pi"));
+        let runtime = lifecycle_runtime();
+        let probes = Arc::new(CommandProbes::new());
+
+        let commands = workspace_commands_core(
+            &probes,
+            &fixture.store,
+            &fixture.config_dir(),
+            &fixture.dir,
+            &runtime,
+            fixture.workspace_id,
+        )
+        .expect("a missing binary is not an error");
+
+        assert!(commands.is_empty(), "got {commands:?}");
+        assert!(
+            fixture
+                .store
+                .list_sessions(fixture.workspace_id)
+                .expect("list sessions")
+                .is_empty(),
+            "a failed probe still writes no session row"
+        );
+        assert!(!fixture.probe_scratch().exists(), "and leaves no scratch file");
+        assert!(runtime.live_ids().is_empty());
+    }
+
+    // Same stance for a child that starts and dies: an empty list, not a failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_child_that_dies_answers_an_empty_list() {
+        let fixture = SessionFixture::new("probe_dead_child");
+        let script = fixture.write_dead_pi("dead-pi.sh");
+        fixture.write_settings(&script);
+        let runtime = lifecycle_runtime();
+        let probes = Arc::new(CommandProbes::new());
+
+        let commands = workspace_commands_core(
+            &probes,
+            &fixture.store,
+            &fixture.config_dir(),
+            &fixture.dir,
+            &runtime,
+            fixture.workspace_id,
+        )
+        .expect("a child that dies is not an error");
+
+        assert!(commands.is_empty(), "got {commands:?}");
+        assert!(!fixture.probe_scratch().exists());
+        assert!(runtime.live_ids().is_empty());
+        assert!(
+            fixture
+                .store
+                .list_sessions(fixture.workspace_id)
+                .expect("list sessions")
+                .is_empty()
+        );
+    }
+
+    // An id the store does not index is a contract violation, not a probe
+    // failure: it is reported, and it costs no child at all.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_for_an_unindexed_workspace_errors_without_spawning() {
+        let fixture = SessionFixture::new("probe_unknown");
+        let script = fixture.write_probe_pi("probe-pi.sh", 0);
+        fixture.write_settings(&script);
+        let runtime = lifecycle_runtime();
+        let probes = Arc::new(CommandProbes::new());
+
+        let err = workspace_commands_core(
+            &probes,
+            &fixture.store,
+            &fixture.config_dir(),
+            &fixture.dir,
+            &runtime,
+            424242,
+        )
+        .expect_err("an unindexed workspace cannot be probed");
+
+        assert!(err.contains("unknown workspace"), "got {err:?}");
+        assert_eq!(process_attempts(&fixture), 0, "nothing was spawned");
+        assert!(runtime.live_ids().is_empty());
     }
 }
