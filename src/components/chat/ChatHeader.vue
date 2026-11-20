@@ -7,7 +7,7 @@
 // The header carries no theme state of its own: `isDark` is the resolved mode
 // the panel owns, and `toggleTheme` asks the panel for the next one (S4: the
 // theme is applied by `src/lib/theme.ts` only).
-import { MoreHorizontalIcon, PanelRightOpenIcon } from "@lucide/vue";
+import { PanelRightOpenIcon } from "@lucide/vue";
 import ThemeToggle from "@/components/chat/ThemeToggle.vue";
 import { Button } from "@/components/ui/button";
 import { t } from "@/lib/i18n";
@@ -52,14 +52,5 @@ const emit = defineEmits<{
          the panel persists the new mode in settings.json. Shared with the
          empty-state cluster so the control never depends on having a turn. -->
     <ThemeToggle :is-dark="isDark" @toggle="emit('toggleTheme')" />
-
-    <!-- Seam: no session menu yet. -->
-    <Button
-      variant="ghost"
-      size="icon-sm"
-      :aria-label="t('chat.moreActions')"
-    >
-      <MoreHorizontalIcon />
-    </Button>
   </header>
 </template>

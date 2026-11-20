@@ -221,7 +221,6 @@
   "chat.noWorkspaceHint": "No workspace selected — add or pick one in the sidebar.",
   "chat.errors.noWorkspace": "Select a workspace before sending a prompt.",
   "chat.expandTools": "Expand tools panel",
-  "chat.moreActions": "More actions (not wired yet)",
   "chat.turnsAndSteps": "{turns} turns · {steps} steps",
   "chat.composer.prompt": "Prompt",
   "chat.composer.placeholder": "Describe what you want to build, / commands, @ files or sessions",
