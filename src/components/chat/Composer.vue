@@ -86,6 +86,12 @@ const props = withDefaults(
     /** Workspace the turn is written into, for the scope chip. */
     workspaceName: string;
     /**
+     * The workspace on screen, `null` before one is chosen. Both autocompletes
+     * need it and neither needs a session: `@` lists the paths of this directory,
+     * and `/` falls back to the last command list this workspace ever answered.
+     */
+    workspaceId: number | null;
+    /**
      * The agent is working (a send is in flight or the turn is streaming): the
      * primary control becomes stop, and submitting queues while S3's queue is on.
      */
@@ -182,6 +188,12 @@ const textareaEl = ref<HTMLTextAreaElement | null>(null);
  * when the first `/` was typed answers on the next attempt.
  */
 const commandsBySession = new Map<string, SessionCommand[]>();
+/**
+ * The last command list each workspace answered, kept after its session is gone.
+ * A list a few seconds stale beats an autocomplete that stays shut until a prompt
+ * has already been sent; the source badge still says where each command came from.
+ */
+const lastCommandsByWorkspace = new Map<number, SessionCommand[]>();
 /** The workspace path of the session, resolved once for the `@` walk. */
 let workspacePath: { id: number; path: string } | null = null;
 /** Bumped per request, so a slow answer cannot overwrite a newer list. */
@@ -226,11 +238,13 @@ function handleInput(event: Event): void {
  * for commands, `@src/a` for paths, and anything else closes the list.
  */
 async function refreshCompletion(text: string, caret: number): Promise<void> {
-  const session = activeSession.value;
   const found = findCompletionTrigger(text, caret);
-  // Both autocompletes belong to a session: the commands are that session's, and
-  // the paths are that session's workspace. Without one there is nothing to offer.
-  if (session === null || found === null) {
+  // The workspace is what both lists need. A session only makes the command list
+  // *fresh*: paths come from the directory, and the commands fall back to what
+  // this workspace answered last. Gating on a session kept both shut until a
+  // prompt had already been sent — exactly when they are least useful.
+  const workspace = activeSession.value?.workspaceId ?? props.workspaceId;
+  if (workspace === null || found === null) {
     closeCompletion();
     return;
   }
@@ -238,8 +252,8 @@ async function refreshCompletion(text: string, caret: number): Promise<void> {
   const request = ++completionRequest;
   const rows =
     found.kind === "command"
-      ? filterCommands(await commandsOf(session), found.query)
-      : await pathSuggestions(session.workspaceId, found.query);
+      ? filterCommands(await commandsFor(workspace), found.query)
+      : await pathSuggestions(workspace, found.query);
   // A newer keystroke already asked for its own list.
   if (request !== completionRequest) return;
   items.value = rows;
@@ -251,21 +265,25 @@ async function refreshCompletion(text: string, caret: number): Promise<void> {
  * spawning, the session stopped, the bridge down) is "nothing to offer yet",
  * never an error: the list simply does not open.
  */
-async function commandsOf(
-  session: NonNullable<typeof activeSession.value>,
-): Promise<SessionCommand[]> {
-  const cached = commandsBySession.get(session.sessionId);
-  if (cached !== undefined) return cached;
-  try {
-    const commands = await sessionCommands(
-      session.workspaceId,
-      Number(session.sessionId),
-    );
-    commandsBySession.set(session.sessionId, commands);
-    return commands;
-  } catch {
-    return [];
+async function commandsFor(workspaceId: number): Promise<SessionCommand[]> {
+  const sessionId = activeSession.value?.sessionId ?? null;
+  if (sessionId !== null) {
+    const cached = commandsBySession.get(sessionId);
+    if (cached !== undefined) {
+      lastCommandsByWorkspace.set(workspaceId, cached);
+      return cached;
+    }
+    try {
+      const commands = await sessionCommands(workspaceId, Number(sessionId));
+      commandsBySession.set(sessionId, commands);
+      lastCommandsByWorkspace.set(workspaceId, commands);
+      return commands;
+    } catch {
+      // A session that cannot answer yet is not a reason to close the list: the
+      // remembered one is offered below.
+    }
   }
+  return lastCommandsByWorkspace.get(workspaceId) ?? [];
 }
 
 /** The source badge of a command: pi's own word, translated when this build knows it. */
