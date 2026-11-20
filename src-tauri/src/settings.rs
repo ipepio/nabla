@@ -72,8 +72,9 @@ pub struct Settings {
     /// string the file holds, like `language` and `permission_mode`: a value this
     /// build does not know is never rewritten here and reads as "no level"
     /// (`Settings::thinking`), which makes the spawn omit the flag and leaves pi
-    /// on its own default. An absent field means `"medium"`, pi's documented
-    /// default for `defaultThinkingLevel`.
+    /// on its own default. An absent field means `"off"` — the maintainer's
+    /// standing default: pi has no per-model level, so a static non-off value
+    /// would impose reasoning nobody asked for on every fresh session.
     #[serde(default = "default_thinking_level")]
     pub thinking_level: String,
 }
@@ -123,11 +124,12 @@ fn default_permission_mode() -> String {
 pub const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// S2: the level a fresh install, or a settings file written before this
-/// preference existed, starts with. `medium` is pi's own documented default for
-/// `defaultThinkingLevel` (pi docs/settings.md:15), so an upgrade neither
-/// silences nor inflates the agent's reasoning on its own.
+/// preference existed, starts with. `off`, the maintainer's decision: no
+/// per-model default exists in pi, so a static non-off level would impose
+/// reasoning on every fresh session that nobody asked for. `off` is the cheap
+/// start, and the human raises it deliberately when a session deserves it.
 fn default_thinking_level() -> String {
-    "medium".to_string()
+    "off".to_string()
 }
 
 /// S2: parses one `--thinking` word, trimmed and case-insensitively. `None` for
@@ -1005,26 +1007,26 @@ mod tests {
 
     // ── thinking level (S2 of `composer-inputs.md`) ─────────────────────────
 
-    // S2: the effort of the next session is a preference like the rest. `medium`
-    // is pi's own documented default for `defaultThinkingLevel`
-    // (pi docs/settings.md:15), so an absent field keeps the level pi would have
-    // chosen on its own instead of switching the agent to reasoning nobody asked
-    // for.
+    // S2: the effort of the next session is a preference like the rest. The
+    // standing default is `off`, the maintainer's decision: no per-model
+    // default exists in pi, so a static non-off level would impose reasoning
+    // nobody asked for on every fresh session. `off` is the cheap start, and
+    // the human raises it deliberately when a session deserves it.
     #[test]
-    fn thinking_level_defaults_to_medium_and_serializes_camel_case() {
+    fn thinking_level_defaults_to_off_and_serializes_camel_case() {
         let s = Settings::default();
-        assert_eq!(s.thinking_level, "medium");
-        assert_eq!(s.thinking(), Some("medium"));
+        assert_eq!(s.thinking_level, "off");
+        assert_eq!(s.thinking(), Some("off"));
 
         // camelCase on the wire, so `types.ts` mirrors this key.
         let json = serde_json::to_value(Settings::default()).expect("serialize");
-        assert_eq!(json["thinkingLevel"], serde_json::json!("medium"));
+        assert_eq!(json["thinkingLevel"], serde_json::json!("off"));
     }
 
     // S2 + the settings header rule: a file written before the preference
-    // existed loads with the documented default and every other key intact.
+    // existed loads with the standing default and every other key intact.
     #[test]
-    fn settings_file_without_thinking_level_uses_the_pi_default() {
+    fn settings_file_without_thinking_level_uses_off() {
         let cfg = TempCfg::new("pre_thinking_level");
         std::fs::write(
             &cfg.0,
@@ -1033,7 +1035,7 @@ mod tests {
         .expect("write fixture");
         let s = load(&cfg.0).expect("an older settings file must load");
         assert_eq!(s.theme, "light");
-        assert_eq!(s.thinking_level, "medium");
+        assert_eq!(s.thinking_level, "off");
     }
 
     // S2: the level is written verbatim and read back unchanged, so a relaunch
