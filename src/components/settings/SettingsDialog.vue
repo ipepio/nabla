@@ -77,6 +77,14 @@
  * pi's MCP configuration on its own mount, and this component knows nothing about
  * that file.
  *
+ * S2 of `agent-profiles.md` added the fourth: Subagents, a pane of its own because a
+ * profile is not a preference of the chat but a stored definition the agent
+ * delegates to. `SubagentsSection.vue` owns its read, its draft and its single
+ * write (`save_agents_config`), so this component only decides that it is on
+ * screen — the same arrangement as MCP. Its draft lives at module scope in
+ * `src/lib/agent-profiles.ts` precisely because this chain unmounts the pane
+ * whenever another section is selected.
+ *
  * Preferences live in `settings.json`; this component owns the get/save flow
  * (`getSettings`/`saveSettings`) and applies the theme through the shared
  * `useAppearance().setMode`, the only path that touches the palette. Every
@@ -85,6 +93,7 @@
 import { computed, ref, watch } from "vue";
 import {
   BlocksIcon,
+  BotIcon,
   CheckIcon,
   ExternalLinkIcon,
   MonitorIcon,
@@ -142,6 +151,7 @@ import AccountsSection from "./AccountsSection.vue";
 import McpSection from "./McpSection.vue";
 import ProviderForm from "./ProviderForm.vue";
 import ProviderModelsEditor from "./ProviderModelsEditor.vue";
+import SubagentsSection from "./SubagentsSection.vue";
 import {
   commandErrorMessage,
   configFilePath,
@@ -158,7 +168,7 @@ import type { AppSettings, ProviderSummary } from "@/contracts/types";
 const open = defineModel<boolean>("open", { default: false });
 
 /** S1 of `settings-dialog.md`: the sections the app can drive right now. */
-type Section = "general" | "providers" | "mcp";
+type Section = "general" | "providers" | "mcp" | "subagents";
 const section = ref<Section>("general");
 
 /** S2: every row renders through the catalogue, so a locale switch re-renders. */
@@ -824,6 +834,20 @@ watch(open, (isOpen) => {
           >
             <BlocksIcon class="size-4 shrink-0" aria-hidden="true" />
             {{ t("settings.section.mcp") }}
+          </button>
+          <button
+            type="button"
+            :aria-current="section === 'subagents' ? 'page' : undefined"
+            :class="[
+              'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+              section === 'subagents'
+                ? 'bg-sidebar-accent font-medium text-sidebar-accent-foreground'
+                : 'text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground',
+            ]"
+            @click="section = 'subagents'"
+          >
+            <BotIcon class="size-4 shrink-0" aria-hidden="true" />
+            {{ t("settings.section.subagents") }}
           </button>
         </nav>
 
@@ -1520,7 +1544,13 @@ watch(open, (isOpen) => {
                pi reads from two different files. It owns its own read/write
                cycle (list, add, remove, login/logout) and its own error line, so
                this component only decides that it is on screen. -->
-          <McpSection v-else />
+          <McpSection v-else-if="section === 'mcp'" />
+
+          <!-- S2 of `agent-profiles.md`: the Subagents pane. Same arrangement as
+               MCP — it owns its read, its draft and its one write — and it is a
+               section rather than a block inside General because a profile is a
+               stored definition, not a preference of the chat. -->
+          <SubagentsSection v-else />
 
           <Alert v-if="error" variant="destructive" class="mb-4">
             <AlertDescription>{{ error }}</AlertDescription>
