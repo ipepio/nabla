@@ -1,0 +1,88 @@
+name: CI
+
+# The three gates that must stay green on every push: frontend build, Rust
+# tests, Rust lints. Only official actions -- no third-party cache or toolchain
+# actions to keep the supply chain small.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch or PR cancels the run it superseded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    # Cold `pnpm install` plus a full vue-tsc + vite build.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # package.json pins `packageManager: pnpm@12.18.0`, and corepack is the
+      # only source of that version -- so it runs before setup-node asks pnpm
+      # for its store path.
+      - name: Enable corepack
+        run: corepack enable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # The gate: `vue-tsc --noEmit && vite build` (package.json scripts.build).
+      - name: Build
+        run: pnpm run build
+
+  rust:
+    name: Rust tests and lints
+    runs-on: macos-latest
+    # The first run compiles ~400 crates from scratch; keep the cache warm and
+    # this generous.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Idempotent: on a runner (or a re-run) where rustup already has stable
+      # and clippy, both commands report "unchanged" / "up to date" and exit 0.
+      # `rustup` is on PATH on GitHub-hosted macOS runners; the guard covers the
+      # case where only `~/.cargo/env` sets it.
+      - name: Ensure stable toolchain and clippy
+        run: |
+          if ! command -v cargo >/dev/null 2>&1; then
+            . "$HOME/.cargo/env"
+          fi
+          rustup toolchain install stable --profile minimal
+          rustup component add clippy
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test
+
+      # No `-D warnings` on purpose. There is exactly one pre-existing clippy
+      # warning in the tree -- `clippy::field_reassign_with_default` at
+      # src/settings.rs:504, a test that assigns fields one by one after
+      # `Settings::default()`. Warnings here are informational: the lint must
+      # not be wired into the exit code, and CI must not be "fixed" by deleting
+      # or reshaping that test only to silence it. Removing this step's
+      # tolerance is a separate, deliberate change.
+      - name: cargo clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets
