@@ -60,6 +60,11 @@ import {
   sessionGeneration,
 } from "@/lib/session-store";
 import {
+  openSubagentId,
+  openSubagentView,
+  syncWorkspaceSubagents,
+} from "@/lib/subagent-store";
+import {
   addWorkspace,
   commandErrorMessage,
   deleteSession,
@@ -70,7 +75,7 @@ import {
   stopSession,
   touchWorkspace,
 } from "../contracts/commands";
-import type { SessionSummary, WorkspaceInfo } from "../contracts/types";
+import type { SessionSummary, SubagentSession, WorkspaceInfo } from "../contracts/types";
 
 const props = defineProps<{ activeWorkspaceId: number | null }>();
 const emit = defineEmits<{ select: [workspace: WorkspaceInfo | null] }>();
@@ -343,6 +348,14 @@ async function loadSessions(workspaceId: number) {
     if (!sameSessionList(sessionsByWorkspace.value[workspaceId] ?? [], list)) {
       sessionsByWorkspace.value = { ...sessionsByWorkspace.value, [workspaceId]: list };
     }
+    // H4: the children of the chats just listed, so a delegating chat nests them
+    // under its row (S2). This is the lazy trigger the sidebar owns: the visible
+    // workspace's sessions are exactly the parents worth asking about, and the
+    // shared store pushes the answer into every open row.
+    void syncWorkspaceSubagents(
+      workspaceId,
+      list.map((session) => session.id),
+    );
     if (sessionsErrors.value[workspaceId] !== undefined) {
       const settledErrors = { ...sessionsErrors.value };
       delete settledErrors[workspaceId];
@@ -504,6 +517,33 @@ async function handleDeleteSession(
 }
 
 /**
+ * H4 of `odd/tasks/subagent-helpers.md`: a child row opens the read-only view of
+ * that child — never a conversation, and never through `selectSession` for the
+ * child itself (a child is not a chat Nabla runs; selecting it would spawn a pi for
+ * its file).
+ *
+ * The parent chat is focused only when its pi is already live, and that is the
+ * reason for the guard below: selecting a stopped session spawns one, and a click on
+ * a child must not be a spawn path. When the parent is not live the view still opens
+ * and the back control returns to whatever chat is on screen.
+ */
+async function handleOpenSubagent(
+  workspace: WorkspaceInfo,
+  opened: { child: SubagentSession; parent: SessionSummary },
+) {
+  const parent = opened.parent;
+  const child = opened.child;
+  if (workspace.id !== props.activeWorkspaceId) await handleSelectWorkspace(workspace);
+  if (
+    activeSession.value?.sessionId !== String(parent.id) &&
+    liveIds.value.includes(String(parent.id))
+  ) {
+    await selectSession(parent);
+  }
+  openSubagentView(child, String(parent.id), workspace.id);
+}
+
+/**
  * S3: the header's folder button. The native folder picker is the whole add
  * flow; cancelling the dialog is not an error, so it silently does nothing. The
  * name is never sent: the store derives it from the path (S6's default).
@@ -551,6 +591,9 @@ async function handleRemoveWorkspace(workspace: WorkspaceInfo) {
     expandedIds.value = expandedIds.value.filter((id) => id !== workspace.id);
     delete sessionsByWorkspace.value[workspace.id];
     delete sessionsErrors.value[workspace.id];
+    // H4: its children go with it. An empty list prunes every parent the store was
+    // holding for this workspace, so nothing keeps polling children nobody lists.
+    void syncWorkspaceSubagents(workspace.id, []);
     // `refreshWorkspaces` replaces the selection when the active row is gone.
     await refreshWorkspaces();
   } catch (cause) {
@@ -790,10 +833,12 @@ onUnmounted(() => {
               :active-session-id="activeSession?.sessionId ?? null"
               :live-session-ids="liveIds"
               :busy-session-ids="busyIds"
+              :open-subagent-id="openSubagentId"
               :action-error="sessionActionErrorFor(workspace.id)"
               @select="handleOpenSession(workspace, $event)"
               @pause="handlePauseSession(workspace, $event)"
               @delete="handleDeleteSession(workspace, $event)"
+              @open-subagent="handleOpenSubagent(workspace, $event)"
             />
           </SidebarMenuItem>
         </SidebarMenu>

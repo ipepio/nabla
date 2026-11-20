@@ -58,6 +58,21 @@ const props = defineProps<{
   /** The "show reasoning" preference: off means the blocks are not rendered. */
   showReasoning: boolean;
   /**
+   * Open the turn's disclosure on mount. Off in a conversation (S1 of
+   * `chat-turn-groups.md`: collapsed by default), on in the read-only subagent view,
+   * where the work is what the human opened the view for.
+   */
+  initialExpanded?: boolean;
+  /**
+   * The chat this turn belongs to, so a `run_agent` chip can point at the child it
+   * started (H4 of `odd/tasks/subagent-helpers.md`). `null` where the turn is not
+   * part of a chat Nabla owns — the read-only child view, whose transcript carries
+   * no chips at all.
+   */
+  parentSessionId?: string | null;
+  /** The workspace of that chat, which every subagent query takes. */
+  workspaceId?: number | null;
+  /**
    * Why this turn did not end on its own (S3 of `turn-continuity.md`), or `null`
    * for a turn that ended normally. The store reads it from pi's own
    * `stopReason`, so nothing here is inferred.
@@ -150,6 +165,7 @@ const notice = computed<string | null>(() => {
       :turn-id="turnId"
       :label="stepsLabel"
       :tools="tools"
+      :initial-expanded="initialExpanded === true"
     >
       <div class="flex flex-col gap-3">
         <div
@@ -167,7 +183,12 @@ const notice = computed<string | null>(() => {
             v-if="intermediateTextOf(step) !== null"
             :text="intermediateTextOf(step) ?? ''"
           />
-          <ToolChips v-if="step.tools.length > 0" :tools="step.tools" />
+          <ToolChips
+            v-if="step.tools.length > 0"
+            :tools="step.tools"
+            :parent-session-id="parentSessionId ?? null"
+            :workspace-id="workspaceId ?? null"
+          />
           <!-- A `tool` line of a recovered transcript: the muted note it has
                always been, kept next to the step it belongs to. -->
           <div
@@ -191,7 +212,12 @@ const notice = computed<string | null>(() => {
         :text="liveReasoningText"
         live
       />
-      <ToolChips v-if="liveChipList.length > 0" :tools="liveChipList" />
+      <ToolChips
+        v-if="liveChipList.length > 0"
+        :tools="liveChipList"
+        :parent-session-id="parentSessionId ?? null"
+        :workspace-id="workspaceId ?? null"
+      />
     </template>
 
     <!-- S2: the answer, above everything else the turn did. While the turn runs

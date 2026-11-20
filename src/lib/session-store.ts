@@ -61,6 +61,36 @@ export interface ToolEntry {
    * chips next to their own step's reasoning, inside the turn's disclosure.
    */
   stepId: string;
+  /**
+   * `run_agent` only: the child this call delegated to (H4 of
+   * `odd/tasks/subagent-helpers.md`). Absent for every other tool, and half-filled
+   * while the call is still on its way — see `SubagentCall`. The helper card in the
+   * turn reads it; nothing else does.
+   */
+  subagent?: SubagentCall;
+}
+
+/**
+ * What one `run_agent` call delegated to, as the bridge reported it (H4 of
+ * `odd/tasks/subagent-helpers.md`).
+ *
+ * The call is the only handle the chat has on a child before the child's index row
+ * is loaded, so the two halves of the link are stamped where they arrive: `agent`
+ * (and the optional run `name`) from the call's own arguments on
+ * `tool_execution_start`, `sessionPath` (and the extension's own status word) from
+ * the answer's `details` on `tool_execution_end`. A field the event did not carry
+ * stays `null` — nothing here is inferred, so the card can say honestly when it
+ * cannot point at a child yet.
+ */
+export interface SubagentCall {
+  /** The agent definition the call ran, from its arguments. */
+  agent: string | null;
+  /** The run name the call asked for, from its arguments (`null` when unnamed). */
+  name: string | null;
+  /** The child's own pi JSONL file, from the result's details. */
+  sessionPath: string | null;
+  /** The status word the extension answered with (`running`, `done`, `failed`, …). */
+  outcome: string | null;
 }
 
 /**
@@ -1019,6 +1049,75 @@ function findTool(buffer: SessionBuffer, toolCallId: string) {
 }
 
 /**
+ * The one tool of the subagent extension that spawns a child (`run_agent`, H2 of
+ * `odd/tasks/subagent-helpers.md`). The other three — status, cancel, steer — are
+ * control calls on children that already exist, so they stay compact chips.
+ */
+const SUBAGENT_RUN_TOOL = "run_agent";
+
+/** One string field of a wire payload this build only partly models. */
+function stringField(source: unknown, key: string): string | null {
+  if (source === null || typeof source !== "object") return null;
+  const value = (source as Record<string, unknown>)[key];
+  return typeof value === "string" && value !== "" ? value : null;
+}
+
+/**
+ * H4: the child a `run_agent` call names, read from the call's own arguments.
+ * Every other tool answers `null`, and so does a call whose arguments this build
+ * does not recognize — a card without an agent name is then the honest chip.
+ */
+function subagentCallOf(toolName: string, args: unknown): SubagentCall | null {
+  if (toolName !== SUBAGENT_RUN_TOOL) return null;
+  const agent = stringField(args, "agent");
+  const name = stringField(args, "name");
+  if (agent === null && name === null) return null;
+  return { agent, name, sessionPath: null, outcome: null };
+}
+
+/**
+ * H4: what `run_agent` answered — the child's session file and the extension's own
+ * status word — read from the tool result's `details`. `null` for every other tool
+ * and for a result that carried none.
+ */
+function subagentOutcomeOf(
+  toolName: string,
+  result: unknown,
+): { sessionPath: string | null; outcome: string | null } | null {
+  if (toolName !== SUBAGENT_RUN_TOOL) return null;
+  const details =
+    result !== null && typeof result === "object"
+      ? (result as Record<string, unknown>).details
+      : null;
+  const sessionPath = stringField(details, "sessionPath");
+  const outcome = stringField(details, "status");
+  if (sessionPath === null && outcome === null) return null;
+  return { sessionPath, outcome };
+}
+
+/**
+ * H4: folds one half of a `run_agent` link into what the chip already carries, so
+ * a call that started before its result arrived is completed rather than replaced.
+ */
+function mergeSubagentCall(
+  existing: SubagentCall | undefined,
+  patch: { sessionPath: string | null; outcome: string | null } | null,
+): SubagentCall | undefined {
+  if (patch === null) return existing;
+  const base: SubagentCall = existing ?? {
+    agent: null,
+    name: null,
+    sessionPath: null,
+    outcome: null,
+  };
+  return {
+    ...base,
+    sessionPath: patch.sessionPath ?? base.sessionPath,
+    outcome: patch.outcome ?? base.outcome,
+  };
+}
+
+/**
  * Appends one tool chip: the only writer of `buffer.tools`.
  *
  * A chip carries two attributions, and both are stamped here so neither can
@@ -1034,6 +1133,7 @@ function pushTool(
   toolCallId: string,
   toolName: string,
   state: ToolEntry["state"],
+  subagent: SubagentCall | null = null,
 ): void {
   const stepId = ensureLiveMessageId(sessionId, buffer);
   buffer.tools.push({
@@ -1044,6 +1144,8 @@ function pushTool(
     // then keeps the chip in the turn it is rendered under instead of dropping it.
     turnId: buffer.turnId ?? stepId,
     stepId,
+    // H4: only a delegation carries this, and only once its arguments are read.
+    ...(subagent === null ? {} : { subagent }),
   });
 }
 
@@ -1117,18 +1219,16 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
       return;
     }
     case "tool_execution_start":
-      pushTool(sessionId, buffer, event.toolCallId, event.toolName, "running");
+      pushTool(
+        sessionId,
+        buffer,
+        event.toolCallId,
+        event.toolName,
+        "running",
+        subagentCallOf(event.toolName, event.args),
+      );
       return;
     case "tool_execution_update": {
-      const entry = findTool(buffer, event.toolCallId);
-      if (entry === undefined) {
-        pushTool(sessionId, buffer, event.toolCallId, event.toolName, "running");
-      } else {
-        entry.state = "running";
-      }
-      return;
-    }
-    case "tool_execution_end": {
       const entry = findTool(buffer, event.toolCallId);
       if (entry === undefined) {
         pushTool(
@@ -1136,10 +1236,32 @@ function applyEvent(sessionId: string, event: AgentEvent): void {
           buffer,
           event.toolCallId,
           event.toolName,
+          "running",
+          subagentCallOf(event.toolName, event.args),
+        );
+      } else {
+        entry.state = "running";
+      }
+      return;
+    }
+    case "tool_execution_end": {
+      const entry = findTool(buffer, event.toolCallId);
+      const outcome = subagentOutcomeOf(event.toolName, event.result);
+      if (entry === undefined) {
+        // A call this store never saw start (a bridge attached mid-turn): the
+        // result still carries the child's file, so the card links where it can.
+        pushTool(
+          sessionId,
+          buffer,
+          event.toolCallId,
+          event.toolName,
           event.isError ? "error" : "done",
+          mergeSubagentCall(undefined, outcome) ?? null,
         );
       } else {
         entry.state = event.isError ? "error" : "done";
+        const linked = mergeSubagentCall(entry.subagent, outcome);
+        if (linked !== undefined) entry.subagent = linked;
       }
       return;
     }

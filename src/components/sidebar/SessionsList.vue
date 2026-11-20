@@ -12,6 +12,12 @@
 // the session has a live process — there is nothing to stop otherwise — and
 // delete asks for confirmation before it emits, because a deleted session leaves
 // the list. Both actions are emitted: this component never calls a command.
+//
+// H4 of `odd/tasks/subagent-helpers.md`: a chat that delegated shows its children
+// nested under it (S2: "no en una lista global"), read from the shared subagent
+// store — which `AppSidebar` fills and which owns the interval that keeps a running
+// child's state fresh. Clicking one is emitted like every other row: it opens the
+// read-only view, never a chat.
 import { onMounted, onUnmounted, ref } from "vue";
 import { MessageSquareIcon, MoreHorizontalIcon, PauseIcon, Trash2Icon } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
@@ -36,7 +42,18 @@ import {
   SidebarMenuSubItem,
 } from "@/components/ui/sidebar";
 import { t } from "@/lib/i18n";
-import type { SessionSummary } from "@/contracts/types";
+import {
+  subagentChildrenOf,
+  subagentStatusDot,
+  subagentStatusLabel,
+} from "@/lib/subagent-store";
+import type { SessionSummary, SubagentSession } from "@/contracts/types";
+
+/** One child row of the list, with the chat that delegated to it (H4). */
+interface OpenSubagentRow {
+  child: SubagentSession;
+  parent: SessionSummary;
+}
 
 defineProps<{
   sessions: SessionSummary[];
@@ -52,6 +69,8 @@ defineProps<{
   liveSessionIds: string[];
   /** Ids whose agent is producing output right now (spinner on the row). */
   busySessionIds: string[];
+  /** Id of the child the read-only view shows, `null` when it shows a chat. */
+  openSubagentId: number | null;
 }>();
 
 const emit = defineEmits<{
@@ -60,6 +79,8 @@ const emit = defineEmits<{
   (e: "pause", session: SessionSummary): void;
   /** Remove the session from the app; the parent archives and deletes it. */
   (e: "delete", session: SessionSummary): void;
+  /** Show the read-only view of a child this chat delegated to (H4). */
+  (e: "openSubagent", opened: OpenSubagentRow): void;
 }>();
 
 /** The session the confirmation dialog is about, `null` when it is closed. */
@@ -79,6 +100,20 @@ let ageTickHandle: number | null = null;
 /** Whether this session currently has a pi process behind it. */
 function isRunning(session: SessionSummary, liveSessionIds: string[]): boolean {
   return liveSessionIds.includes(String(session.id));
+}
+
+/**
+ * The children this chat delegated to (H4), as the shared store knows them. Read
+ * inside the render: the rows appear the moment the parent's list lands, and their
+ * status dots move on their own while something runs.
+ */
+function childrenOf(session: SessionSummary): SubagentSession[] {
+  return subagentChildrenOf(session.id);
+}
+
+/** What a child row is called: the agent definition it runs. */
+function childLabel(child: SubagentSession): string {
+  return child.agent.trim() !== "" ? child.agent : child.name;
 }
 
 /** The contract has no title yet, so the fallback is the neutral "Session". */
@@ -220,6 +255,40 @@ onUnmounted(() => {
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
+
+      <!-- H4: the chats this one delegated to, nested under it (S2). Indented and
+           with no ⋯ menu: a child is read, never paused or deleted from here — its
+           life belongs to the parent chat that started it. Clicking one opens the
+           read-only view, not a conversation. -->
+      <ul
+        v-if="childrenOf(session).length > 0"
+        class="mt-0.5 mb-1 ml-3 flex flex-col gap-0.5 border-l border-border/60 pl-2"
+        :aria-label="t('chat.subagent.list')"
+      >
+        <li v-for="child in childrenOf(session)" :key="child.sessionId">
+          <SidebarMenuSubButton
+            as="button"
+            type="button"
+            size="sm"
+            :is-active="child.sessionId === openSubagentId"
+            class="w-full pl-2"
+            @click="emit('openSubagent', { child, parent: session })"
+          >
+            <span
+              class="size-1.5 shrink-0 rounded-full"
+              :class="subagentStatusDot(child.status)"
+              aria-hidden="true"
+            />
+            <span class="min-w-0 flex-1 truncate">{{ childLabel(child) }}</span>
+            <span
+              class="shrink-0 text-[10px] text-muted-foreground"
+              :title="subagentStatusLabel(child.status)"
+            >
+              {{ subagentStatusLabel(child.status) }}
+            </span>
+          </SidebarMenuSubButton>
+        </li>
+      </ul>
     </SidebarMenuSubItem>
 
     <li v-if="loading" class="px-2 py-1 text-xs text-muted-foreground">

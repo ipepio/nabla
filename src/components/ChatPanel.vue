@@ -21,6 +21,7 @@ import ChatHeader from "@/components/chat/ChatHeader.vue";
 import Composer from "@/components/chat/Composer.vue";
 import QuestionCard from "@/components/chat/QuestionCard.vue";
 import QuestionPrompt from "@/components/chat/QuestionPrompt.vue";
+import SubagentView from "@/components/chat/SubagentView.vue";
 import TurnGroup from "@/components/chat/TurnGroup.vue";
 import { deriveTurnGroups } from "@/components/chat/turn-groups";
 import { draftKeyFor, usePromptDraft } from "@/components/chat/use-prompt-draft";
@@ -77,6 +78,10 @@ import {
   type ToolEntry,
 } from "@/lib/session-store";
 import { applyPreferences, queueMessages, showReasoning } from "@/lib/preferences";
+import {
+  closeSubagentView,
+  openSubagent,
+} from "@/lib/subagent-store";
 import { isDarkMode, type ThemeMode } from "@/lib/theme";
 
 /** The drawer owns the workspace list; the active one arrives already chosen. */
@@ -218,6 +223,21 @@ const liveText = useThrottledText(
 const transcriptLoading = computed(() =>
   isTranscriptLoading(currentSession.value?.sessionId ?? null),
 );
+
+/**
+ * H4 of `odd/tasks/subagent-helpers.md`: the panel is showing the read-only view of
+ * a child instead of a conversation.
+ *
+ * The child view is a *state of this column*, not a page and not a second panel:
+ * the conversation underneath was never left (its buffer, its process and its
+ * draft are untouched), so going back is a reset of one ref in the shared store.
+ */
+const showsSubagentView = computed(() => openSubagent.value !== null);
+
+/** The child view's back control: returns the column to the chat it covered. */
+function handleCloseSubagent(): void {
+  closeSubagentView();
+}
 
 /**
  * The muted "loading conversation" note, and the only condition under which it
@@ -1181,7 +1201,10 @@ onUnmounted(() => {
          the same controls) does not exist yet, so both switches live here until
          the first turn. Tools toggle hides while the drawer is open.
          -->
-    <div v-if="isEmptyState" class="absolute top-2 right-2 z-10 flex items-center gap-1">
+    <div
+      v-if="isEmptyState && !showsSubagentView"
+      class="absolute top-2 right-2 z-10 flex items-center gap-1"
+    >
       <ThemeToggle :is-dark="isDark" @toggle="handleToggleTheme" />
       <Button
         v-if="!toolsOpen"
@@ -1195,9 +1218,16 @@ onUnmounted(() => {
       </Button>
     </div>
 
+    <!-- H4 of `odd/tasks/subagent-helpers.md`: the read-only view of a child a chat
+         delegated to. It takes the column before either chat state does — a view
+         opened from the sidebar must show even when the chat behind it has nothing
+         painted yet — and it owns its whole surface: no composer, no queue, no
+         picker, and no pi spawn path at all. -->
+    <SubagentView v-if="showsSubagentView" @back="handleCloseSubagent" />
+
     <!-- S1: no conversation yet — brand mark, chips and composer, no header. -->
     <ChatEmptyState
-      v-if="isEmptyState"
+      v-else-if="isEmptyState"
       :provider="providerName"
       :hint="workspace === null ? t('chat.noWorkspaceHint') : null"
     >
@@ -1383,6 +1413,8 @@ onUnmounted(() => {
             :live-message-id="liveMessageId"
             :live-tools="group.liveTools"
             :show-reasoning="showReasoning"
+            :parent-session-id="currentSession?.sessionId ?? null"
+            :workspace-id="workspace?.id ?? null"
             @continue="handleContinue"
           />
 

@@ -23,6 +23,12 @@ const props = defineProps<{
   label: string;
   /** Every chip of the turn, for the breakdown and the failure count. */
   tools: ToolEntry[];
+  /**
+   * Open the disclosure on mount. Off for a conversation (S1: collapsed by
+   * default); on for a read-only surface where the work *is* what the human came
+   * to watch and there is no live tail to follow.
+   */
+  initialExpanded?: boolean;
 }>();
 
 /**
@@ -31,7 +37,7 @@ const props = defineProps<{
  * for another surface, and a remount (a session switch, a template re-render)
  * landing it closed again is the safe direction (S1: collapsed by default).
  */
-const expanded = ref(false);
+const expanded = ref(props.initialExpanded === true);
 
 /** DOM id of the disclosure, derived from a store id (`12:3`), which is not a
  * safe id as-is. */
