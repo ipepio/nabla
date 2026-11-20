@@ -16,6 +16,7 @@
 // and a watcher's getter would run during setup — the TDZ trap this codebase has
 // already paid for twice.
 import { computed, onMounted, ref } from "vue";
+import { TriangleAlertIcon } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { getPermissionMode, setPermissionMode } from "@/contracts/commands";
 import type { PermissionMode } from "@/contracts/types";
@@ -86,11 +87,16 @@ onMounted(async () => {
 </script>
 
 <template>
-  <!-- Small on purpose: this is a status control, not a settings page. -->
+  <!-- Small on purpose: this is a status control, not a settings page.
+
+       `yolo` carries a mark, not a red pill: destructive red is the language of
+       "something went wrong", and choosing yolo is the human's deliberate call,
+       not a fault. The warning triangle says "mind what this means" while the
+       label keeps saying it in words. -->
   <Button
     variant="outline"
     size="xs"
-    :class="mode === 'yolo' ? 'text-destructive' : 'text-muted-foreground'"
+    class="text-muted-foreground"
     :title="hint"
     :aria-label="switchLabel"
     :aria-busy="saving"
@@ -98,6 +104,7 @@ onMounted(async () => {
     data-slot="permission-mode"
     @click="cycle"
   >
+    <TriangleAlertIcon v-if="mode === 'yolo'" class="size-3 shrink-0" />
     {{ label }}
   </Button>
 </template>
