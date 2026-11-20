@@ -136,3 +136,7 @@ auto-update.
 - [CONTENTS.md](CONTENTS.md) — the index of deep-dives under `docs/`
 - [docs/adr/](docs/adr/) — architecture decisions, including the security baseline
 - `odd/tasks/` — feature specifications and their logs
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
