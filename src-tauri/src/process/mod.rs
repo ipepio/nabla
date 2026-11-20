@@ -1142,8 +1142,13 @@ fn spawn_args(
     args.push("--append-system-prompt".to_string());
     // S7/S8 of `agent-profiles.md`: with the gate closed this is the identity
     // byte for byte; open, it carries the routing table that tells the model
-    // which profile answers which question.
-    args.push(compose_system_prompt(layout.delegating));
+    // which profile answers which question. A session file left with an
+    // unanswered tool call appends one honest note (see below).
+    args.push(compose_spawn_prompt(
+        layout.delegating,
+        session_file,
+        layout.data_dir,
+    ));
     args
 }
 
@@ -1162,6 +1167,9 @@ const DELEGATING_CLOSE: &str = "<!-- nabla:delegating:end -->";
 /// S7: the routing table only travels when the human opened the gate. S8: with
 /// the gate closed the answer is the identity exactly as the file holds it before
 /// the marker — the same bytes every session received before delegation existed.
+///
+/// This is also the base a reopened session's resume note appends to (see
+/// `compose_spawn_prompt` below): a note, never a replacement for these bytes.
 pub(crate) fn compose_system_prompt(delegating: bool) -> String {
     let Some((identity, rest)) = NABLA_SYSTEM_PROMPT.split_once(DELEGATING_OPEN) else {
         // A hand edit that dropped the marker: the identity is used whole instead
@@ -1177,6 +1185,183 @@ pub(crate) fn compose_system_prompt(delegating: bool) -> String {
     // One blank line between the identity and the section, whichever way the
     // markers are spaced in the file.
     format!("{identity}\n{}", section.trim_start())
+}
+
+/// Where the subagent extension writes each child's own pi session file
+/// (`resources/nabla-subagents.ts`): what the resume note points at when the call
+/// that never returned was `run_agent`.
+fn subagent_transcripts_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("sessions").join("subagents")
+}
+
+/// Marker the resume note opens with: unique enough that a test (or a human
+/// reading the prompt) can tell the note from the identity.
+const RESUME_NOTE_TITLE: &str = "## This session was reopened after the app closed unexpectedly";
+
+/// Name reported for a `toolCall` block that carries none.
+const UNKNOWN_TOOL_NAME: &str = "unknown tool";
+
+/// One line of a pi session file, reduced to what a dangling call leaves behind.
+///
+/// Deliberately tolerant, because pi owns the format: only the role of an
+/// assistant message, the ids of its `toolCall` blocks and the `toolCallId` of a
+/// result are depended on. A line that is not JSON, or JSON of another shape, is
+/// skipped without a word.
+fn scan_session_line(line: &str, pending: &mut Vec<(String, String)>) {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    // pi wraps a stored message as `{"type":"message","message":{..}}`; a bare
+    // message object is accepted too, so an older or degraded file still reads.
+    let message = value
+        .get("message")
+        .filter(|message| message.is_object())
+        .unwrap_or(&value);
+    let Some(object) = message.as_object() else {
+        return;
+    };
+    // A result answers its call wherever the result sits in the tree.
+    for field in ["toolCallId", "tool_call_id"] {
+        if let Some(id) = object.get(field).and_then(Value::as_str) {
+            pending.retain(|(call, _)| call.as_str() != id);
+        }
+    }
+    let role = object
+        .get("role")
+        .or_else(|| value.get("role"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    // Only an assistant message STARTS a call; a result that happens to mention
+    // one is history that already answered.
+    if !role.eq_ignore_ascii_case("assistant") {
+        return;
+    }
+    let Some(parts) = object.get("content").and_then(Value::as_array) else {
+        return;
+    };
+    for part in parts {
+        let Some(block) = part.as_object() else {
+            continue;
+        };
+        let kind = block.get("type").and_then(Value::as_str).unwrap_or_default();
+        if !matches!(kind, "toolCall" | "tool_call" | "tool_use") {
+            continue;
+        }
+        let Some(id) = ["id", "toolCallId", "tool_call_id"]
+            .iter()
+            .find_map(|field| block.get(*field).and_then(Value::as_str))
+        else {
+            continue;
+        };
+        let name = ["name", "toolName", "tool_name"]
+            .iter()
+            .find_map(|field| block.get(*field).and_then(Value::as_str))
+            .unwrap_or(UNKNOWN_TOOL_NAME);
+        if !pending.iter().any(|(call, _)| call.as_str() == id) {
+            pending.push((id.to_string(), name.to_string()));
+        }
+    }
+}
+
+/// Every tool call of `session_file` that never received a result, as
+/// `(toolName, count)`: deduplicated, in the order the calls appear.
+///
+/// The file is streamed line by line — session files reach ~12 MB, so nothing
+/// here slurps it. Ids are collected as calls appear and dropped when their result
+/// shows up, which is what makes a call answered LATER not dangling; a call from
+/// any earlier turn that never came back counts too, because old poison is still
+/// poison. A missing file is a NEW session and answers nothing.
+fn pending_tool_calls(session_file: &Path) -> Vec<(String, usize)> {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(session_file) else {
+        return Vec::new();
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut pending: Vec<(String, String)> = Vec::new();
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            // Lossy on purpose: a byte a hard kill tore into the file must not
+            // take the rest of the history with it.
+            Ok(_) => scan_session_line(&String::from_utf8_lossy(&line), &mut pending),
+            // An unreadable file still lets the session open: report what was
+            // found instead of failing the spawn.
+            Err(_) => break,
+        }
+    }
+    let mut tools: Vec<(String, usize)> = Vec::new();
+    for (_, name) in pending {
+        match tools.iter_mut().find(|(seen, _)| *seen == name) {
+            Some((_, count)) => *count += 1,
+            None => tools.push((name, 1)),
+        }
+    }
+    tools
+}
+
+/// The honest note one spawn appends when its session file carries a call the
+/// app's death left unanswered, or `None` when every call came back.
+///
+/// The four facts are the whole point: the session was reopened after an
+/// unexpected close, these calls never returned, nothing of that turn is running
+/// now, and a rerun needs the human. Without them a model reads a pending call as
+/// work in flight and invents its progress.
+fn resume_note(pending: &[(String, usize)], data_dir: Option<&Path>) -> Option<String> {
+    if pending.is_empty() {
+        return None;
+    }
+    let mut note = String::from(RESUME_NOTE_TITLE);
+    note.push_str(
+        "\n\nNabla reopened this session after the app closed unexpectedly. An earlier turn of \
+         this session started the tool calls below and they never returned: their results were \
+         lost when the app stopped.\n\n",
+    );
+    for (name, count) in pending {
+        let calls = if *count == 1 {
+            "1 call".to_string()
+        } else {
+            format!("{count} calls")
+        };
+        note.push_str(&format!("- `{name}` ({calls})\n"));
+    }
+    note.push_str(
+        "\nNothing from that turn is still running: no tool and no subagent is alive now, so \
+         there is nothing to wait for, nothing to collect and no report to read. Do not assume \
+         pending work, a queued job or a child that is finishing something. If the interrupted \
+         work still matters, tell the human what you were doing and ask the human before \
+         redoing it.\n",
+    );
+    // A lost `run_agent` lost the child's report, not the child's own session
+    // file: point at it in case the human wants what it actually did.
+    if pending.iter().any(|(name, _)| name == "run_agent")
+        && let Some(dir) = data_dir
+    {
+        note.push_str(&format!(
+            "\nWhat a child of that `run_agent` actually did is on disk under `{}`; open those \
+             files with the human instead of guessing.\n",
+            subagent_transcripts_dir(dir).display()
+        ));
+    }
+    Some(note)
+}
+
+/// The system prompt of one spawn: the identity (plus the routing table when the
+/// delegation gate is open) and, when the session was reopened with an unanswered
+/// tool call, the resume note.
+///
+/// The note lives ONLY in this spawn's prompt. The session file belongs to pi and
+/// is never written here: the next spawn rescans it and reaches the same answer.
+fn compose_spawn_prompt(delegating: bool, session_file: &Path, data_dir: Option<&Path>) -> String {
+    let mut prompt = compose_system_prompt(delegating);
+    if let Some(note) = resume_note(&pending_tool_calls(session_file), data_dir) {
+        // One blank line between the identity and the note, the same spacing the
+        // routing table already uses.
+        prompt.push_str("\n\n");
+        prompt.push_str(&note);
+    }
+    prompt
 }
 
 /// The first-party pi extension that gives the agent its three ask tools (S1,
@@ -3098,5 +3283,225 @@ printf 'exited\n' >> '@MARKER@'
         let prompt = spawned_prompt(&args).expect("--append-system-prompt still reaches pi");
         assert!(!prompt.contains("## Delegating"), "{prompt}");
         manager.stop_all();
+    }
+
+    // ── the resume note for an interrupted session ───────────────────────────
+    //
+    // A hard app kill (or a stop whose grace expires mid-call) leaves a
+    // `toolCall` in the session file with no `toolResult`. Reopened, the model
+    // reads that as work still in flight and invents its progress: it hallucinated
+    // a subagent "finishing the last checks", nudged it with four `bash` calls and
+    // finally asked the human to open a browser. The note below is the only place
+    // that can say the truth at spawn time; nothing is written to the file.
+
+    /// One pi session file line: the entry envelope plus the message it carries,
+    /// in the shape pi persists (upstream `docs/session-format.md`).
+    fn message_line(message: serde_json::Value) -> String {
+        json!({
+            "type": "message",
+            "id": "e1",
+            "parentId": null,
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "message": message,
+        })
+        .to_string()
+    }
+
+    /// An assistant message that asked for `name` under `id`: pi's own content
+    /// block shape (`type: "toolCall"`, `id`, `name`).
+    fn tool_call_line(id: &str, name: &str) -> String {
+        message_line(json!({
+            "role": "assistant",
+            "content": [{"type": "toolCall", "id": id, "name": name, "arguments": {}}],
+            "stopReason": "toolUse",
+        }))
+    }
+
+    /// The message pi persists when a call comes back.
+    fn tool_result_line(id: &str, name: &str) -> String {
+        message_line(json!({
+            "role": "toolResult",
+            "toolCallId": id,
+            "toolName": name,
+            "content": [{"type": "text", "text": "ok"}],
+            "isError": false,
+        }))
+    }
+
+    fn write_session(scratch: &Scratch, name: &str, lines: &[String]) -> PathBuf {
+        let path = scratch.path(name);
+        let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        std::fs::write(&path, body).expect("write session file");
+        path
+    }
+
+    /// The prompt one spawn would hand pi for `session_file`.
+    fn prompt_for(session_file: &Path, data_dir: Option<&Path>) -> String {
+        let args = spawn_args(
+            session_file,
+            SessionModel {
+                provider: TEST_PROVIDER,
+                model: TEST_MODEL,
+                thinking: None,
+            },
+            SpawnLayout {
+                data_dir,
+                ..SpawnLayout::default()
+            },
+        );
+        args.last().cloned().expect("the prompt is the last argument")
+    }
+
+    // The incident this note exists for: `run_agent` was in flight when the app
+    // died, so its result is gone and the child is gone with it.
+    #[test]
+    fn a_dangling_run_agent_call_adds_a_resume_note_to_the_prompt() {
+        let scratch = Scratch::new("resume_note_run_agent");
+        let path = write_session(&scratch, "s.jsonl", &[tool_call_line("call-1", "run_agent")]);
+        let prompt = prompt_for(&path, Some(&scratch.dir));
+        // Appended, never a replacement: the identity stays whole.
+        assert!(
+            prompt.starts_with(&compose_system_prompt(false)),
+            "the note only appends to the identity: {prompt}"
+        );
+        let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        // The four facts the model needs to stop inventing progress.
+        assert!(flat.contains("reopened"), "it was reopened: {flat}");
+        assert!(flat.contains("`run_agent`"), "the tool is named: {flat}");
+        assert!(flat.contains("never returned"), "the result was lost: {flat}");
+        assert!(
+            flat.contains("no tool and no subagent is alive now"),
+            "nothing is still running: {flat}"
+        );
+        assert!(
+            flat.contains("ask the human before redoing it"),
+            "a rerun needs the human: {flat}"
+        );
+        // A `run_agent` that never returned also points at the children's files,
+        // which is the only record of what a child actually did.
+        let transcripts = scratch.dir.join("sessions").join("subagents");
+        assert!(
+            flat.contains(&transcripts.display().to_string()),
+            "the subagent transcripts directory is named: {flat}"
+        );
+        // The note only ever appends, on one blank line, and it is not wrapped by
+        // continuation artefacts: what the model reads is a clean paragraph.
+        let note = prompt
+            .strip_prefix(&compose_system_prompt(false))
+            .expect("the note follows the identity");
+        assert!(note.starts_with("\n\n## "), "one blank line, then a heading: {note:?}");
+        assert!(!note.contains("  "), "no double space from wrapping: {note:?}");
+    }
+
+    // S8-style regression: nothing was interrupted, so the spawn is today's —
+    // the same prompt bytes and the same argv.
+    #[test]
+    fn a_clean_session_file_produces_todays_prompt_byte_for_byte() {
+        let scratch = Scratch::new("resume_note_clean");
+        let identity = compose_system_prompt(false);
+        let clean = write_session(
+            &scratch,
+            "clean.jsonl",
+            &[
+                tool_call_line("call-1", "read"),
+                tool_result_line("call-1", "read"),
+            ],
+        );
+        assert_eq!(prompt_for(&clean, Some(&scratch.dir)), identity);
+        // A session pi has not written yet (a NEW session) is today's too.
+        let fresh = scratch.path("fresh.jsonl");
+        assert!(!fresh.exists());
+        assert_eq!(prompt_for(&fresh, Some(&scratch.dir)), identity);
+        // And the argv, not just the prompt: the note adds no flag.
+        let model = SessionModel {
+            provider: TEST_PROVIDER,
+            model: TEST_MODEL,
+            thinking: None,
+        };
+        let clean_args = spawn_args(&clean, model, SpawnLayout::default());
+        let fresh_args = spawn_args(&fresh, model, SpawnLayout::default());
+        assert_eq!(clean_args.last(), Some(&identity));
+        assert_eq!(fresh_args.last(), Some(&identity));
+        // Only the `--session` path differs, as it must (index 3 holds it).
+        let without_session_path = |mut args: Vec<String>| {
+            args.remove(3);
+            args
+        };
+        assert_eq!(
+            without_session_path(clean_args),
+            without_session_path(fresh_args),
+        );
+    }
+
+    // A result that appears later in the file answers its call: old history is
+    // only "poison" when no result ever followed.
+    #[test]
+    fn a_tool_call_answered_later_is_not_dangling() {
+        let scratch = Scratch::new("resume_note_later");
+        let path = write_session(
+            &scratch,
+            "later.jsonl",
+            &[
+                tool_call_line("call-1", "bash"),
+                message_line(json!({"role": "user", "content": "keep going"})),
+                tool_result_line("call-1", "bash"),
+            ],
+        );
+        assert_eq!(prompt_for(&path, Some(&scratch.dir)), compose_system_prompt(false));
+    }
+
+    // Several calls can be in flight when the app dies, and a call from any
+    // earlier turn that never came back counts too.
+    #[test]
+    fn every_dangling_tool_call_is_named_in_the_resume_note() {
+        let scratch = Scratch::new("resume_note_many");
+        let path = write_session(
+            &scratch,
+            "many.jsonl",
+            &[
+                tool_call_line("call-0", "read"),
+                tool_result_line("call-0", "read"),
+                tool_call_line("call-1", "run_agent"),
+                tool_call_line("call-2", "bash"),
+                tool_call_line("call-3", "bash"),
+            ],
+        );
+        let prompt = prompt_for(&path, Some(&scratch.dir));
+        let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        for name in ["run_agent", "bash"] {
+            assert!(flat.contains(&format!("`{name}`")), "`{name}` is named: {flat}");
+        }
+        // Deduplicated with a count, and the answered `read` is not reported.
+        assert!(flat.contains("`bash` (2 calls)"), "counted once per tool: {flat}");
+        assert!(flat.contains("`run_agent` (1 call)"), "singular when one: {flat}");
+        assert!(!flat.contains("`read`"), "an answered call is not reported: {flat}");
+    }
+
+    // The real world: a hard kill can tear the last line, and a hand-edited file
+    // can hold anything. Neither may stop the session from opening.
+    #[test]
+    fn malformed_session_lines_are_skipped_not_fatal() {
+        let scratch = Scratch::new("resume_note_malformed");
+        let path = write_session(
+            &scratch,
+            "malformed.jsonl",
+            &[
+                "not json at all".to_string(),
+                "{\"type\":\"message\",\"message\":{\"role\":\"assis".to_string(),
+                String::new(),
+                tool_call_line("call-1", "bash"),
+                "[]".to_string(),
+                "{\"type\":\"message\",\"message\":42}".to_string(),
+            ],
+        );
+        let prompt = prompt_for(&path, Some(&scratch.dir));
+        assert!(prompt.contains("`bash`"), "the readable call is reported: {prompt}");
+        // A file of nothing but garbage composes today's prompt, unchanged.
+        let garbage = write_session(
+            &scratch,
+            "garbage.jsonl",
+            &["}{".to_string(), "null".to_string()],
+        );
+        assert_eq!(prompt_for(&garbage, None), compose_system_prompt(false));
     }
 }
