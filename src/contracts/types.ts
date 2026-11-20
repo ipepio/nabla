@@ -175,6 +175,12 @@ export interface SessionSummary {
   model: string | null;
   startedAt: string;
   updatedAt: string;
+  /**
+   * v5 of `odd/tasks/subagent-helpers.md`: the chat that delegated to this
+   * session, or `null` for a session the human started. It is what nests a child
+   * under its parent in the sidebar instead of listing it as another chat.
+   */
+  parentSessionId: number | null;
 }
 
 /** User-editable preferences persisted in settings.json. */
@@ -314,6 +320,33 @@ export interface TranscriptMessage {
 
 /** The roles a pi transcript line can have; anything else is ignored by Rust. */
 export type TranscriptRole = "user" | "assistant" | "tool";
+
+/**
+ * One child a chat delegated to, as `subagent_sessions` answers it (H3 of
+ * `odd/tasks/subagent-helpers.md`). Mirrors `SubagentSession` in
+ * `src-tauri/src/commands.rs`.
+ *
+ * `status` is read from the extension's manifest on every call, never from the
+ * database, so it cannot go stale: `queued`, `running`, `done`, `failed`, or
+ * `unknown` when the manifest no longer names a child the index still has. The
+ * child's transcript is a normal pi session file — `sessionTranscript` takes
+ * `sessionId` and works unchanged, which is why there is no child-specific reader.
+ */
+export interface SubagentSession {
+  sessionId: number;
+  /** The name of this run, what the parent's `agent_*` tools address. */
+  name: string;
+  /** The agent definition it runs. */
+  agent: string;
+  /** Absolute path of the child's own pi JSONL file. */
+  sessionPath: string;
+  status: SubagentStatus;
+  startedAt: string | null;
+  endedAt: string | null;
+}
+
+/** The states the manifest can report, plus the honest "we cannot tell". */
+export type SubagentStatus = "queued" | "running" | "done" | "failed" | "unknown";
 
 /**
  * One message of the preview the app keeps for a session: the newest turns as it

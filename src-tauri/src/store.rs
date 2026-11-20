@@ -52,6 +52,26 @@ pub struct SessionRow {
     pub model: Option<String>,
     pub started_at: String,
     pub updated_at: String,
+    /// v5 of `subagent-helpers.md` (H3): the chat that delegated to this session,
+    /// or `None` for a session the human started. A child row is indexed under the
+    /// workspace of its parent and dies with it (the FK cascade), which is what
+    /// makes the nested sidebar a filter on this column instead of a second table.
+    pub parent_session_id: Option<i64>,
+}
+
+/// The fields of one subagent child the host just discovered in the manifest
+/// (`subagent-helpers.md`, H3). Bundled so the store takes one value instead of
+/// five positional arguments, and so the manifest shape stays in the command
+/// layer: the store only ever sees a path, a title and two stamps.
+pub struct ChildSessionNew<'a> {
+    /// The parent session row the manifest named.
+    pub parent: &'a SessionRow,
+    /// Absolute path of the child's own pi JSONL file.
+    pub pi_session_path: &'a str,
+    /// The agent name the child runs — what the sidebar shows.
+    pub title: &'a str,
+    pub started_at: &'a str,
+    pub updated_at: &'a str,
 }
 
 /// S5: one persisted account badge — what the last probe said about a provider
@@ -224,6 +244,23 @@ impl Store {
                  COMMIT;",
             )?;
         }
+        if current < 5 {
+            // v5 (H3 of `subagent-helpers.md`): the link that makes a session row
+            // a *child* of the chat that delegated to it. Additive and nullable,
+            // so every existing row keeps its data and reads as "no parent". The
+            // cascade is what a subagent row owes its parent: a child that
+            // outlived the chat that started it would be an orphan in the sidebar
+            // with no turn to open it from.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE sessions ADD COLUMN parent_session_id INTEGER
+                   REFERENCES sessions(id) ON DELETE CASCADE;
+                 CREATE INDEX IF NOT EXISTS idx_sessions_parent
+                   ON sessions(parent_session_id);
+                 PRAGMA user_version = 5;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
     }
 
@@ -356,20 +393,9 @@ impl Store {
             ],
         )?;
         let row = conn.query_row(
-            "SELECT id, workspace_id, pi_session_path, title, model, started_at, updated_at
-             FROM sessions WHERE pi_session_path = ?1",
+            "SELECT id, workspace_id, pi_session_path, title, model, started_at, updated_at,\n                    parent_session_id\n             FROM sessions WHERE pi_session_path = ?1",
             [&session.pi_session_path],
-            |row| {
-                Ok(SessionRow {
-                    id: row.get(0)?,
-                    workspace_id: row.get(1)?,
-                    pi_session_path: row.get(2)?,
-                    title: row.get(3)?,
-                    model: row.get(4)?,
-                    started_at: row.get(5)?,
-                    updated_at: row.get(6)?,
-                })
-            },
+            session_from_row,
         )?;
         Ok(row)
     }
@@ -405,20 +431,9 @@ impl Store {
         let conn = self.conn()?;
         let row = conn
             .query_row(
-                "SELECT id, workspace_id, pi_session_path, title, model, started_at, updated_at
-                 FROM sessions WHERE id = ?1",
+                "SELECT id, workspace_id, pi_session_path, title, model, started_at, updated_at,\n                        parent_session_id\n                 FROM sessions WHERE id = ?1",
                 [id],
-                |row| {
-                    Ok(SessionRow {
-                        id: row.get(0)?,
-                        workspace_id: row.get(1)?,
-                        pi_session_path: row.get(2)?,
-                        title: row.get(3)?,
-                        model: row.get(4)?,
-                        started_at: row.get(5)?,
-                        updated_at: row.get(6)?,
-                    })
-                },
+                session_from_row,
             )
             .optional()?;
         Ok(row)
@@ -484,25 +499,91 @@ impl Store {
     pub fn list_sessions(&self, workspace_id: i64) -> StoreResult<Vec<SessionRow>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, workspace_id, pi_session_path, title, model, started_at, updated_at
+            "SELECT id, workspace_id, pi_session_path, title, model, started_at, updated_at,
+                    parent_session_id
              FROM sessions WHERE workspace_id = ?1
              ORDER BY updated_at DESC, id DESC",
         )?;
         let rows = stmt
-            .query_map([workspace_id], |row| {
-                Ok(SessionRow {
-                    id: row.get(0)?,
-                    workspace_id: row.get(1)?,
-                    pi_session_path: row.get(2)?,
-                    title: row.get(3)?,
-                    model: row.get(4)?,
-                    started_at: row.get(5)?,
-                    updated_at: row.get(6)?,
-                })
-            })?
+            .query_map([workspace_id], session_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    /// v5 (H3): indexes one child discovered in the manifest, under the parent the
+    /// manifest named, inheriting that parent's workspace.
+    ///
+    /// Idempotent and quiet on purpose: refreshing a listing re-reads the manifest
+    /// every time, and a child that is already indexed with the same parent, title
+    /// and stamp must cost one statement and no write. The `WHERE` on the upsert is
+    /// what makes that true — SQLite skips the row entirely when nothing changed.
+    /// A child always keeps its own `started_at`: that is when its run began, not
+    /// when this database first heard about it.
+    pub fn ensure_child_session(&self, child: &ChildSessionNew<'_>) -> StoreResult<SessionRow> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO sessions
+               (workspace_id, pi_session_path, title, model, started_at, updated_at,
+                parent_session_id)
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)
+             ON CONFLICT(pi_session_path) DO UPDATE SET
+               parent_session_id = excluded.parent_session_id,
+               title = excluded.title,
+               updated_at = excluded.updated_at
+             WHERE sessions.parent_session_id IS NOT excluded.parent_session_id
+                OR sessions.title IS NOT excluded.title
+                OR sessions.updated_at <> excluded.updated_at",
+            rusqlite::params![
+                child.parent.workspace_id,
+                child.pi_session_path,
+                child.title,
+                child.started_at,
+                child.updated_at,
+                child.parent.id,
+            ],
+        )?;
+        conn.query_row(
+            "SELECT id, workspace_id, pi_session_path, title, model, started_at, updated_at,
+                    parent_session_id
+             FROM sessions WHERE pi_session_path = ?1",
+            [child.pi_session_path],
+            session_from_row,
+        )
+        .map_err(StoreError::from)
+    }
+
+    /// v5 (H3): the children indexed under one parent, in the order they started.
+    /// The status is not stored — it lives in the manifest and is read fresh on
+    /// every listing, so a child's state can never be stale in the database.
+    pub fn child_sessions(&self, parent_session_id: i64) -> StoreResult<Vec<SessionRow>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, workspace_id, pi_session_path, title, model, started_at, updated_at,
+                    parent_session_id
+             FROM sessions WHERE parent_session_id = ?1
+             ORDER BY started_at, id",
+        )?;
+        let rows = stmt
+            .query_map([parent_session_id], session_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+}
+
+/// Maps one `sessions` row into its payload. Every session SELECT shares this,
+/// so the column order lives in exactly one place — adding v5's
+/// `parent_session_id` had to touch one line, not four queries.
+fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
+    Ok(SessionRow {
+        id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        pi_session_path: row.get(2)?,
+        title: row.get(3)?,
+        model: row.get(4)?,
+        started_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        parent_session_id: row.get(7)?,
+    })
 }
 
 /// Maps one `workspaces` row into its payload. Every workspace SELECT shares
@@ -687,10 +768,10 @@ mod tests {
             .upsert_session(&session_new(all[0].id, "/sessions/v1.jsonl"))
             .expect("sessions still work after the upgrade");
         assert!(session.id > 0);
-        // The migration chain runs to its head, so a v1 file leaves at v4 (the
-        // preview table joined in v4) and every earlier table is present along
-        // the way.
-        assert_eq!(user_version(&store), 4);
+        // The migration chain runs to its head, so a v1 file leaves at v5 (the
+        // parent link joined in v5) and every earlier table is present along the
+        // way.
+        assert_eq!(user_version(&store), 5);
         assert!(store.list_provider_status().expect("list status").is_empty());
         // A second open must not re-run the ALTER statements.
         drop(store);
@@ -764,7 +845,7 @@ mod tests {
             .expect("the cache accepts a row after the upgrade");
         assert_eq!(store.list_provider_status().expect("list").len(), 1);
 
-        assert_eq!(user_version(&store), 4, "v4 is the migration contract");
+        assert_eq!(user_version(&store), 5, "v5 is the migration contract");
     }
 
     // v4: the preview table is additive. Workspaces, sessions and the provider
@@ -818,7 +899,7 @@ mod tests {
 
         let store = Store::open(&db.0).expect("upgrade v3 -> v4");
 
-        assert_eq!(user_version(&store), 4);
+        assert_eq!(user_version(&store), 5);
         let workspaces = store.list_workspaces().expect("list workspaces");
         assert_eq!(workspaces.len(), 1, "the v3 workspace must survive");
         assert!(workspaces[0].pinned);
@@ -859,7 +940,7 @@ mod tests {
         // Reopening an already-migrated database re-runs nothing.
         drop(store);
         let reopened = Store::open(&db.0).expect("reopen");
-        assert_eq!(user_version(&reopened), 4);
+        assert_eq!(user_version(&reopened), 5);
         assert!(
             reopened
                 .session_preview(sessions[0].id)
@@ -993,10 +1074,10 @@ mod tests {
             .expect("insert");
         drop(store);
 
-        let reopened = Store::open(&db.0).expect("reopen a v4 database");
+        let reopened = Store::open(&db.0).expect("reopen a v5 database");
         assert_eq!(
             user_version(&reopened),
-            4,
+            5,
             "reopening must not change the schema version"
         );
         let rows = reopened.list_provider_status().expect("list");
@@ -1479,8 +1560,240 @@ mod tests {
             model,
             started_at: _,
             updated_at: _,
+            // v5: a session the human started has no parent.
+            parent_session_id,
         } = &row;
         assert!(pi_session_path.ends_with(".jsonl"));
         assert!(title.is_some() && model.is_some());
+        assert_eq!(parent_session_id, &None);
+    }
+
+    // v5 (H3 of `subagent-helpers.md`): the parent link is additive. A database
+    // that shipped before it arrives on the other side with every row intact, and
+    // every session it holds reads as "the human started it".
+    #[test]
+    fn open_upgrades_a_v4_database_to_v5_keeping_every_row() {
+        let db = TempDb::new("migrate_v4");
+        {
+            // Faithful v4 schema: everything above, with no parent link yet.
+            let conn = rusqlite::Connection::open(&db.0).expect("create v4 db");
+            conn.execute_batch(
+                "CREATE TABLE workspaces (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   path TEXT NOT NULL UNIQUE,
+                   name TEXT NOT NULL,
+                   created_at TEXT NOT NULL,
+                   pinned INTEGER NOT NULL DEFAULT 0,
+                   last_used_at TEXT
+                 );
+                 CREATE TABLE sessions (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+                   pi_session_path TEXT NOT NULL UNIQUE,
+                   title TEXT,
+                   model TEXT,
+                   started_at TEXT NOT NULL,
+                   updated_at TEXT NOT NULL
+                 );
+                 CREATE INDEX idx_sessions_workspace_updated
+                   ON sessions(workspace_id, updated_at DESC);
+                 CREATE TABLE provider_status (
+                   provider TEXT PRIMARY KEY,
+                   state TEXT NOT NULL,
+                   credential INTEGER NOT NULL,
+                   checked_at TEXT NOT NULL
+                 );
+                 CREATE TABLE session_preview (
+                   session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                   preview TEXT NOT NULL,
+                   updated_at TEXT NOT NULL
+                 );
+                 INSERT INTO workspaces (path, name, created_at, pinned, last_used_at)
+                   VALUES ('/tmp/v4-proj', 'v4-proj', '2026-04-01T00:00:00Z', 0, NULL);
+                 INSERT INTO sessions
+                   (workspace_id, pi_session_path, title, model, started_at, updated_at)
+                   VALUES (1, '/sessions/v4.jsonl', 'kept', 'gpt-6.1-sol',
+                           '2026-04-01T00:00:00Z', '2026-04-01T00:10:00Z');
+                 INSERT INTO session_preview (session_id, preview, updated_at)
+                   VALUES (1, '[]', '2026-04-01T00:11:00Z');
+                 PRAGMA user_version = 4;",
+            )
+            .expect("seed v4 schema");
+        }
+
+        let store = Store::open(&db.0).expect("upgrade v4 -> v5");
+
+        assert_eq!(user_version(&store), 5, "the chain reaches v5");
+        let sessions = store.list_sessions(1).expect("list");
+        assert_eq!(sessions.len(), 1, "the v4 session must survive");
+        assert_eq!(sessions[0].pi_session_path, "/sessions/v4.jsonl");
+        assert_eq!(
+            sessions[0].parent_session_id, None,
+            "a session that predates the link has no parent"
+        );
+        assert!(
+            store.session_preview(1).expect("preview").is_some(),
+            "the v4 preview must survive"
+        );
+
+        // The new column is usable straight away: a child links to that row.
+        let parent = store.session_by_id(1).expect("by id").expect("the row");
+        let child = store
+            .ensure_child_session(&ChildSessionNew {
+                parent: &parent,
+                pi_session_path: "/sessions/v4-child.jsonl",
+                title: "review",
+                started_at: "2026-04-02T00:00:00Z",
+                updated_at: "2026-04-02T00:01:00Z",
+            })
+            .expect("index a child after the upgrade");
+        assert_eq!(child.parent_session_id, Some(parent.id));
+
+        // Reopening an already-migrated database re-runs nothing.
+        drop(store);
+        let reopened = Store::open(&db.0).expect("reopen");
+        assert_eq!(user_version(&reopened), 5);
+    }
+
+    // v5: a child dies with the chat that started it. An orphan row would be a
+    // subagent the sidebar can never open from the turn that launched it.
+    #[test]
+    fn deleting_a_parent_session_cascades_its_child_rows() {
+        let db = TempDb::new("parent_cascade");
+        let store = Store::open(&db.0).expect("open");
+        let ws = ws_new(&store, "/tmp/proj-parent");
+        let parent = store
+            .upsert_session(&session_new(ws.id, "/sessions/parent.jsonl"))
+            .expect("insert parent");
+        let child = store
+            .ensure_child_session(&ChildSessionNew {
+                parent: &parent,
+                pi_session_path: "/sessions/child.jsonl",
+                title: "review",
+                started_at: "2026-05-01T10:00:00Z",
+                updated_at: "2026-05-01T10:05:00Z",
+            })
+            .expect("insert child");
+        let unrelated = store
+            .upsert_session(&session_new(ws.id, "/sessions/other.jsonl"))
+            .expect("insert unrelated");
+
+        assert!(store.delete_session(parent.id).expect("delete parent"));
+
+        assert_eq!(
+            store.session_by_id(child.id).expect("child lookup"),
+            None,
+            "the child row must not outlive its parent"
+        );
+        assert!(
+            store
+                .session_by_id(unrelated.id)
+                .expect("unrelated lookup")
+                .is_some(),
+            "a session with no parent link is untouched"
+        );
+    }
+
+    // v5: indexing a child is what a listing does on every call, so it has to be
+    // idempotent — the same row, the same id, never a duplicate — while still
+    // repairing a title that drifted.
+    #[test]
+    fn ensure_child_session_links_the_child_and_is_idempotent() {
+        let db = TempDb::new("child_upsert");
+        let store = Store::open(&db.0).expect("open");
+        let ws = ws_new(&store, "/tmp/proj-child");
+        let parent = store
+            .upsert_session(&session_new(ws.id, "/sessions/p.jsonl"))
+            .expect("insert parent");
+
+        let first = store
+            .ensure_child_session(&ChildSessionNew {
+                parent: &parent,
+                pi_session_path: "/sessions/c.jsonl",
+                title: "review",
+                started_at: "2026-05-02T10:00:00Z",
+                updated_at: "2026-05-02T10:05:00Z",
+            })
+            .expect("insert");
+        assert_eq!(first.workspace_id, ws.id, "the child inherits the workspace");
+        assert_eq!(first.parent_session_id, Some(parent.id));
+        assert_eq!(first.title.as_deref(), Some("review"));
+        assert_eq!(first.started_at, "2026-05-02T10:00:00Z");
+
+        let again = store
+            .ensure_child_session(&ChildSessionNew {
+                parent: &parent,
+                pi_session_path: "/sessions/c.jsonl",
+                title: "review",
+                started_at: "2026-05-02T10:00:00Z",
+                updated_at: "2026-05-02T10:05:00Z",
+            })
+            .expect("re-ensure");
+        assert_eq!(again.id, first.id, "the same file reuses its row");
+        assert_eq!(
+            store.list_sessions(ws.id).expect("list").len(),
+            2,
+            "one parent and one child, never a duplicate"
+        );
+
+        // A manifest that renamed the run repairs the title in place.
+        let renamed = store
+            .ensure_child_session(&ChildSessionNew {
+                parent: &parent,
+                pi_session_path: "/sessions/c.jsonl",
+                title: "review-2",
+                started_at: "2026-05-02T10:00:00Z",
+                updated_at: "2026-05-02T10:09:00Z",
+            })
+            .expect("repair");
+        assert_eq!(renamed.id, first.id);
+        assert_eq!(renamed.title.as_deref(), Some("review-2"));
+        assert_eq!(renamed.started_at, first.started_at, "the start is history");
+    }
+
+    // v5: the nested sidebar asks one parent for its children, so the query must
+    // be scoped to that parent and ordered by when each child started.
+    #[test]
+    fn child_sessions_lists_only_that_parents_children_in_start_order() {
+        let db = TempDb::new("child_list");
+        let store = Store::open(&db.0).expect("open");
+        let ws = ws_new(&store, "/tmp/proj-children");
+        let parent = store
+            .upsert_session(&session_new(ws.id, "/sessions/p.jsonl"))
+            .expect("insert parent");
+        let other = store
+            .upsert_session(&session_new(ws.id, "/sessions/other.jsonl"))
+            .expect("insert other parent");
+
+        for (path, at, owner) in [
+            ("/sessions/late.jsonl", "2026-06-01T12:00:00Z", &parent),
+            ("/sessions/early.jsonl", "2026-06-01T09:00:00Z", &parent),
+            ("/sessions/stranger.jsonl", "2026-06-01T10:00:00Z", &other),
+        ] {
+            store
+                .ensure_child_session(&ChildSessionNew {
+                    parent: owner,
+                    pi_session_path: path,
+                    title: "review",
+                    started_at: at,
+                    updated_at: at,
+                })
+                .expect("index child");
+        }
+
+        let children = store.child_sessions(parent.id).expect("list children");
+        let paths: Vec<&str> = children
+            .iter()
+            .map(|row| row.pi_session_path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["/sessions/early.jsonl", "/sessions/late.jsonl"],
+            "only this parent's children, in the order they started"
+        );
+        assert!(
+            store.child_sessions(other.id).expect("list").len() == 1,
+            "a sibling chat keeps its own child"
+        );
     }
 }

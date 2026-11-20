@@ -421,6 +421,9 @@ pub struct ProcessManager {
     /// that is the failure mode this field makes visible to the caller (see
     /// `lib.rs`, which reports it once at boot).
     permissions_extension: Option<PathBuf>,
+    /// The subagent helpers (`subagent-helpers.md`, H2). `None` when it could not
+    /// be materialized: every session still works, it simply cannot delegate.
+    subagents_extension: Option<PathBuf>,
     /// The absolute app data dir the gate reads its projection from (L4). `None`
     /// means the child never receives `NABLA_DATA_DIR`, so the gate cannot read
     /// any mode and falls back to `write` on every call — never to `yolo`.
@@ -439,6 +442,7 @@ impl ProcessManager {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             ask_extension: None,
             permissions_extension: None,
+            subagents_extension: None,
             data_dir: None,
         }
     }
@@ -456,6 +460,14 @@ impl ProcessManager {
     /// (`permission-modes.md`, M2).
     pub fn with_permissions_extension(mut self, path: PathBuf) -> ProcessManager {
         self.permissions_extension = Some(path);
+        self
+    }
+
+    /// Loads the subagent helpers into every child this manager spawns (`-e`),
+    /// next to the question extension and the gate (`subagent-helpers.md`, H2).
+    /// Without it a session has no way to delegate.
+    pub fn with_subagents_extension(mut self, path: PathBuf) -> ProcessManager {
+        self.subagents_extension = Some(path);
         self
     }
 
@@ -538,6 +550,7 @@ impl ProcessManager {
             SpawnLayout {
                 ask_extension: self.ask_extension.as_deref(),
                 permissions_extension: self.permissions_extension.as_deref(),
+                subagents_extension: self.subagents_extension.as_deref(),
                 data_dir: self.data_dir.as_deref(),
             },
         )
@@ -1007,6 +1020,8 @@ pub struct SessionModel<'a> {
 struct SpawnLayout<'a> {
     ask_extension: Option<&'a Path>,
     permissions_extension: Option<&'a Path>,
+    /// The subagent helpers (`subagent-helpers.md`, H2).
+    subagents_extension: Option<&'a Path>,
     /// Absolute `<data_dir>`; the MODE itself is never part of it.
     data_dir: Option<&'a Path>,
 }
@@ -1069,6 +1084,14 @@ fn spawn_args(
         args.push("-e".to_string());
         args.push(path.to_string_lossy().to_string());
     }
+    if let Some(path) = layout.subagents_extension {
+        // H2 of `subagent-helpers.md`: the four delegation tools. Without this
+        // flag the agent simply cannot delegate — nothing else breaks, which is
+        // why the caller reports a failed materialization instead of failing the
+        // start.
+        args.push("-e".to_string());
+        args.push(path.to_string_lossy().to_string());
+    }
     args.push("--append-system-prompt".to_string());
     args.push(NABLA_SYSTEM_PROMPT.to_string());
     args
@@ -1086,6 +1109,11 @@ const ASK_EXTENSION_SOURCE: &str = include_str!("../../../resources/nabla-ask.ts
 /// permission mode (`permission-modes.md`, M2), embedded the same way.
 const PERMISSIONS_EXTENSION_SOURCE: &str =
     include_str!("../../../resources/nabla-permissions.ts");
+
+/// The first-party pi extension that lets a session delegate to subagent
+/// sessions (`subagent-helpers.md`, H2), embedded the same way: `-e` must always
+/// point at a file that matches this build.
+const SUBAGENTS_EXTENSION_SOURCE: &str = include_str!("../../../resources/nabla-subagents.ts");
 
 /// Writes the embedded extension into `<data_dir>/extensions/nabla-ask.ts` and
 /// answers its absolute path, which is what `-e` receives at spawn.
@@ -1108,6 +1136,13 @@ pub fn materialize_permissions_extension(data_dir: &Path) -> std::io::Result<Pat
         "nabla-permissions.ts",
         PERMISSIONS_EXTENSION_SOURCE,
     )
+}
+
+/// Writes the subagent helpers into `<data_dir>/extensions/nabla-subagents.ts`
+/// and answers its absolute path, with the same content-idempotent rule as the
+/// two extensions above. On failure sessions run the same, without delegation.
+pub fn materialize_subagents_extension(data_dir: &Path) -> std::io::Result<PathBuf> {
+    materialize_extension(data_dir, "nabla-subagents.ts", SUBAGENTS_EXTENSION_SOURCE)
 }
 
 /// The one materializer both extensions use: `extensions/<name>` under the data
@@ -1570,7 +1605,9 @@ printf 'exited\n' >> '@MARKER@'
     // second `-e`, next to the built-in MCP support, because `--no-extensions`
     // leaves pi without any way to ask the human anything. M2 of
     // `permission-modes.md`: the permission gate is the third `-e`, loaded right
-    // after it — a gate nobody loads is a gate that blocks nothing.
+    // after it — a gate nobody loads is a gate that blocks nothing. H2 of
+    // `subagent-helpers.md`: the subagent helpers are the fourth, because a
+    // session that cannot be loaded with them cannot delegate at all.
     #[test]
     fn spawn_args_match_the_pi_rpc_invocation() {
         let args = spawn_args(
@@ -1584,6 +1621,9 @@ printf 'exited\n' >> '@MARKER@'
                 ask_extension: Some(Path::new("/tmp/nabla/extensions/nabla-ask.ts")),
                 permissions_extension: Some(Path::new(
                     "/tmp/nabla/extensions/nabla-permissions.ts",
+                )),
+                subagents_extension: Some(Path::new(
+                    "/tmp/nabla/extensions/nabla-subagents.ts",
                 )),
                 data_dir: Some(Path::new("/tmp/nabla")),
             },
@@ -1610,6 +1650,8 @@ printf 'exited\n' >> '@MARKER@'
                 "/tmp/nabla/extensions/nabla-ask.ts".to_string(),
                 "-e".to_string(),
                 "/tmp/nabla/extensions/nabla-permissions.ts".to_string(),
+                "-e".to_string(),
+                "/tmp/nabla/extensions/nabla-subagents.ts".to_string(),
                 "--append-system-prompt".to_string(),
                 NABLA_SYSTEM_PROMPT.to_string(),
             ]
@@ -1621,8 +1663,8 @@ printf 'exited\n' >> '@MARKER@'
     }
 
     // Without a materialized extension the session still has to start: the agent
-    // simply has no ask tools and no gate, and the flag list must not carry a
-    // dangling `-e`.
+    // simply has no ask tools, no gate and no delegation, and the flag list must
+    // not carry a dangling `-e`.
     #[test]
     fn spawn_args_omit_the_extra_flag_when_no_extension_was_materialized() {
         let args = spawn_args(
@@ -1803,6 +1845,68 @@ printf 'exited\n' >> '@MARKER@'
         assert!(PERMISSIONS_EXTENSION_SOURCE.contains("preflight"));
     }
 
+    // H2 of `subagent-helpers.md`: the four tools a session can only have if this
+    // extension is loaded, and the two facts the feature would be dishonest
+    // without — no recursion, and the permission gate applied to the child's
+    // allowlist (H1.1: the parent's `tool_call` hook never sees a child).
+    #[test]
+    fn the_subagents_extension_registers_the_four_tools() {
+        for tool in [
+            "run_agent",
+            "agent_status",
+            "agent_cancel",
+            "agent_send_message",
+        ] {
+            assert!(
+                SUBAGENTS_EXTENSION_SOURCE.contains(tool),
+                "the extension must register `{tool}`"
+            );
+        }
+        // H1.1: the gate is applied while the allowlist is built, reading the
+        // same projection the gate itself reads on every tool call.
+        assert!(SUBAGENTS_EXTENSION_SOURCE.contains("permissions.json"));
+        assert!(SUBAGENTS_EXTENSION_SOURCE.contains("NABLA_DATA_DIR"));
+        // H1.2/H1.3: the SDK is the runner, and the child's file is ours to place.
+        for needle in ["createAgentSession", "SessionManager.open", "excludeTools"] {
+            assert!(
+                SUBAGENTS_EXTENSION_SOURCE.contains(needle),
+                "the extension must use `{needle}`"
+            );
+        }
+        // H2: the host contract is the manifest, keyed by the parent's own path.
+        assert!(SUBAGENTS_EXTENSION_SOURCE.contains("getSessionFile()"));
+        assert!(SUBAGENTS_EXTENSION_SOURCE.contains("parentSessionPath"));
+        assert!(SUBAGENTS_EXTENSION_SOURCE.contains("\"subagents\""));
+        // S6: a child never asks the human anything, so the extension must not
+        // reach for the ask dialogs the question bridge owns.
+        assert!(!SUBAGENTS_EXTENSION_SOURCE.contains("ctx.ui.select("));
+        assert!(!SUBAGENTS_EXTENSION_SOURCE.contains("ctx.ui.input("));
+    }
+
+    // H2: the extension is embedded and written at boot, so `-e` always points at
+    // a file that matches this binary — same rule as the two extensions above.
+    #[test]
+    fn materialize_subagents_extension_writes_the_embedded_source_idempotently() {
+        let scratch = Scratch::new("subagents_extension");
+        let path = materialize_subagents_extension(&scratch.dir).expect("materialize");
+        assert_eq!(
+            path,
+            scratch.dir.join("extensions").join("nabla-subagents.ts")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            SUBAGENTS_EXTENSION_SOURCE
+        );
+        std::fs::write(&path, "// stale helpers\n").expect("write stale copy");
+        let again = materialize_subagents_extension(&scratch.dir).expect("rematerialize");
+        assert_eq!(again, path);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            SUBAGENTS_EXTENSION_SOURCE,
+            "a stale copy must be replaced by the embedded one"
+        );
+    }
+
     // L4: the child learns WHERE the projection is (`NABLA_DATA_DIR`), never WHAT
     // the mode is — an environment is fixed at spawn time, so a mode in it could
     // not change without restarting the session (S2).
@@ -1822,6 +1926,7 @@ printf 'exited\n' >> '@MARKER@'
                 permissions_extension: Some(Path::new(
                     "/data/extensions/nabla-permissions.ts",
                 )),
+                subagents_extension: None,
                 data_dir: Some(Path::new("/data")),
             },
         );

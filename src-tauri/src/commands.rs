@@ -2147,6 +2147,208 @@ pub fn session_transcript(
     session_transcript_for(&state.store, &session_id)
 }
 
+// ── subagent sessions (H3 of `subagent-helpers.md`) ─────────────────────────
+
+/// One child as the extension's manifest describes it.
+///
+/// Every field is optional on purpose: the manifest is written by an extension
+/// this file does not compile against, so a newer or older copy of it must be
+/// readable rather than fatal. A line that cannot name a session file is skipped
+/// by the sync below instead of failing a whole listing.
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct SubagentManifestEntry {
+    /// The name of this run (`review`, `review-2`), which the parent's tools use.
+    name: String,
+    /// The agent definition the child runs.
+    agent: String,
+    /// Absolute path of the child's own pi JSONL file.
+    session_path: String,
+    /// `queued`, `running`, `done` or `failed`.
+    status: String,
+    started_at: Option<String>,
+    ended_at: Option<String>,
+    /// The parent's own pi session file — the join key back to `sessions`.
+    parent_session_path: Option<String>,
+}
+
+/// One child as the command answers it: the indexed row plus the live status the
+/// manifest holds. `status` is never stored in the database, so it cannot go
+/// stale between two reads of the same manifest.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentSession {
+    pub session_id: i64,
+    pub name: String,
+    pub agent: String,
+    pub session_path: String,
+    pub status: String,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+}
+
+/// Directory the extension publishes its manifests in, under the app data dir.
+fn manifests_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("subagents")
+}
+
+/// Parses one manifest body: a JSON array of children. Anything else — a file a
+/// crash left half-written, an object where an array belongs — contributes no
+/// children and is not an error.
+fn manifest_entries(body: &str) -> Vec<SubagentManifestEntry> {
+    let parsed = serde_json::from_str::<serde_json::Value>(body);
+    match parsed {
+        Ok(serde_json::Value::Array(items)) => items
+            .into_iter()
+            .filter_map(|item| serde_json::from_value(item).ok())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Every child every manifest in `<data_dir>/subagents/` declares, in file order.
+///
+/// Read fresh on every call (H3.3): the manifest is the only place a child's live
+/// status exists, and caching it here would make an open sidebar show a finished
+/// child as running.
+fn read_manifests(data_dir: &Path) -> Vec<SubagentManifestEntry> {
+    let dir = manifests_dir(data_dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        // No directory yet: no session has delegated, which is an empty answer.
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    files.sort();
+    let mut children = Vec::new();
+    for file in files {
+        if let Ok(body) = std::fs::read_to_string(&file) {
+            children.extend(manifest_entries(&body));
+        }
+    }
+    children
+}
+
+/// The status word the contract allows. A word this build does not know reads as
+/// `unknown` — never as `done` (a run wrongly reported as finished is worse than
+/// one the UI shows without a state) and never as `running` (which would look
+/// live forever).
+fn manifest_status(raw: &str) -> String {
+    match raw.trim() {
+        "queued" | "running" | "done" | "failed" => raw.trim().to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+/// H3: indexes every child the manifests attribute to `parent`.
+///
+/// The link is the parent's own pi session file, which is the only handle the
+/// extension can know about its session — a manifest that names a path no row has
+/// links nothing and is skipped, because guessing the parent from "the workspace's
+/// active chat" would attach a child to the wrong conversation.
+fn sync_subagent_children(
+    store: &Store,
+    data_dir: &Path,
+    parent: &SessionRow,
+) -> Result<Vec<SessionRow>, String> {
+    for entry in read_manifests(data_dir) {
+        if entry.parent_session_path.as_deref() != Some(parent.pi_session_path.as_str()) {
+            continue;
+        }
+        if entry.session_path.trim().is_empty() {
+            continue;
+        }
+        // The agent definition is what the sidebar calls the child; the run name
+        // is what the parent's tools address. Without an agent, the run name is
+        // all there is.
+        let title = if entry.agent.trim().is_empty() {
+            entry.name.clone()
+        } else {
+            entry.agent.clone()
+        };
+        let started_at = entry.started_at.clone().unwrap_or_else(now_iso);
+        let updated_at = entry.ended_at.clone().unwrap_or_else(|| started_at.clone());
+        store
+            .ensure_child_session(&crate::store::ChildSessionNew {
+                parent,
+                pi_session_path: &entry.session_path,
+                title: &title,
+                started_at: &started_at,
+                updated_at: &updated_at,
+            })
+            .map_err(display_err)?;
+    }
+    store.child_sessions(parent.id).map_err(display_err)
+}
+
+/// H3: the children of one chat, with the status the manifest holds right now.
+///
+/// The database contributes identity (the row, its file) and the manifest
+/// contributes state, so the answer is live without a write per call: the sync
+/// above only inserts a child it has never seen.
+fn subagent_sessions_for(
+    store: &Store,
+    data_dir: &Path,
+    workspace_id: i64,
+    parent_session_id: i64,
+) -> Result<Vec<SubagentSession>, String> {
+    let parent = store
+        .session_by_id(parent_session_id)
+        .map_err(display_err)?
+        .ok_or_else(|| unknown_session(&parent_session_id.to_string()))?;
+    if parent.workspace_id != workspace_id {
+        return Err(format!(
+            "session {parent_session_id} is not indexed in workspace {workspace_id}"
+        ));
+    }
+    let manifests = read_manifests(data_dir);
+    let rows = sync_subagent_children(store, data_dir, &parent)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let live = manifests
+                .iter()
+                .find(|entry| entry.session_path == row.pi_session_path);
+            SubagentSession {
+                session_id: row.id,
+                name: live
+                    .map(|entry| entry.name.clone())
+                    .filter(|name| !name.trim().is_empty())
+                    .or_else(|| row.title.clone())
+                    .unwrap_or_else(|| format!("subagent-{}", row.id)),
+                agent: live
+                    .map(|entry| entry.agent.clone())
+                    .filter(|agent| !agent.trim().is_empty())
+                    .or_else(|| row.title.clone())
+                    .unwrap_or_default(),
+                status: live.map_or_else(|| "unknown".to_string(), |entry| {
+                    manifest_status(&entry.status)
+                }),
+                session_path: row.pi_session_path,
+                started_at: live
+                    .and_then(|entry| entry.started_at.clone())
+                    .or(Some(row.started_at)),
+                ended_at: live.and_then(|entry| entry.ended_at.clone()),
+            }
+        })
+        .collect())
+}
+
+/// H3.3: the children the chat at `parent_session_id` started, so the sidebar can
+/// nest them under it and each one can open its own transcript (a child's JSONL is
+/// a normal pi session file — `session_transcript` reads it as-is).
+#[tauri::command]
+pub fn subagent_sessions(
+    state: State<'_, AppState>,
+    workspace_id: i64,
+    parent_session_id: i64,
+) -> Result<Vec<SubagentSession>, String> {
+    subagent_sessions_for(&state.store, &state.data_dir, workspace_id, parent_session_id)
+}
+
 // ── session preview: the instant first paint ────────────────────────────────
 
 /// How many messages a preview keeps. Matches the tail `session-store.ts` sends,
@@ -5260,5 +5462,321 @@ exit 1
         assert!(err.contains("unknown workspace"), "got {err:?}");
         assert_eq!(process_attempts(&fixture), 0, "nothing was spawned");
         assert!(runtime.live_ids().is_empty());
+    }
+
+    // ── subagent sessions (H3 of `subagent-helpers.md`) ─────────────────────
+
+    /// A store with one workspace and one indexed session, plus the data dir the
+    /// extension would publish its manifests into: everything the linkage needs and
+    /// nothing else.
+    struct SubagentFixture {
+        dir: TempSeedDir,
+        store: Store,
+        workspace_id: i64,
+        parent: SessionRow,
+    }
+
+    impl SubagentFixture {
+        fn new(tag: &str) -> Self {
+            let dir = TempSeedDir::new(tag);
+            let store = dir.store();
+            let workspace = store.add_workspace("/tmp/proj-subagents", None).expect("ws");
+            let parent = store
+                .upsert_session(&SessionNew {
+                    workspace_id: workspace.id,
+                    pi_session_path: "/sessions/parent-chat.jsonl".into(),
+                    title: Some("the chat".into()),
+                    model: Some("gpt-6.1-sol".into()),
+                    started_at: "2026-07-01T09:00:00Z".into(),
+                    updated_at: "2026-07-01T09:30:00Z".into(),
+                })
+                .expect("parent session");
+            SubagentFixture {
+                dir,
+                store,
+                workspace_id: workspace.id,
+                parent,
+            }
+        }
+
+        fn data_dir(&self) -> std::path::PathBuf {
+            self.dir.0.join("data")
+        }
+
+        /// The manifest the extension writes, under a name that does NOT encode
+        /// the parent: the link is the `parentSessionPath` field, never the file
+        /// name, so a rename cannot silently unparent a child.
+        fn write_manifest(&self, file: &str, body: &str) {
+            let dir = self.data_dir().join("subagents");
+            std::fs::create_dir_all(&dir).expect("manifest dir");
+            std::fs::write(dir.join(file), body).expect("manifest");
+        }
+    }
+
+    // H3.1/H3.2: the manifest is the whole host contract, so parsing it is the one
+    // place a newer or older extension could break the sidebar. A line that names
+    // no session file, a body that is not an array and a field this build does not
+    // know must all be readable without failing anything.
+    #[test]
+    fn manifest_entries_reads_the_host_contract() {
+        let entries = manifest_entries(
+            r#"[
+              {
+                "name": "review",
+                "agent": "reviewer",
+                "sessionPath": "/data/sessions/subagents/a.jsonl",
+                "status": "running",
+                "startedAt": "2026-07-01T10:00:00.000Z",
+                "endedAt": null,
+                "parentSessionPath": "/sessions/parent-chat.jsonl",
+                "somethingNewer": 42
+              },
+              { "agent": "reviewer" }
+            ]"#,
+        );
+        assert_eq!(entries.len(), 2, "both lines parse: {entries:?}");
+        assert_eq!(entries[0].name, "review");
+        assert_eq!(entries[0].agent, "reviewer");
+        assert_eq!(
+            entries[0].session_path,
+            "/data/sessions/subagents/a.jsonl"
+        );
+        assert_eq!(entries[0].status, "running");
+        assert_eq!(entries[0].ended_at, None);
+        assert_eq!(
+            entries[0].parent_session_path.as_deref(),
+            Some("/sessions/parent-chat.jsonl")
+        );
+        // A half-written line keeps the fields it has: the sync skips it for
+        // having no path, it does not fail the listing.
+        assert_eq!(entries[1].session_path, "");
+
+        assert!(manifest_entries("").is_empty());
+        assert!(manifest_entries("{}").is_empty(), "an object is not a list");
+        assert!(manifest_entries("not json").is_empty());
+    }
+
+    // H3.2/H3.6: a child the manifest attributes to a chat is indexed under that
+    // chat, in its workspace, and the answer carries the run's identity.
+    #[test]
+    fn subagent_sessions_links_a_child_to_the_manifest_parent() {
+        let fixture = SubagentFixture::new("subagent_link");
+        fixture.write_manifest(
+            "parent-chat.json",
+            r#"[
+              {
+                "name": "review",
+                "agent": "reviewer",
+                "sessionPath": "/data/sessions/subagents/child-a.jsonl",
+                "status": "running",
+                "startedAt": "2026-07-01T10:00:00Z",
+                "endedAt": null,
+                "parentSessionPath": "/sessions/parent-chat.jsonl"
+              }
+            ]"#,
+        );
+
+        let children = subagent_sessions_for(
+            &fixture.store,
+            &fixture.data_dir(),
+            fixture.workspace_id,
+            fixture.parent.id,
+        )
+        .expect("list children");
+
+        assert_eq!(children.len(), 1, "got {children:?}");
+        assert_eq!(children[0].name, "review");
+        assert_eq!(children[0].agent, "reviewer");
+        assert_eq!(
+            children[0].session_path,
+            "/data/sessions/subagents/child-a.jsonl"
+        );
+        assert_eq!(children[0].status, "running");
+        // The row really is a child row of the index, not just a payload.
+        let row = fixture
+            .store
+            .session_by_id(children[0].session_id)
+            .expect("by id")
+            .expect("the row");
+        assert_eq!(row.parent_session_id, Some(fixture.parent.id));
+        assert_eq!(row.workspace_id, fixture.workspace_id);
+        assert_eq!(row.title.as_deref(), Some("reviewer"));
+    }
+
+    // H3.3: the status is live — read from the manifest on every call — while the
+    // row behind it is not rewritten, so refreshing a sidebar costs no writes.
+    #[test]
+    fn subagent_sessions_reports_live_status_without_adding_a_row_twice() {
+        let fixture = SubagentFixture::new("subagent_status");
+        let running = r#"[
+              {
+                "name": "review",
+                "agent": "reviewer",
+                "sessionPath": "/data/sessions/subagents/child-a.jsonl",
+                "status": "running",
+                "startedAt": "2026-07-01T10:00:00Z",
+                "endedAt": null,
+                "parentSessionPath": "/sessions/parent-chat.jsonl"
+              },
+              {
+                "name": "tests",
+                "agent": "tester",
+                "sessionPath": "/data/sessions/subagents/child-b.jsonl",
+                "status": "done",
+                "startedAt": "2026-07-01T10:01:00Z",
+                "endedAt": "2026-07-01T10:04:00Z",
+                "parentSessionPath": "/sessions/parent-chat.jsonl"
+              }
+            ]"#;
+        fixture.write_manifest("parent-chat.json", running);
+
+        let first = subagent_sessions_for(
+            &fixture.store,
+            &fixture.data_dir(),
+            fixture.workspace_id,
+            fixture.parent.id,
+        )
+        .expect("first listing");
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].status, "running");
+        assert_eq!(first[0].ended_at, None);
+        assert_eq!(first[1].status, "done");
+        assert_eq!(first[1].ended_at.as_deref(), Some("2026-07-01T10:04:00Z"));
+        let ids: Vec<i64> = first.iter().map(|child| child.session_id).collect();
+
+        // The same manifest again: same rows, no duplicates, no drift.
+        let again = subagent_sessions_for(
+            &fixture.store,
+            &fixture.data_dir(),
+            fixture.workspace_id,
+            fixture.parent.id,
+        )
+        .expect("second listing");
+        assert_eq!(
+            again.iter().map(|child| child.session_id).collect::<Vec<_>>(),
+            ids,
+            "re-reading a manifest must not add rows"
+        );
+
+        // The child finishes: the very next call says so, with no write of ours.
+        fixture.write_manifest(
+            "parent-chat.json",
+            &running.replace("\"running\"", "\"done\""),
+        );
+        let finished = subagent_sessions_for(
+            &fixture.store,
+            &fixture.data_dir(),
+            fixture.workspace_id,
+            fixture.parent.id,
+        )
+        .expect("third listing");
+        assert_eq!(finished[0].session_id, ids[0]);
+        assert_eq!(finished[0].status, "done");
+        assert_eq!(
+            fixture
+                .store
+                .child_sessions(fixture.parent.id)
+                .expect("children")
+                .len(),
+            2,
+            "two children, still"
+        );
+    }
+
+    // H3.6 negative case: a manifest whose parent path matches no indexed session
+    // links nothing. Attaching the child to "the workspace's active chat" would
+    // be a guess, and a wrong guess shows a stranger's work under this turn.
+    #[test]
+    fn subagent_sessions_skips_a_manifest_with_no_indexed_parent() {
+        let fixture = SubagentFixture::new("subagent_orphan");
+        fixture.write_manifest(
+            "orphan.json",
+            r#"[
+              {
+                "name": "review",
+                "agent": "reviewer",
+                "sessionPath": "/data/sessions/subagents/orphan.jsonl",
+                "status": "done",
+                "startedAt": "2026-07-01T10:00:00Z",
+                "endedAt": "2026-07-01T10:02:00Z",
+                "parentSessionPath": "/sessions/not-indexed.jsonl"
+              }
+            ]"#,
+        );
+
+        let children = subagent_sessions_for(
+            &fixture.store,
+            &fixture.data_dir(),
+            fixture.workspace_id,
+            fixture.parent.id,
+        )
+        .expect("an orphan manifest is not an error");
+        assert!(children.is_empty(), "got {children:?}");
+        assert_eq!(
+            fixture.store.list_sessions(fixture.workspace_id).expect("list"),
+            vec![fixture.parent.clone()],
+            "nothing was indexed for a manifest the host cannot attribute"
+        );
+
+        // A parent that is not indexed at all is answered by name.
+        let err = subagent_sessions_for(
+            &fixture.store,
+            &fixture.data_dir(),
+            fixture.workspace_id,
+            424242,
+        )
+        .expect_err("an unindexed parent");
+        assert!(err.contains("unknown session"), "got {err:?}");
+    }
+
+    // H3.4: a child's file is a normal pi JSONL, so the existing reader serves the
+    // child view without a special case — no new endpoint, no copy of the content.
+    #[test]
+    fn a_child_transcript_reads_like_any_other_session() {
+        let fixture = SubagentFixture::new("subagent_transcript");
+        let session_dir = fixture.data_dir().join("sessions").join("subagents");
+        std::fs::create_dir_all(&session_dir).expect("session dir");
+        let child_path = session_dir.join("child-a.jsonl");
+        std::fs::write(
+            &child_path,
+            "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"review the diff\"}}\n\
+             {\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"nothing to fix\"}}\n",
+        )
+        .expect("child transcript");
+        let manifest = format!(
+            r#"[
+              {{
+                "name": "review",
+                "agent": "reviewer",
+                "sessionPath": "{}",
+                "status": "done",
+                "startedAt": "2026-07-01T10:00:00Z",
+                "endedAt": "2026-07-01T10:02:00Z",
+                "parentSessionPath": "{}"
+              }}
+            ]"#,
+            child_path.to_string_lossy(),
+            fixture.parent.pi_session_path
+        );
+        fixture.write_manifest("parent-chat.json", &manifest);
+
+        let children = subagent_sessions_for(
+            &fixture.store,
+            &fixture.data_dir(),
+            fixture.workspace_id,
+            fixture.parent.id,
+        )
+        .expect("list children");
+        let transcript = session_transcript_for(
+            &fixture.store,
+            &children[0].session_id.to_string(),
+        )
+        .expect("the child transcript");
+
+        assert_eq!(transcript.len(), 2, "got {transcript:?}");
+        assert_eq!(transcript[0].role, "user");
+        assert_eq!(transcript[0].text, "review the diff");
+        assert_eq!(transcript[1].role, "assistant");
+        assert_eq!(transcript[1].text, "nothing to fix");
     }
 }

@@ -62,6 +62,15 @@ pub fn run() {
                     None
                 }
             };
+            // H2 of `subagent-helpers.md`: the delegation helpers are written the
+            // same way. Not fatal: without them a session simply cannot delegate.
+            let subagents_extension = match process::materialize_subagents_extension(&data_dir) {
+                Ok(path) => Some(path),
+                Err(err) => {
+                    eprintln!("could not materialize the subagent helpers: {err}");
+                    None
+                }
+            };
             // L4 of `permission-modes.md`: the gate reads the current mode from
             // `<data_dir>/permissions.json` on every tool call, so the projection
             // has to exist before the first child does. A failure is not fatal —
@@ -105,6 +114,13 @@ pub fn run() {
             // without restarting the session.
             let runtime = match permissions_extension {
                 Some(path) => runtime.with_permissions_extension(path),
+                None => runtime,
+            };
+            // H2 of `subagent-helpers.md`: and with the delegation helpers, so a
+            // chat can start child sessions (their JSONL files land under the data
+            // dir the host already owns).
+            let runtime = match subagents_extension {
+                Some(path) => runtime.with_subagents_extension(path),
                 None => runtime,
             };
             let runtime = runtime.with_data_dir(data_dir.clone());
@@ -248,6 +264,10 @@ pub fn run() {
             // and read back from the pi-owned file.
             commands::open_session,
             commands::session_transcript,
+            // H3 of `subagent-helpers.md`: the subagent children a chat's manifest
+            // links to it, so the sidebar can nest them under the turn that
+            // started them.
+            commands::subagent_sessions,
             // The preview: the newest turns as the app last streamed them, with
             // their reasoning, so a session paints before pi boots.
             commands::save_session_preview,

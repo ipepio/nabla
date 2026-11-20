@@ -36,6 +36,7 @@ import type {
   SessionSummary,
   ShellOutputEvent,
   ShellSession,
+  SubagentSession,
   ThinkingLevel,
   TranscriptMessage,
   UiAnswer,
@@ -794,6 +795,27 @@ export function sessionTranscript(
   sessionId: string,
 ): Promise<TranscriptMessage[]> {
   return invoke<TranscriptMessage[]>("session_transcript", { sessionId });
+}
+
+/**
+ * H3 of `odd/tasks/subagent-helpers.md`: the children a chat delegated to, so the
+ * sidebar can nest them under the turn that started them.
+ *
+ * The status is live: Rust re-reads the extension's manifest on every call, so a
+ * child that just finished reads as `done` without the caller polling a cache.
+ * It also indexes any child it has never seen, which is why opening a chat is
+ * enough for its children to appear. Each child's `sessionId` is a normal session
+ * id — `sessionTranscript` reads it as-is, because the child's file is a pi JSONL
+ * like any other.
+ */
+export function subagentSessions(
+  workspaceId: number,
+  parentSessionId: number,
+): Promise<SubagentSession[]> {
+  return invoke<SubagentSession[]>("subagent_sessions", {
+    workspaceId,
+    parentSessionId,
+  });
 }
 
 /**
