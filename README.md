@@ -14,6 +14,7 @@ builds.
 | macOS | 13+ | the only platform exercised so far. Linux/Windows are untested |
 | [Node.js](https://nodejs.org) | 22+ | Vite and the Tauri CLI |
 | [Rust](https://rustup.rs) | 1.85+ | the crate uses edition 2024 |
+| [pnpm](https://pnpm.io) | 12+ | the only package manager this repo uses |
 | Xcode Command Line Tools | — | `xcode-select --install` |
 | [Pi](https://github.com/earendil-works/pi) | latest | `npm install -g @earendil-works/pi-coding-agent` |
 
@@ -26,10 +27,11 @@ pi --version
 ## Run it
 
 ```bash
+corepack enable        # ships with Node 22+
 git clone git@github.com:nabla-agent/nabla.git
 cd nabla
-npm install
-npm run tauri dev
+pnpm install
+pnpm tauri dev
 ```
 
 The first build compiles the whole Rust dependency tree; expect several minutes.
@@ -48,7 +50,7 @@ conversation.
    the effort selector next to it controls how much the model thinks.
 
 If sessions fail to start with `failed to spawn pi (pi)`, the app could not find the
-binary. Launching from a terminal (`npm run tauri dev`) inherits your shell `PATH` and
+binary. Launching from a terminal (`pnpm tauri dev`) inherits your shell `PATH` and
 usually fixes it; a Finder-launched app does not. As a last resort set the absolute
 path in `settings.json`:
 
@@ -91,7 +93,7 @@ everything.
 ## Checks
 
 ```bash
-npm run build                         # frontend gate: vue-tsc --noEmit + vite build
+pnpm run build                        # frontend gate: vue-tsc --noEmit + vite build
 cd src-tauri && cargo test            # Rust tests
 cd src-tauri && cargo clippy          # Rust lint
 ```
@@ -101,7 +103,7 @@ There is no frontend test runner; UI behaviour is verified by hand.
 ## Build a desktop app
 
 ```bash
-npm run tauri build
+pnpm tauri build
 ```
 
 The bundle lands in `src-tauri/target/release/bundle/`. It is **unsigned and
