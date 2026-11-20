@@ -37,12 +37,14 @@ pi padre (sesión del chat, ProcessManager, eventos → puente)
 - **Vista**: transcript del niño con el renderizador existente (grupos por turno ya funcionan con cualquier JSONL de pi) + tail en vivo mientras `status = running`.
 - **Permisos**: el gate global ya corre en el proceso del padre; si el hook cubre a los niños (H1), el modo lectura/escritura/yolo aplica también a ellos por herencia real, no por configuración.
 
-## Verificaciones pendientes (H1, antes de implementar)
+## H1 — verificado (responde las cuatro)
 
-1. ¿El hook `tool_call` de `nabla-permissions` intercepta las tools de una sesión SDK anidada? (decide si heredan permisos gratis)
-2. ¿`nested_session_path` es convención de pi (dónde vive el JSONL del niño exactamente) y viaja en el `details` del tool result — o hay que exponerla desde nuestra extensión?
-3. ¿Cómo importa una extensión el SDK (`loadPiSdkModule`)? Y qué opciones acepta `createAgentSession` (¿sink de eventos?).
-4. ¿El niño carga extensiones (nabla-ask) o arranca limpio? (S6 asume limpio)
+1. **El hook NO ve a los niños**: cada `createAgentSession` arma su propio `Agent` y un runner de extensiones privado (`dist/core/sdk.js:69`); el `tool_call` del padre no intercepta nada del niño. **Consecuencia**: el gate de permisos se aplica **al construir la allowlist** — nuestra extensión lee la proyección de permisos (como `nabla-permissions`) y en modo `read` quita `bash/powershell/edit/write` de la allowlist del niño. Enforcement real, no indirecto.
+2. **La allowlist `tools` ES de verdad** (sdk.d.ts: una tool no listada no se registra ni corre). Matices: MCP queda *registrada* para codemode salvo entrada `mcp__*` o lista vacía — irrelevante para niños limpios sin extensiones; una lista de sólo `+name/-name` son modificadores, no allowlist. V1: nombres llanos explícitos + `excludeTools: ["mcp__*"]` por cinturón y tirantes.
+3. **El JSONL del niño lo colocamos nosotros**: `CreateAgentSessionOptions.sessionManager` acepta un manager propio (constructor: cwd, sessionDir, sessionFile…) → el niño escribe en `<NABLA_DATA_DIR>/sessions/subagents/<uuid>.jsonl`, determinista, y la extensión reporta la ruta al host. **Sin depender de la convención `nested_session_path` de pi ni de la SQLite de la referencia.**
+4. **Niños limpios** (decisión del humano: «así se ciñe a lo que le pide el padre»): el SDK no carga extensiones en las sesiones que crea; el import es por el main del paquete (`createAgentSession` exportado de `dist/index.js`), mismo patrón que `nabla-ask`.
+
+**Contrato de host (vínculo)**: la extensión escribe un **manifiesto** `<NABLA_DATA_DIR>/subagents/<clave-padre>.json` con los hijos (nombre, ruta JSONL, estado, timestamps) al crear/terminar cada niño; Rust lo lee para indexar y enlazar. La clave del padre: la extensión debe aprender su propia identidad de sesión (verificar acceso a sessionFile desde el ExtensionAPI/ctx; si no existe, manifest por workspace y enlace por el padre activo — más débil, y se declara).
 
 ## Tasks (se refinan con H1)
 
