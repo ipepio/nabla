@@ -29,3 +29,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Rust build output: regenerable, and it was committed once by the scaffold —
+# 3924 files that then blocked a fast-forward when cargo rewrote them.
+/src-tauri/target/
