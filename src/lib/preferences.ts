@@ -116,6 +116,18 @@ export const webSearchEnabled = ref(false);
  */
 export const webSearchInstance = ref("");
 
+/**
+ * `web-search.md`: the optional credential of that instance, as typed. Empty (the
+ * default) sends no `Authorization` header at all. The shape
+ * decides the scheme in Rust (`user:password` → Basic, anything else → Bearer), so
+ * nothing is interpreted here; it is stored as written and never prefilled with
+ * anything Rust did not send.
+ *
+ * It lives in `settings.json` beside every other preference, unencrypted — the
+ * same trust level as the rest of that file, which is the human's own.
+ */
+export const webSearchCredentials = ref("");
+
 /** S5: whether one tool id is enabled right now. Unknown ids read as off. */
 export function isToolEnabled(id: string): boolean {
   return enabledTools.value.includes(id);
@@ -158,6 +170,7 @@ export function applyPreferences(settings: AppSettings | null): void {
   // is OFF and no instance — never "on, anywhere" by omission.
   webSearchEnabled.value = settings?.webSearchEnabled ?? false;
   webSearchInstance.value = settings?.webSearchInstance ?? "";
+  webSearchCredentials.value = settings?.webSearchCredentials ?? "";
 }
 
 /**
@@ -210,6 +223,43 @@ export async function setWebSearchInstance(next: string): Promise<void> {
 }
 
 /**
+ * Stores the web-search credential the human typed, trimmed and otherwise
+ * verbatim.
+ *
+ * The field is a password input so it is never echoed in full on screen, but
+ * nothing here is encrypted on its way to the file: the Rust side keeps the value
+ * as written in `settings.json`, the documented trade-off of "plain settings, no
+ * new crypto machinery". An empty value is a real choice — it removes the header
+ * from every request — never "keep the old one".
+ */
+export async function setWebSearchCredentials(next: string): Promise<void> {
+  const trimmed = next.trim();
+  webSearchCredentials.value = trimmed;
+  await persist({ webSearchCredentials: trimmed });
+}
+
+/**
+ * S3 of `web-search.md`: what a text preference draft is worth when it is
+ * committed, or `null` when there is nothing to write.
+ *
+ * The two web-search text fields stay drafts for a whole typing session, so a
+ * keystroke never rewrites `settings.json`; the pane asks this function on blur or
+ * Enter. Surrounding spaces are dropped (a typo nobody can see in the field), and a
+ * draft that is only whitespace away from what the file already holds writes
+ * nothing — a save for no change is a write that can only go wrong.
+ *
+ * An emptied draft is `""`, not `null`: clearing the field is a real choice, the
+ * same rule the setters document.
+ */
+export function preferenceDraftCommit(
+  draft: string,
+  stored: string,
+): string | null {
+  const trimmed = draft.trim();
+  return trimmed === stored.trim() ? null : trimmed;
+}
+
+/**
  * S2 of `composer-inputs.md`: changes the effort a NEW session will start with.
  *
  * Only the composer uses this path when there is no session to change — the
@@ -258,6 +308,7 @@ export function usePreferences() {
     thinkingLevel,
     webSearchEnabled,
     webSearchInstance,
+    webSearchCredentials,
     isToolEnabled,
     applyPreferences,
   };

@@ -91,6 +91,18 @@ pub struct Settings {
     /// instance is the reliable one. Kept verbatim here, trimmed by the reader.
     #[serde(default)]
     pub web_search_instance: String,
+    /// The optional credential of that instance — `user:password` for an
+    /// instance behind Basic auth (what an nginx proxy asks for) or a token for one
+    /// behind a bearer check (`websearch::authorization_header` decides from the
+    /// shape). **Empty, the default, sends no `Authorization` header at all**, which
+    /// is what every public instance and every unauthenticated private one expects.
+    /// Stored as written, in `settings.json`, **unencrypted beside every other
+    /// preference**: that file is the human's own, readable by them with an editor
+    /// and by anything running as their user — the same trust level the rest of the
+    /// file already has, and this field adds no second one. It is never sent to a
+    /// public fallback instance (`websearch::credentials_for`).
+    #[serde(default)]
+    pub web_search_credentials: String,
 }
 
 /// S2/S3 of `chat-preferences-and-queue.md`: both chat toggles ship enabled, so
@@ -152,10 +164,7 @@ fn default_thinking_level() -> String {
 /// handing pi a word it would ignore.
 pub fn parse_thinking_level(raw: &str) -> Option<&'static str> {
     let word = raw.trim().to_ascii_lowercase();
-    THINKING_LEVELS
-        .iter()
-        .copied()
-        .find(|level| *level == word)
+    THINKING_LEVELS.iter().copied().find(|level| *level == word)
 }
 
 impl Default for Settings {
@@ -177,6 +186,9 @@ impl Default for Settings {
             // asks for it, and no instance is preferred over any other.
             web_search_enabled: false,
             web_search_instance: String::new(),
+            // No credential until the human types one; an instance that needs
+            // none must never receive an empty header.
+            web_search_credentials: String::new(),
         }
     }
 }
@@ -389,9 +401,7 @@ pub type SettingsResult<T> = Result<T, SettingsError>;
 /// Loads settings from `path`; returns defaults when the file does not exist.
 pub fn load(path: &Path) -> SettingsResult<Settings> {
     match std::fs::read_to_string(path) {
-        Ok(raw) => {
-            serde_json::from_str(&raw).map_err(|e| SettingsError::Parse(e.to_string()))
-        }
+        Ok(raw) => serde_json::from_str(&raw).map_err(|e| SettingsError::Parse(e.to_string())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
         Err(e) => Err(SettingsError::Io(e.to_string())),
     }
@@ -399,7 +409,8 @@ pub fn load(path: &Path) -> SettingsResult<Settings> {
 
 /// Saves settings atomically: write temp file, then rename over the target.
 pub fn save(path: &Path, settings: &Settings) -> SettingsResult<()> {
-    let json = serde_json::to_string_pretty(settings).map_err(|e| SettingsError::Parse(e.to_string()))?;
+    let json =
+        serde_json::to_string_pretty(settings).map_err(|e| SettingsError::Parse(e.to_string()))?;
     write_atomic(path, &json).map_err(|e| SettingsError::Io(e.to_string()))
 }
 
@@ -545,8 +556,7 @@ mod tests {
     #[test]
     fn settings_file_without_provider_and_model_uses_defaults() {
         let cfg = TempCfg::new("pre_provider");
-        std::fs::write(&cfg.0, r#"{"theme":"light","piBinary":"/opt/pi"}"#)
-            .expect("write fixture");
+        std::fs::write(&cfg.0, r#"{"theme":"light","piBinary":"/opt/pi"}"#).expect("write fixture");
         let s = load(&cfg.0).expect("an older settings file must load");
         assert_eq!(s.theme, "light");
         assert_eq!(s.pi_binary, "/opt/pi");
@@ -703,7 +713,12 @@ mod tests {
             },
         )
         .expect("save");
-        assert!(!load(&cfg.0).expect("load").enabled_tools.contains(&"files".to_string()));
+        assert!(
+            !load(&cfg.0)
+                .expect("load")
+                .enabled_tools
+                .contains(&"files".to_string())
+        );
     }
 
     // S5 + settings header rule: a file written before the switches existed must
@@ -884,7 +899,11 @@ mod tests {
     #[test]
     fn permission_mode_round_trips() {
         let cfg = TempCfg::new("permission_mode_roundtrip");
-        for mode in [PermissionMode::Read, PermissionMode::Write, PermissionMode::Yolo] {
+        for mode in [
+            PermissionMode::Read,
+            PermissionMode::Write,
+            PermissionMode::Yolo,
+        ] {
             let s = Settings {
                 permission_mode: mode.as_str().to_string(),
                 ..Settings::default()
@@ -914,7 +933,11 @@ mod tests {
     // also blocked `read` would leave the agent unable to look at anything.
     #[test]
     fn decide_allows_the_free_tools_in_every_mode() {
-        for mode in [PermissionMode::Read, PermissionMode::Write, PermissionMode::Yolo] {
+        for mode in [
+            PermissionMode::Read,
+            PermissionMode::Write,
+            PermissionMode::Yolo,
+        ] {
             for tool in ["read", "grep", "find", "ls"] {
                 assert_eq!(
                     decide(mode, tool),
@@ -948,7 +971,10 @@ mod tests {
     #[test]
     fn decide_asks_for_shell_tools_and_allows_file_edits_in_write_mode() {
         for tool in ["edit", "write"] {
-            assert_eq!(decide(PermissionMode::Write, tool), PermissionDecision::Allow);
+            assert_eq!(
+                decide(PermissionMode::Write, tool),
+                PermissionDecision::Allow
+            );
         }
         for tool in ["bash", "powershell"] {
             assert_eq!(decide(PermissionMode::Write, tool), PermissionDecision::Ask);
@@ -981,9 +1007,17 @@ mod tests {
     // build does not know (the browser bridge) is never blocked by this gate.
     #[test]
     fn decide_leaves_unknown_tools_alone_in_every_mode() {
-        for mode in [PermissionMode::Read, PermissionMode::Write, PermissionMode::Yolo] {
+        for mode in [
+            PermissionMode::Read,
+            PermissionMode::Write,
+            PermissionMode::Yolo,
+        ] {
             for tool in ["nabla-browser_navigate", "some_future_tool"] {
-                assert_eq!(decide(mode, tool), PermissionDecision::Allow, "{tool} in {mode:?}");
+                assert_eq!(
+                    decide(mode, tool),
+                    PermissionDecision::Allow,
+                    "{tool} in {mode:?}"
+                );
             }
         }
     }
@@ -1071,7 +1105,10 @@ mod tests {
             };
             save(&cfg.0, &s).expect("save");
             let loaded = load(&cfg.0).expect("load");
-            assert_eq!(loaded.thinking_level, *level, "{level} must survive the file");
+            assert_eq!(
+                loaded.thinking_level, *level,
+                "{level} must survive the file"
+            );
             assert_eq!(loaded.thinking(), Some(*level));
         }
     }
@@ -1167,6 +1204,57 @@ mod tests {
         let off = load(&cfg.0).expect("load");
         assert!(!off.web_search_enabled);
         assert_eq!(off.web_search_instance, "https://searx.example");
+    }
+
+    // The credentials are a preference like the instance — one plain string in
+    // `settings.json`, written and read back unchanged (no encryption machinery,
+    // and the doc comment says so). Empty is the default, and an empty value is a
+    // real choice: no header is sent.
+    #[test]
+    fn web_search_credentials_default_to_empty_and_round_trip() {
+        assert_eq!(Settings::default().web_search_credentials, "");
+
+        // camelCase on the wire, so `types.ts` mirrors this key.
+        let json = serde_json::to_value(Settings::default()).expect("serialize");
+        assert_eq!(json["webSearchCredentials"], serde_json::json!(""));
+
+        let cfg = TempCfg::new("web_search_credentials");
+        save(
+            &cfg.0,
+            &Settings {
+                web_search_credentials: "user:pass".to_string(),
+                ..Settings::default()
+            },
+        )
+        .expect("save");
+        let loaded = load(&cfg.0).expect("load");
+        assert_eq!(loaded.web_search_credentials, "user:pass");
+
+        // Clearing it is a preference too, and it survives the write.
+        save(
+            &cfg.0,
+            &Settings {
+                web_search_credentials: String::new(),
+                ..loaded
+            },
+        )
+        .expect("save");
+        assert_eq!(load(&cfg.0).expect("load").web_search_credentials, "");
+    }
+
+    // The settings header rule: a file written before the field existed loads
+    // it empty instead of failing, so an upgrade never rejects an older file.
+    #[test]
+    fn settings_file_without_credentials_loads_them_empty() {
+        let cfg = TempCfg::new("pre_web_search_credentials");
+        std::fs::write(
+            &cfg.0,
+            r#"{"theme":"dark","piBinary":"pi","webSearchEnabled":true,"webSearchInstance":"https://searx.example"}"#,
+        )
+        .expect("write fixture");
+        let s = load(&cfg.0).expect("an older settings file must load");
+        assert_eq!(s.web_search_instance, "https://searx.example");
+        assert_eq!(s.web_search_credentials, "");
     }
 
     #[test]
