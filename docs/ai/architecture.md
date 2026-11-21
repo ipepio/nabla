@@ -34,6 +34,7 @@ Vue.
 | App store | `src-tauri/src/store.rs` | Owned projection: workspaces, session index | Transcript content, pi's session files |
 | Human config | `src-tauri/src/settings.rs` | `settings.json` load/save | Accumulated application state |
 | Image input | `src-tauri/src/image_input.rs` | Format sniffing, base64 and the per-turn bounds of a prompt's images | Reading files the human did not pick or drop; persisting a payload |
+| PDF input | `src-tauri/src/pdf_input.rs` | Local `pdftotext` extraction, page numbering and its bounds (file, pages, characters, time) | OCR, inventing text for a scan, persisting an extraction |
 | Runtime | not created | Spawning/stopping pi sessions, streaming events | Depending on Vue or presentation details |
 
 ## Capability placement
@@ -61,12 +62,20 @@ in the local `.docs/04-arquitectura-base.md`; treat it as provisional until vers
   not an existing directory → store insert (unique path) → view refreshes the list.
 - **Settings round trip:** `getSettings()` / `saveSettings()` → `settings.rs` load/save whole with an
   atomic write; unknown fields are tolerated so newer files still parse.
-- **Prompt with images:** the composer collects candidates (the `+` picker, a screenshot paste, or a
-  native desktop drop) into `src/lib/composer-attachments.ts`, keyed by draft. Sending hands them to
-  `sendPrompt(...)` → `commands::send_prompt`, which validates count, format and size, asks whether the
-  active model declares image input (`get_state` of the live child, else pi's catalogue) and refuses
-  with an explanation instead of switching models. The prompt line carries pi's own `ImageContent`;
-  the transcript and the stored preview keep only the image count.
+- **Prompt with images:** the composer collects candidates (the `+` menu's image entry, a screenshot
+  paste, or a native desktop drop) into `src/lib/composer-attachments.ts`, keyed by draft. Sending
+  hands them to `sendPrompt(...)` → `commands::send_prompt`, which validates count, format and size,
+  asks whether the active model declares image input (`get_state` of the live child, else pi's
+  catalogue) and refuses with an explanation instead of switching models. The prompt line carries
+  pi's own `ImageContent`; the transcript and the stored preview keep only the image count.
+- **Prompt with a PDF and/or a tool request:** the same draft holds the PDFs and the per-turn tool
+  requests. The PDF entry (or a dropped `*.pdf`) goes to `read_pdf_attachment` → `pdf_input.rs`, which
+  runs `pdftotext` as an argv-only child and answers the selectable text of every page, bounded in
+  size, pages, characters and time, keeping page numbers even for empty pages and reporting a scan as
+  `hasText: false`. `src/components/chat/composer-turn.ts` composes the turn's text once — question,
+  one line per requested tool, then the page-numbered document — and the label the transcript and the
+  queue keep names the attachments without copying the text. A request is a line of the prompt, never
+  an execution, a settings write or a permission bypass.
 - **Session start (planned):** command → runtime supervisor spawns `pi --mode rpc` → events → typed
   Tauri events → Vue; `upsert_session` records the pi session path in the index.
 

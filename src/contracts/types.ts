@@ -470,6 +470,33 @@ export interface ImageAttachment {
   byteLength: number;
 }
 
+// ── composer PDF input (S3 of `odd/tasks/composer-tools-pdf.md`) ────────────
+
+/**
+ * One PDF the composer extracted locally, page by page. Mirrors `PdfAttachment`
+ * in `src-tauri/src/pdf_input.rs` field for field.
+ *
+ * `pages` is the selectable text of every page, in page order: index 0 is page 1,
+ * and an empty page is an empty string — never a renumbered list. `pageCount` is
+ * `pages.length` as Rust counted it, so a page that holds nothing still occupies
+ * its number. `hasText` is `false` when no page carried selectable text at all
+ * (a scan): the composer shows that instead of pretending the document was read.
+ */
+export interface PdfAttachment {
+  /** File name, shown as the attachment's label. */
+  name: string;
+  /** Pages Rust really found; equals `pages.length`. */
+  pageCount: number;
+  /** Selectable text per page, oldest first; empty string for an empty page. */
+  pages: string[];
+  /** Total characters of selectable text across `pages`. */
+  charCount: number;
+  /** `false` when the document has no selectable text (a scan, no OCR). */
+  hasText: boolean;
+  /** Size of the file in bytes, bounded before extraction. */
+  byteLength: number;
+}
+
 // ── pi CLI bridge (S1-S4 of `odd/tasks/pi-cli-bridge.md`) ────────────────────
 
 /**

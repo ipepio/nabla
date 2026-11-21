@@ -204,6 +204,16 @@ export interface QueuedPrompt {
    */
   images: PromptImage[];
   /**
+   * S3 of `odd/tasks/composer-tools-pdf.md`: what the queue row and the turn's
+   * transcript entry say — the typed text plus a label for the attachments that
+   * travel with it. `null` means "derive it from the text and the images", which is
+   * what every prompt without a PDF or a tool request keeps doing.
+   *
+   * The label never carries the PDF's extracted text: the queue keeps the prompt
+   * that will be sent and a human-readable name for what came with it.
+   */
+  display: string | null;
+  /**
    * The prompt was typed before its pi process existed (`spawning`), so it waits
    * for the process, not for a turn. It is the one entry a drain may send with
    * the queue preference off: waiting for a process that does not exist yet is
@@ -742,7 +752,7 @@ function settleQueuedMessage(
   buffer.transcript.push({
     id: entry.id,
     role: "user",
-    text: promptDisplayText(entry.text, entry.images.length),
+    text: entry.display ?? promptDisplayText(entry.text, entry.images.length),
     at: new Date().toISOString(),
   });
 }
@@ -783,6 +793,7 @@ export function enqueuePrompt(
   text: string,
   workspaceId: number | null = null,
   images: PromptImage[] = [],
+  display: string | null = null,
 ): void {
   const prompt = text.trim();
   // S2 of `composer-image-input.md`: an image-only prompt is a prompt.
@@ -797,6 +808,9 @@ export function enqueuePrompt(
     // A copy of the payload: the composer's draft is cleared as soon as the
     // prompt is queued, and the queue is what keeps its images.
     images: [...images],
+    // The label the row and the eventual turn show; an attachment-free prompt
+    // leaves it to `promptDisplayText`, exactly as before.
+    display,
     // Why it waits decides what may drain it: a session that is still spawning
     // has no stdin yet, which is not something the preference can switch off.
     awaitingProcess: buffer.status === "spawning",
@@ -839,7 +853,7 @@ export function queuedPrompts(sessionId: string | null): string[] {
   const buffer = sessionBuffer(sessionId);
   if (buffer === null) return [];
   return buffer.queue.map((entry) =>
-    promptDisplayText(entry.text, entry.images.length),
+    entry.display ?? promptDisplayText(entry.text, entry.images.length),
   );
 }
 
@@ -1690,6 +1704,7 @@ export async function sendUserTurn(
   workspaceId: number,
   text: string,
   images: PromptImage[] = [],
+  display: string | null = null,
 ): Promise<void> {
   const prompt = text.trim();
   // S2 of `composer-image-input.md`: an image-only prompt is a prompt.
@@ -1707,11 +1722,15 @@ export async function sendUserTurn(
     const opened = await openSession(sessionId);
     markLive(sessionId, opened.status);
     if (opened.status === "spawning") {
-      enqueuePrompt(sessionId, prompt, workspaceId, images);
+      enqueuePrompt(sessionId, prompt, workspaceId, images, display);
       return;
     }
   }
-  const id = pushUserTurn(sessionId, buffer, promptDisplayText(prompt, images.length));
+  const id = pushUserTurn(
+    sessionId,
+    buffer,
+    display ?? promptDisplayText(prompt, images.length),
+  );
   buffer.busy = true;
   try {
     await sendPrompt(workspaceId, Number(sessionId), prompt, images);

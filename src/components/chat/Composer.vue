@@ -17,20 +17,34 @@
 // their remove controls are drawn here, from the list the panel owns. What counts
 // as an image, how many fit and what a clipboard paste means are rules of
 // `composer-images.ts`, never restated in this template.
+//
+// S2-S3 of `odd/tasks/composer-tools-pdf.md`: the same `+` is now a menu with the
+// two attachments (an image, a PDF) and the per-turn tool requests. The request
+// rows are rules of `composer-tools.ts` — offered only when this run really has
+// the capability, and otherwise disabled with the reason in words — and the PDF
+// chips are rules of `composer-pdfs.ts`. Neither selection executes anything: the
+// request becomes one line of the turn's text, and the page-numbered document is
+// composed by `composer-turn.ts` when the panel sends or queues.
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   ArrowUpIcon,
   CheckIcon,
   ChevronDownIcon,
+  FileTextIcon,
+  ImageIcon,
   PlusIcon,
   SquareIcon,
+  WrenchIcon,
   XIcon,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
@@ -61,6 +75,14 @@ import {
   shouldAttachFromClipboard,
   type ComposerImage,
 } from "@/components/chat/composer-images";
+import type { ComposerPdf } from "@/components/chat/composer-pdfs";
+import {
+  COMPOSER_TOOL_INTENTS,
+  toolIntentLabelKey,
+  toolUnavailableReason,
+  toolUnavailableReasonKey,
+  type ComposerToolIntent,
+} from "@/components/chat/composer-tools";
 import { onFileDrop } from "@/contracts/window";
 import { activeSession } from "@/lib/session-store";
 import PermissionModeChip from "@/components/chat/PermissionModeChip.vue";
@@ -150,6 +172,33 @@ const props = withDefaults(
      * silent model switch, which is what this flag exists to prevent.
      */
     imageInputUnsupported: boolean;
+    /** S3: the PDFs of the draft on screen, in attachment order. */
+    pdfs: ComposerPdf[];
+    /** S2: the tool requests chosen for this draft, in canonical order. */
+    intents: ComposerToolIntent[];
+    /**
+     * S3: at least one attached PDF has no selectable text (a scan). It cannot be
+     * sent, and the notice says why; the chip's remove control is the way out.
+     */
+    pdfUnreadable: boolean;
+    /** S3: an extraction is running, so the composer says it is reading. */
+    pdfReading: boolean;
+    /** S2: `settings.webSearchEnabled` — the human turned the `web_search` tool on. */
+    webSearchEnabled: boolean;
+    /**
+     * S2: this run bound the MCP endpoint the agent's tools are published from
+     * (`web_search` and the browser's). `false` means the agent has neither, so
+     * both request rows are disabled with the reason instead of being offered as
+     * if they worked.
+     */
+    toolEndpointReady: boolean;
+    /**
+     * S2: the Browser tool is on in Settings → Tools (`enabledTools`). The browser
+     * request needs it: the switch ships off because the browser drives a real
+     * Chromium instance, so a row that ignored it would advertise a tool the human
+     * never turned on.
+     */
+    browserEnabled: boolean;
   }>(),
   { maxWidth: COMPOSER_MAX_WIDTH },
 );
@@ -164,6 +213,9 @@ const emit = defineEmits<{
   (e: "removeImage", id: string): void;
   (e: "pasteImages", files: File[]): void;
   (e: "dropFiles", paths: string[]): void;
+  (e: "pickPdf"): void;
+  (e: "removePdf", id: string): void;
+  (e: "toggleIntent", intent: ComposerToolIntent): void;
 }>();
 
 /**
@@ -189,10 +241,57 @@ const canSubmit = computed(() => {
   if (props.disabled) return false;
   // S2 of `composer-image-input.md`: an image-only turn is a turn. The typed text
   // is not the only thing that can make a prompt worth sending.
-  if (props.modelValue.trim() === "" && props.images.length === 0) return false;
-  if (props.imageInputUnsupported) return false;
+  if (
+    props.modelValue.trim() === "" &&
+    props.images.length === 0 &&
+    props.pdfs.length === 0
+  ) {
+    return false;
+  }
+  // S3 of `composer-tools-pdf.md`: a scan carries no text, so it is never sent.
+  if (props.imageInputUnsupported || props.pdfUnreadable) return false;
   return props.streaming ? props.canQueue : props.canSend;
 });
+
+/**
+ * S2: the menu rows for the tool requests, with the availability answer each one
+ * gets from the pure rules. A row that cannot be offered keeps its place — the
+ * human sees what exists and what would make it usable — and is disabled. Both
+ * switches are facts of this run (the Browser tool in Settings → Tools, the web
+ * search preference); the unproven SearXNG round trip is the module's own fact, so
+ * `web-search` stays disabled here even with everything the panel can see ready.
+ */
+const toolRows = computed(() => {
+  const context = {
+    webSearchEnabled: props.webSearchEnabled,
+    toolEndpointReady: props.toolEndpointReady,
+    browserEnabled: props.browserEnabled,
+  };
+  return COMPOSER_TOOL_INTENTS.map((intent) => {
+    const reason = toolUnavailableReason(intent, context);
+    return {
+      intent,
+      label: t(toolIntentLabelKey(intent)),
+      available: reason === null,
+      reason: reason === null ? "" : t(toolUnavailableReasonKey(reason)),
+    };
+  });
+});
+
+/** Whether anything (besides the text) is attached to this draft. */
+const hasAttachments = computed(
+  () =>
+    props.images.length > 0 ||
+    props.pdfs.length > 0 ||
+    props.intents.length > 0,
+);
+
+/** S2: one row of the menu is selectable only when the capability exists. */
+function intentAvailable(intent: ComposerToolIntent): boolean {
+  // Read from the rows above so the disabled state and the reason can never
+  // disagree about the same request.
+  return toolRows.value.find((row) => row.intent === intent)?.available ?? false;
+}
 
 /**
  * What one submit means. The button and the Enter key share this, so they can
@@ -206,7 +305,7 @@ const canSubmit = computed(() => {
 function submit(): void {
   if (!canSubmit.value) {
     debugLog(
-      `composer submit: nothing to do (text=${props.modelValue.trim() !== ""} images=${props.images.length} streaming=${props.streaming} canQueue=${props.canQueue} canSend=${props.canSend} disabled=${props.disabled})`,
+      `composer submit: nothing to do (text=${props.modelValue.trim() !== ""} images=${props.images.length} pdfs=${props.pdfs.length} streaming=${props.streaming} canQueue=${props.canQueue} canSend=${props.canSend} disabled=${props.disabled})`,
     );
     return;
   }
@@ -214,7 +313,7 @@ function submit(): void {
   // complete.
   closeCompletion();
   debugLog(
-    `composer submit: ${props.streaming ? "queue" : "send"} (images=${props.images.length})`,
+    `composer submit: ${props.streaming ? "queue" : "send"} (images=${props.images.length} pdfs=${props.pdfs.length} tools=${props.intents.length})`,
   );
   if (props.streaming) emit("queue");
   else emit("send");
@@ -822,35 +921,116 @@ watch(() => props.workspaceId, prewarmCommands);
       @highlight="activeIndex = $event"
     />
 
-    <!-- S1-S2: the images of this draft, before the text they travel with. The
-         preview is the same base64 the model will receive, so nothing extra is
-         stored; removing one only forgets it, which is the undo the human asked
-         for. -->
+    <!-- S1-S3: everything attached to this draft, before the text it travels
+         with. An image preview is the same base64 the model will receive; a PDF
+         chip names its pages without carrying their text; a tool chip names the
+         request the turn will include. Removing any of them only forgets it,
+         which is the undo the human asked for. -->
     <div
-      v-if="images.length > 0"
+      v-if="hasAttachments"
       class="flex flex-wrap items-start gap-1.5 px-3 pt-2"
-      :aria-label="t('chat.composer.attachedImages')"
     >
       <div
-        v-for="image in images"
-        :key="image.id"
-        class="relative size-14 overflow-hidden rounded-md border border-border"
+        v-if="images.length > 0"
+        class="flex flex-wrap items-start gap-1.5"
+        :aria-label="t('chat.composer.attachedImages')"
       >
-        <img
-          :src="`data:${image.mimeType};base64,${image.data}`"
-          :alt="image.name"
-          class="size-full object-cover"
-        />
-        <button
-          type="button"
-          class="absolute top-0.5 right-0.5 rounded-full bg-background/80 p-0.5 text-foreground shadow-sm hover:bg-background"
-          :aria-label="t('chat.composer.removeImage', { name: image.name })"
-          @click="emit('removeImage', image.id)"
+        <div
+          v-for="image in images"
+          :key="image.id"
+          class="relative size-14 overflow-hidden rounded-md border border-border"
         >
-          <XIcon class="size-3" />
-        </button>
+          <img
+            :src="`data:${image.mimeType};base64,${image.data}`"
+            :alt="image.name"
+            class="size-full object-cover"
+          />
+          <button
+            type="button"
+            class="absolute top-0.5 right-0.5 rounded-full bg-background/80 p-0.5 text-foreground shadow-sm hover:bg-background"
+            :aria-label="t('chat.composer.removeImage', { name: image.name })"
+            @click="emit('removeImage', image.id)"
+          >
+            <XIcon class="size-3" />
+          </button>
+        </div>
+      </div>
+
+      <!-- S3: one chip per PDF. The page count is what the turn will carry; the
+           text itself never enters the UI, so a long report costs one chip. -->
+      <div
+        v-if="pdfs.length > 0"
+        class="flex flex-wrap items-center gap-1.5"
+        :aria-label="t('chat.composer.attachedPdfs')"
+      >
+        <span
+          v-for="pdf in pdfs"
+          :key="pdf.id"
+          class="inline-flex max-w-full items-center gap-1 rounded-md border border-border bg-muted/40 px-1.5 py-1 text-xs"
+        >
+          <FileTextIcon class="size-3 shrink-0" />
+          <span class="min-w-0 max-w-[12rem] truncate" :title="pdf.name">
+            {{ pdf.name }}
+          </span>
+          <span class="shrink-0 text-muted-foreground">
+            {{ t("chat.composer.pdfPageCount", { count: pdf.pages.length }) }}
+          </span>
+          <button
+            type="button"
+            class="rounded-full p-0.5 text-foreground hover:bg-background"
+            :aria-label="t('chat.composer.removePdf', { name: pdf.name })"
+            @click="emit('removePdf', pdf.id)"
+          >
+            <XIcon class="size-3" />
+          </button>
+        </span>
+      </div>
+
+      <!-- S2: the requested tools of this turn, removable like any attachment. -->
+      <div
+        v-if="intents.length > 0"
+        class="flex flex-wrap items-center gap-1.5"
+        :aria-label="t('chat.composer.toolRequests')"
+      >
+        <span
+          v-for="intent in intents"
+          :key="intent"
+          class="inline-flex items-center gap-1 rounded-md border border-border bg-muted/40 px-1.5 py-1 text-xs"
+        >
+          <WrenchIcon class="size-3 shrink-0" />
+          <span>{{ t(toolIntentLabelKey(intent)) }}</span>
+          <button
+            type="button"
+            class="rounded-full p-0.5 text-foreground hover:bg-background"
+            :aria-label="
+              t('chat.composer.removeTool', {
+                name: t(toolIntentLabelKey(intent)),
+              })
+            "
+            @click="emit('toggleIntent', intent)"
+          >
+            <XIcon class="size-3" />
+          </button>
+        </span>
       </div>
     </div>
+
+    <!-- S3: a document with no selectable text cannot be sent, and the reason is
+         never a guess: no OCR runs here, so its pages would carry nothing. -->
+    <p
+      v-if="pdfUnreadable"
+      class="px-3.5 pt-1.5 text-xs text-warning"
+      role="status"
+    >
+      {{ t("chat.composer.pdfNoText") }}
+    </p>
+    <p
+      v-if="pdfReading"
+      class="px-3.5 pt-1.5 text-xs text-muted-foreground"
+      role="status"
+    >
+      {{ t("chat.composer.pdfExtracting") }}
+    </p>
 
     <!-- S2: the explanation that replaces a silent model switch. It is a notice,
          not a dialog: the images and the text stay exactly where the human left
@@ -877,16 +1057,57 @@ watch(() => props.workspaceId, prewarmCommands);
     />
 
     <div class="flex min-w-0 items-center gap-1 px-2 pb-2">
-      <!-- S1: attaching an image (a file, a screenshot via paste, or a drop). -->
-      <Button
-        variant="ghost"
-        size="icon-sm"
-        :aria-label="t('chat.composer.addImage')"
-        :disabled="disabled"
-        @click="emit('pickImages')"
-      >
-        <PlusIcon />
-      </Button>
+      <!-- S1/S2/S3: attaching (an image or a PDF) and the per-turn tool
+           requests. The attachment rows come first and the tool requests under
+           their own label; a request that cannot be offered keeps its row,
+           disabled, with the reason in words. Selecting one writes no setting and
+           runs nothing — it only becomes a line of this turn's text. -->
+      <DropdownMenu>
+        <DropdownMenuTrigger as-child>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            :aria-label="t('chat.composer.attach')"
+            :disabled="disabled"
+          >
+            <PlusIcon />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" side="top" class="w-72">
+          <DropdownMenuItem class="gap-2 text-xs" @select="emit('pickImages')">
+            <ImageIcon class="size-3.5 shrink-0" />
+            {{ t("chat.composer.attachImage") }}
+          </DropdownMenuItem>
+          <DropdownMenuItem class="gap-2 text-xs" @select="emit('pickPdf')">
+            <FileTextIcon class="size-3.5 shrink-0" />
+            {{ t("chat.composer.attachPdf") }}
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel class="text-xs">
+            {{ t("chat.composer.useTool") }}
+          </DropdownMenuLabel>
+          <DropdownMenuCheckboxItem
+            v-for="row in toolRows"
+            :key="row.intent"
+            class="items-start text-xs"
+            :model-value="intents.includes(row.intent)"
+            :disabled="!intentAvailable(row.intent)"
+            @update:model-value="emit('toggleIntent', row.intent)"
+          >
+            <span class="flex min-w-0 flex-col gap-0.5">
+              <span class="truncate">{{ row.label }}</span>
+              <!-- A disabled row always says why, so "nothing happens" is never
+                   the whole answer. -->
+              <span
+                v-if="!row.available"
+                class="text-[10px] leading-snug text-muted-foreground"
+              >
+                {{ row.reason }}
+              </span>
+            </span>
+          </DropdownMenuCheckboxItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
 
       <span
         class="hidden min-w-0 items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground sm:inline-flex"

@@ -13,6 +13,7 @@ use tauri_plugin_opener::OpenerExt;
 
 use crate::cli::{self, CliSessions, CliSink, PiAuthStatus, PiCliResult};
 use crate::image_input::{self, ImageAttachment, PromptImage};
+use crate::pdf_input::PdfAttachment;
 use crate::mcp::{self, McpAddDraft, McpScope, McpServerSummary};
 use crate::mcp_server::{REGISTRATION_WAIT, RegistrationGate, RegistrationOutcome};
 use crate::process::{ProcessManager, SessionModel, StartupOutcome};
@@ -988,6 +989,18 @@ pub fn send_prompt(
 #[tauri::command]
 pub fn read_image_attachment(path: String) -> Result<ImageAttachment, String> {
     image_input::read_image_attachment(Path::new(&path)).map_err(display_err)
+}
+
+/// S3 of `composer-tools-pdf.md`: extracts one PDF the human picked or dropped,
+/// locally and page by page (`pdf_input::read_pdf_attachment`).
+///
+/// The bounds — file size, page count, extracted characters, elapsed time — and
+/// the argv-only child live in that module, so this is the only path a filesystem
+/// path a webview produced becomes document text, and it answers text rather than
+/// the PDF's bytes.
+#[tauri::command]
+pub fn read_pdf_attachment(path: String) -> Result<PdfAttachment, String> {
+    crate::pdf_input::read_pdf_attachment(Path::new(&path)).map_err(display_err)
 }
 
 /// The files the image-capability preflight reads. Grouped so the helper that

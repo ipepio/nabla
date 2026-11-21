@@ -12,7 +12,7 @@ Run from the repository root unless the table says otherwise.
 | Frontend gate | `npm run build` | `vue-tsc --noEmit` then `vite build`; writes `dist/` (gitignored) |
 | Node tests | `node --test tests/` | Pure modules and composables; Node strips the types, no test framework is a dependency |
 | Desktop app | `npm run tauri dev` | Starts Vite on port 1420 and opens the window; needs a GUI session |
-| Rust tests | `cd src-tauri && cargo test` | In-module `#[cfg(test)]` tests; no network, temp dirs per test |
+| Rust tests | `cd src-tauri && cargo test` | In-module `#[cfg(test)]` tests; no network, temp dirs per test. The PDF tests that need real extraction skip (with a note) when `pdftotext` is not installed; the argv, timeout, bounds and page-splitting tests run everywhere |
 | Rust lint | `cd src-tauri && cargo clippy` | Clean at the time of writing |
 | Rust lint, all targets | `cd src-tauri && cargo clippy --all-targets` | One pre-existing test-only warning (`settings.rs`), see project status F3 |
 
@@ -27,6 +27,7 @@ Never install dependencies, add a test runner or upgrade the toolchain on your o
 | Rust logic, validation, SQL | `cargo test` with the rule's examples, boundaries and rejected inputs |
 | Node-testable module or composable (pure rules, stores) | `node --test tests/` with the rule's examples, boundaries and rejected inputs, plus `npm run build` for the types |
 | Command or contract change | Both sides of the seam: Rust tests for behavior, `npm run build` for the TS mirror, payload comparison Rust ↔ TS |
+| Attachment intake (image, PDF, tool request) | The module's own tests on both sides: `composer-pdfs.ts` / `composer-tools.ts` / `composer-turn.ts` under `node --test tests/`, the Rust bounds and extraction in `cargo test`, plus `npm run build` for the props the composer gained |
 | Vue view / component | `npm run build` plus a manual pass of the affected states in `npm run tauri dev` |
 | Process/runtime change | Tests against a fake `pi` script emitting known NDJSON; never a real pi binary or network |
 | Config or security surface (CSP, capabilities) | Diff inspection of `src-tauri/tauri.conf.json` and `src-tauri/capabilities/` |

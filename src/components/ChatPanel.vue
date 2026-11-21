@@ -32,6 +32,15 @@ import {
   type ImageCandidate,
   type ImageRejection,
 } from "@/components/chat/composer-images";
+import {
+  COMPOSER_PDF_LIMIT,
+  COMPOSER_PDF_MAX_PAGES,
+  hasUnreadablePdf,
+  type ComposerPdf,
+  type PdfRejection,
+} from "@/components/chat/composer-pdfs";
+import type { ComposerToolIntent } from "@/components/chat/composer-tools";
+import { composeTurnDisplay, composeTurnPrompt } from "@/components/chat/composer-turn";
 import { draftKeyFor, usePromptDraft } from "@/components/chat/use-prompt-draft";
 import { useThrottledText } from "@/components/chat/use-throttled-text";
 import { createTranscriptFollow } from "@/components/chat/transcript-follow";
@@ -44,8 +53,11 @@ import {
   commandErrorMessage,
   debugLog,
   getSettings,
+  mcpEndpoint,
   pickImageFiles,
+  pickPdfFiles,
   readImageAttachment,
+  readPdfAttachment,
   saveSettings,
   sessionStatus,
   setSessionModel,
@@ -62,11 +74,16 @@ import { useAppearance } from "@/lib/appearance";
 import { takeBootSettings } from "@/lib/boot-settings";
 import {
   addAttachments,
+  addPdfAttachment,
   attachmentsFor,
   attachmentsToPromptImages,
   clearAttachments,
+  intentsFor,
   moveAttachments,
+  pdfsFor,
   removeAttachment,
+  removePdfAttachment,
+  toggleIntent,
 } from "@/lib/composer-attachments";
 import { t } from "@/lib/i18n";
 import {
@@ -99,7 +116,13 @@ import {
   type SessionBuffer,
   type ToolEntry,
 } from "@/lib/session-store";
-import { applyPreferences, queueMessages, showReasoning } from "@/lib/preferences";
+import {
+  applyPreferences,
+  isToolEnabled,
+  queueMessages,
+  showReasoning,
+  webSearchEnabled,
+} from "@/lib/preferences";
 import {
   closeSubagentView,
   openSubagent,
@@ -146,6 +169,14 @@ const inFlightPrompt = ref<string | null>(null);
  * empty text), so ownership is the pair.
  */
 const inFlightImages = ref(0);
+/**
+ * S3 of `composer-tools-pdf.md`: how many PDFs and tool requests that send
+ * carries. Ownership is everything the turn is made of, so a prompt typed after
+ * the click — even with the same words — is never mistaken for the one on its
+ * way, and the document of one draft cannot be confused with another's.
+ */
+const inFlightPdfs = ref(0);
+const inFlightIntents = ref(0);
 /** Same latch for the "there is no session yet" half of the first send. */
 const starting = ref(false);
 const stopping = ref(false);
@@ -199,6 +230,45 @@ const prompt = draft.text;
  * live in memory only — no base64 ever reaches localStorage, a log line or SQLite.
  */
 const images = computed(() => [...attachmentsFor(draftKey.value)]);
+
+/**
+ * S3 of `odd/tasks/composer-tools-pdf.md`: the PDFs attached to the draft on
+ * screen. Same key and same memory-only lifetime as the images, so switching
+ * conversations switches them too and nothing extracted ever reaches storage.
+ */
+const pdfs = computed<ComposerPdf[]>(() => [...pdfsFor(draftKey.value)]);
+
+/**
+ * S2: the tool requests chosen for this draft, oldest first. They are text the
+ * next turn carries, never a setting and never an execution.
+ */
+const intents = computed<ComposerToolIntent[]>(() => [...intentsFor(draftKey.value)]);
+
+/**
+ * S3: a PDF with no selectable text (a scan) cannot be sent — Nabla runs no OCR,
+ * so its pages carry nothing and the composer says so instead of pretending.
+ */
+const pdfUnreadable = computed(() => hasUnreadablePdf(pdfs.value));
+
+/** How many PDFs are being extracted right now, so the composer can say so. */
+const pdfReading = ref(0);
+
+/**
+ * S2 of `composer-tools-pdf.md`: whether this run bound the MCP endpoint the
+ * agent's tools are published from (`web_search` and the browser's). Read once,
+ * because it is a property of the process: no endpoint means the agent has
+ * neither, and the menu says that instead of offering a request nothing can
+ * answer — whatever `settings.json` holds.
+ */
+const toolEndpointReady = ref(false);
+
+/**
+ * S2 of `composer-tools-pdf.md`: the Browser request needs the Browser tool the
+ * human turned on in Settings → Tools, read from the shared preference ref so a
+ * flip in the dialog reaches the composer's `+` menu without a reload. The search
+ * preference is the other switch; neither is inferred from the endpoint being up.
+ */
+const browserToolEnabled = computed(() => isToolEnabled("browser"));
 
 /**
  * Why an image was not attached, as the human reads it. `composer-images.ts`
@@ -261,6 +331,68 @@ async function handlePickImages(): Promise<void> {
   }
 }
 
+/** Why a PDF was not attached, as the human reads it. */
+function pdfRejectionMessage(rejection: PdfRejection): string {
+  switch (rejection) {
+    case "too-many":
+      return t("chat.composer.pdfTooMany", { count: COMPOSER_PDF_LIMIT });
+    case "too-many-pages":
+      return t("chat.composer.pdfTooManyPages", { count: COMPOSER_PDF_MAX_PAGES });
+    case "too-large":
+      return t("chat.composer.pdfTooLarge");
+    default:
+      return t("chat.composer.pdfEmpty");
+  }
+}
+
+/**
+ * S3: extracts the PDFs Rust was asked for, one at a time, so one unreadable
+ * document reports its own reason without discarding the others.
+ *
+ * Rust owns the extraction (local `pdftotext`, argv-only, bounded in time, size,
+ * pages and characters); this only turns its answer — or its refusal — into an
+ * attached document the composer can show and remove.
+ */
+async function addPdfPaths(paths: string[]): Promise<void> {
+  if (paths.length === 0) return;
+  for (const path of paths) {
+    pdfReading.value += 1;
+    try {
+      const extracted = await readPdfAttachment(path);
+      const { added, rejection } = addPdfAttachment(draftKey.value, extracted);
+      debugLog(
+        `composer pdf: +${added} pages=${extracted.pageCount} hasText=${extracted.hasText}${rejection === null ? "" : ` (${rejection})`}`,
+      );
+      if (rejection !== null) panelError.value = pdfRejectionMessage(rejection);
+    } catch (cause) {
+      panelError.value = commandErrorMessage(cause);
+    } finally {
+      pdfReading.value -= 1;
+    }
+  }
+}
+
+/** S3: the menu's PDF entry — the system picker, filtered to PDF files. */
+async function handlePickPdf(): Promise<void> {
+  panelError.value = null;
+  try {
+    await addPdfPaths(await pickPdfFiles());
+  } catch (cause) {
+    panelError.value = commandErrorMessage(cause);
+  }
+}
+
+/** S3: the PDF chip's own undo — the document simply was not sent. */
+function handleRemovePdf(id: string): void {
+  removePdfAttachment(draftKey.value, id);
+}
+
+/** S2: adds or removes one tool request of this draft; nothing else happens. */
+function handleToggleIntent(intent: ComposerToolIntent): void {
+  toggleIntent(draftKey.value, intent);
+  debugLog(`composer tool request: ${intent} ${intents.value.includes(intent) ? "on" : "off"}`);
+}
+
 /** Reads one pasted `Blob` as the data url `parseImageDataUrl` expects. */
 function readFileAsDataUrl(file: Blob): Promise<string | null> {
   return new Promise((resolve) => {
@@ -289,7 +421,16 @@ async function handlePasteImages(files: File[]): Promise<void> {
 
 /** S1: files dropped on the composer, read through the same path as the picker. */
 function handleDropFiles(paths: string[]): void {
-  void addImagePaths(paths);
+  // S3: a dropped PDF is extracted, a dropped image is read as an image; the
+  // extension only routes the path, the bytes are still checked by Rust.
+  const pdfPaths: string[] = [];
+  const imagePaths: string[] = [];
+  for (const path of paths) {
+    if (path.toLowerCase().endsWith(".pdf")) pdfPaths.push(path);
+    else imagePaths.push(path);
+  }
+  if (pdfPaths.length > 0) void addPdfPaths(pdfPaths);
+  if (imagePaths.length > 0) void addImagePaths(imagePaths);
 }
 
 /** S1: the preview's own undo — the image simply was not sent. */
@@ -613,8 +754,11 @@ const agentWorking = computed(
 const canSend = computed(
   () =>
     props.workspace !== null &&
-    (prompt.value.trim() !== "" || images.value.length > 0) &&
+    (prompt.value.trim() !== "" ||
+      images.value.length > 0 ||
+      pdfs.value.length > 0) &&
     !imageInputUnsupported.value &&
+    !pdfUnreadable.value &&
     !agentWorking.value,
 );
 
@@ -629,7 +773,9 @@ const submittingSamePrompt = computed(
   () =>
     inFlightPrompt.value !== null &&
     prompt.value.trim() === inFlightPrompt.value &&
-    images.value.length === inFlightImages.value,
+    images.value.length === inFlightImages.value &&
+    pdfs.value.length === inFlightPdfs.value &&
+    intents.value.length === inFlightIntents.value,
 );
 
 /**
@@ -651,8 +797,11 @@ const canQueue = computed(
     !submittingSamePrompt.value &&
     currentSession.value !== null &&
     props.workspace !== null &&
-    (prompt.value.trim() !== "" || images.value.length > 0) &&
-    !imageInputUnsupported.value,
+    (prompt.value.trim() !== "" ||
+      images.value.length > 0 ||
+      pdfs.value.length > 0) &&
+    !imageInputUnsupported.value &&
+    !pdfUnreadable.value,
 );
 
 /** Prompts of the session on screen that are waiting for a turn to end (S3). */
@@ -1139,9 +1288,23 @@ async function handleSend() {
   // S1-S2: the images of this draft travel with the text, and an image-only turn
   // is a turn. The wire copy is taken now, before a send can clear the draft.
   const attached = attachmentsToPromptImages(draftKey.value);
-  if (text === "" && attached.length === 0) return;
+  // S2-S3 of `composer-tools-pdf.md`: the text the agent receives is composed
+  // once here — question, requested tools and page-numbered PDFs — while the
+  // label the transcript keeps names the attachments and never their content.
+  const turn = {
+    imageCount: attached.length,
+    pdfs: pdfs.value,
+    intents: intents.value,
+  };
+  const wireText = composeTurnPrompt(prompt.value, turn);
+  const display = composeTurnDisplay(prompt.value, turn);
+  if (text === "" && attached.length === 0 && pdfs.value.length === 0) return;
   if (imageInputUnsupported.value) {
     debugLog("chat send: images attached but the named model takes none");
+    return;
+  }
+  if (pdfUnreadable.value) {
+    debugLog("chat send: a PDF has no selectable text (scan), nothing sent");
     return;
   }
   // The key the text was typed under, before a send can create its session.
@@ -1163,6 +1326,8 @@ async function handleSend() {
   // SAME text must not queue it a second time, and a different one may.
   inFlightPrompt.value = text;
   inFlightImages.value = attached.length;
+  inFlightPdfs.value = turn.pdfs.length;
+  inFlightIntents.value = turn.intents.length;
   panelError.value = null;
   try {
     const current = await ensureSession();
@@ -1172,11 +1337,17 @@ async function handleSend() {
     // keeps a rejected send's images with the text that is still in the composer.
     moveAttachments(originKey, draftKey.value);
     if (isSessionSpawning(current.sessionId)) {
-      enqueuePrompt(current.sessionId, text, current.workspaceId, attached);
+      enqueuePrompt(current.sessionId, wireText, current.workspaceId, attached, display);
       forgetSentDraft(originKey);
       return;
     }
-    await sendUserTurn(current.sessionId, current.workspaceId, text, attached);
+    await sendUserTurn(
+      current.sessionId,
+      current.workspaceId,
+      wireText,
+      attached,
+      display,
+    );
     forgetSentDraft(originKey);
   } catch (cause) {
     // The composer keeps the text and the images: a prompt that never left is
@@ -1186,6 +1357,8 @@ async function handleSend() {
     sending.value = false;
     inFlightPrompt.value = null;
     inFlightImages.value = 0;
+    inFlightPdfs.value = 0;
+    inFlightIntents.value = 0;
   }
 }
 
@@ -1216,6 +1389,16 @@ function handleQueue() {
   const current = currentSession.value;
   const text = prompt.value.trim();
   const attached = attachmentsToPromptImages(draftKey.value);
+  // S2-S3: the same composition the direct send uses, so a queued turn carries
+  // exactly what a sent one would — one line per requested tool, the PDFs with
+  // their page numbers, and a label that names them without copying their text.
+  const turn = {
+    imageCount: attached.length,
+    pdfs: pdfs.value,
+    intents: intents.value,
+  };
+  const wireText = composeTurnPrompt(prompt.value, turn);
+  const display = composeTurnDisplay(prompt.value, turn);
   // Ownership, not the latch (see `canQueue`): the text of the send that is in
   // flight is already on its way and must not also enter the queue; a prompt
   // typed after that click is somebody else's text and is queued now.
@@ -1225,19 +1408,20 @@ function handleQueue() {
   }
   if (
     current === null ||
-    (text === "" && attached.length === 0) ||
+    (text === "" && attached.length === 0 && pdfs.value.length === 0) ||
     !queueMessages.value ||
-    imageInputUnsupported.value
+    imageInputUnsupported.value ||
+    pdfUnreadable.value
   ) {
     debugLog(
-      `chat queue: nothing to queue (session=${current !== null} text=${text !== ""} images=${attached.length} pref=${queueMessages.value})`,
+      `chat queue: nothing to queue (session=${current !== null} text=${text !== ""} images=${attached.length} pdfs=${pdfs.value.length} pref=${queueMessages.value})`,
     );
     return;
   }
   // The panel knows the workspace of the session it renders, so the queued
   // prompt is addressable the moment the turn ends — even if the human has
   // moved to another workspace by then.
-  enqueuePrompt(current.sessionId, text, current.workspaceId, attached);
+  enqueuePrompt(current.sessionId, wireText, current.workspaceId, attached, display);
   // P2: a queued prompt is not unsent either, so the session's draft goes too.
   draft.clear();
   clearAttachments(draftKey.value);
@@ -1412,6 +1596,16 @@ onMounted(() => {
   // is already reflected here.
   void refreshProviderModels();
   void loadSettings();
+  // S2: whether this run bound the MCP endpoint the agent's tools come from.
+  // Read once — it is a property of the process, not of the turn — and a failure
+  // answers "no tools", never a promise.
+  void mcpEndpoint()
+    .then((endpoint) => {
+      toolEndpointReady.value = endpoint !== null;
+    })
+    .catch(() => {
+      toolEndpointReady.value = false;
+    });
   // L3/S4: the store owns the single `agent-event` subscription and buffers
   // every session, so this panel only asks for it to be installed. It is never
   // torn down with the panel: a background session must keep receiving events.
@@ -1544,6 +1738,13 @@ onUnmounted(() => {
             :can-stop="currentSession !== null && !stopping"
             :images="images"
             :image-input-unsupported="imageInputUnsupported"
+            :pdfs="pdfs"
+            :intents="intents"
+            :pdf-unreadable="pdfUnreadable"
+            :pdf-reading="pdfReading > 0"
+            :web-search-enabled="webSearchEnabled"
+            :tool-endpoint-ready="toolEndpointReady"
+            :browser-enabled="browserToolEnabled"
             @select-model="handleSelectModel"
             @send="handleSend"
             @queue="handleQueue"
@@ -1552,6 +1753,9 @@ onUnmounted(() => {
             @remove-image="handleRemoveImage"
             @paste-images="handlePasteImages"
             @drop-files="handleDropFiles"
+            @pick-pdf="handlePickPdf"
+            @remove-pdf="handleRemovePdf"
+            @toggle-intent="handleToggleIntent"
           />
         </div>
       </template>
@@ -1767,6 +1971,13 @@ onUnmounted(() => {
           :can-stop="currentSession !== null && !stopping"
           :images="images"
           :image-input-unsupported="imageInputUnsupported"
+          :pdfs="pdfs"
+          :intents="intents"
+          :pdf-unreadable="pdfUnreadable"
+          :pdf-reading="pdfReading > 0"
+          :web-search-enabled="webSearchEnabled"
+          :tool-endpoint-ready="toolEndpointReady"
+          :browser-enabled="browserToolEnabled"
           @select-model="handleSelectModel"
           @send="handleSend"
           @queue="handleQueue"
@@ -1775,6 +1986,9 @@ onUnmounted(() => {
           @remove-image="handleRemoveImage"
           @paste-images="handlePasteImages"
           @drop-files="handleDropFiles"
+          @pick-pdf="handlePickPdf"
+          @remove-pdf="handleRemovePdf"
+          @toggle-intent="handleToggleIntent"
         />
         <p class="mt-2 text-center text-xs text-muted-foreground">
           {{ t("chat.turnsAndSteps", { turns, steps }) }}

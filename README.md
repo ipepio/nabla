@@ -17,6 +17,7 @@ builds.
 | [pnpm](https://pnpm.io) | 12+ | the only package manager this repo uses |
 | Xcode Command Line Tools | — | `xcode-select --install` |
 | [Pi](https://github.com/earendil-works/pi) | latest | `npm install -g @earendil-works/pi-coding-agent` |
+| [Poppler](https://poppler.freedesktop.org) (`pdftotext`) | latest | optional: attaching a PDF reads its text locally. Without it the composer tells you what to install (`brew install poppler`) |
 
 Verify the last one, because Nabla resolves it by name from `PATH`:
 
@@ -91,7 +92,9 @@ The two features ship off because both leave your machine:
 
 - **Web search** — Settings → Web search. A SearXNG instance you name, or any public
   one if you leave the field empty. The agent gets titles, urls and snippets; the page
-  itself is never opened by the search.
+  itself is never opened by the search. The switch gives the agent the tool; the
+  composer's per-turn *web search* request stays disabled until the SearXNG round trip
+  is verified end to end (see below).
 - **Subagents** — Settings → Subagents. One master switch, then one switch per
   profile. With it off the agent has no delegation tools at all. Templates (explorer,
   researcher, worker, judge, judge-2) arrive written and disabled; enable the ones you
@@ -100,6 +103,20 @@ The two features ship off because both leave your machine:
 The permission chip in the composer is the other switch worth knowing: `read` blocks
 shell and file edits, `write` allows edits and asks before commands, `yolo` allows
 everything.
+
+**The composer's `+` menu** attaches an image or a PDF, or marks a per-turn tool
+request. A PDF is extracted locally by `pdftotext`, page by page, and travels with
+your question; page numbers survive pages that hold nothing, and a scan (no
+selectable text) is reported instead of being sent, because no OCR runs here. A tool
+request — web search, the embedded browser — is one line added to that turn's prompt:
+it changes no setting, runs nothing by itself, and is only offered when the
+capability is really on. Both requests need the run's own tool endpoint, which
+publishes the browser tools and `web_search`; the browser request additionally needs
+the Browser switch in Settings → Tools, because it drives a real Chromium instance.
+Web search is **not** offered yet: a switch and a bound endpoint do not prove that a
+SearXNG instance answers a query, so the row stays visible and disabled with
+"End-to-end search verification pending" until that round trip has been verified.
+Otherwise the row stays visible, disabled, with the reason.
 
 ## Checks
 
@@ -148,7 +165,9 @@ confusion.
 ## What to try, and what will bite you
 
 Worth exercising: paste a screenshot into the composer (or drop one on it) and ask a
-question about it; delegate to a subagent and watch its session appear nested under the
+question about it; attach a PDF from the `+` menu and ask which page each conclusion
+appears on; queue a second question while a turn runs and watch it keep its own
+attachments; delegate to a subagent and watch its session appear nested under the
 chat that started it; open that child and watch it work, read-only; stop the parent and
 see the children die with it; ask the agent to drive the embedded browser pane.
 

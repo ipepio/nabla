@@ -157,12 +157,34 @@ same way, so no layer guesses at another's rule:
 | `src/lib/composer-attachments.ts` | Where a pending image belongs | One list per draft key (`nabla.draft.<sessionId>` or `nabla.draft.new.<workspaceId>`), in memory only: switching conversations switches images, a rejected send keeps them with the text (`moveAttachments` covers the key the first send creates), and nothing ever writes base64 to `localStorage`, a log line or SQLite. |
 | `src-tauri/src/image_input.rs` | What a file and a prompt may carry | The format is sniffed from the bytes, never the extension; the metadata size is checked before the file is read; at most `MAX_PROMPT_IMAGES` per prompt and `MAX_IMAGE_BYTES` per image; the payload leaves as pi's own `ImageContent` (`type: "image"`, `data`, `mimeType`). `send_prompt` runs the same bounds again, so the webview is never the authority. |
 
-`Composer.vue` only wires the entry points: the `+` button asks the system picker (through
+`Composer.vue` only wires the entry points: the `+` menu asks the system pickers (through
 `src/contracts/`), a paste is filtered by the clipboard rule, and a desktop drop arrives from the
 window because Tauri hands the OS paths there, not to the DOM (`onFileDrop`, positioned against the
 card's rectangle). `ChatPanel.vue` turns every candidate into a pending attachment and sends or queues
 the whole turn (text plus images, or images alone) through the same `sendUserTurn` / `enqueuePrompt`
 path a text prompt uses.
+
+## Composer PDFs and tool requests — four seams
+
+The same feature (`odd/tasks/composer-tools-pdf.md`, S2-S3) adds two things a turn can carry besides
+its text, and each rule lives in exactly one module:
+
+| Layer | Owns | Contract |
+| --- | --- | --- |
+| `src-tauri/src/pdf_input.rs` | Extraction and its bounds | `pdftotext` runs as an argv-only child (never a shell string); the file must be a regular file under 32 MiB starting with `%PDF-`; the child is killed at 20 s and its stdout is capped; the answer is refused over 200 pages or 1,000,000 characters. The form feed splits pages, so page N is index N-1 and an empty page stays `""`; a document with no selectable text answers `hasText: false` and no OCR runs. A missing `pdftotext` names the poppler package. Pinned by the module's own `#[cfg(test)]` tests, which build their PDFs in a temp dir. |
+| `src/components/chat/composer-pdfs.ts` | What the composer accepts | `COMPOSER_PDF_LIMIT` documents per turn; the page/character ceilings re-applied to the payload; the page-numbered block (`[page N]` before each page, nothing for an empty one); `hasUnreadablePdf` for the scan case, which attaches and blocks sending. Pinned by `tests/composer-pdfs.test.ts`. |
+| `src/components/chat/composer-tools.ts` | What a tool request is | Text only: `web-search` and `browser`, each one explicit line the turn carries. Both are published from the local MCP endpoint this run bound and registered with pi, so without it neither request exists — whatever `settings.json` says. Above that each has its own human switch: `browser` needs the Browser tool in Settings → Tools (`enabledTools`), and `web-search` needs `settings.webSearchEnabled`. `web-search` additionally stays disabled with `search-verification-pending` until the SearXNG round trip is proven end to end: a switch and a bound endpoint are not that proof, and `webSearchEndToEndVerified` is the single place that fact changes. A request that is not available stays visible, disabled, with the reason — the first unmet precondition, in the order the rule reads it — never advertised as ready. Choosing one executes nothing, flips no setting, makes no network call, and the underlying service is never disabled. Pinned by `tests/composer-tools.test.ts`. |
+| `src/components/chat/composer-turn.ts` | What a turn really contains | `composeTurnPrompt` is the single place question + request lines + PDF blocks become the wire text, and `composeTurnDisplay` the single place the transcript/queue label is built. The panel composes once per send or queue, then clears the draft; the label names attachments, never their content. Pinned by both Node suites. |
+
+`ChatPanel.vue` owns the facts a row is decided from: the MCP endpoint is read once at mount (a
+process property, not a turn's), `webSearchEnabled` and `isToolEnabled("browser")` come from the
+shared preference refs, so a flip in the settings dialog reaches an open menu without a reload, and
+no switch is ever inferred from the endpoint being up.
+
+The queue owns what it is given: `enqueuePrompt` / `sendUserTurn` store the composed text, the image
+payloads and the label, so a queued turn keeps its PDFs and its requests while it waits, and a
+rejected send leaves the whole draft (text, images, PDFs, requests) in place. Nothing extracted is
+ever persisted: the PDF text lives in `src/lib/composer-attachments.ts` for as long as the draft does.
 
 **The capability preflight is two-layered on purpose.** The composer shows the notice as soon as the
 named model's catalogue entry lacks `image` in its `input` list, and Rust refuses before writing to the

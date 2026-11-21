@@ -27,6 +27,7 @@ import type {
   PiCliResult,
   PreviewMessage,
   PromptImage,
+  PdfAttachment,
   ProviderDraft,
   ProviderModel,
   ProviderModelDraft,
@@ -473,6 +474,24 @@ export async function pickImageFiles(): Promise<string[]> {
 }
 
 /**
+ * S3 of `odd/tasks/composer-tools-pdf.md`: the menu's PDF entry opens the same
+ * picker filtered to `*.pdf`, and answers the absolute paths (an empty list when
+ * the human dismissed it, which is not an error).
+ *
+ * The file is read and extracted by Rust (`readPdfAttachment`): the webview never
+ * opens a PDF, so no parser — and no shell — ever runs inside it.
+ */
+export async function pickPdfFiles(): Promise<string[]> {
+  const selected = await openDialog({
+    multiple: true,
+    directory: false,
+    filters: [{ name: "PDF", extensions: ["pdf"] }],
+  });
+  if (selected === null) return [];
+  return Array.isArray(selected) ? selected : [selected];
+}
+
+/**
  * S1 of `tool-drawer-and-mcp.md`: shows one absolute path in the system file
  * manager, with the file already selected.
  *
@@ -668,6 +687,23 @@ export function sendPrompt(
  */
 export function readImageAttachment(path: string): Promise<ImageAttachment> {
   return invoke<ImageAttachment>("read_image_attachment", { path });
+}
+
+/**
+ * S3 of `odd/tasks/composer-tools-pdf.md`: extracts one PDF's selectable text,
+ * locally and page by page, with pi's own runtime never involved.
+ *
+ * Extraction is Rust's: `pdftotext` runs as an argv-only child (no shell), with the
+ * file size, page count, output size and elapsed time bounded there, and the answer
+ * preserves page numbering — an empty page stays an empty string in `pages`. A
+ * missing `pdftotext` rejects with the install hint, and a document with no
+ * selectable text answers `hasText: false` instead of invented text.
+ *
+ * The path is one the human picked or dropped; this command never lists a
+ * directory and answers extracted text, never the PDF's bytes.
+ */
+export function readPdfAttachment(path: string): Promise<PdfAttachment> {
+  return invoke<PdfAttachment>("read_pdf_attachment", { path });
 }
 
 export function stopSession(

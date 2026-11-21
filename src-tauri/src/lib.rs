@@ -7,6 +7,9 @@ mod embed;
 // (`odd/tasks/composer-image-input.md`).
 mod image_input;
 mod mcp;
+// The composer's PDF input: local `pdftotext` extraction, page by page, bounded
+// (`odd/tasks/composer-tools-pdf.md`).
+mod pdf_input;
 // The other end of MCP: a local server pi connects to in order to drive the
 // embedded webview (`webview-control.md`).
 mod mcp_server;
@@ -296,6 +299,7 @@ pub fn run() {
             // S1 of `composer-image-input.md`: the composer reads a picked or
             // dropped image through Rust (sniffed format, bounded size).
             commands::read_image_attachment,
+            commands::read_pdf_attachment,
             // S2/S3 of `composer-inputs.md`: the effort selector and the `/`
             // completion. The level is applied live and kept as the next
             // session's default; the commands are pi's own list, proxied.
