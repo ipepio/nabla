@@ -52,8 +52,8 @@ and stays manual until GUI automation exists.
 ## Not covered yet
 
 - Typed command errors: no contract on either side, so only message text can be asserted (F1).
-- Frontend unit or component tests: no runner is installed (F2); Vue behavior is checked by
-  `vue-tsc` and manual passes.
+- Frontend unit tests: `node --test tests/` runs the pure modules (no framework is a dependency);
+  Vue components and composables still rest on `vue-tsc` and a manual pass.
 - End-to-end desktop automation and CI: absent; nothing enforces these checks automatically.
 - Runtime behavior: no fake `pi` harness exists yet; it arrives with R2 (spec S8) in
   `odd/tasks/pi-runtime.md`.

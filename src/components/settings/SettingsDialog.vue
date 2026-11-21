@@ -66,8 +66,10 @@
  * General pane; the header no longer repeats it.
  *
  * S5 of `settings-dialog.md`: the nav lists only the sections the app can drive
- * — permissions, font size, work details, code view and shortcuts have no
- * backend yet, so they are not painted as if they worked. S1 of
+ * — permissions, font size, work details and code view have no backend yet, so
+ * they are not painted as if they worked. Shortcuts left that list when the zoom
+ * chords landed: the General pane shows them read-only, because a chord is not a
+ * preference (`src/lib/zoom.ts` owns the listener and the labels). S1 of
  * `tool-drawer-and-mcp.md` added the third one: MCP, a pane of its own rather
  * than a block inside Providers, because servers and providers are two different
  * things pi reads from two different files.
@@ -143,6 +145,7 @@ import {
   type ToolPreferenceId,
 } from "@/lib/preferences";
 import { useI18n, type Locale, type MessageKey } from "@/lib/i18n";
+import { detectPlatform, zoomShortcutLabels } from "@/lib/zoom";
 import {
   invalidateProviderModels,
   loadProviderModels,
@@ -203,6 +206,30 @@ const THEME_OPTIONS: {
 const LANGUAGE_OPTIONS: { value: Locale; labelKey: MessageKey }[] = [
   { value: "en", labelKey: "settings.general.language.english" },
   { value: "es", labelKey: "settings.general.language.spanish" },
+];
+
+/**
+ * The zoom chords this build listens to, labelled for the platform it runs on.
+ *
+ * Read-only on purpose: a chord is not a preference yet, and `src/lib/zoom.ts`
+ * owns both the listener and these labels, so this list cannot describe a key the
+ * app ignores. The platform is read once, exactly as `App.vue` reads it.
+ */
+const SHORTCUT_PLATFORM = detectPlatform(navigator.userAgent, navigator.platform);
+const ZOOM_SHORTCUT_LABELS = zoomShortcutLabels(SHORTCUT_PLATFORM);
+const SHORTCUT_ROWS: { labelKey: MessageKey; keys: string }[] = [
+  {
+    labelKey: "settings.general.shortcuts.zoomIn",
+    keys: ZOOM_SHORTCUT_LABELS.in,
+  },
+  {
+    labelKey: "settings.general.shortcuts.zoomOut",
+    keys: ZOOM_SHORTCUT_LABELS.out,
+  },
+  {
+    labelKey: "settings.general.shortcuts.zoomReset",
+    keys: ZOOM_SHORTCUT_LABELS.reset,
+  },
 ];
 
 /** Persisted preferences, `null` until the file is read on open. */
@@ -1235,6 +1262,36 @@ watch(open, (isOpen) => {
                   </SelectItem>
                 </SelectContent>
               </Select>
+            </section>
+
+            <!-- The zoom chords are the only shortcuts with a backend, and they
+                 are the app's, not a preference: a read-only list instead of a
+                 control. S5 of `settings-dialog.md` still holds for the rest
+                 (font size, work details, code view). -->
+            <section class="space-y-2">
+              <div>
+                <h3 class="text-sm font-medium">
+                  {{ t("settings.general.shortcuts") }}
+                </h3>
+                <p class="mt-0.5 text-xs text-muted-foreground">
+                  {{ t("settings.general.shortcuts.description") }}
+                </p>
+              </div>
+              <ul class="divide-y rounded-md border">
+                <li
+                  v-for="row in SHORTCUT_ROWS"
+                  :key="row.labelKey"
+                  class="flex items-center justify-between gap-4 px-3 py-2"
+                >
+                  <span class="text-xs">{{ t(row.labelKey) }}</span>
+                  <kbd
+                    class="rounded-sm bg-muted px-1.5 py-0.5 font-sans text-[0.7rem] font-medium text-muted-foreground"
+                  >{{ row.keys }}</kbd>
+                </li>
+              </ul>
+              <p class="text-xs text-muted-foreground">
+                {{ t("settings.general.shortcuts.zoomScope") }}
+              </p>
             </section>
 
             <!-- S4: the only configuration-file action, at the end of the pane. -->

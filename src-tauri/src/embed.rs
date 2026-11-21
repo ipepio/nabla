@@ -238,10 +238,16 @@ impl std::fmt::Display for EmbedError {
                 write!(f, "embed: could not place the embedded browser: {message}")
             }
             EmbedError::Visibility(message) => {
-                write!(f, "embed: could not show or hide the embedded browser: {message}")
+                write!(
+                    f,
+                    "embed: could not show or hide the embedded browser: {message}"
+                )
             }
             EmbedError::Navigate(message) => {
-                write!(f, "embed: could not navigate the embedded browser: {message}")
+                write!(
+                    f,
+                    "embed: could not navigate the embedded browser: {message}"
+                )
             }
             EmbedError::Eval(message) => write!(f, "embed: {message}"),
             EmbedError::Unsupported => write!(
@@ -289,10 +295,7 @@ pub fn validate_url(raw: &str) -> Result<String, EmbedError> {
 /// filesystem is outside what this pane is for — so links, `data:`, `blob:` and
 /// app-handled schemes keep working inside the child webview.
 fn navigation_allowed(url: &str) -> bool {
-    !url
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("file:")
+    !url.trim_start().to_ascii_lowercase().starts_with("file:")
 }
 
 /// Which new-window requests are adopted as a tab of the pane.
@@ -893,13 +896,7 @@ fn adopt_popup(app: AppHandle, embeds: EmbedSessions, view_id: String) {
         return give_up("no opener is registered");
     };
     debug_line!("popup {view_id} adopted by {opener_id}");
-    let _ = app.emit(
-        POPUP_EVENT,
-        PopupTab {
-            view_id,
-            opener_id,
-        },
-    );
+    let _ = app.emit(POPUP_EVENT, PopupTab { view_id, opener_id });
 }
 
 /// The one removal step [`EmbedSessions::forget`] and [`EmbedSessions::evict`]
@@ -1012,7 +1009,9 @@ impl EmbedSessions {
                 // Ready HERE, not when it was reserved: a tool that waited for a
                 // pane must never act on a label the platform has not built yet.
                 if !self.mark_ready(&view.id) {
-                    webview.close().map_err(|err| EmbedError::Create(err.to_string()))?;
+                    webview
+                        .close()
+                        .map_err(|err| EmbedError::Create(err.to_string()))?;
                     return Err(EmbedError::UnknownView(view.id));
                 }
                 // A popup whose opener is gone is unreachable: no tab can return to
@@ -1124,9 +1123,7 @@ impl EmbedSessions {
                 // result of a script nobody waits for is dropped, not unwrapped.
                 let _ = sender.send(result);
             })
-            .map_err(|err| {
-                EmbedError::Eval(format!("the script could not be evaluated: {err}"))
-            })?;
+            .map_err(|err| EmbedError::Eval(format!("the script could not be evaluated: {err}")))?;
         receiver.recv_timeout(EVAL_TIMEOUT).map_err(|_| {
             EmbedError::Eval(format!(
                 "{view_id} did not answer within {}s",
@@ -1158,7 +1155,11 @@ impl EmbedSessions {
         }
         debug_line!(
             "close {view_id}: entry={known} webview={closed}{}",
-            if known { "" } else { " (orphan, closed by label)" }
+            if known {
+                ""
+            } else {
+                " (orphan, closed by label)"
+            }
         );
         known || closed
     }
@@ -1294,13 +1295,19 @@ mod tests {
 
     #[test]
     fn validate_url_accepts_http_and_https_and_normalizes_them() {
-        assert_eq!(validate_url("https://example.com"), Ok("https://example.com/".into()));
+        assert_eq!(
+            validate_url("https://example.com"),
+            Ok("https://example.com/".into())
+        );
         assert_eq!(
             validate_url("http://127.0.0.1:1420/app?x=1"),
             Ok("http://127.0.0.1:1420/app?x=1".into())
         );
         // Surrounding whitespace is trimmed, not rejected: a pasted url has it.
-        assert_eq!(validate_url("  https://tauri.app/  "), Ok("https://tauri.app/".into()));
+        assert_eq!(
+            validate_url("  https://tauri.app/  "),
+            Ok("https://tauri.app/".into())
+        );
     }
 
     #[test]
@@ -1328,7 +1335,10 @@ mod tests {
                 message.contains("only http, https and about:blank"),
                 "unexpected message: {message}"
             );
-            assert!(message.contains(raw), "the message names the input: {message}");
+            assert!(
+                message.contains(raw),
+                "the message names the input: {message}"
+            );
         }
     }
 
@@ -1473,7 +1483,10 @@ mod tests {
     #[test]
     fn too_many_carries_the_cap_in_its_message() {
         let message = EmbedError::TooMany(MAX_VIEWS).to_string();
-        assert!(message.contains(&MAX_VIEWS.to_string()), "unexpected: {message}");
+        assert!(
+            message.contains(&MAX_VIEWS.to_string()),
+            "unexpected: {message}"
+        );
         assert!(message.contains("already open"), "unexpected: {message}");
     }
 
@@ -1483,7 +1496,10 @@ mod tests {
     fn set_url_records_the_last_navigation() {
         let sessions = EmbedSessions::new();
         let view = sessions.reserve(DEFAULT_URL.into()).expect("view");
-        assert_eq!(sessions.get(&view.id).map(|v| v.url), Some(DEFAULT_URL.into()));
+        assert_eq!(
+            sessions.get(&view.id).map(|v| v.url),
+            Some(DEFAULT_URL.into())
+        );
 
         assert!(sessions.set_url(&view.id, "https://example.com/"));
         assert_eq!(
@@ -1524,7 +1540,9 @@ mod tests {
     fn evict_removes_the_entry_from_the_registry() {
         let sessions = EmbedSessions::new();
         let dead = sessions.reserve(DEFAULT_URL.into()).expect("dead");
-        let live = sessions.reserve("https://example.com/".into()).expect("live");
+        let live = sessions
+            .reserve("https://example.com/".into())
+            .expect("live");
 
         assert_eq!(sessions.evict(&dead.id), Some(dead.clone()));
         assert_eq!(sessions.get(&dead.id), None, "the dead entry is gone");
@@ -1532,7 +1550,11 @@ mod tests {
         assert_eq!(sessions.views(), vec![live]);
         // The navigation handler of a webview that fired late cannot resurrect it.
         assert!(!sessions.set_url(&dead.id, "https://example.com/"));
-        assert_eq!(sessions.evict(&dead.id), None, "evicting twice is empty, not a panic");
+        assert_eq!(
+            sessions.evict(&dead.id),
+            None,
+            "evicting twice is empty, not a panic"
+        );
     }
 
     // An eviction is not the human's close: a tool waiting for a pane keeps
@@ -1567,11 +1589,16 @@ mod tests {
     fn drain_closes_the_registry_in_one_step() {
         let sessions = EmbedSessions::new();
         sessions.reserve(DEFAULT_URL.into()).expect("first");
-        sessions.reserve("https://example.com/".into()).expect("second");
+        sessions
+            .reserve("https://example.com/".into())
+            .expect("second");
         let drained = sessions.drain();
         assert_eq!(drained.len(), 2);
         assert!(sessions.is_empty(), "close_all leaves no view behind");
-        assert!(sessions.drain().is_empty(), "draining twice is empty, not a panic");
+        assert!(
+            sessions.drain().is_empty(),
+            "draining twice is empty, not a panic"
+        );
     }
 
     // ── waiting for a pane (`auto-open-pane.md`, S1/S3/S4) ───────────────────
@@ -1628,7 +1655,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             // What the pane's `embed_create` does first: the view exists in the
             // registry before the webview does.
-            let reserved = creating.reserve(DEFAULT_URL.into()).expect("the pane's create");
+            let reserved = creating
+                .reserve(DEFAULT_URL.into())
+                .expect("the pane's create");
             assert!(!creating.is_ready(&reserved.id), "reserved first");
             std::thread::sleep(Duration::from_millis(50));
             // ... and this is `add_child` answering.
@@ -1655,14 +1684,19 @@ mod tests {
     fn ready_views_lists_only_what_the_platform_has_built() {
         let sessions = EmbedSessions::new();
         let reserved = sessions.reserve(DEFAULT_URL.into()).expect("reserved");
-        let built = sessions.reserve("https://example.com/".into()).expect("built");
+        let built = sessions
+            .reserve("https://example.com/".into())
+            .expect("built");
         assert!(sessions.mark_ready(&built.id));
 
         assert_eq!(sessions.views(), vec![reserved.clone(), built.clone()]);
         assert_eq!(sessions.ready_views(), vec![built.clone()]);
         assert!(sessions.is_ready(&built.id));
         assert!(!sessions.is_ready(&reserved.id));
-        assert!(!sessions.is_ready("embed-99"), "an unknown id is never ready");
+        assert!(
+            !sessions.is_ready("embed-99"),
+            "an unknown id is never ready"
+        );
     }
 
     // A creation racing a close: the platform answers after the pane is gone. The
@@ -1702,8 +1736,14 @@ mod tests {
         let waited = started.elapsed();
 
         assert!(!opened, "silence is a no, not an invented view");
-        assert!(waited >= Duration::from_millis(80), "the wait is the timeout it was given");
-        assert!(waited < Duration::from_secs(5), "and no longer than that, took {waited:?}");
+        assert!(
+            waited >= Duration::from_millis(80),
+            "the wait is the timeout it was given"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "and no longer than that, took {waited:?}"
+        );
     }
 
     /// Runs `close` on another thread once the waiter is inside its wait, so the
@@ -1856,7 +1896,11 @@ mod tests {
         let mut expected = vec![first.id.clone(), second.id.clone(), nested.id.clone()];
         expected.sort();
         assert_eq!(closed, expected, "the page and its popups are one thing");
-        assert_eq!(sessions.get(&page.id), Some(page), "the page itself is not touched");
+        assert_eq!(
+            sessions.get(&page.id),
+            Some(page),
+            "the page itself is not touched"
+        );
         assert_eq!(sessions.len(), 1, "nothing else was registered");
     }
 
@@ -1876,7 +1920,10 @@ mod tests {
             .reserve_popup(DEFAULT_URL.into(), &first.id)
             .expect("nested");
 
-        assert_eq!(sessions.popups_of(&page.id), vec![first.clone(), second.clone()]);
+        assert_eq!(
+            sessions.popups_of(&page.id),
+            vec![first.clone(), second.clone()]
+        );
         assert_eq!(sessions.popups_of(&first.id), vec![nested]);
         assert!(sessions.popups_of(&second.id).is_empty());
         assert!(sessions.popups_of("embed-99").is_empty());
@@ -1901,7 +1948,11 @@ mod tests {
             .into_iter()
             .map(|view| view.id)
             .collect();
-        assert_eq!(closed, vec![nested.id.clone()], "a popup's own popups go with it");
+        assert_eq!(
+            closed,
+            vec![nested.id.clone()],
+            "a popup's own popups go with it"
+        );
         assert_eq!(
             sessions.get(&sibling.id),
             Some(sibling),

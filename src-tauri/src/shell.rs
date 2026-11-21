@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtyPair, PtySize};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtyPair, PtySize, native_pty_system};
 
 /// How many terminals may be live at once. A tab per workspace is the intended
 /// use; the cap is there so a stuck UI cannot leak processes without bound.
@@ -129,17 +129,16 @@ pub fn resolve_shell() -> String {
 /// skipped — a `$SHELL` left over from an uninstalled shell would otherwise open
 /// a tab that can never start. When no candidate exists the last one is still
 /// named, so the spawn reports its own clear failure instead of an empty argv.
-fn resolve_shell_with(
-    configured: Option<String>,
-    exists: impl Fn(&Path) -> bool,
-) -> String {
+fn resolve_shell_with(configured: Option<String>, exists: impl Fn(&Path) -> bool) -> String {
     let configured = configured.filter(|shell| !shell.trim().is_empty());
-    let candidates: Vec<String> = configured.into_iter().chain(
-        ["/bin/zsh", "/bin/bash"]
-            .iter()
-            .map(|shell| shell.to_string()),
-    )
-    .collect();
+    let candidates: Vec<String> = configured
+        .into_iter()
+        .chain(
+            ["/bin/zsh", "/bin/bash"]
+                .iter()
+                .map(|shell| shell.to_string()),
+        )
+        .collect();
     candidates
         .iter()
         .find(|shell| exists(Path::new(shell)))
@@ -457,7 +456,9 @@ fn wait_flag(flag: &AtomicBool, budget: Duration) -> bool {
 /// Locks without panicking: a poisoned lock in a background thread must not turn
 /// into a terminal the host can no longer address.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -555,7 +556,11 @@ exit 0
 
         /// Waits until `check` accepts the collected events, so no test races a
         /// reader thread. Panics with what it saw on timeout.
-        fn wait_for(&self, what: &str, check: impl Fn(&[ShellOutputEvent]) -> bool) -> Vec<ShellOutputEvent> {
+        fn wait_for(
+            &self,
+            what: &str,
+            check: impl Fn(&[ShellOutputEvent]) -> bool,
+        ) -> Vec<ShellOutputEvent> {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 let events = self.snapshot();
@@ -604,14 +609,7 @@ exit 0
         let sessions = ShellSessions::new();
 
         let session = sessions
-            .open_with(
-                binary(&script),
-                &[],
-                &scratch.dir,
-                80,
-                24,
-                collected.sink(),
-            )
+            .open_with(binary(&script), &[], &scratch.dir, 80, 24, collected.sink())
             .expect("open a pty");
 
         assert!(!session.session_id.is_empty(), "a session has an id");
@@ -638,19 +636,14 @@ exit 0
         let sessions = ShellSessions::new();
 
         let session = sessions
-            .open_with(
-                binary(&script),
-                &[],
-                &scratch.dir,
-                80,
-                24,
-                collected.sink(),
-            )
+            .open_with(binary(&script), &[], &scratch.dir, 80, 24, collected.sink())
             .expect("open a pty");
         collected.wait_for("the greeting", contains("ready line"));
 
         assert!(
-            sessions.write(&session.session_id, "hello\n").expect("write"),
+            sessions
+                .write(&session.session_id, "hello\n")
+                .expect("write"),
             "a live session accepts input"
         );
         collected.wait_for("the echoed line", contains("echo:hello"));
@@ -668,14 +661,7 @@ exit 0
         let sessions = ShellSessions::new();
 
         let session = sessions
-            .open_with(
-                binary(&script),
-                &[],
-                &scratch.dir,
-                80,
-                24,
-                collected.sink(),
-            )
+            .open_with(binary(&script), &[], &scratch.dir, 80, 24, collected.sink())
             .expect("open a pty");
         collected.wait_for("the greeting", contains("ready line"));
         sessions.write(&session.session_id, "bye\n").expect("write");
@@ -715,9 +701,11 @@ exit 0
         let sessions = ShellSessions::new();
         assert!(!sessions.close("shell-does-not-exist"));
         assert!(!sessions.write("shell-does-not-exist", "x").expect("write"));
-        assert!(!sessions
-            .resize("shell-does-not-exist", 100, 30)
-            .expect("resize"));
+        assert!(
+            !sessions
+                .resize("shell-does-not-exist", 100, 30)
+                .expect("resize")
+        );
     }
 
     // S2: the cap is a live count, not a lifetime quota. Eight are allowed, the
@@ -734,14 +722,7 @@ exit 0
         let mut ids = Vec::new();
         for index in 0..MAX_SESSIONS {
             let session = sessions
-                .open_with(
-                    binary(&script),
-                    &[],
-                    &scratch.dir,
-                    80,
-                    24,
-                    collected.sink(),
-                )
+                .open_with(binary(&script), &[], &scratch.dir, 80, 24, collected.sink())
                 .unwrap_or_else(|err| panic!("session {index} must open: {err}"));
             ids.push(session.session_id);
         }
@@ -749,14 +730,8 @@ exit 0
         ids.dedup();
         assert_eq!(ids.len(), MAX_SESSIONS, "every session gets its own id");
 
-        let rejected = sessions.open_with(
-            binary(&script),
-            &[],
-            &scratch.dir,
-            80,
-            24,
-            collected.sink(),
-        );
+        let rejected =
+            sessions.open_with(binary(&script), &[], &scratch.dir, 80, 24, collected.sink());
         match rejected {
             Err(ShellError::TooMany(cap)) => assert_eq!(cap, MAX_SESSIONS),
             other => panic!("the ninth session must be refused, got: {other:?}"),
@@ -770,14 +745,7 @@ exit 0
         // Closing one frees exactly one slot.
         assert!(sessions.close(&ids[0]));
         sessions
-            .open_with(
-                binary(&script),
-                &[],
-                &scratch.dir,
-                80,
-                24,
-                collected.sink(),
-            )
+            .open_with(binary(&script), &[], &scratch.dir, 80, 24, collected.sink())
             .expect("a freed slot is reusable");
     }
 

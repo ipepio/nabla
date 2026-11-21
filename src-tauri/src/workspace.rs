@@ -252,8 +252,8 @@ pub fn list_dir(workspace: &str, rel_path: &str) -> Result<Vec<FsEntry>, String>
     }
     let prefix = prefix_of(rel_path)?;
     let mut entries = Vec::new();
-    let reader = std::fs::read_dir(&dir)
-        .map_err(|err| format!("cannot read {}: {err}", label(rel_path)))?;
+    let reader =
+        std::fs::read_dir(&dir).map_err(|err| format!("cannot read {}: {err}", label(rel_path)))?;
     for entry in reader {
         let Ok(entry) = entry else { continue };
         // `file_type` does not follow the link, so a symlink is reported as
@@ -316,7 +316,10 @@ pub fn image_mime(name: &str) -> Option<&'static str> {
 pub fn preview(workspace: &str, rel_path: &str) -> Result<FsPreview, String> {
     let file = resolve(workspace, rel_path)?;
     if file.is_dir() {
-        return Err(format!("not a file (it is a directory): {}", label(rel_path)));
+        return Err(format!(
+            "not a file (it is a directory): {}",
+            label(rel_path)
+        ));
     }
     let size_bytes = std::fs::metadata(&file)
         .map_err(|err| format!("cannot read {}: {err}", label(rel_path)))?
@@ -613,10 +616,7 @@ pub fn git_diff(workspace: &str, path: &str) -> Result<String, String> {
     }
     let rel = parts.join("/");
     if !is_repo(&root) {
-        return Err(format!(
-            "not a git repository: {}",
-            root.to_string_lossy()
-        ));
+        return Err(format!("not a git repository: {}", root.to_string_lossy()));
     }
     // A deleted file no longer exists, so containment checks the deepest
     // ancestor that does instead of failing on a missing leaf.
@@ -727,7 +727,10 @@ mod tests {
         tree.outside("secret.txt", b"secret");
 
         let err = list_dir(&tree.ws_str(), "..").expect_err("`..` must be rejected");
-        assert!(err.contains(".."), "message names the rejected segment: {err}");
+        assert!(
+            err.contains(".."),
+            "message names the rejected segment: {err}"
+        );
         let err = list_dir(&tree.ws_str(), "sub/../../").expect_err("nested `..` must be rejected");
         assert!(err.contains(".."), "{err}");
     }
@@ -752,7 +755,8 @@ mod tests {
         tree.outside("outside/secret.txt", b"secret");
         symlink(&tree.0.join("outside"), &tree.ws().join("escape"));
 
-        let err = list_dir(&tree.ws_str(), "escape").expect_err("escaping symlink must be rejected");
+        let err =
+            list_dir(&tree.ws_str(), "escape").expect_err("escaping symlink must be rejected");
         assert!(err.contains("outside the workspace"), "{err}");
         // The traversal through the link is rejected too, not just the link.
         let err = list_dir(&tree.ws_str(), "escape/secret.txt").expect_err("nested escape");
@@ -800,7 +804,11 @@ mod tests {
         symlink(&tree.0.join("gone"), &tree.ws().join("broken"));
 
         let entries = list_dir(&tree.ws_str(), "").expect("listing");
-        assert_eq!(names(&entries), vec!["real.txt"], "a broken symlink is skipped");
+        assert_eq!(
+            names(&entries),
+            vec!["real.txt"],
+            "a broken symlink is skipped"
+        );
     }
 
     // ── security: previews ───────────────────────────────────────────────────
@@ -916,7 +924,10 @@ mod tests {
         let preview = preview(&tree.ws_str(), "shot.PNG").expect("image");
         assert_eq!(preview.kind, PreviewKind::Image);
         assert_eq!(preview.mime.as_deref(), Some("image/png"));
-        assert_eq!(preview.content, None, "bytes go through fs_read_image_bytes");
+        assert_eq!(
+            preview.content, None,
+            "bytes go through fs_read_image_bytes"
+        );
         assert_eq!(image_mime("x.webp"), Some("image/webp"));
         assert_eq!(image_mime("x.svg"), Some("image/svg+xml"));
         assert_eq!(image_mime("x.woff2"), None);
@@ -1030,7 +1041,10 @@ mod tests {
         }
         let tree = TempTree::new("status_nongit");
         tree.file("a.txt", b"a");
-        assert_eq!(git_status(&tree.ws_str()).expect("not an error"), Vec::new());
+        assert_eq!(
+            git_status(&tree.ws_str()).expect("not an error"),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -1075,7 +1089,11 @@ mod tests {
         let entries = git_status(&nested.to_string_lossy()).expect("status");
 
         let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
-        assert_eq!(paths, vec!["fresh.txt", "tracked.txt"], "workspace-relative");
+        assert_eq!(
+            paths,
+            vec!["fresh.txt", "tracked.txt"],
+            "workspace-relative"
+        );
         // And the reported path is the one the other commands accept.
         let diff = git_diff(&nested.to_string_lossy(), "tracked.txt").expect("diff");
         assert!(diff.contains("+two"), "{diff}");
@@ -1089,7 +1107,11 @@ mod tests {
         assert_eq!(truncate_diff(small), small, "no marker when nothing is cut");
 
         let exact = "a".repeat(DIFF_LIMIT);
-        assert_eq!(truncate_diff(&exact).len(), DIFF_LIMIT, "the cap is inclusive");
+        assert_eq!(
+            truncate_diff(&exact).len(),
+            DIFF_LIMIT,
+            "the cap is inclusive"
+        );
 
         let big = "a".repeat(DIFF_LIMIT + 10);
         let cut = truncate_diff(&big);
@@ -1098,7 +1120,10 @@ mod tests {
             cut.contains("truncated"),
             "the string names the truncation: {cut}"
         );
-        assert!(cut.len() < big.len() + 128, "the cap still bounds the answer");
+        assert!(
+            cut.len() < big.len() + 128,
+            "the cap still bounds the answer"
+        );
     }
 
     #[test]
@@ -1142,7 +1167,10 @@ mod tests {
 
         let diff = git_diff(&tree.ws_str(), "tracked.txt").expect("diff");
 
-        assert!(diff.contains("diff --git a/tracked.txt b/tracked.txt"), "{diff}");
+        assert!(
+            diff.contains("diff --git a/tracked.txt b/tracked.txt"),
+            "{diff}"
+        );
         assert!(diff.contains("+two"), "{diff}");
     }
 

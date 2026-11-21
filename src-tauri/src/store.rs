@@ -776,7 +776,12 @@ mod tests {
         // parent link joined in v5) and every earlier table is present along the
         // way.
         assert_eq!(user_version(&store), 5);
-        assert!(store.list_provider_status().expect("list status").is_empty());
+        assert!(
+            store
+                .list_provider_status()
+                .expect("list status")
+                .is_empty()
+        );
         // A second open must not re-run the ALTER statements.
         drop(store);
         Store::open(&db.0).expect("reopen an already-migrated database");
@@ -840,7 +845,10 @@ mod tests {
 
         // The new table starts empty, which is what paints "never checked".
         assert!(
-            store.list_provider_status().expect("list status").is_empty(),
+            store
+                .list_provider_status()
+                .expect("list status")
+                .is_empty(),
             "the upgraded cache has no rows until the first probe"
         );
         // Usable straight after the upgrade, not merely readable.
@@ -874,7 +882,11 @@ mod tests {
             .expect("index the child");
 
         let listed = store.list_sessions(ws.id).expect("list");
-        assert_eq!(listed.len(), 1, "only the chat that delegated is listed: {listed:#?}");
+        assert_eq!(
+            listed.len(),
+            1,
+            "only the chat that delegated is listed: {listed:#?}"
+        );
         assert_eq!(listed[0].id, parent.id);
     }
 
@@ -959,11 +971,7 @@ mod tests {
         );
         assert!(
             store
-                .upsert_session_preview(
-                    sessions[0].id,
-                    "[]",
-                    "2026-03-03T00:00:00Z"
-                )
+                .upsert_session_preview(sessions[0].id, "[]", "2026-03-03T00:00:00Z")
                 .expect("write a preview after the upgrade")
         );
 
@@ -1063,10 +1071,7 @@ mod tests {
             "the deleted session's preview is gone"
         );
         assert!(
-            store
-                .session_preview(kept.id)
-                .expect("preview")
-                .is_some(),
+            store.session_preview(kept.id).expect("preview").is_some(),
             "a sibling session keeps its preview"
         );
     }
@@ -1187,14 +1192,8 @@ mod tests {
                 .map(|row| row.credential)
                 .expect("row for provider")
         };
-        assert!(
-            !read("google"),
-            "an absent credential reads back as false"
-        );
-        assert!(
-            read("openai"),
-            "a present credential reads back as true"
-        );
+        assert!(!read("google"), "an absent credential reads back as false");
+        assert!(read("openai"), "a present credential reads back as true");
 
         store
             .upsert_provider_status("google", "ready", true, "2026-03-01T11:00:00Z")
@@ -1271,9 +1270,7 @@ mod tests {
         assert!(reopened.list_workspaces().expect("list")[0].pinned);
 
         assert!(
-            reopened
-                .set_workspace_pinned(ws.id, false)
-                .expect("unpin"),
+            reopened.set_workspace_pinned(ws.id, false).expect("unpin"),
             "unpinning an existing row reports a change"
         );
         assert!(!reopened.list_workspaces().expect("list")[0].pinned);
@@ -1489,9 +1486,11 @@ mod tests {
         let row = store
             .upsert_session(&session_new(ws.id, "/sessions/titled.jsonl"))
             .expect("insert");
-        assert!(store
-            .set_session_title(row.id, "Fix the drawer spacing")
-            .expect("set"));
+        assert!(
+            store
+                .set_session_title(row.id, "Fix the drawer spacing")
+                .expect("set")
+        );
         let fetched = store
             .session_by_id(row.id)
             .expect("lookup")
@@ -1745,7 +1744,10 @@ mod tests {
                 updated_at: "2026-05-02T10:05:00Z",
             })
             .expect("insert");
-        assert_eq!(first.workspace_id, ws.id, "the child inherits the workspace");
+        assert_eq!(
+            first.workspace_id, ws.id,
+            "the child inherits the workspace"
+        );
         assert_eq!(first.parent_session_id, Some(parent.id));
         assert_eq!(first.title.as_deref(), Some("review"));
         assert_eq!(first.started_at, "2026-05-02T10:00:00Z");

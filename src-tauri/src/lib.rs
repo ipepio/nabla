@@ -17,6 +17,9 @@ mod store;
 // configures or, failing that, by any public one (`web-search.md`).
 mod websearch;
 mod workspace;
+// `zoom`: the range of the UI's own zoom and the command that applies it to the
+// main webview (the chords and the step live in `src/lib/zoom.ts`).
+mod zoom;
 
 use std::sync::Arc;
 
@@ -96,20 +99,21 @@ pub fn run() {
             // as `agent-event` with the camelCase `{ sessionId, event }`
             // envelope the TS contracts mirror (R4).
             let handle = app.handle().clone();
-            let runtime = ProcessManager::new(Arc::new(move |session_id: &str, event: &AgentEvent| {
-                // The on-demand command probe is a child, not a session (its
-                // runtime key carries the reserved `probe:` prefix). Its
-                // lifecycle frames would reach the store as an unknown id and
-                // land in the drawer's live list, so they stop here.
-                if commands::is_probe_key(session_id) {
-                    return;
-                }
-                let envelope = AgentEventEnvelope {
-                    session_id: session_id.to_string(),
-                    event: event.clone(),
-                };
-                let _ = handle.emit("agent-event", envelope);
-            }));
+            let runtime =
+                ProcessManager::new(Arc::new(move |session_id: &str, event: &AgentEvent| {
+                    // The on-demand command probe is a child, not a session (its
+                    // runtime key carries the reserved `probe:` prefix). Its
+                    // lifecycle frames would reach the store as an unknown id and
+                    // land in the drawer's live list, so they stop here.
+                    if commands::is_probe_key(session_id) {
+                        return;
+                    }
+                    let envelope = AgentEventEnvelope {
+                        session_id: session_id.to_string(),
+                        event: event.clone(),
+                    };
+                    let _ = handle.emit("agent-event", envelope);
+                }));
             // Every child this app spawns is loaded with that extension (S2).
             let runtime = match ask_extension {
                 Some(path) => runtime.with_ask_extension(path),
@@ -371,7 +375,10 @@ pub fn run() {
             commands::debug_log,
             // `webview-control.md` T1: the local MCP endpoint the agent connects
             // to so it can drive those views.
-            commands::mcp_endpoint
+            commands::mcp_endpoint,
+            // The UI's own zoom (`⌘`/`Ctrl` `+`, `-`, `0`): the main webview only,
+            // never the embedded browser's child webviews.
+            commands::set_webview_zoom
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

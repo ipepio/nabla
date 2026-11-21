@@ -76,6 +76,24 @@ path in `settings.json`:
 Conversation content lives only in Pi's JSONL files; the database is a rebuildable
 index, never a second copy. To start from zero: quit Nabla and remove that folder.
 
+## Keyboard shortcuts
+
+Zoom is the one shortcut shipped so far. The modifier is the platform's own: `⌘` on
+macOS, `Ctrl` on Windows and Linux.
+
+| Shortcut | macOS | Windows / Linux |
+| --- | --- | --- |
+| Zoom in | `⌘ +` | `Ctrl +` |
+| Zoom out | `⌘ −` | `Ctrl −` |
+| Zoom back to 100% | `⌘ 0` | `Ctrl 0` |
+
+The zoom walks a fixed list of levels (50% → 200%) one step per press and clamps at
+both ends; it is not persisted, so a fresh launch starts at 100%. What scales is the
+app's own interface — the main webview. The embedded browser's panes are separate
+webviews and keep the page at its own size, so an agent-driven page never jumps
+because you zoomed the shell around it. The same three chords are listed in
+Settings → General.
+
 ## Turning capabilities on
 
 A fresh install starts with everything optional **off**. That is the intended
@@ -142,11 +160,13 @@ keep the instance unauthenticated on your machine and reach it over loopback ins
 
 ```bash
 pnpm run build                        # frontend gate: vue-tsc --noEmit + vite build
+node --test tests/                    # pure frontend modules (Node strips the types)
 cd src-tauri && cargo test            # Rust tests
 cd src-tauri && cargo clippy          # Rust lint
 ```
 
-There is no frontend test runner; UI behaviour is verified by hand.
+The `tests/` files are the frontend's unit tests, run by Node's own runner; a screen still has to be
+looked at by hand in `pnpm run tauri dev`.
 
 ### Rust build cache and dev diagnostics
 

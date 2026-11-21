@@ -150,10 +150,9 @@ impl std::fmt::Display for ProvidersError {
         match self {
             ProvidersError::Io(m) => write!(f, "providers io error: {m}"),
             ProvidersError::Parse(m) => write!(f, "providers parse error: {m}"),
-            ProvidersError::InvalidId(id) => write!(
-                f,
-                "provider id must match ^[a-z0-9-]{{1,32}}$: {id:?}"
-            ),
+            ProvidersError::InvalidId(id) => {
+                write!(f, "provider id must match ^[a-z0-9-]{{1,32}}$: {id:?}")
+            }
             ProvidersError::InvalidModelId(id) => write!(
                 f,
                 "model id must be 1-{MODEL_ID_MAX} chars of [a-z0-9-._/:] and contain a \
@@ -187,10 +186,7 @@ pub fn models_path(home_dir: &Path) -> PathBuf {
 /// place the models of a signed-in provider (openai, openai-codex) exist. Nabla
 /// reads it and never writes it.
 pub fn models_store_path(home_dir: &Path) -> PathBuf {
-    home_dir
-        .join(".pi")
-        .join("agent")
-        .join("models-store.json")
+    home_dir.join(".pi").join("agent").join("models-store.json")
 }
 
 /// Path of pi's credentials file inside a home directory.
@@ -246,7 +242,10 @@ pub fn save_provider(path: &Path, draft: &ProviderDraft) -> ProvidersResult<Prov
         .entry("providers")
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
     let providers = providers_value.as_object_mut().ok_or_else(|| {
-        ProvidersError::Parse(format!("{}: `providers` is not a JSON object", path.display()))
+        ProvidersError::Parse(format!(
+            "{}: `providers` is not a JSON object",
+            path.display()
+        ))
     })?;
 
     // Merge into the existing entry instead of replacing it, so keys pi owns
@@ -464,9 +463,9 @@ pub fn apply_hidden_models(providers: &mut [ProviderModels], hidden: &[String]) 
     }
     for provider in providers.iter_mut() {
         for model in provider.models.iter_mut() {
-            model.hidden = hidden
-                .iter()
-                .any(|entry| entry == &crate::settings::hidden_model_key(&provider.provider, &model.id));
+            model.hidden = hidden.iter().any(|entry| {
+                entry == &crate::settings::hidden_model_key(&provider.provider, &model.id)
+            });
         }
     }
 }
@@ -499,13 +498,14 @@ pub fn update_provider_model(
 
     // A provider the file lists without models gets the array it needs; anything
     // other than an array there is a file Nabla must not guess at.
-    if !entry.get("models").map(serde_json::Value::is_array).unwrap_or(false) {
+    if !entry
+        .get("models")
+        .map(serde_json::Value::is_array)
+        .unwrap_or(false)
+    {
         match entry.get("models") {
             None | Some(serde_json::Value::Null) => {
-                entry.insert(
-                    "models".to_string(),
-                    serde_json::Value::Array(Vec::new()),
-                );
+                entry.insert("models".to_string(), serde_json::Value::Array(Vec::new()));
             }
             Some(_) => {
                 return Err(ProvidersError::Parse(format!(
@@ -546,7 +546,11 @@ pub fn update_provider_model(
         .as_object_mut()
         .expect("the entry was built as a JSON object above");
     merge_model_draft(object, id, draft).map_err(|message| {
-        ProvidersError::Parse(format!("{}: {}: {message}", path.display(), model_ref(provider, id)))
+        ProvidersError::Parse(format!(
+            "{}: {}: {message}",
+            path.display(),
+            model_ref(provider, id)
+        ))
     })?;
 
     // The answer is the entry as it now stands, so the editor refreshes from what
@@ -742,8 +746,8 @@ fn backup_before_rewrite(path: &Path, existed: bool) -> ProvidersResult<()> {
 /// Serializes and atomically writes the whole root. One helper, so every writer
 /// keeps the same formatting and the same crash safety.
 fn write_root(path: &Path, root: &serde_json::Value) -> ProvidersResult<()> {
-    let serialized = serde_json::to_string_pretty(root)
-        .map_err(|e| ProvidersError::Parse(e.to_string()))?;
+    let serialized =
+        serde_json::to_string_pretty(root).map_err(|e| ProvidersError::Parse(e.to_string()))?;
     write_atomic(path, &serialized)
 }
 
@@ -752,9 +756,8 @@ fn write_root(path: &Path, root: &serde_json::Value) -> ProvidersResult<()> {
 fn read_root(path: &Path) -> ProvidersResult<(serde_json::Value, bool)> {
     match std::fs::read_to_string(path) {
         Ok(raw) => {
-            let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-                ProvidersError::Parse(format!("{}: {e}", path.display()))
-            })?;
+            let value: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|e| ProvidersError::Parse(format!("{}: {e}", path.display())))?;
             if !value.is_object() {
                 return Err(ProvidersError::Parse(format!(
                     "{}: root is not a JSON object",
@@ -794,9 +797,7 @@ fn validate_model_id(id: &str) -> ProvidersResult<()> {
         && id.len() <= MODEL_ID_MAX
         && id.chars().any(|c| c.is_ascii_alphanumeric())
         && id.chars().all(|c| {
-            c.is_ascii_lowercase()
-                || c.is_ascii_digit()
-                || matches!(c, '-' | '.' | '_' | '/' | ':')
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '.' | '_' | '/' | ':')
         });
     if valid {
         Ok(())
@@ -1071,10 +1072,7 @@ fn summary_of(id: &str, entry: &serde_json::Value) -> ProviderSummary {
 
 /// S2: `GET {base_url}/models` from Rust, so the api key never reaches the
 /// webview and CORS/CSP stay out of the problem.
-pub async fn discover_models(
-    base_url: &str,
-    api_key: &str,
-) -> ProvidersResult<Vec<ModelOption>> {
+pub async fn discover_models(base_url: &str, api_key: &str) -> ProvidersResult<Vec<ModelOption>> {
     let endpoint = models_endpoint(base_url);
     let client = reqwest::Client::builder()
         .timeout(MODELS_TIMEOUT)
@@ -1304,7 +1302,13 @@ mod tests {
         fn entries(&self) -> Vec<String> {
             let mut names: Vec<String> = std::fs::read_dir(&self.0)
                 .expect("read dir")
-                .map(|entry| entry.expect("entry").file_name().to_string_lossy().to_string())
+                .map(|entry| {
+                    entry
+                        .expect("entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .to_string()
+                })
                 .collect();
             names.sort();
             names
@@ -1402,7 +1406,10 @@ mod tests {
             !json.contains("sk-secret-value"),
             "the api key must never be serialized: {json}"
         );
-        assert!(!json.contains("apiKey"), "no apiKey field in the DTO: {json}");
+        assert!(
+            !json.contains("apiKey"),
+            "no apiKey field in the DTO: {json}"
+        );
     }
 
     #[test]
@@ -1457,7 +1464,10 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).expect("read"))
                 .expect("parse written file");
         let provider = &written["providers"]["acme"];
-        assert_eq!(provider["baseUrl"], serde_json::json!("https://api.example.com/v1"));
+        assert_eq!(
+            provider["baseUrl"],
+            serde_json::json!("https://api.example.com/v1")
+        );
         assert_eq!(provider["api"], serde_json::json!(DEFAULT_API));
         assert_eq!(provider["apiKey"], serde_json::json!("sk-test"));
         assert_eq!(provider["models"][0]["id"], serde_json::json!("model-a"));
@@ -1518,7 +1528,10 @@ mod tests {
         assert_eq!(provider["api"], serde_json::json!("openai-responses"));
         assert_eq!(provider["timeoutSeconds"], serde_json::json!(300));
         assert_eq!(provider["modelOverrides"]["m"]["x"], serde_json::json!(1));
-        assert_eq!(provider["baseUrl"], serde_json::json!("https://api.example.com/v1"));
+        assert_eq!(
+            provider["baseUrl"],
+            serde_json::json!("https://api.example.com/v1")
+        );
     }
 
     #[test]
@@ -1531,7 +1544,10 @@ mod tests {
         save_provider(&dir.path(), &d).expect("save provider");
 
         let written: serde_json::Value = serde_json::from_str(&dir.read()).expect("parse");
-        assert_eq!(written["providers"]["acme"]["api"], serde_json::json!("openai-responses"));
+        assert_eq!(
+            written["providers"]["acme"]["api"],
+            serde_json::json!("openai-responses")
+        );
     }
 
     // S3/S4: an existing file is backed up before it is rewritten.
@@ -1624,7 +1640,12 @@ mod tests {
     // S3: base url must be http(s).
     #[test]
     fn non_http_base_urls_are_rejected() {
-        for url in ["", "api.example.com/v1", "ftp://x.test", "file:///etc/passwd"] {
+        for url in [
+            "",
+            "api.example.com/v1",
+            "ftp://x.test",
+            "file:///etc/passwd",
+        ] {
             let mut d = draft("acme");
             d.base_url = url.to_string();
             match assert_rejected(&d) {
@@ -1846,8 +1867,8 @@ mod tests {
         dir.write(TWO_PROVIDERS);
         let before = dir.read();
         for key in ["", "   "] {
-            let err = set_provider_key(&dir.path(), "keep", key)
-                .expect_err("an empty key is rejected");
+            let err =
+                set_provider_key(&dir.path(), "keep", key).expect_err("an empty key is rejected");
             match err {
                 ProvidersError::EmptyApiKey => {}
                 other => panic!("expected EmptyApiKey for {key:?}, got {other:?}"),
@@ -2003,10 +2024,7 @@ mod tests {
         let nan = providers.iter().find(|p| p.provider == "nan").expect("nan");
         assert_eq!(nan.name, "NaN");
         assert_eq!(
-            nan.models
-                .iter()
-                .map(|m| m.id.as_str())
-                .collect::<Vec<_>>(),
+            nan.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
             vec!["qwen3.6", "glm5.3"],
             "models keep the order the file declares"
         );
@@ -2032,7 +2050,10 @@ mod tests {
         assert_eq!(nan.models[1].output_cost, Some(2.0));
 
         // A provider without a `models` array is listed with an empty list.
-        let empty = providers.iter().find(|p| p.provider == "empty").expect("empty");
+        let empty = providers
+            .iter()
+            .find(|p| p.provider == "empty")
+            .expect("empty");
         assert_eq!(empty.name, "Empty");
         assert!(empty.models.is_empty());
 
@@ -2120,13 +2141,11 @@ mod tests {
     /// pi's credentials file with one signed-in provider: the per-provider object
     /// pi writes. Only its presence as a non-empty object matters here, so no real
     /// token appears in the fixture.
-    const AUTH_OPENAI: &str =
-        r#"{"openai":{"type":"oauth","access":"token-value","refresh":"token-value","expires":1794769407}}"#;
+    const AUTH_OPENAI: &str = r#"{"openai":{"type":"oauth","access":"token-value","refresh":"token-value","expires":1794769407}}"#;
 
     /// The signed-in openai-codex entry the tests authenticate against the same
     /// way pi writes it, plus the two chat models the cache carries.
-    const AUTH_OPENAI_CODEX: &str =
-        r#"{"openai-codex":{"type":"oauth","access":"token-value","refresh":"token-value","expires":1794769407}}"#;
+    const AUTH_OPENAI_CODEX: &str = r#"{"openai-codex":{"type":"oauth","access":"token-value","refresh":"token-value","expires":1794769407}}"#;
 
     /// A cached openai-codex catalogue, exactly the shape pi caches whether or
     /// not the human ever signed in to it.
@@ -2393,7 +2412,11 @@ mod tests {
                 "only the configured provider is listed for {contents:?}"
             );
             assert_eq!(listed_ids(&providers, "keep"), vec!["alpha"]);
-            assert_eq!(dir.read(), configured_before, "models.json is not rewritten");
+            assert_eq!(
+                dir.read(),
+                configured_before,
+                "models.json is not rewritten"
+            );
             assert_eq!(
                 std::fs::read_to_string(dir.store_path()).expect("read store"),
                 contents,
@@ -2566,10 +2589,17 @@ mod tests {
         apply_hidden_models(&mut providers, &hidden);
 
         let nan = providers.iter().find(|p| p.provider == "nan").expect("nan");
-        assert_eq!(listed_ids(&providers, "nan").len(), 2, "the hidden model is still listed");
+        assert_eq!(
+            listed_ids(&providers, "nan").len(),
+            2,
+            "the hidden model is still listed"
+        );
         assert!(nan.models[0].hidden, "the configured model is hidden");
         assert!(!nan.models[1].hidden, "its sibling stays visible");
-        assert_eq!(nan.models[0].source, MODEL_SOURCE_CONFIGURED, "hiding is a mark, not an edit");
+        assert_eq!(
+            nan.models[0].source, MODEL_SOURCE_CONFIGURED,
+            "hiding is a mark, not an edit"
+        );
 
         let codex = providers
             .iter()
@@ -2583,7 +2613,10 @@ mod tests {
             .iter()
             .find(|p| p.provider == "empty")
             .expect("empty");
-        assert!(empty.models.is_empty(), "a provider without models is untouched");
+        assert!(
+            empty.models.is_empty(),
+            "a provider without models is untouched"
+        );
 
         // The flag travels in the payload the UI reads.
         let json = serde_json::to_value(&providers).expect("serialize");
@@ -2724,12 +2757,18 @@ mod tests {
             root["providers"]["nan"]["models"][1],
             original["providers"]["nan"]["models"][1]
         );
-        assert_eq!(root["providers"]["nan"]["timeoutSeconds"], serde_json::json!(300));
+        assert_eq!(
+            root["providers"]["nan"]["timeoutSeconds"],
+            serde_json::json!(300)
+        );
         assert_eq!(
             root["providers"]["nan"]["modelOverrides"]["qwen3.6"]["contextWindow"],
             serde_json::json!(4096)
         );
-        assert_eq!(root["providers"]["nan"]["apiKey"], serde_json::json!("sk-nan-secret"));
+        assert_eq!(
+            root["providers"]["nan"]["apiKey"],
+            serde_json::json!("sk-nan-secret")
+        );
         assert_eq!(root["theme"], serde_json::json!("dark"));
     }
 
@@ -2745,7 +2784,11 @@ mod tests {
 
         assert!(!info.enabled);
         let root = written(&dir);
-        assert_eq!(model_ids(&root, "nan"), vec!["qwen3.6"], "nothing is dropped");
+        assert_eq!(
+            model_ids(&root, "nan"),
+            vec!["qwen3.6"],
+            "nothing is dropped"
+        );
         let model = &root["providers"]["nan"]["models"][0];
         assert_eq!(model["enabled"], serde_json::json!(false));
         assert_eq!(model["name"], serde_json::json!("Qwen 3.6"));
@@ -2767,15 +2810,21 @@ mod tests {
         assert!(remove_provider_model(&dir.path(), "nan", "qwen3.6").expect("remove"));
 
         let root = written(&dir);
-        assert_eq!(model_ids(&root, "nan"), vec!["glm5.3"], "only one model is gone");
+        assert_eq!(
+            model_ids(&root, "nan"),
+            vec!["glm5.3"],
+            "only one model is gone"
+        );
         let original: serde_json::Value = serde_json::from_str(PI_FILE).expect("parse fixture");
         assert_eq!(
-            root["providers"]["nan"]["models"][0],
-            original["providers"]["nan"]["models"][1],
+            root["providers"]["nan"]["models"][0], original["providers"]["nan"]["models"][1],
             "the surviving model is untouched"
         );
         assert_eq!(root["providers"]["empty"], original["providers"]["empty"]);
-        assert_eq!(root["providers"]["nan"]["apiKey"], serde_json::json!("sk-nan-secret"));
+        assert_eq!(
+            root["providers"]["nan"]["apiKey"],
+            serde_json::json!("sk-nan-secret")
+        );
         assert_eq!(root["theme"], serde_json::json!("dark"));
 
         let written_backups = backups(&dir);
@@ -2834,7 +2883,11 @@ mod tests {
             update_provider_model(&missing.path(), &model_draft("absent", "qwen3.6")),
             Err(ProvidersError::UnknownProvider(_))
         ));
-        assert_eq!(missing.entries(), Vec::<String>::new(), "nothing is written");
+        assert_eq!(
+            missing.entries(),
+            Vec::<String>::new(),
+            "nothing is written"
+        );
     }
 
     // S3: both ids are validated before the file is touched, so a malformed id
@@ -2904,7 +2957,10 @@ mod tests {
         let nan = listed.iter().find(|p| p.provider == "nan").expect("nan");
         let listed_ids: Vec<&str> = nan.models.iter().map(|m| m.id.as_str()).collect();
         for id in ids {
-            assert!(listed_ids.contains(&id), "{id:?} is missing: {listed_ids:?}");
+            assert!(
+                listed_ids.contains(&id),
+                "{id:?} is missing: {listed_ids:?}"
+            );
         }
     }
 
@@ -3152,7 +3208,11 @@ mod tests {
             provider_discovery_credentials(&missing.path(), "absent"),
             Err(ProvidersError::UnknownProvider(_))
         ));
-        assert_eq!(missing.entries(), Vec::<String>::new(), "nothing is written");
+        assert_eq!(
+            missing.entries(),
+            Vec::<String>::new(),
+            "nothing is written"
+        );
     }
 
     // S2/S4: a remote provider without a key cannot be discovered, and the error
@@ -3317,7 +3377,10 @@ mod tests {
             has_api_key: true,
         };
         let json = serde_json::to_value(&summary).expect("serialize");
-        assert_eq!(json["baseUrl"], serde_json::json!("https://api.example.com"));
+        assert_eq!(
+            json["baseUrl"],
+            serde_json::json!("https://api.example.com")
+        );
         assert_eq!(json["modelCount"], serde_json::json!(3));
         assert_eq!(json["hasApiKey"], serde_json::json!(true));
 

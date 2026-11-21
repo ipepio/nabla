@@ -37,8 +37,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value};
 
 use crate::rpc::{
-    AgentEvent, Frame, FrameCodec, RpcResponse, RuntimeStatus, StopReason, UiAnswer,
-    STARTUP_PROBE_COMMAND, STARTUP_PROBE_ID, encode_ui_response,
+    AgentEvent, Frame, FrameCodec, RpcResponse, RuntimeStatus, STARTUP_PROBE_COMMAND,
+    STARTUP_PROBE_ID, StopReason, UiAnswer, encode_ui_response,
 };
 
 /// Startup attempts per `spawn()`: the initial try plus one retry, used ONLY
@@ -153,8 +153,12 @@ pub enum ProcessError {
 impl std::fmt::Display for ProcessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ProcessError::AlreadyRunning(key) => write!(f, "a pi process is already running for session {key}"),
-            ProcessError::NotRunning(key) => write!(f, "no pi process is running for session {key}"),
+            ProcessError::AlreadyRunning(key) => {
+                write!(f, "a pi process is already running for session {key}")
+            }
+            ProcessError::NotRunning(key) => {
+                write!(f, "no pi process is running for session {key}")
+            }
             ProcessError::Transport(msg) => write!(f, "pi rpc transport error: {msg}"),
             ProcessError::ResponseTimeout(msg) => write!(f, "pi rpc response timeout: {msg}"),
         }
@@ -258,7 +262,9 @@ impl TurnSettled {
 /// Locks without panicking: a poisoned lock in a background thread must not turn
 /// into a dead session the host cannot supervise.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Appends one diagnostic line, keeping the tail bounded (S4).
@@ -293,7 +299,13 @@ fn set_status(
         }
     };
     if changed {
-        sink(key, &AgentEvent::ProcessStatus { status: next, error });
+        sink(
+            key,
+            &AgentEvent::ProcessStatus {
+                status: next,
+                error,
+            },
+        );
     }
     next
 }
@@ -574,7 +586,8 @@ impl ProcessManager {
                 delegating: delegation.routing_table,
             },
         )
-        .spawn() {
+        .spawn()
+        {
             Ok(child) => child,
             Err(err) => {
                 let message = format!("failed to spawn pi ({pi_binary}): {err}");
@@ -759,13 +772,7 @@ impl ProcessManager {
                 force_stop(pid, &exit, &self.timeouts);
                 let tail = tail_snapshot(&stderr_tail);
                 let error = Some(tail.join("\n")).filter(|text| !text.trim().is_empty());
-                set_status(
-                    &self.sink,
-                    key,
-                    &status,
-                    RuntimeStatus::Crashed,
-                    error,
-                );
+                set_status(&self.sink, key, &status, RuntimeStatus::Crashed, error);
                 SpawnReport {
                     outcome,
                     pid: Some(pid),
@@ -783,13 +790,9 @@ impl ProcessManager {
         startup: &mpsc::Receiver<StartupSignal>,
         stdin: &mpsc::Sender<StdinMsg>,
     ) -> StartupOutcome {
-        let probe = format!(
-            "{{\"type\":\"{STARTUP_PROBE_COMMAND}\",\"id\":\"{STARTUP_PROBE_ID}\"}}\n"
-        );
-        let tick = self
-            .timeouts
-            .probe_interval
-            .max(Duration::from_millis(1));
+        let probe =
+            format!("{{\"type\":\"{STARTUP_PROBE_COMMAND}\",\"id\":\"{STARTUP_PROBE_ID}\"}}\n");
+        let tick = self.timeouts.probe_interval.max(Duration::from_millis(1));
         let deadline = Instant::now() + self.timeouts.ready;
         let mut next_probe = Instant::now();
         loop {
@@ -1066,8 +1069,7 @@ struct Delegation {
 fn delegation_for_spawn(data_dir: Option<&Path>, materialized: Option<&Path>) -> Delegation {
     let config = crate::agents::config_for_spawn(data_dir);
     Delegation {
-        extension: materialized
-            .and_then(|path| crate::agents::extension_for_spawn(&config, path)),
+        extension: materialized.and_then(|path| crate::agents::extension_for_spawn(&config, path)),
         routing_table: crate::agents::routing_table_enabled(&config),
     }
 }
@@ -1243,7 +1245,10 @@ fn scan_session_line(line: &str, pending: &mut Vec<(String, String)>) {
         let Some(block) = part.as_object() else {
             continue;
         };
-        let kind = block.get("type").and_then(Value::as_str).unwrap_or_default();
+        let kind = block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if !matches!(kind, "toolCall" | "tool_call" | "tool_use") {
             continue;
         }
@@ -1370,8 +1375,7 @@ const ASK_EXTENSION_SOURCE: &str = include_str!("../../../resources/nabla-ask.ts
 
 /// The first-party pi extension that gates every tool call by the human's
 /// permission mode (`permission-modes.md`, M2), embedded the same way.
-const PERMISSIONS_EXTENSION_SOURCE: &str =
-    include_str!("../../../resources/nabla-permissions.ts");
+const PERMISSIONS_EXTENSION_SOURCE: &str = include_str!("../../../resources/nabla-permissions.ts");
 
 /// The first-party pi extension that lets a session delegate to subagent
 /// sessions (`subagent-helpers.md`, H2), embedded the same way: `-e` must always
@@ -1410,11 +1414,7 @@ pub fn materialize_subagents_extension(data_dir: &Path) -> std::io::Result<PathB
 
 /// The one materializer both extensions use: `extensions/<name>` under the data
 /// dir, rewritten only when the embedded bytes differ.
-fn materialize_extension(
-    data_dir: &Path,
-    name: &str,
-    source: &str,
-) -> std::io::Result<PathBuf> {
+fn materialize_extension(data_dir: &Path, name: &str, source: &str) -> std::io::Result<PathBuf> {
     let dir = data_dir.join("extensions");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(name);
@@ -1650,7 +1650,10 @@ mod tests {
                 if check(&events) {
                     return events;
                 }
-                assert!(Instant::now() < deadline, "timed out waiting for {what}: {events:#?}");
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {what}: {events:#?}"
+                );
                 thread::sleep(Duration::from_millis(10));
             }
         }
@@ -1664,10 +1667,7 @@ mod tests {
                     session_id,
                     assistant_message_event,
                     ..
-                } => Some((
-                    session_id.clone(),
-                    assistant_message_event.delta.clone(),
-                )),
+                } => Some((session_id.clone(), assistant_message_event.delta.clone())),
                 _ => None,
             })
             .collect()
@@ -1794,7 +1794,13 @@ printf 'exited\n' >> '@MARKER@'
 "#;
 
     #[cfg(unix)]
-    fn write_script(scratch: &Scratch, name: &str, attempts: &Path, marker: &Path, body: &str) -> PathBuf {
+    fn write_script(
+        scratch: &Scratch,
+        name: &str,
+        attempts: &Path,
+        marker: &Path,
+        body: &str,
+    ) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = scratch.path(name);
         // Every fake script can log its argv here: the file sits next to the
@@ -1811,7 +1817,9 @@ printf 'exited\n' >> '@MARKER@'
             .replace("@ANSWERS@", &answers_log.display().to_string())
             .replace("@ABORTED@", &aborted_log.display().to_string());
         std::fs::write(&path, script).expect("write fake pi");
-        let mut perms = std::fs::metadata(&path).expect("stat fake pi").permissions();
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat fake pi")
+            .permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod fake pi");
         path
@@ -1887,9 +1895,7 @@ printf 'exited\n' >> '@MARKER@'
                 permissions_extension: Some(Path::new(
                     "/tmp/nabla/extensions/nabla-permissions.ts",
                 )),
-                subagents_extension: Some(Path::new(
-                    "/tmp/nabla/extensions/nabla-subagents.ts",
-                )),
+                subagents_extension: Some(Path::new("/tmp/nabla/extensions/nabla-subagents.ts")),
                 data_dir: Some(Path::new("/tmp/nabla")),
                 delegating: true,
             },
@@ -2101,7 +2107,8 @@ printf 'exited\n' >> '@MARKER@'
     // connected in the same session. The prompt is the only place that can draw
     // the line between "the drawer is the human's" and "this one tab is yours".
     #[test]
-    fn the_identity_tells_the_agent_it_can_drive_the_browser_pane() {        assert!(
+    fn the_identity_tells_the_agent_it_can_drive_the_browser_pane() {
+        assert!(
             NABLA_SYSTEM_PROMPT.contains("nabla-browser"),
             "without the server name the agent cannot find its browser tools"
         );
@@ -2351,9 +2358,7 @@ printf 'exited\n' >> '@MARKER@'
             Path::new("/tmp"),
             SpawnLayout {
                 ask_extension: None,
-                permissions_extension: Some(Path::new(
-                    "/data/extensions/nabla-permissions.ts",
-                )),
+                permissions_extension: Some(Path::new("/data/extensions/nabla-permissions.ts")),
                 subagents_extension: None,
                 data_dir: Some(Path::new("/data")),
                 delegating: false,
@@ -2410,7 +2415,12 @@ printf 'exited\n' >> '@MARKER@'
                 &scratch.dir,
             )
             .expect("spawn");
-        assert_eq!(report.outcome, StartupOutcome::Ready, "stderr: {:?}", report.stderr_tail);
+        assert_eq!(
+            report.outcome,
+            StartupOutcome::Ready,
+            "stderr: {:?}",
+            report.stderr_tail
+        );
 
         // The extension path reached the child as a second `-e`.
         let args = recorded_args(&scratch, "fake-pi.sh");
@@ -2498,13 +2508,20 @@ printf 'exited\n' >> '@MARKER@'
                 &scratch.dir,
             )
             .expect("spawn");
-        assert_eq!(report.outcome, StartupOutcome::Ready, "stderr: {:?}", report.stderr_tail);
+        assert_eq!(
+            report.outcome,
+            StartupOutcome::Ready,
+            "stderr: {:?}",
+            report.stderr_tail
+        );
 
         let args = recorded_args(&scratch, "fake-pi.sh");
         let provider_at = args.iter().position(|arg| arg == "--provider");
         let model_at = args.iter().position(|arg| arg == "--model");
         assert_eq!(
-            provider_at.and_then(|at| args.get(at + 1)).map(String::as_str),
+            provider_at
+                .and_then(|at| args.get(at + 1))
+                .map(String::as_str),
             Some("nan"),
             "the child must receive --provider nan, got {args:?}"
         );
@@ -2513,7 +2530,10 @@ printf 'exited\n' >> '@MARKER@'
             Some("glm5.3"),
             "the child must receive --model glm5.3, got {args:?}"
         );
-        let session_at = args.iter().position(|arg| arg == "--session").expect("--session");
+        let session_at = args
+            .iter()
+            .position(|arg| arg == "--session")
+            .expect("--session");
         assert!(
             session_at < provider_at.unwrap_or(0) && provider_at.unwrap() < model_at.unwrap(),
             "flags follow --session in provider-then-model order: {args:?}"
@@ -2522,7 +2542,9 @@ printf 'exited\n' >> '@MARKER@'
         // session starts where the effort selector was left.
         let thinking_at = args.iter().position(|arg| arg == "--thinking");
         assert_eq!(
-            thinking_at.and_then(|at| args.get(at + 1)).map(String::as_str),
+            thinking_at
+                .and_then(|at| args.get(at + 1))
+                .map(String::as_str),
             Some("high"),
             "the child must receive --thinking high, got {args:?}"
         );
@@ -2563,7 +2585,9 @@ printf 'exited\n' >> '@MARKER@'
         assert!(names.contains(&"GOOGLE_CLOUD_PROJECT"));
         assert!(names.contains(&"OPENAI_API_KEY"));
         assert!(
-            !names.iter().any(|n| n.starts_with("AWS_") || n.contains("SECRET") || n.starts_with("RANDOM_")),
+            !names
+                .iter()
+                .any(|n| n.starts_with("AWS_") || n.contains("SECRET") || n.starts_with("RANDOM_")),
             "allowlist leaked a non-engine variable: {names:?}"
         );
         // Values are forwarded untouched.
@@ -2602,44 +2626,59 @@ printf 'exited\n' >> '@MARKER@'
 
         let report = manager
             .spawn(
-            "s1",
-            script.to_str().unwrap(),
-            &scratch.path("s1.jsonl"),
-            SessionModel {
-                provider: TEST_PROVIDER,
-                model: TEST_MODEL,
-                thinking: None,
-            },
-            &scratch.dir,
-        )
+                "s1",
+                script.to_str().unwrap(),
+                &scratch.path("s1.jsonl"),
+                SessionModel {
+                    provider: TEST_PROVIDER,
+                    model: TEST_MODEL,
+                    thinking: None,
+                },
+                &scratch.dir,
+            )
             .expect("spawn");
-        assert_eq!(report.outcome, StartupOutcome::Ready, "stderr: {:?}", report.stderr_tail);
+        assert_eq!(
+            report.outcome,
+            StartupOutcome::Ready,
+            "stderr: {:?}",
+            report.stderr_tail
+        );
         assert_eq!(report.status, RuntimeStatus::Ready);
         assert!(report.pid.unwrap_or(0) > 0);
-        assert_eq!(attempts_count(&attempts), 1, "identical process must not respawn");
+        assert_eq!(
+            attempts_count(&attempts),
+            1,
+            "identical process must not respawn"
+        );
 
         // Readiness is a state transition the webview can observe (S4).
         collected.wait_for("ready status", |events| {
             statuses(events).contains(&RuntimeStatus::Ready)
         });
-        assert_eq!(manager.status("s1").map(|s| s.status), Some(RuntimeStatus::Ready));
+        assert_eq!(
+            manager.status("s1").map(|s| s.status),
+            Some(RuntimeStatus::Ready)
+        );
 
         // S6: pi's streamed assistant text is decoded and forwarded per session.
         let response = manager
-            .send(
-                "s1",
-                "prompt",
-                {
-                    let mut map = Map::new();
-                    map.insert("message".to_string(), json!("hi"));
-                    map
-                },
-            )
+            .send("s1", "prompt", {
+                let mut map = Map::new();
+                map.insert("message".to_string(), json!("hi"));
+                map
+            })
             .expect("prompt response");
-        assert_eq!(response.id.as_deref(), Some("1"), "response must echo our request id");
+        assert_eq!(
+            response.id.as_deref(),
+            Some("1"),
+            "response must echo our request id"
+        );
         assert_eq!(response.command.as_deref(), Some("prompt"));
         assert!(response.success);
-        assert_eq!(manager.status("s1").map(|s| s.status), Some(RuntimeStatus::Running));
+        assert_eq!(
+            manager.status("s1").map(|s| s.status),
+            Some(RuntimeStatus::Running)
+        );
 
         let events = collected.wait_for("streamed deltas", |events| {
             message_updates(events).len() >= 2
@@ -2660,8 +2699,9 @@ printf 'exited\n' >> '@MARKER@'
         );
         assert!(ordering.contains(&RuntimeStatus::Running), "{ordering:?}");
         assert!(
-            events.iter().any(|(key, event)| key == "s1"
-                && matches!(event, AgentEvent::AgentStart)),
+            events
+                .iter()
+                .any(|(key, event)| key == "s1" && matches!(event, AgentEvent::AgentStart)),
             "agent_start forwarded"
         );
 
@@ -2677,7 +2717,10 @@ printf 'exited\n' >> '@MARKER@'
             thread::sleep(Duration::from_millis(10));
         }
         let log = std::fs::read_to_string(&marker).unwrap_or_default();
-        assert!(log.contains("exited"), "fake pi never reached its exit path: {log:?}");
+        assert!(
+            log.contains("exited"),
+            "fake pi never reached its exit path: {log:?}"
+        );
         let events = collected.wait_for("stopped status", |events| {
             statuses(events).contains(&RuntimeStatus::Stopped)
         });
@@ -2714,7 +2757,12 @@ printf 'exited\n' >> '@MARKER@'
                 &scratch.dir,
             )
             .expect("spawn");
-        assert_eq!(report.outcome, StartupOutcome::Ready, "stderr: {:?}", report.stderr_tail);
+        assert_eq!(
+            report.outcome,
+            StartupOutcome::Ready,
+            "stderr: {:?}",
+            report.stderr_tail
+        );
 
         // A turn really is running, so the abort has something to close.
         let prompt = manager
@@ -2725,7 +2773,10 @@ printf 'exited\n' >> '@MARKER@'
             })
             .expect("prompt response");
         assert!(prompt.success);
-        assert_eq!(manager.status("s1").map(|s| s.status), Some(RuntimeStatus::Running));
+        assert_eq!(
+            manager.status("s1").map(|s| s.status),
+            Some(RuntimeStatus::Running)
+        );
 
         let started = Instant::now();
         let outcome = manager.abort_and_wait("s1").expect("abort");
@@ -2756,7 +2807,13 @@ printf 'exited\n' >> '@MARKER@'
         // The turn ended through the protocol, with the reason the UI needs.
         assert!(
             events.iter().any(|(key, event)| key == "s1"
-                && matches!(event, AgentEvent::TurnEnd { stop_reason: Some(StopReason::Aborted), .. })),
+                && matches!(
+                    event,
+                    AgentEvent::TurnEnd {
+                        stop_reason: Some(StopReason::Aborted),
+                        ..
+                    }
+                )),
             "the aborted turn is forwarded with its reason: {events:#?}"
         );
         // The request reached the child as the protocol's own frame, once, with
@@ -2786,7 +2843,11 @@ printf 'exited\n' >> '@MARKER@'
             })
             .expect("the session must stay usable after a settled stop");
         assert!(again.success);
-        assert_eq!(attempts_count(&attempts), 1, "the stop never respawned the child");
+        assert_eq!(
+            attempts_count(&attempts),
+            1,
+            "the stop never respawned the child"
+        );
         manager.stop_all();
     }
 
@@ -2799,7 +2860,13 @@ printf 'exited\n' >> '@MARKER@'
         let scratch = Scratch::new("abort_deaf");
         let attempts = scratch.path("attempts");
         let marker = scratch.path("marker");
-        let script = write_script(&scratch, "fake-pi.sh", &attempts, &marker, FAKE_PI_ABORT_DEAF);
+        let script = write_script(
+            &scratch,
+            "fake-pi.sh",
+            &attempts,
+            &marker,
+            FAKE_PI_ABORT_DEAF,
+        );
         let collected = Arc::new(Collected::default());
         let manager = ProcessManager::with_timeouts(collected.sink(), test_timeouts());
 
@@ -2816,13 +2883,22 @@ printf 'exited\n' >> '@MARKER@'
                 &scratch.dir,
             )
             .expect("spawn");
-        assert_eq!(report.outcome, StartupOutcome::Ready, "stderr: {:?}", report.stderr_tail);
+        assert_eq!(
+            report.outcome,
+            StartupOutcome::Ready,
+            "stderr: {:?}",
+            report.stderr_tail
+        );
 
         let started = Instant::now();
         let outcome = manager.abort_and_wait("s1").expect("abort");
         let waited = started.elapsed();
 
-        assert_eq!(outcome, AbortOutcome::Killed, "a child that never settles is killed");
+        assert_eq!(
+            outcome,
+            AbortOutcome::Killed,
+            "a child that never settles is killed"
+        );
         assert!(
             waited >= test_timeouts().abort_grace,
             "the abort is given its whole grace before the kill: {waited:?}"
@@ -2875,16 +2951,16 @@ printf 'exited\n' >> '@MARKER@'
 
         let report = manager
             .spawn(
-            "s1",
-            script.to_str().unwrap(),
-            &scratch.path("s1.jsonl"),
-            SessionModel {
-                provider: TEST_PROVIDER,
-                model: TEST_MODEL,
-                thinking: None,
-            },
-            &scratch.dir,
-        )
+                "s1",
+                script.to_str().unwrap(),
+                &scratch.path("s1.jsonl"),
+                SessionModel {
+                    provider: TEST_PROVIDER,
+                    model: TEST_MODEL,
+                    thinking: None,
+                },
+                &scratch.dir,
+            )
             .expect("spawn attempt");
         assert_eq!(report.outcome, StartupOutcome::Crashed);
         assert_eq!(report.status, RuntimeStatus::Crashed);
@@ -2893,7 +2969,10 @@ printf 'exited\n' >> '@MARKER@'
             STARTUP_MAX_ATTEMPTS,
             "a crash before ready is retried exactly once"
         );
-        assert!(!manager.contains("s1"), "a crashed startup leaves no session");
+        assert!(
+            !manager.contains("s1"),
+            "a crashed startup leaves no session"
+        );
 
         let events = collected.wait_for("crashed status", |events| {
             statuses(events).contains(&RuntimeStatus::Crashed)
@@ -2925,16 +3004,16 @@ printf 'exited\n' >> '@MARKER@'
         let started = Instant::now();
         let report = manager
             .spawn(
-            "s1",
-            script.to_str().unwrap(),
-            &scratch.path("s1.jsonl"),
-            SessionModel {
-                provider: TEST_PROVIDER,
-                model: TEST_MODEL,
-                thinking: None,
-            },
-            &scratch.dir,
-        )
+                "s1",
+                script.to_str().unwrap(),
+                &scratch.path("s1.jsonl"),
+                SessionModel {
+                    provider: TEST_PROVIDER,
+                    model: TEST_MODEL,
+                    thinking: None,
+                },
+                &scratch.dir,
+            )
             .expect("spawn attempt");
         assert_eq!(report.outcome, StartupOutcome::Timeout);
         assert_eq!(report.status, RuntimeStatus::Crashed);
@@ -2963,16 +3042,16 @@ printf 'exited\n' >> '@MARKER@'
 
         manager
             .spawn(
-            "s1",
-            script.to_str().unwrap(),
-            &scratch.path("s1.jsonl"),
-            SessionModel {
-                provider: TEST_PROVIDER,
-                model: TEST_MODEL,
-                thinking: None,
-            },
-            &scratch.dir,
-        )
+                "s1",
+                script.to_str().unwrap(),
+                &scratch.path("s1.jsonl"),
+                SessionModel {
+                    provider: TEST_PROVIDER,
+                    model: TEST_MODEL,
+                    thinking: None,
+                },
+                &scratch.dir,
+            )
             .expect("first spawn");
         let second = manager.spawn(
             "s1",
@@ -2992,16 +3071,16 @@ printf 'exited\n' >> '@MARKER@'
         // A second session gets its own process.
         manager
             .spawn(
-            "s2",
-            script.to_str().unwrap(),
-            &scratch.path("s2.jsonl"),
-            SessionModel {
-                provider: TEST_PROVIDER,
-                model: TEST_MODEL,
-                thinking: None,
-            },
-            &scratch.dir,
-        )
+                "s2",
+                script.to_str().unwrap(),
+                &scratch.path("s2.jsonl"),
+                SessionModel {
+                    provider: TEST_PROVIDER,
+                    model: TEST_MODEL,
+                    thinking: None,
+                },
+                &scratch.dir,
+            )
             .expect("second session spawn");
         assert!(manager.contains("s1") && manager.contains("s2"));
         assert_eq!(attempts_count(&attempts), 2);
@@ -3037,7 +3116,12 @@ printf 'exited\n' >> '@MARKER@'
                 &scratch.dir,
             )
             .expect("spawn");
-        assert_eq!(report.outcome, StartupOutcome::Ready, "stderr: {:?}", report.stderr_tail);
+        assert_eq!(
+            report.outcome,
+            StartupOutcome::Ready,
+            "stderr: {:?}",
+            report.stderr_tail
+        );
         let pid = report.pid.expect("a ready child has a pid");
 
         let worker = manager.clone();
@@ -3081,7 +3165,11 @@ printf 'exited\n' >> '@MARKER@'
         let script = write_script(&scratch, "fake-pi.sh", &attempts, &marker, FAKE_PI);
         let collected = Arc::new(Collected::default());
         let manager = ProcessManager::with_timeouts(collected.sink(), test_timeouts());
-        assert_eq!(manager.live_ids(), Vec::<String>::new(), "nothing spawned yet");
+        assert_eq!(
+            manager.live_ids(),
+            Vec::<String>::new(),
+            "nothing spawned yet"
+        );
 
         manager
             .spawn(
@@ -3114,12 +3202,19 @@ printf 'exited\n' >> '@MARKER@'
             vec!["s1".to_string(), "s2".to_string()],
             "live ids come from the registry and are stable"
         );
-        assert_eq!(attempts_count(&attempts), 2, "reading live ids never spawns");
+        assert_eq!(
+            attempts_count(&attempts),
+            2,
+            "reading live ids never spawns"
+        );
 
         manager.stop_and_wait("s1").expect("stop s1");
         assert_eq!(manager.live_ids(), vec!["s2".to_string()]);
         manager.stop_all();
-        assert!(manager.live_ids().is_empty(), "a stopped session is not live");
+        assert!(
+            manager.live_ids().is_empty(),
+            "a stopped session is not live"
+        );
     }
 
     // ── the master gate (S3, S8 of `agent-profiles.md`) ──────────────────────
@@ -3147,7 +3242,9 @@ printf 'exited\n' >> '@MARKER@'
     /// line from the flag on). `None` when the flag never reached the child.
     #[cfg(unix)]
     fn spawned_prompt(args: &[String]) -> Option<String> {
-        let at = args.iter().position(|arg| arg == "--append-system-prompt")?;
+        let at = args
+            .iter()
+            .position(|arg| arg == "--append-system-prompt")?;
         Some(args.get(at + 1..)?.join("\n"))
     }
 
@@ -3181,7 +3278,12 @@ printf 'exited\n' >> '@MARKER@'
                 &scratch.dir,
             )
             .expect("spawn");
-        assert_eq!(report.outcome, StartupOutcome::Ready, "stderr: {:?}", report.stderr_tail);
+        assert_eq!(
+            report.outcome,
+            StartupOutcome::Ready,
+            "stderr: {:?}",
+            report.stderr_tail
+        );
 
         let args = recorded_args(&scratch, "fake-pi.sh");
         let helper_arg = helpers.to_string_lossy().to_string();
@@ -3226,7 +3328,12 @@ printf 'exited\n' >> '@MARKER@'
                 &scratch.dir,
             )
             .expect("spawn");
-        assert_eq!(report.outcome, StartupOutcome::Ready, "stderr: {:?}", report.stderr_tail);
+        assert_eq!(
+            report.outcome,
+            StartupOutcome::Ready,
+            "stderr: {:?}",
+            report.stderr_tail
+        );
 
         let args = recorded_args(&scratch, "fake-pi.sh");
         let helper_arg = helpers.to_string_lossy().to_string();
@@ -3273,7 +3380,12 @@ printf 'exited\n' >> '@MARKER@'
                 &scratch.dir,
             )
             .expect("spawn");
-        assert_eq!(report.outcome, StartupOutcome::Ready, "stderr: {:?}", report.stderr_tail);
+        assert_eq!(
+            report.outcome,
+            StartupOutcome::Ready,
+            "stderr: {:?}",
+            report.stderr_tail
+        );
 
         let args = recorded_args(&scratch, "fake-pi.sh");
         assert!(
@@ -3349,7 +3461,9 @@ printf 'exited\n' >> '@MARKER@'
                 ..SpawnLayout::default()
             },
         );
-        args.last().cloned().expect("the prompt is the last argument")
+        args.last()
+            .cloned()
+            .expect("the prompt is the last argument")
     }
 
     // The incident this note exists for: `run_agent` was in flight when the app
@@ -3357,7 +3471,11 @@ printf 'exited\n' >> '@MARKER@'
     #[test]
     fn a_dangling_run_agent_call_adds_a_resume_note_to_the_prompt() {
         let scratch = Scratch::new("resume_note_run_agent");
-        let path = write_session(&scratch, "s.jsonl", &[tool_call_line("call-1", "run_agent")]);
+        let path = write_session(
+            &scratch,
+            "s.jsonl",
+            &[tool_call_line("call-1", "run_agent")],
+        );
         let prompt = prompt_for(&path, Some(&scratch.dir));
         // Appended, never a replacement: the identity stays whole.
         assert!(
@@ -3368,7 +3486,10 @@ printf 'exited\n' >> '@MARKER@'
         // The four facts the model needs to stop inventing progress.
         assert!(flat.contains("reopened"), "it was reopened: {flat}");
         assert!(flat.contains("`run_agent`"), "the tool is named: {flat}");
-        assert!(flat.contains("never returned"), "the result was lost: {flat}");
+        assert!(
+            flat.contains("never returned"),
+            "the result was lost: {flat}"
+        );
         assert!(
             flat.contains("no tool and no subagent is alive now"),
             "nothing is still running: {flat}"
@@ -3389,8 +3510,14 @@ printf 'exited\n' >> '@MARKER@'
         let note = prompt
             .strip_prefix(&compose_system_prompt(false))
             .expect("the note follows the identity");
-        assert!(note.starts_with("\n\n## "), "one blank line, then a heading: {note:?}");
-        assert!(!note.contains("  "), "no double space from wrapping: {note:?}");
+        assert!(
+            note.starts_with("\n\n## "),
+            "one blank line, then a heading: {note:?}"
+        );
+        assert!(
+            !note.contains("  "),
+            "no double space from wrapping: {note:?}"
+        );
     }
 
     // S8-style regression: nothing was interrupted, so the spawn is today's —
@@ -3447,7 +3574,10 @@ printf 'exited\n' >> '@MARKER@'
                 tool_result_line("call-1", "bash"),
             ],
         );
-        assert_eq!(prompt_for(&path, Some(&scratch.dir)), compose_system_prompt(false));
+        assert_eq!(
+            prompt_for(&path, Some(&scratch.dir)),
+            compose_system_prompt(false)
+        );
     }
 
     // Several calls can be in flight when the app dies, and a call from any
@@ -3469,12 +3599,24 @@ printf 'exited\n' >> '@MARKER@'
         let prompt = prompt_for(&path, Some(&scratch.dir));
         let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
         for name in ["run_agent", "bash"] {
-            assert!(flat.contains(&format!("`{name}`")), "`{name}` is named: {flat}");
+            assert!(
+                flat.contains(&format!("`{name}`")),
+                "`{name}` is named: {flat}"
+            );
         }
         // Deduplicated with a count, and the answered `read` is not reported.
-        assert!(flat.contains("`bash` (2 calls)"), "counted once per tool: {flat}");
-        assert!(flat.contains("`run_agent` (1 call)"), "singular when one: {flat}");
-        assert!(!flat.contains("`read`"), "an answered call is not reported: {flat}");
+        assert!(
+            flat.contains("`bash` (2 calls)"),
+            "counted once per tool: {flat}"
+        );
+        assert!(
+            flat.contains("`run_agent` (1 call)"),
+            "singular when one: {flat}"
+        );
+        assert!(
+            !flat.contains("`read`"),
+            "an answered call is not reported: {flat}"
+        );
     }
 
     // The real world: a hard kill can tear the last line, and a hand-edited file
@@ -3495,7 +3637,10 @@ printf 'exited\n' >> '@MARKER@'
             ],
         );
         let prompt = prompt_for(&path, Some(&scratch.dir));
-        assert!(prompt.contains("`bash`"), "the readable call is reported: {prompt}");
+        assert!(
+            prompt.contains("`bash`"),
+            "the readable call is reported: {prompt}"
+        );
         // A file of nothing but garbage composes today's prompt, unchanged.
         let garbage = write_session(
             &scratch,

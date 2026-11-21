@@ -98,8 +98,12 @@ impl McpState {
         let normalized = raw.trim().to_ascii_lowercase().replace(['-', ' '], "_");
         match normalized.as_str() {
             "connected" | "ready" | "ok" => Some(McpState::Ready),
-            "needs_auth" | "needs_authentication" | "needs_sign_in" | "needs_signin"
-            | "login_required" | "unauthorized" => Some(McpState::NeedsSignIn),
+            "needs_auth"
+            | "needs_authentication"
+            | "needs_sign_in"
+            | "needs_signin"
+            | "login_required"
+            | "unauthorized" => Some(McpState::NeedsSignIn),
             "failed" | "error" | "disconnected" | "closed" => Some(McpState::Error),
             "disabled" | "off" => Some(McpState::Disabled),
             "unknown" | "connecting" => Some(McpState::Unknown),
@@ -245,11 +249,7 @@ impl std::error::Error for McpError {}
 /// `pi mcp list --json`. The only source of MCP state: never a file read, and
 /// never the exit code (L of the feature doc).
 pub fn list_args() -> Vec<String> {
-    vec![
-        "mcp".to_string(),
-        "list".to_string(),
-        "--json".to_string(),
-    ]
+    vec!["mcp".to_string(), "list".to_string(), "--json".to_string()]
 }
 
 /// Parses the JSON of `pi mcp list --json`. Never panics: anything it cannot
@@ -385,9 +385,10 @@ fn tool_names(value: Option<&serde_json::Value>) -> Vec<String> {
         .iter()
         .filter_map(|item| match item {
             serde_json::Value::String(name) => Some(name.trim()),
-            serde_json::Value::Object(map) => {
-                map.get("name").and_then(|value| value.as_str()).map(str::trim)
-            }
+            serde_json::Value::Object(map) => map
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(str::trim),
             _ => None,
         })
         .filter(|name| !name.is_empty())
@@ -455,7 +456,11 @@ pub fn add_args(draft: &McpAddDraft) -> Result<Vec<String>, McpError> {
             args.push(url.to_string());
             for pair in &draft.headers {
                 args.push("--header".to_string());
-                args.push(format!("{}={}", validate_key(&pair.key, false)?, pair.value));
+                args.push(format!(
+                    "{}={}",
+                    validate_key(&pair.key, false)?,
+                    pair.value
+                ));
             }
             if let Some(name) = draft
                 .bearer_token_env_var
@@ -505,11 +510,7 @@ pub fn logout_args(name: &str, scope: McpScope) -> Result<Vec<String>, McpError>
 /// name a server can never drift apart.
 fn scoped_args(verb: &str, name: &str, scope: McpScope) -> Result<Vec<String>, McpError> {
     validate_name(name)?;
-    let mut args = vec![
-        "mcp".to_string(),
-        verb.to_string(),
-        name.trim().to_string(),
-    ];
+    let mut args = vec!["mcp".to_string(), verb.to_string(), name.trim().to_string()];
     if let Some(flag) = scope.flag() {
         args.push(flag.to_string());
     }
@@ -669,7 +670,11 @@ mod tests {
 
     fn one(json: &str) -> McpServerSummary {
         let mut servers = parse_list(json);
-        assert_eq!(servers.len(), 1, "expected exactly one server: {servers:#?}");
+        assert_eq!(
+            servers.len(),
+            1,
+            "expected exactly one server: {servers:#?}"
+        );
         servers.remove(0)
     }
 
@@ -772,13 +777,21 @@ mod tests {
           "errors": ["config error: bad entry"]
         }"#;
         let servers = parse_list(json);
-        assert_eq!(servers.len(), 3, "the nameless entries are dropped: {servers:#?}");
+        assert_eq!(
+            servers.len(),
+            3,
+            "the nameless entries are dropped: {servers:#?}"
+        );
 
         assert_eq!(servers[0].name, "object-transport");
         assert_eq!(servers[0].transport, McpTransport::Http);
         assert_eq!(servers[0].target, "https://example.test/mcp");
         assert_eq!(servers[0].state, McpState::Unknown);
-        assert_eq!(servers[0].scope, McpScope::Global, "an absent scope is global");
+        assert_eq!(
+            servers[0].scope,
+            McpScope::Global,
+            "an absent scope is global"
+        );
         assert!(servers[0].enabled, "an absent enabled flag is enabled");
 
         assert_eq!(servers[1].name, "bare");
@@ -904,7 +917,10 @@ mod tests {
     fn add_args_builds_the_documented_http_shape() {
         let mut http = draft(McpTransport::Http, McpScope::Global);
         http.url = Some("https://mcp.example.test/mcp".to_string());
-        http.headers = vec![pair("X-Tenant", "acme"), pair("Authorization", "${ACME_TOKEN}")];
+        http.headers = vec![
+            pair("X-Tenant", "acme"),
+            pair("Authorization", "${ACME_TOKEN}"),
+        ];
         http.bearer_token_env_var = Some("MCP_TOKEN".to_string());
         // Fields of the other transport are ignored, so the form may keep them.
         http.command = Some("ignored".to_string());
@@ -949,7 +965,13 @@ mod tests {
 
         assert_eq!(
             add_args(&http).expect("a valid http draft"),
-            strings(&["mcp", "add", "engram", "--url", "https://mcp.example.test/mcp"])
+            strings(&[
+                "mcp",
+                "add",
+                "engram",
+                "--url",
+                "https://mcp.example.test/mcp"
+            ])
         );
     }
 
@@ -966,7 +988,15 @@ mod tests {
         assert_eq!(
             add_args(&stdio).expect("a valid stdio draft"),
             strings(&[
-                "mcp", "add", "engram", "--exposure", "direct", "--", "npx", "-y", "some-mcp",
+                "mcp",
+                "add",
+                "engram",
+                "--exposure",
+                "direct",
+                "--",
+                "npx",
+                "-y",
+                "some-mcp",
             ])
         );
 
@@ -976,7 +1006,13 @@ mod tests {
         blank.exposure = Some("  ".to_string());
         assert_eq!(
             add_args(&blank).expect("a blank exposure is not an error"),
-            strings(&["mcp", "add", "engram", "--url", "https://mcp.example.test/mcp"])
+            strings(&[
+                "mcp",
+                "add",
+                "engram",
+                "--url",
+                "https://mcp.example.test/mcp"
+            ])
         );
 
         // A mode pi does not accept never reaches its command line.
@@ -1121,8 +1157,19 @@ mod tests {
         for good in ["engram", "chrome-devtools_mcp", "a.b", "A1"] {
             assert_eq!(validate_name(good), Ok(()), "expected {good:?} to be valid");
         }
-        for bad in ["", "  ", "with space", "semi;colon", "quote'", "back\\slash", "../up"] {
-            assert!(validate_name(bad).is_err(), "expected {bad:?} to be invalid");
+        for bad in [
+            "",
+            "  ",
+            "with space",
+            "semi;colon",
+            "quote'",
+            "back\\slash",
+            "../up",
+        ] {
+            assert!(
+                validate_name(bad).is_err(),
+                "expected {bad:?} to be invalid"
+            );
         }
         assert!(validate_name(&"a".repeat(NAME_MAX_LEN)).is_ok());
         assert!(validate_name(&"a".repeat(NAME_MAX_LEN + 1)).is_err());

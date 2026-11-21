@@ -34,6 +34,7 @@ Vue.
 | App store | `src-tauri/src/store.rs` | Owned projection: workspaces, session index | Transcript content, pi's session files |
 | Human config | `src-tauri/src/settings.rs` | `settings.json` load/save | Accumulated application state |
 | Runtime | not created | Spawning/stopping pi sessions, streaming events | Depending on Vue or presentation details |
+| Zoom shortcuts | `src/lib/zoom.ts`, `src/contracts/window.ts`, `src-tauri/src/zoom.rs` | The chord, the step, the range, and which port receives the factor | DOM or Tauri calls outside the ports it is handed |
 
 ## Capability placement
 
@@ -62,6 +63,20 @@ in the local `.docs/04-arquitectura-base.md`; treat it as provisional until vers
   atomic write; unknown fields are tolerated so newer files still parse.
 - **Session start (planned):** command → runtime supervisor spawns `pi --mode rpc` → events → typed
   Tauri events → Vue; `upsert_session` records the pi session path in the index.
+- **Zoom (`⌘`/`Ctrl` `+`, `-`, `0`):** a document-level `keydown` in `src/App.vue` → `zoomAction` /
+  `nextZoomLevel` in `src/lib/zoom.ts` (pure; covered by `tests/zoom.test.ts`) → `setWebviewZoom()` in
+  `src/contracts/window.ts` → `commands::set_webview_zoom` → `zoom::validate_scale` → Tauri
+  `Webview::set_zoom` on the **main** webview. That is `wry`'s page zoom: `WKWebView.setPageZoom`
+  (macOS 11+), WebView2 `SetZoomFactor`, webkit2gtk `set_zoom_level` — present in this build on all
+  three desktops, taking a factor where `1.0` is 100%. Zoom belongs to ONE webview, so the embedded
+  browser's child webviews (`embed-<n>`) keep their own scale, and because page zoom does not change
+  CSS pixels, the rect the UI sends for a child stays valid under zoom. The JS route
+  (`getCurrentWebview().setZoom()`) exists but is a `core:` command and would need
+  `core:webview:allow-set-webview-zoom` in `capabilities/default.json`; the app's own command answers
+  the same question without widening a capability for one keystroke. A refusal (a plain browser during
+  `vite dev`, or a platform without it) falls back to CSS `zoom` on the root element, which is a
+  DEGRADED mode: viewport units and the child-webview rect stop agreeing — that is why native is
+  always tried first and why the fallback is sticky.
 
 ## Accepted rules
 
