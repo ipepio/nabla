@@ -267,6 +267,7 @@
   "chat.queue.heading": "En cola ({count})",
   "chat.queue.list": "Mensajes en cola",
   "chat.queue.remove": "Quitar el mensaje en cola {index}",
+  "chat.transcript.showOlder": "Mostrar turnos anteriores ({count})",
   "message.copy": "Copiar mensaje",
   "chat.permissionMode.read": "Lectura",
   "chat.permissionMode.write": "Escritura",

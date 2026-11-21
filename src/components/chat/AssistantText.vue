@@ -6,16 +6,20 @@
 // wrote can turn into markup.
 //
 // `segmentsOf` does all the recognising, so this file only decides what each
-// block looks like. It is the same function the streaming throttle feeds, which
-// is why a heading that appears mid-stream is painted exactly as it will be once
-// the turn is committed.
+// block looks like. It runs through a cache (`createSegmentCache`) because a
+// streamed answer only appends: every delta re-parsing the blocks that already
+// closed is work that cannot change what they look like. A paragraph that appears
+// mid-stream is therefore painted exactly as it will be once the turn is
+// committed.
 import { computed, Fragment, h, type FunctionalComponent, type VNodeChild } from "vue";
 import CodeBlock from "@/components/chat/CodeBlock.vue";
-import { segmentsOf, type InlinePart } from "@/components/chat/code-segments";
+import { createSegmentCache, type InlinePart } from "@/components/chat/code-segments";
 
 const props = defineProps<{ text: string }>();
 
-const segments = computed(() => segmentsOf(props.text));
+/** One cache per bubble: the text it is asked about only ever belongs to itself. */
+const segmentsCache = createSegmentCache();
+const segments = computed(() => segmentsCache.segmentsFor(props.text));
 
 /**
  * One run of inline markup, painted inside whatever block holds it — a

@@ -5,6 +5,7 @@ import App from "./App.vue";
 import "./assets/index.css";
 import { getSettings } from "./contracts/commands";
 import { applyWindowMinimums } from "./contracts/window";
+import { rememberBootSettings } from "./lib/boot-settings";
 import { setLocale } from "./lib/i18n";
 import { APP_MIN_HEIGHT, APP_MIN_WIDTH } from "./lib/layout";
 
@@ -13,10 +14,17 @@ import { APP_MIN_HEIGHT, APP_MIN_WIDTH } from "./lib/layout";
  * and applied before the first mount, so the window never paints a frame of the
  * wrong language. A missing file — or a plain browser during `vite dev` — keeps
  * the catalogue default (English): a preference must never block the boot.
+ *
+ * S2 of `odd/tasks/drawer-responsiveness-oauth.md`: the payload this read already
+ * produced is handed to the chat (`rememberBootSettings`), so the panel's startup
+ * load applies the theme and the chat preferences from ONE read instead of
+ * issuing a second identical command. Nothing else is cached: later reads still
+ * go to the file.
  */
 async function boot(): Promise<void> {
   try {
     const settings = await getSettings();
+    rememberBootSettings(settings);
     setLocale(settings.language);
   } catch {
     // English stays applied; the settings dialog reports read failures itself.

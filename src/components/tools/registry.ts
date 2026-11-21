@@ -24,7 +24,7 @@
 //
 // Nothing else lives in this file: the registry is data, and every tool keeps its
 // own state and its own requests.
-import type { Component } from "vue";
+import { defineAsyncComponent, type Component } from "vue";
 import {
   FilesIcon,
   GitBranchIcon,
@@ -36,7 +36,23 @@ import type { MessageKey } from "@/lib/i18n";
 import BrowserTool from "./BrowserTool.vue";
 import ChangesTool from "./ChangesTool.vue";
 import FilesTool from "./FilesTool.vue";
-import TerminalTool from "./TerminalTool.vue";
+
+/**
+ * The terminal is the one tool whose code is not in the drawer's startup bundle.
+ *
+ * `TerminalTool.vue` pulls in xterm and its fit addon, and Terminal is OFF by
+ * default (S5): most sessions never open a shell, so the editor, the parser and
+ * the fonts it carries were downloaded and evaluated on every start for a pane
+ * nobody asked for. A dynamic import moves that work to the moment the first
+ * terminal pane mounts (S2 of `odd/tasks/drawer-responsiveness-oauth.md`), and the
+ * dock needed no change: `DockPane.vue` already mounts `component` through `<component
+ * :is>`, which renders an async component as soon as its chunk arrives.
+ *
+ * The other three stay eager on purpose: Files and Changes are the panes a session
+ * opens first, and Browser coordinates its child webview with the drawer's first
+ * paint — neither may wait for a second round-trip.
+ */
+const TerminalTool = defineAsyncComponent(() => import("./TerminalTool.vue"));
 
 /**
  * The context of one tool instance, per tool. Files browses a folder, Terminal

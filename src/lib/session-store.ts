@@ -36,6 +36,11 @@ import type {
   UiAnswer,
 } from "../contracts/types";
 import { queueMessages } from "./preferences";
+import {
+  forgetSavedPreview,
+  savePreviewOnce,
+  sessionRefresh,
+} from "./session-refresh";
 
 /** One tool call of a session, kept as the compact chip the panel renders. */
 export interface ToolEntry {
@@ -410,8 +415,10 @@ const transcriptSeeded = new Set<string>();
 const previewPainted = new Set<string>();
 
 /**
- * Bumped whenever a session is created. The drawer watches it to refresh the
- * index lists, which is the only thing it means.
+ * Bumped when a session is created or the selection is dropped: the index gained
+ * or lost a row. Per-turn activity does not bump it any more — it goes through
+ * `sessionRefresh` (`src/lib/session-refresh.ts`), which names the workspace that
+ * changed so the drawer re-reads one open list instead of all of them.
  */
 export const sessionGeneration = ref(0);
 
@@ -1055,8 +1062,10 @@ async function sendQueuedTurn(
   debugLog(
     `store drain: sent one queued prompt (${buffer.queue.length} still waiting, awaitingProcess=${entry.awaitingProcess})`,
   );
-  settleQueuedMessage(sessionId, buffer, entry);  // The drawer sorts by activity, so a queued turn is activity too.
-  sessionGeneration.value += 1;
+  settleQueuedMessage(sessionId, buffer, entry);
+  // The drawer sorts by activity, so a queued turn is activity too — of this
+  // session's workspace, which is the only list whose order it can move.
+  sessionRefresh.note(workspaceId);
 }
 
 function findTool(buffer: SessionBuffer, toolCallId: string) {
@@ -1176,12 +1185,14 @@ function finishTurn(sessionId: string, buffer: SessionBuffer): void {
   flushStreaming(sessionId, buffer);
   // The finished turn is exactly what an open will paint next time, so the
   // snapshot is taken here and nowhere else: after the flush, the buffer is the
-  // whole conversation including this turn's reasoning.
+  // whole conversation including this turn's reasoning. `agent_end` closes the
+  // same turn right after `turn_end`, and the snapshot is per tail, so the second
+  // close costs nothing (`savePreviewOnce`).
   snapshotPreview(sessionId, buffer);
-  // A finished turn is activity the drawer must see: bump the generation so the
-  // session list re-reads and the row moves up now, instead of waiting for the
-  // next poll tick.
-  sessionGeneration.value += 1;
+  // A finished turn is activity the drawer must see, so the row moves up now
+  // instead of on the next poll tick. Only its own workspace is noted: the other
+  // open lists cannot have changed (S2 of `drawer-responsiveness-oauth.md`).
+  sessionRefresh.note(buffer.workspaceId);
   // S3: a finished turn releases the next queued prompt, so nothing ever talks
   // to pi while it is working. Flushing first keeps the conversation in order:
   // the answer lands above the next question. This is one of the two drains; the
@@ -1453,9 +1464,13 @@ async function paintPreview(
  * it still holds the reasoning pi streamed, which the file never stored.
  *
  * Best-effort and fire-and-forget: a failed save resolves to silence and is never
- * surfaced, because a preview must never break the turn that produced it. Two
- * events can snapshot the same turn (`turn_end` then `agent_end`); both send the
- * same tail, so the later write cannot lose anything.
+ * surfaced, because a preview must never break the turn that produced it.
+ *
+ * Two events can snapshot the same turn (`turn_end` then `agent_end`), and they
+ * send the same tail. That duplicate is skipped by `savePreviewOnce`, which
+ * remembers the tail it last stored per session: the payload is not serialized
+ * and the row is not rewritten twice for one fact, while a turn that really moved
+ * the conversation still produces a different tail and is written.
  */
 function snapshotPreview(sessionId: string, buffer: SessionBuffer): void {
   if (buffer.transcript.length === 0) return;
@@ -1469,7 +1484,9 @@ function snapshotPreview(sessionId: string, buffer: SessionBuffer): void {
       reasoning: message.reasoning ?? null,
       at: message.at,
     }));
-  void saveSessionPreview(Number(sessionId), messages).catch(() => {
+  void savePreviewOnce(sessionId, messages, (tail) =>
+    saveSessionPreview(Number(sessionId), tail),
+  ).catch(() => {
     /* best effort: pi's file is the transcript, this is only a head start */
   });
 }
@@ -1581,6 +1598,11 @@ export async function newSession(workspaceId: number): Promise<SessionDto> {
   // A session created here has no earlier conversation to read back.
   transcriptSeeded.add(started.sessionId);
   activeSession.value = started;
+  // The index gained a row in this workspace, so the list that shows it must
+  // re-read — one open list, not every one of them (S2 of
+  // `drawer-responsiveness-oauth.md`). `sessionGeneration` still marks the shape
+  // change itself, which every surface that lists sessions may follow.
+  sessionRefresh.note(workspaceId);
   sessionGeneration.value += 1;
   return started;
 }
@@ -1609,6 +1631,9 @@ export function removeSession(sessionId: string | number): void {
   transcriptSeeded.delete(key);
   previewPainted.delete(key);
   transcriptLoading.delete(key);
+  // A row that no longer exists can never be snapshotted again, so its stored
+  // tail is not knowledge worth keeping.
+  forgetSavedPreview(key);
   // A send that was still on its way for a session that no longer exists must not
   // keep a later session with the same id from draining its own queue.
   draining.delete(key);
@@ -1661,7 +1686,9 @@ export async function sendUserTurn(
     dropTranscriptMessage(buffer, id);
     throw cause;
   }
-  sessionGeneration.value += 1;
+  // The human turn moved this session's `updated_at`: one workspace's rows
+  // changed, not every open list.
+  sessionRefresh.note(workspaceId);
 }
 
 /**

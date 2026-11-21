@@ -48,6 +48,7 @@ import WorkspaceRow from "@/components/sidebar/WorkspaceRow.vue";
 import { useAppearance } from "@/lib/appearance";
 import { themedBrand } from "@/lib/brand";
 import { t } from "@/lib/i18n";
+import { sessionRefresh } from "@/lib/session-refresh";
 import {
   activeSession,
   busyIds,
@@ -416,11 +417,27 @@ function handleVisibilityChange() {
 }
 
 // N1: a new session (from the button or from the composer's first send) changes
-// what each open list must show.
-watch(sessionGeneration, () => {
-  sessionsByWorkspace.value = {};
-  syncSessions(expandedIds.value);
-});
+// what an open list must show, exactly like a finished turn does. The drawer used
+// to answer every index change by dropping the whole cache and refetching every
+// open workspace; it now asks the planner which open list actually changed (S2 of
+// `drawer-responsiveness-oauth.md`).
+//
+// What is deliberately unchanged: the refresh still goes through `loadSessions`,
+// which owns the per-workspace sequence guard, the pending counter and the
+// replace-only-when-it-differs rule — so the rows on screen are kept while the
+// re-read is in flight and replaced only when a different index lands. Nothing
+// clears `sessionsByWorkspace` here any more: a turn landing in one workspace must
+// not blank the rows of the others.
+function applySessionRefresh() {
+  const plan = sessionRefresh.takePlan(expandedIds.value);
+  for (const workspaceId of plan.workspaces) void loadSessions(workspaceId);
+}
+
+// Activity (a prompt sent, a turn finished, a session created) arrives through
+// the planner's signal; the index-shape counter is watched too, so a creation or a
+// cleared selection still reaches the open lists.
+watch(sessionRefresh.signal, applySessionRefresh);
+watch(sessionGeneration, applySessionRefresh);
 
 /** S2: creates a session for the selected workspace — the one creation path. */
 async function handleNewSession() {
@@ -591,6 +608,9 @@ async function handleRemoveWorkspace(workspace: WorkspaceInfo) {
     expandedIds.value = expandedIds.value.filter((id) => id !== workspace.id);
     delete sessionsByWorkspace.value[workspace.id];
     delete sessionsErrors.value[workspace.id];
+    // Its revision cannot describe anything any more, so a re-created workspace
+    // never inherits the activity of the row that was removed.
+    sessionRefresh.forget(workspace.id);
     // H4: its children go with it. An empty list prunes every parent the store was
     // holding for this workspace, so nothing keeps polling children nobody lists.
     void syncWorkspaceSubagents(workspace.id, []);

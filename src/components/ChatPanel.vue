@@ -23,9 +23,12 @@ import QuestionCard from "@/components/chat/QuestionCard.vue";
 import QuestionPrompt from "@/components/chat/QuestionPrompt.vue";
 import SubagentView from "@/components/chat/SubagentView.vue";
 import TurnGroup from "@/components/chat/TurnGroup.vue";
+import OlderTurnsControl from "@/components/chat/OlderTurnsControl.vue";
 import { deriveTurnGroups } from "@/components/chat/turn-groups";
 import { draftKeyFor, usePromptDraft } from "@/components/chat/use-prompt-draft";
 import { useThrottledText } from "@/components/chat/use-throttled-text";
+import { createTranscriptFollow } from "@/components/chat/transcript-follow";
+import { useTurnWindow } from "@/components/chat/turn-window";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -47,6 +50,7 @@ import type {
   WorkspaceInfo,
 } from "@/contracts/types";
 import { useAppearance } from "@/lib/appearance";
+import { takeBootSettings } from "@/lib/boot-settings";
 import { t } from "@/lib/i18n";
 import {
   COMPOSER_MAX_WIDTH,
@@ -207,6 +211,24 @@ const liveTurnId = computed<string | null>(() => {
 const turnGroups = computed(() =>
   deriveTurnGroups(transcript.value, tools.value, liveTurnId.value),
 );
+
+/**
+ * How much of the conversation is mounted: the newest page of turns, plus the
+ * pages the human asked for (`turn-window.ts`). A session that has run for hours
+ * is not mounted whole to show its last answer, and the window resets when the
+ * session on screen changes — one conversation's reveals say nothing about
+ * another's.
+ *
+ * The identity is read from `currentSession` rather than `activeSessionId`
+ * because that derived value is declared further down: a watch getter runs during
+ * setup, and referencing a later `const` is a temporal-dead-zone crash.
+ */
+const {
+  groups: visibleTurnGroups,
+  hiddenCount: hiddenTurnCount,
+  hasOlder: hasOlderTurns,
+  showOlder: revealOlderTurns,
+} = useTurnWindow(turnGroups, () => currentSession.value?.sessionId ?? null);
 const streamingText = computed(() => buffer.value?.streamingText ?? "");
 /**
  * The reasoning still streaming for the turn in progress. Rendered by the same
@@ -270,90 +292,30 @@ const showsLoadingPlaceholder = computed(
 );
 
 /**
- * Scroll behaviour of the transcript: the view follows the bottom only while the
- * human is already there. Reading the middle of a conversation must survive the
- * tokens that keep streaming in (and any other growth of the transcript), which
- * is why "at the bottom" is a state this panel tracks instead of an assumption.
+ * Scroll behaviour of the transcript: one controller
+ * (`transcript-follow.ts`) owns the pin, the coalesced scroll and the anchor used
+ * when older turns are revealed above the reader. It follows the newest line only
+ * while the human is already there, so reading the middle of a conversation
+ * survives the tokens that keep streaming in (and any other growth of the
+ * transcript).
  */
-const BOTTOM_SLACK_PX = 48;
-/** The human is at (or near) the end, so new content may move the view. */
-const pinnedToBottom = ref(true);
+const follow = createTranscriptFollow();
 /** The transcript's content wrapper; the scrolling element is its ancestor. */
 const transcriptContent = ref<HTMLElement | null>(null);
-/** The `ScrollArea` viewport (`data-slot` of `ui/scroll-area/ScrollArea.vue`). */
-const transcriptViewport = ref<HTMLElement | null>(null);
+/** The element the scroll listener is bound to, so detaching can unbind it. */
+let transcriptViewport: HTMLElement | null = null;
 let transcriptResize: ResizeObserver | null = null;
-/** The offset this panel itself last scrolled to (see `handleTranscriptScroll`). */
-let programmaticOffset = 0;
-
-/** Distance to the end under the slack still counts as "open at the bottom". */
-function isAtBottom(element: HTMLElement): boolean {
-  return element.scrollHeight - element.scrollTop - element.clientHeight <= BOTTOM_SLACK_PX;
-}
-
-/**
- * Re-reads the pin from the live scroll position. Only used where the movement
- * is the human's; programmatic scrolls go through `handleTranscriptScroll`.
- */
-function syncPinnedToBottom(): void {
-  const viewport = transcriptViewport.value;
-  if (viewport === null) return;
-  pinnedToBottom.value = isAtBottom(viewport);
-}
-
-/**
- * Moves the view to the latest message. Instant rather than smooth: a streaming
- * answer grows per token, and an animation would chase a moving target.
- */
-function scrollToBottom(): void {
-  const viewport = transcriptViewport.value;
-  if (viewport === null) return;
-  // Assigning past the maximum is clamped by the browser, so this also works
-  // when the content is shorter than the viewport (nothing to scroll).
-  viewport.scrollTop = viewport.scrollHeight;
-  programmaticOffset = viewport.scrollTop;
-  pinnedToBottom.value = true;
-}
-
-/**
- * The `scroll` listener of the viewport, so the pin follows every movement the
- * human makes (wheel, keyboard, scrollbar, touch) — not only the ones this panel
- * performs.
- *
- * A scroll event does not say who moved the view, and content can grow between
- * this panel's own `scrollTop` and the event it produces. An offset at or below
- * the one this panel set is therefore read as "still at the end, follow the new
- * bottom"; only an offset *above* it is the human moving up the conversation.
- */
-function handleTranscriptScroll(): void {
-  const viewport = transcriptViewport.value;
-  if (viewport === null) return;
-  if (pinnedToBottom.value && viewport.scrollTop >= programmaticOffset) {
-    scrollToBottom();
-    return;
-  }
-  pinnedToBottom.value = isAtBottom(viewport);
-}
-
-/**
- * A resize (window, drawer, composer) reflows the transcript: the flag is
- * re-read from the position, and a view that was glued stays glued.
- */
-function handleViewportResize(): void {
-  if (pinnedToBottom.value) {
-    scrollToBottom();
-    return;
-  }
-  syncPinnedToBottom();
-}
 
 function detachTranscriptViewport(): void {
-  const viewport = transcriptViewport.value;
-  if (viewport !== null) viewport.removeEventListener("scroll", handleTranscriptScroll);
+  if (transcriptViewport !== null) {
+    transcriptViewport.removeEventListener("scroll", handleTranscriptScroll);
+    transcriptViewport = null;
+  }
   transcriptResize?.disconnect();
   transcriptResize = null;
-  transcriptViewport.value = null;
-  programmaticOffset = 0;
+  // `detach` cancels a frame that has not landed yet: nothing scrolls a
+  // transcript that is no longer on screen.
+  follow.detach();
 }
 
 /**
@@ -365,17 +327,43 @@ function attachTranscriptViewport(): void {
   const content = transcriptContent.value;
   const viewport =
     content?.closest<HTMLElement>('[data-slot="scroll-area-viewport"]') ?? null;
-  transcriptViewport.value = viewport;
+  // Opening at the end belongs to `attach`: a freshly mounted transcript has no
+  // position to preserve.
+  follow.attach(viewport);
+  transcriptViewport = viewport;
   if (viewport === null) return;
   viewport.addEventListener("scroll", handleTranscriptScroll, { passive: true });
-  transcriptResize ??= new ResizeObserver(handleViewportResize);
+  transcriptResize ??= new ResizeObserver(handleTranscriptResize);
   transcriptResize.observe(viewport);
   // The content element is observed too: collapsing the reasoning block (or a
   // code block growing) changes its height without touching the viewport, and a
   // view glued to the bottom must follow that change as well.
   if (content !== null) transcriptResize.observe(content);
-  // A freshly mounted transcript has no position to preserve: open at the end.
-  scrollToBottom();
+}
+
+/** Every movement of the viewport, whoever made it (wheel, keys, scrollbar, touch). */
+function handleTranscriptScroll(): void {
+  follow.handleScroll();
+}
+
+/**
+ * A resize (window, drawer, composer) reflows the transcript: a view glued to the
+ * bottom is put back on it, a free one only re-reads its pin.
+ */
+function handleTranscriptResize(): void {
+  follow.handleResize();
+}
+
+/**
+ * Reveals one page of older turns, keeping the reader exactly where they were:
+ * the new turns land *above* them, so the offset has to absorb that growth
+ * (`TranscriptFollow.restore`). The control only exists at the top of the mounted
+ * window, which is where a reader who walks back through history already is.
+ */
+function handleShowOlderTurns(): void {
+  const anchor = follow.snapshot();
+  revealOlderTurns();
+  void nextTick(() => follow.restore(anchor));
 }
 
 watch(
@@ -729,16 +717,14 @@ const transcriptSignature = computed(() =>
 /**
  * The follow itself: while the pin holds, every growth moves the view to the new
  * bottom; while it does not, nothing touches the scroll offset, so a human
- * reading higher up keeps the exact place they had.
+ * reading higher up keeps the exact place they had. The scroll is coalesced to
+ * one per frame (`request`), because several growths — a committed turn and its
+ * chips, the throttled tail and the reasoning — land in the same one.
  */
 watch(
   transcriptSignature,
   () => {
-    // `post` plus a tick: the scroll height read must be the grown one.
-    void nextTick(() => {
-      if (!pinnedToBottom.value) return;
-      scrollToBottom();
-    });
+    follow.request();
   },
   { flush: "post" },
 );
@@ -752,12 +738,11 @@ const activeSessionId = computed(() => currentSession.value?.sessionId ?? null);
  * pin, so the seed never fights the human afterwards.
  */
 watch(activeSessionId, () => {
-  pinnedToBottom.value = true;
+  follow.jump();
   void nextTick(() => {
-    scrollToBottom();
     // The history may still be loading; only keep following when we truly landed
     // at the end (a short conversation leaves nothing to scroll).
-    syncPinnedToBottom();
+    follow.syncPin();
   });
 });
 
@@ -840,7 +825,12 @@ function handleWindowFocus(): void {
 
 async function loadSettings() {
   try {
-    settings.value = await getSettings();
+    // S2 of `drawer-responsiveness-oauth.md`: the startup load reuses the payload
+    // `main.ts` already read for the language, instead of asking the file a second
+    // time before the first paint. `takeBootSettings()` answers `null` once, and
+    // this is the only caller — every other settings read in this panel stays a
+    // fresh command, because by then the file may have changed.
+    settings.value = takeBootSettings() ?? (await getSettings());
     // Apply the persisted mode as soon as the file is read, so the first paint
     // after startup shows the theme the human chose.
     setMode(settings.value.theme);
@@ -1440,9 +1430,18 @@ onUnmounted(() => {
                `chat-turn-groups.md`): one group per human message, holding the
                steps pi took for it inside a single disclosure and its final
                answer visible under it (S2). A turn still running keeps the step
-               in progress outside that fold (S3). -->
+               in progress outside that fold (S3).
+
+               Only the newest page is mounted (`turn-window.ts`); the control
+               above reveals the rest, one page at a time. -->
+          <OlderTurnsControl
+            v-if="hasOlderTurns"
+            :count="hiddenTurnCount"
+            @reveal="handleShowOlderTurns"
+          />
+
           <TurnGroup
-            v-for="group in turnGroups"
+            v-for="group in visibleTurnGroups"
             :key="group.id"
             :turn-id="group.id"
             :prompt="group.prompt"

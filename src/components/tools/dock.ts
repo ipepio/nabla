@@ -8,12 +8,17 @@
 //
 // THE HIERARCHY — drawer → tabs → panes:
 //
-//   drawer        the whole right panel. Starts EMPTY: no tab is open, and no tool
-//                 is chosen for the human. The `+` at the end of the strip adds
-//                 one, and there is no limit on how many.
+//   drawer        the whole right panel. It OPENS on its chooser: the first time
+//                 the drawer is opened it holds one EMPTY tab, so choosing a tool
+//                 is one click instead of "+ then pick" (S1 of
+//                 `odd/tasks/drawer-responsiveness-oauth.md`). `openDrawer` is the
+//                 only seeding path, and it seeds on the OPEN, never on a
+//                 reconcile: a human who closes the last tab while the drawer is
+//                 open gets the empty drawer back, not a fresh tab.
 //   tab           a named area with its own layout. A new tab is EMPTY (`layout:
 //                 null`) and shows the tool chooser; starting a tool turns that
-//                 empty area into the tab's single pane.
+//                 empty area into the tab's single pane. There is no limit on how
+//                 many tabs a drawer holds.
 //   pane          one tool instance. A tab's layout is a binary split tree: a leaf
 //                 is one instance, a split is two children laid out in a row (side
 //                 by side) or a column (stacked). Splitting a leaf nests one more
@@ -102,7 +107,8 @@ export interface DockTab {
   layout: Pane | null;
 }
 
-/** Every open tab, left to right. Empty on a fresh start by design. */
+/** Every open tab, left to right. Empty until the drawer is first opened, or after
+ * the human closes its last tab. */
 export const tabs = ref<DockTab[]>([]);
 
 /** The tab whose body is drawn. `null` only when there is no tab at all. */
@@ -239,6 +245,32 @@ function splitAt(
         }
       : leaf,
   );
+}
+
+/**
+ * Opens one empty tab when the drawer has none, so its first face is the tool
+ * chooser and never a strip that only offers `+` (S1).
+ *
+ * Called when the drawer becomes visible (`App.vue`), and it RECONCILES FIRST for
+ * the same reason `openTool` does: a drawer that is not current for its workspace
+ * must be cleared before a tab is born in it, or the next reconcile erases the tab
+ * that was just seeded.
+ *
+ * Where the seed deliberately does NOT live: inside `applyDock`. The reconcile runs
+ * on inputs the drawer does not control (a settling workspace, a settings list),
+ * and seeding there would reopen the tab the human just closed while the drawer was
+ * on screen. Reopening the collapsed drawer runs this again, which is what S1 asks
+ * for: opening the drawer always shows the chooser.
+ *
+ * Existing tabs are left exactly as they are — same ids, same active tab, same
+ * panes — which is what makes collapsing and reopening free.
+ */
+export function openDrawer(
+  workspace: WorkspaceInfo | null,
+  enabled: readonly string[],
+): void {
+  applyDock(workspace, enabled);
+  if (tabs.value.length === 0) addTab();
 }
 
 /**
@@ -388,8 +420,13 @@ export function startToolInTab(
  * later reconcile with the same inputs is a no-op.
  *
  * An app-wide tool that already lives in the drawer is REVEALED, never duplicated;
- * otherwise one new empty tab becomes the tool. Answers the tab showing the tool, or
- * `null` when the registry does not ship it (nothing is left behind in that case).
+ * otherwise the drawer's EMPTY active tab becomes the tool, and only when there is
+ * none (or the active tab already holds a layout) does a new tab open for it. That
+ * second rule is what keeps `openDrawer`'s chooser tab from being left behind as an
+ * orphan when the agent opens a pane in a drawer that was just opened.
+ *
+ * Answers the tab showing the tool, or `null` when the registry does not ship it
+ * (nothing is left behind in that case).
  */
 export function openTool(
   toolId: ToolId,
@@ -409,7 +446,9 @@ export function openTool(
       return holder.id;
     }
   }
-  const tabId = addTab();
+  const current = activeTab();
+  const tabId =
+    current !== undefined && current.layout === null ? current.id : addTab();
   if (!startToolInTab(tabId, toolId, workspace)) {
     // Nothing was started: no empty tab is left behind as the trace of the failure.
     closeTab(tabId);

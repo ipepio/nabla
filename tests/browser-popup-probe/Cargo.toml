@@ -1,0 +1,25 @@
+# Isolated viability probe for popup tabs in the embedded browser
+# (`drawer-responsiveness-oauth.md`, T3 / S3). Standalone on purpose: it shares no
+# code with the app, so a probe never changes what the app builds or runs.
+#
+# It uses the same dependency versions the app pins (`src-tauri/Cargo.lock`):
+# tauri 2.12.5 with the `unstable` feature, which is what exposes
+# `Window::add_child` / `WebviewBuilder` / `Webview::reparent`.
+[package]
+name = "browser-popup-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "=2.7.4", features = [] }
+
+[dependencies]
+tauri = { version = "=2.12.5", features = ["unstable"] }
+# Pinned to what the app resolves (`src-tauri/Cargo.lock`), so the probe measures the
+# same webview layer the app ships. Not used directly: it is a resolution constraint.
+wry = "=0.57.2"
+
+# A standalone package: the repository is not a Cargo workspace, and this must
+# never be dragged into the app's build.
+[workspace]

@@ -760,6 +760,22 @@ export interface EmbedNavEvent {
   url: string;
 }
 
+/**
+ * One popup the pane can adopt as a tab: the popup's view and the view that opened
+ * it (`odd/tasks/drawer-responsiveness-oauth.md`, S3/L3 — a new window is a tab
+ * INSIDE the browser pane, not a drawer tab and not a window). Mirrors `PopupTab`
+ * in `src-tauri/src/embed.rs` field for field.
+ *
+ * Ids only on purpose: a popup's url is a provider redirect, and a redirect can
+ * carry an authorization code, so it is never part of this payload.
+ */
+export interface EmbedPopupTab {
+  /** The popup's view: `embed-<n>`, a child webview of the main window. */
+  viewId: string;
+  /** The page tab that opened it. Closing the popup returns to it. */
+  openerId: string;
+}
+
 // ── the app's own MCP endpoint (T3 of `odd/tasks/webview-control.md`) ───────
 
 /**

@@ -58,6 +58,128 @@ one contracts module. Do not add layers that the current screens do not need.
 - After a successful write, reload or patch the affected data deliberately — do not assume the
   database changed the UI state.
 
+## Drawer startup — one chooser tab, one boot read
+
+The tools drawer is the first screen a session reaches for, so its startup path is one open and one
+settings read (S1/S2 of `odd/tasks/drawer-responsiveness-oauth.md`):
+
+- **The drawer opens on its chooser.** `openDrawer()` in `src/components/tools/dock.ts` is the only
+  path that seeds a tab: it reconciles the dock with the active workspace and the enabled tools
+  first, then adds one EMPTY tab when the drawer has none, so choosing a tool is one click instead
+  of `+` and then a pick. `App.vue` calls it when the human opens the drawer. Seeding is tied to the
+  open and never to the reconcile: closing the last tab while the drawer is on screen leaves it
+  empty (a later workspace or settings reconcile does not resurrect it), and reopening keeps every
+  tab, its panes and the active tab exactly as they were. The agent's `openTool()` fills the empty
+  active tab instead of leaving it beside a new one, and still reveals an existing app-wide pane
+  (Browser) rather than duplicating it.
+- **Terminal is the one lazily mounted tool.** `src/components/tools/registry.ts` wraps it in
+  `defineAsyncComponent(() => import("./TerminalTool.vue"))`, so xterm and its fit addon are
+  downloaded and evaluated when the first terminal pane mounts, not when the drawer's bundle loads.
+  Files, Changes and Browser stay eager: the first two are the panes a session opens first, and
+  Browser coordinates its child webview with the drawer's first paint.
+- **The boot settings read is handed over once.** `main.ts` already reads `settings.json` before the
+  first mount for the language; it hands that payload to `src/lib/boot-settings.ts`
+  (`rememberBootSettings`), and the chat's startup `loadSettings()` takes it (`takeBootSettings`)
+  instead of issuing a second identical command. Taking is one-shot: every later read — the settings
+  dialog, the read-merge-save of a theme or model write — asks the command again, so a hand-edited or
+  externally written file is never answered from a payload read before mount.
+
+## Drawer refresh — one workspace, one scan, one snapshot
+
+A turn landing anywhere used to move one global counter, and the drawer answered it by dropping every
+cached list and refetching every open workspace (S2 of `odd/tasks/drawer-responsiveness-oauth.md`).
+Three rules now keep that cost proportional to what actually changed, and each one lives where it can
+be stated once:
+
+- **The refresh is workspace-scoped.** `src/lib/session-refresh.ts` holds the planner (`sessionRefresh`,
+  created by `createSessionRefreshPlanner`). The store calls `note(workspaceId)` where activity
+  originates — a prompt sent, a turn finished, a queued prompt sent, a session created — and the drawer
+  watches `signal` and asks `takePlan(expandedIds)` which open lists to re-read. Only an expanded
+  workspace whose revision moved is re-read: a change in a closed list costs nothing (expanding reads
+  it anyway), and a change the store cannot attribute to a workspace (an event for a session it never
+  placed) asks for every open list. Rows are preserved: the refresh goes through the existing
+  `loadSessions`, which replaces `sessionsByWorkspace[workspaceId]` only when a different index lands
+  and still lets the newest request win, so nothing blanks the drawer while a re-read is in flight.
+  `sessionGeneration` keeps its own meaning (a session was created, the selection was dropped) and is
+  watched by the same handler.
+- **A snapshot is written once per tail.** `turn_end` and `agent_end` both close the same turn and both
+  snapshot the session preview. `savePreviewOnce(sessionId, tail, write)` fingerprints the payload
+  (role, text, reasoning and time — reasoning is what pi's file never stored) and skips a tail it
+  already stored, so the duplicate completion costs no serialization and no row write. The semantics
+  are unchanged: every turn that moved the conversation is written, a write that answered `false` or
+  rejected is not remembered (the next completion retries it), and `forgetSavedPreview` drops the
+  memory when the session is deleted.
+- **One manifest scan per query.** `subagent_sessions_for` reads the extension's `<data dir>/subagents/`
+  directory once and passes that snapshot to `sync_subagent_children`, which uses it for the rows it
+  indexes *and* for the live status the answer carries. The directory is never walked twice for one
+  listing; the scan counter behind that claim is test-only and per thread.
+
+The two frontend rules are pure and covered in `tests/session-refresh.test.ts`; the scan is covered by
+`subagent_sessions_scans_the_manifests_once_per_query` in `src-tauri/src/commands.rs`.
+
+## The Browser pane — one pane, N tabs
+
+A page that opens a popup gets a tab **inside the Browser pane** — not a drawer tab and not a window of
+its own (S3/L3 of `odd/tasks/drawer-responsiveness-oauth.md`; the native story and its limits are in
+[browser-popups.md](browser-popups.md)). The pane therefore carries a small tab strip, and the rules
+that make it safe to have a live auth window sitting next to the agent's page are split in two:
+
+- **`src/components/tools/browser-tabs.ts` owns the model and is pure.** One tab per child webview, a
+  popup inserted right after the view that opened it, exactly one drawn tab, a new tab taking the
+  focus, a manual close returning to the opener, and no path at all that closes the page tab (it *is*
+  the pane). A mutation that changes nothing returns the state it was given, so a caller can compare
+  by identity, and a close answers the ids the pane must close natively. Pinned by
+  `tests/browser-tabs.test.ts`.
+- **`BrowserTool.vue` owns the platform.** Every tab is one child webview: the page is the one the pane
+  created (`embed_create`, the view the agent drives), a popup arrives already built — Rust reparented
+  it into the main window and keeps it hidden — and is adopted from `embed-popup`, or from
+  `embed_popups` when the event fired while no listener was up. Only the drawn tab's view is placed and
+  shown; the others are hidden with `embed_set_visible` and keep their document, history and login.
+  Closing the page closes its popups: in the model, and in Rust, which cascades by opener and closes by
+  label so a view the registry already dropped is still reached.
+- **`BrowserTabs.vue` is presentation only**: it draws the items `stripItems` returns and emits
+  `select`/`close`. It appears with the first popup, because a strip with one tab is noise.
+- **What the agent can reach does not change.** The page tab stays the target; a popup is excluded from
+  the answers the MCP bridge reads (`ready_views`, `is_ready`) because it carries the human's live
+  provider session. The pane's footer still describes the page, never the popups.
+- **The missing native signal is documented, not hidden.** macOS never reports `window.close()`, so a
+  popup tab's close button is the end of its life — stated in [browser-popups.md](browser-popups.md) and
+  in the component's own notes, instead of pretending the tab ends itself.
+
+## Long conversations — three seams
+
+A conversation that has run for hours is a long list of turns, a growing answer and a scroll column that
+receives requests from everywhere at once. Three pure modules keep that bounded, and each one states its
+contract so a view never re-implements it:
+
+| Module | Owns | Contract |
+| --- | --- | --- |
+| `src/components/chat/turn-window.ts` | How many turn groups are mounted | The newest page (`INITIAL_VISIBLE_TURNS`, default 12) plus one page per `showOlder()`; it is derived from the list, so history that arrives *after* mount is bounded too; the visible window ends at the newest turn, so the live turn is always mounted; a change of identity (session id, open child) starts over. |
+| `src/components/chat/code-segments.ts` (`createSegmentCache`) | Reuse of already-formatted blocks | `segmentsFor(text)` returns exactly what `segmentsOf(text)` returns, always. It may only reuse when the new text extends the previous one, and only up to the last *complete* line where the parser would start a fresh block — a heading, a list row that does not continue the run above it, prose after a non-prose line, and the closing line of a fence. An open paragraph or an open list run is never split, so no block boundary is invented. The search for those boundaries is incremental: a delta reads only the lines that arrived since the previous call, so a plain formatted answer does not pay a full scan per delta. A replaced, truncated or reordered text restarts the parse. |
+| `src/components/chat/transcript-follow.ts` (`createTranscriptFollow`) | Every movement of a transcript's scroll offset | `request()` scrolls at most once per frame and only while the view is pinned to the end; moving up unpins (`handleScroll`), returning re-pins, `handleResize` re-glues immediately, `detach()` cancels the pending frame, and `snapshot()`/`restore()` keep a reader's place when content is added above them. |
+
+Both transcripts (`ChatPanel.vue`, `SubagentView.vue`) wire the same three: a turn window over their
+groups, a follow controller over their scroller, and `OlderTurnsControl` above the first mounted turn,
+whose reveal is anchored with `snapshot()`/`restore()` so the reader keeps the line they were on. The
+views keep ownership of their refs, listeners and `ResizeObserver`; the modules keep the policy.
+
+## Tests
+
+- Deterministic behaviour of the pure modules and composables lives in `tests/*.ts` and runs with the
+  runtime already on the machine: `node --test tests/` (Node strips the types; no test framework is a
+  dependency). The files import the modules with their `.ts` extension, which `tsconfig.json` allows
+  (`allowImportingTsExtensions`).
+- Test only through the public contract, and compare against the naive reference where one exists (the
+  segment cache is checked against `segmentsOf`, prefix by prefix and on generated append-only streams;
+  reuse itself is observed as block identity, because that is what a caller can see).
+- A module that imports `.vue` files or the `@/` alias is still testable: `tests/drawer-startup.test.ts`
+  registers Node's synchronous module hooks (`registerHooks`) to map the alias, stub `.vue` modules
+  and resolve extensionless `.ts` imports, then imports the real `dock.ts` and asserts the tab model
+  through its public functions. The same hook records which `.vue` modules were evaluated, which is
+  how the deferred Terminal load is proven from the outside.
+- A test that needs state on disk creates it in a fresh `mktemp -d` and removes it before it ends; no
+  scratch path, cache or fixture is left in the worktree.
+
 ## Extraction
 
 - Extract when a block is a coherent interaction with clear inputs and outputs, not because a file

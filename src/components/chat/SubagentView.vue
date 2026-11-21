@@ -12,10 +12,13 @@
 // no composer, no queue, no picker and no prompt path here, and the store behind it
 // imports neither `openSession` nor `sendPrompt`: a child cannot be spawned or
 // messaged from this view.
-import { computed, ref } from "vue";
+import { computed, nextTick, onUnmounted, ref, watch } from "vue";
 import { ArrowLeftIcon } from "@lucide/vue";
+import OlderTurnsControl from "@/components/chat/OlderTurnsControl.vue";
 import TurnGroup from "@/components/chat/TurnGroup.vue";
+import { createTranscriptFollow } from "@/components/chat/transcript-follow";
 import { deriveTurnGroups } from "@/components/chat/turn-groups";
+import { useTurnWindow } from "@/components/chat/turn-window";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { t } from "@/lib/i18n";
@@ -23,6 +26,7 @@ import { CONVERSATION_TRANSCRIPT_MAX_WIDTH } from "@/lib/layout";
 import { showReasoning } from "@/lib/preferences";
 import {
   openSubagent,
+  openSubagentId,
   openSubagentStatus,
   subagentStatusDot,
   subagentStatusLabel,
@@ -60,6 +64,20 @@ const dotClass = computed(() => subagentStatusDot(openSubagentStatus.value));
  */
 const groups = computed(() => deriveTurnGroups(subagentTranscript.value, [], null));
 
+/**
+ * How much of the child's history is mounted (S3): the newest page of turns plus
+ * whatever the human revealed (`turn-window.ts`). A child that has run for a
+ * while reads as a document rather than as a page that mounts all of it, and
+ * every turn here is mounted open, so the bound is what keeps opening the view
+ * cheap. Another child starts from its own newest page.
+ */
+const {
+  groups: visibleGroups,
+  hiddenCount: hiddenTurnCount,
+  hasOlder: hasOlderTurns,
+  showOlder: revealOlderTurns,
+} = useTurnWindow(groups, () => openSubagentId.value);
+
 /** `HH:MM` of a turn's prompt; pi's stamps, formatted for display only. */
 function timeLabel(at: string | null | undefined): string | undefined {
   if (at === null || at === undefined || at === "") return undefined;
@@ -70,29 +88,52 @@ function timeLabel(at: string | null | undefined): string | undefined {
   return `${hours}:${minutes}`;
 }
 
-/** Distance to the end under which the view counts as glued to the newest line. */
-const BOTTOM_SLACK_PX = 48;
-const pinned = ref(true);
-let scroller: HTMLElement | null = null;
+/**
+ * The scrolling element, the follow controller (`transcript-follow.ts`) and the
+ * transient anchor of a reveal. A view the human left at the bottom follows the
+ * newest line; one they scrolled up to read is never pulled back. The scroll
+ * request is coalesced to one per frame, which is what keeps a child's frequent
+ * re-read from scrolling on every poll.
+ */
+const follow = createTranscriptFollow();
+const scroller = ref<HTMLElement | null>(null);
+
+watch(
+  scroller,
+  () => follow.attach(scroller.value),
+  { flush: "post" },
+);
 
 /**
- * The scrolling element, bound as a function ref: Vue calls it when the node is
- * mounted and on every patch of it, which is exactly when the transcript may have
- * grown — no watcher needed, and none that could run during setup. A view the human
- * left at the bottom follows the newest line; one they scrolled up to read is never
- * pulled back.
+ * The child's file was read again and the flow changed: follow it while glued.
+ * The store replaces the array only when the transcript really differs (a
+ * running child keeps appending to its last message), so watching the reference
+ * is what catches both a new turn and a longer one.
  */
-function attachScroller(element: unknown): void {
-  scroller = element instanceof HTMLElement ? element : null;
-  if (scroller === null) return;
-  if (pinned.value) scroller.scrollTop = scroller.scrollHeight;
+watch(
+  subagentTranscript,
+  () => follow.request(),
+  { flush: "post" },
+);
+
+/** Another child opens at its own newest line instead of the previous offset. */
+watch(openSubagentId, () => {
+  follow.jump();
+  void nextTick(() => follow.syncPin());
+});
+
+/**
+ * Reveals one page of older turns and keeps the reader on the line they were
+ * reading: the new turns land above them, so the offset absorbs that growth.
+ */
+function handleShowOlderTurns(): void {
+  const anchor = follow.snapshot();
+  revealOlderTurns();
+  void nextTick(() => follow.restore(anchor));
 }
 
-function handleScroll(): void {
-  if (scroller === null) return;
-  pinned.value =
-    scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= BOTTOM_SLACK_PX;
-}
+// Nothing of the view outlives it: a pending frame would write into a gone element.
+onUnmounted(() => follow.detach());
 
 /** The transcript of the child on screen; only a first read can be "loading". */
 const showsLoading = computed(
@@ -152,9 +193,9 @@ const isUntouched = computed(
     </header>
 
     <div
-      :ref="attachScroller"
+      ref="scroller"
       class="min-h-0 flex-1 overflow-y-auto"
-      @scroll="handleScroll"
+      @scroll="follow.handleScroll()"
     >
       <div
         class="mx-auto flex w-full flex-col gap-4 p-4"
@@ -173,9 +214,16 @@ const isUntouched = computed(
 
         <!-- The same turn groups the conversation renders, opened instead of
              folded: nothing here is a live tail, so the work should be readable
-             without a click per turn. -->
+             without a click per turn. Only the newest page is mounted; the
+             control above reveals the rest. -->
+        <OlderTurnsControl
+          v-if="hasOlderTurns"
+          :count="hiddenTurnCount"
+          @reveal="handleShowOlderTurns"
+        />
+
         <TurnGroup
-          v-for="group in groups"
+          v-for="group in visibleGroups"
           :key="group.id"
           :turn-id="group.id"
           :prompt="group.prompt"

@@ -315,3 +315,158 @@ export function segmentsOf(text: string): TextSegment[] {
   );
   return segments;
 }
+
+/**
+ * How far into `text` the blocks of an append-only stream are settled for good.
+ *
+ * A block is settled when the line that starts it is *complete* (it ends with a
+ * newline, so the next append cannot touch it) and the parser would start a
+ * fresh block there. That is the whole contract: `segmentsOf` parses a prose
+ * region line by line and flushes a paragraph or a list run when it meets a
+ * heading, a row of the other list kind, or prose after a non-prose line, so a
+ * split at one of those lines produces exactly the blocks one full parse does —
+ * and nothing else does, which is why an open paragraph or an open list run is
+ * never split (see `tests/segments-cache.test.ts`).
+ *
+ * Two kinds of settled line exist:
+ *
+ * - a prose line that starts a block: an ATX heading, a list row that does not
+ *   continue the run above it, and prose that follows a heading or a list row;
+ * - the closing line of a fence, which settles everything up to and including
+ *   itself; an opening fence settles the prose above it, so a code block that
+ *   is still streaming no longer re-parses the answer that introduced it.
+ *
+ * The scan is incremental: it remembers where it stopped and the state it needs
+ * (`at`, `inFence`, `last`), so a delta reads only the lines that arrived since
+ * the previous call. A plain formatted answer therefore costs one line read per
+ * delta instead of one full scan for nothing — which is what made the cache
+ * slower than no cache for prose without fences.
+ */
+type ProseLine = "none" | "prose" | "heading" | "ordered" | "unordered";
+
+interface Boundaries {
+  /** Offset just past the last complete line already read. */
+  at: number;
+  /** A fence has opened and its closing line has not been read yet. */
+  inFence: boolean;
+  /** The kind of the last complete prose line read, `"none"` before the first. */
+  last: ProseLine;
+  /** Offset where the text settled; `0` before anything settles. */
+  settled: number;
+}
+
+/** A scan that has not read anything yet. */
+function freshBoundaries(): Boundaries {
+  return { at: 0, inFence: false, last: "none", settled: 0 };
+}
+
+/** Moves the settled offset forward; it never goes back. */
+function settle(boundaries: Boundaries, offset: number): void {
+  if (offset > boundaries.settled) boundaries.settled = offset;
+}
+
+/** Reads the complete lines of `text` that `boundaries` has not seen yet. */
+function scanBoundaries(boundaries: Boundaries, text: string): void {
+  for (;;) {
+    const newline = text.indexOf("\n", boundaries.at);
+    // The last line can still grow, so it is never proof of anything.
+    if (newline === -1) return;
+    const start = boundaries.at;
+    const line = text.slice(start, newline);
+    boundaries.at = newline + 1;
+
+    if (boundaries.inFence) {
+      if (!FENCE_CLOSE.test(line)) continue;
+      boundaries.inFence = false;
+      boundaries.last = "none";
+      settle(boundaries, newline + 1);
+      continue;
+    }
+    if (FENCE_OPEN.test(line)) {
+      boundaries.inFence = true;
+      boundaries.last = "none";
+      settle(boundaries, start);
+      continue;
+    }
+    if (HEADING.test(line)) {
+      boundaries.last = "heading";
+      settle(boundaries, start);
+      continue;
+    }
+    const row = listRowOf(line);
+    if (row !== null) {
+      const kind = row.ordered ? "ordered" : "unordered";
+      // A row of the same kind continues the run above it: that run can still
+      // gain a row, so its start is not a boundary yet.
+      if (boundaries.last !== kind) settle(boundaries, start);
+      boundaries.last = kind;
+      continue;
+    }
+    // Prose after a heading or a list row opens a new block; prose after prose
+    // is the same paragraph, blank lines included.
+    if (boundaries.last !== "prose") settle(boundaries, start);
+    boundaries.last = "prose";
+  }
+}
+
+/** A parser that reuses the blocks an append-only text already settled. */
+export interface SegmentCache {
+  /**
+   * The same segments `segmentsOf(text)` returns, reusing what the previous call
+   * settled when `text` only grew. Any other change (a replacement, a truncation,
+   * another turn's text) restarts the parse.
+   */
+  segmentsFor(text: string): TextSegment[];
+}
+
+/**
+ * Creates a parser for one growing message — a streaming answer, or a bubble
+ * whose text is re-rendered by the throttle.
+ *
+ * Re-parsing the whole message per delta is what this exists to avoid: a long
+ * answer re-reads every block it already painted, once per delta, for no change
+ * at all. Only the region after the last settled block can still change, so only
+ * that region is parsed again; the blocks above it are handed back as the same
+ * objects. The boundary is a line where `segmentsOf` would start a fresh block
+ * (see `scanBoundaries`), so a fenced answer and a plain formatted one are both
+ * reused: the fences are not the only constructs a stream settles.
+ *
+ * The reuse is a *composition*, not a second parser: the settled prefix and the
+ * open tail are each parsed by `segmentsOf`, split at a line boundary that the
+ * parser itself would have started a fresh region at, which is why the result is
+ * exactly what one full parse produces.
+ */
+export function createSegmentCache(): SegmentCache {
+  /** The text of the previous call; `null` before the first one. */
+  let parsed: string | null = null;
+  /** The incremental search for boundaries, kept across the appends. */
+  let boundaries = freshBoundaries();
+  /** The segments of `parsed.slice(0, boundaries.settled)`, reused verbatim. */
+  let settledSegments: TextSegment[] = [];
+  /** What `segmentsFor(parsed)` answered. */
+  let answer: TextSegment[] = [];
+
+  return {
+    segmentsFor(text: string): TextSegment[] {
+      if (parsed === text) return answer;
+      // Anything but an append invalidates every offset the scan remembers.
+      if (parsed === null || !text.startsWith(parsed)) {
+        boundaries = freshBoundaries();
+        settledSegments = [];
+      }
+      const wasSettled = boundaries.settled;
+      scanBoundaries(boundaries, text);
+      const settledAt = boundaries.settled;
+      if (settledAt > wasSettled) {
+        // Only the newly settled lines are read: the blocks above them stay.
+        settledSegments = settledSegments.concat(
+          segmentsOf(text.slice(wasSettled, settledAt)),
+        );
+      }
+      const tail = segmentsOf(text.slice(settledAt));
+      answer = settledAt === 0 ? tail : settledSegments.concat(tail);
+      parsed = text;
+      return answer;
+    },
+  };
+}

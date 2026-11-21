@@ -2235,12 +2235,31 @@ fn manifest_entries(body: &str) -> Vec<SubagentManifestEntry> {
     }
 }
 
+// How many times this thread has scanned the manifest directory.
+//
+// Test-only, and per thread on purpose: "one scan per query" is the property
+// under test, and a process-wide counter would race with every other test that
+// reads a manifest in parallel.
+#[cfg(test)]
+thread_local! {
+    static MANIFEST_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The scan counter of this thread; see `read_manifests`.
+#[cfg(test)]
+fn manifest_scan_count() -> usize {
+    MANIFEST_SCANS.with(|scans| scans.get())
+}
+
 /// Every child every manifest in `<data_dir>/subagents/` declares, in file order.
 ///
 /// Read fresh on every call (H3.3): the manifest is the only place a child's live
 /// status exists, and caching it here would make an open sidebar show a finished
-/// child as running.
+/// child as running. It is read once per query and passed down, so one listing
+/// costs one scan of the extension's directory (`subagent_sessions_for`).
 fn read_manifests(data_dir: &Path) -> Vec<SubagentManifestEntry> {
+    #[cfg(test)]
+    MANIFEST_SCANS.with(|scans| scans.set(scans.get() + 1));
     let dir = manifests_dir(data_dir);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         // No directory yet: no session has delegated, which is an empty answer.
@@ -2278,12 +2297,17 @@ fn manifest_status(raw: &str) -> String {
 /// extension can know about its session — a manifest that names a path no row has
 /// links nothing and is skipped, because guessing the parent from "the workspace's
 /// active chat" would attach a child to the wrong conversation.
+///
+/// `manifests` is the scan the query already did: the extension's directory is
+/// read once per listing and the same snapshot decides both the rows inserted here
+/// and the live status the answer carries. Reading it again in here walked every
+/// manifest twice per query (`subagent_sessions_for`).
 fn sync_subagent_children(
     store: &Store,
-    data_dir: &Path,
+    manifests: &[SubagentManifestEntry],
     parent: &SessionRow,
 ) -> Result<Vec<SessionRow>, String> {
-    for entry in read_manifests(data_dir) {
+    for entry in manifests {
         if entry.parent_session_path.as_deref() != Some(parent.pi_session_path.as_str()) {
             continue;
         }
@@ -2333,8 +2357,11 @@ fn subagent_sessions_for(
             "session {parent_session_id} is not indexed in workspace {workspace_id}"
         ));
     }
+    // One scan per query: the rows are indexed from this snapshot and the status
+    // of every child is read from it, so the extension's directory is never walked
+    // twice for one listing.
     let manifests = read_manifests(data_dir);
-    let rows = sync_subagent_children(store, data_dir, &parent)?;
+    let rows = sync_subagent_children(store, &manifests, &parent)?;
     Ok(rows
         .into_iter()
         .map(|row| {
@@ -3078,6 +3105,10 @@ pub async fn embed_eval(
 /// outlive the entry that described it (the MCP driver evicts one it believes is
 /// dead), and such an orphan floats above the HTML painting over the app. An
 /// id-only close could never reach it — see `embed::EmbedSessions::close`.
+///
+/// Closing a page view closes the popup tabs it opened: they are one thing to the
+/// human, and a popup left behind would be a hidden webview holding a provider's
+/// live session (`drawer-responsiveness-oauth.md`, S3).
 #[tauri::command]
 pub fn embed_close(state: State<'_, AppState>, app: tauri::AppHandle, view_id: String) -> bool {
     state.embeds.close(&app, &view_id)
@@ -3092,6 +3123,18 @@ pub fn embed_url(state: State<'_, AppState>, view_id: String) -> Result<String, 
         .get(&view_id)
         .map(|view| view.url)
         .ok_or_else(|| display_err(crate::embed::EmbedError::UnknownView(view_id)))
+}
+
+/// The popups the platform has finished building, with the view that opened each
+/// one (`drawer-responsiveness-oauth.md`, S3/L3).
+///
+/// The pane adopts a popup as a tab when `embed-popup` arrives, and asks for this
+/// list when it mounts: the event can fire while the UI is not listening, and a
+/// popup nobody adopted would be a hidden webview with no tab. Ids only — a popup's
+/// url is a redirect url, and a redirect can carry an authorization code.
+#[tauri::command]
+pub fn embed_popups(state: State<'_, AppState>) -> Vec<crate::embed::PopupTab> {
+    state.embeds.open_popup_tabs()
 }
 
 /// Closes every view and answers how many were closed. The app also does this on
@@ -5738,6 +5781,48 @@ exit 1
                 .len(),
             2,
             "two children, still"
+        );
+    }
+
+    // S2 of `drawer-responsiveness-oauth.md`: one listing is one scan of the
+    // extension's directory. The indexed rows and the live status come from the
+    // same snapshot, so the sidebar refreshing many chats cannot pay for the same
+    // disk walk twice per query.
+    #[test]
+    fn subagent_sessions_scans_the_manifests_once_per_query() {
+        let fixture = SubagentFixture::new("subagent_single_scan");
+        fixture.write_manifest(
+            "parent-chat.json",
+            r#"[
+              {
+                "name": "review",
+                "agent": "reviewer",
+                "sessionPath": "/data/sessions/subagents/child-a.jsonl",
+                "status": "running",
+                "startedAt": "2026-07-01T10:00:00Z",
+                "endedAt": null,
+                "parentSessionPath": "/sessions/parent-chat.jsonl"
+              }
+            ]"#,
+        );
+        let before = manifest_scan_count();
+
+        let children = subagent_sessions_for(
+            &fixture.store,
+            &fixture.data_dir(),
+            fixture.workspace_id,
+            fixture.parent.id,
+        )
+        .expect("list children");
+
+        // The row and its live status really were read from that one snapshot.
+        assert_eq!(children.len(), 1, "got {children:?}");
+        assert_eq!(children[0].agent, "reviewer");
+        assert_eq!(children[0].status, "running");
+        assert_eq!(
+            manifest_scan_count() - before,
+            1,
+            "one query must walk the manifest directory once"
         );
     }
 

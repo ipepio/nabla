@@ -10,7 +10,7 @@ import AppSidebar from "./components/AppSidebar.vue";
 import ChatPanel from "./components/ChatPanel.vue";
 import ResizableAside from "./components/ResizableAside.vue";
 import ToolTabs from "./components/tools/ToolTabs.vue";
-import { openTool } from "./components/tools/dock";
+import { openDrawer, openTool } from "./components/tools/dock";
 import { Button } from "./components/ui/button";
 import { SidebarInset, SidebarProvider } from "./components/ui/sidebar";
 import { subscribeEmbedNeedView } from "./contracts/commands";
@@ -22,6 +22,24 @@ const activeWorkspace = ref<WorkspaceInfo | null>(null);
 // Right tools drawer (S6): collapsed by default; the chat header and the empty
 // state both expose the toggle, so it is reachable in every state.
 const toolsOpen = ref(false);
+
+/**
+ * S1 of `odd/tasks/drawer-responsiveness-oauth.md`: opening the drawer is the
+ * whole gesture. The dock seeds one EMPTY tab on that open, so the human lands on
+ * the tool chooser instead of having to press `+` and then pick a tool.
+ *
+ * The seed belongs to the OPEN, not to the drawer's reconcile: a human who closes
+ * the last tab while the drawer is on screen keeps an empty drawer, and a
+ * workspace or settings change that lands afterwards does not put a tab back. The
+ * tabs that do exist are untouched, so collapsing and reopening keeps the tab
+ * that was active (`dock.ts`).
+ */
+function toggleDrawer(): void {
+  toolsOpen.value = !toolsOpen.value;
+  if (toolsOpen.value) {
+    openDrawer(activeWorkspace.value, enabledTools.value);
+  }
+}
 
 /**
  * `auto-open-pane.md` (S1, S2, S5): a browser tool needs a view and there is
@@ -90,7 +108,7 @@ onBeforeUnmount(() => {
           <ChatPanel
             :workspace="activeWorkspace"
             :tools-open="toolsOpen"
-            @toggle-tools="toolsOpen = !toolsOpen"
+            @toggle-tools="toggleDrawer"
           />
         </div>
 

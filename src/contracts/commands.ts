@@ -10,6 +10,7 @@ import type {
   AgentsConfig,
   AppSettings,
   EmbedNavEvent,
+  EmbedPopupTab,
   FsEntry,
   FsPreview,
   GitEntry,
@@ -1062,6 +1063,18 @@ export function embedUrl(viewId: string): Promise<string> {
 }
 
 /**
+ * The popups the platform has finished building, each with the view that opened it.
+ *
+ * The pane adopts them as tabs of its own strip (`embed-popup` is the live signal;
+ * this is the reconciliation, for a popup that arrived while no listener was up).
+ * A popup is never an agent target: Rust keeps it out of the list the MCP bridge
+ * gives the model.
+ */
+export function embedPopups(): Promise<EmbedPopupTab[]> {
+  return invoke<EmbedPopupTab[]>("embed_popups");
+}
+
+/**
  * Subscribes to the `embed-nav` stream. One listener serves every view, so the
  * caller filters by its own `viewId`; the listener lives here because no
  * component imports the Tauri API directly (contract-seam rule, AGENTS.md 1).
@@ -1072,6 +1085,21 @@ export async function subscribeEmbedNav(
   handler: (event: EmbedNavEvent) => void,
 ): Promise<() => void> {
   return listen<EmbedNavEvent>("embed-nav", ({ payload }) => {
+    handler(payload);
+  });
+}
+
+/**
+ * Subscribes to `embed-popup`: a page asked for a new window and the popup is now a
+ * hidden child webview the pane can adopt as a tab. The payload carries ids only
+ * (see `EmbedPopupTab`). The listener lives here for the same reason as the ones
+ * above (contract-seam rule, AGENTS.md 1). Resolves with an unsubscribe function:
+ * call it on unmount or it keeps receiving events after teardown.
+ */
+export async function subscribeEmbedPopup(
+  handler: (popup: EmbedPopupTab) => void,
+): Promise<() => void> {
+  return listen<EmbedPopupTab>("embed-popup", ({ payload }) => {
     handler(payload);
   });
 }

@@ -18,6 +18,26 @@
 // pixels all the way through: CSS pixels in this webview are logical pixels, and
 // Tauri's `LogicalPosition`/`LogicalSize` take them unchanged.
 //
+// ONE PANE, N TABS (`odd/tasks/drawer-responsiveness-oauth.md`, S3 and L3) — a page
+// that calls `window.open` or clicks `target=_blank` gets a tab INSIDE this pane,
+// next to the page that opened it: not a drawer tab, not a window of its own. Every
+// tab is still one child webview of the main window, created by Rust on the
+// page's request, reparented into it, and hidden until this pane places it. Only
+// the DRAWN tab's view is visible and placed; the others keep their document,
+// their history and their login, and come back when the human switches back.
+//
+//   - the page tab is the view this pane created (`embed_create`), the one the
+//     agent drives, and the only tab that cannot be closed: it IS the pane;
+//   - a popup tab arrives on `embed-popup` (or from `embed_popups` when a popup
+//     landed while no listener was up) and takes the focus, because an auth window
+//     is what the human has to act in;
+//   - a popup cannot close itself: macOS never reports `window.close()` (there is
+//     no `webViewDidClose:` in wry), so the strip's close button is the end of a
+//     popup's life and it returns to the tab that opened it
+//     (`docs/ai/browser-popups.md`);
+//   - closing the page closes its popups (Rust cascades), so no hidden webview is
+//     left holding a provider's session.
+//
 // KEEPING IT IN SYNC — the body rect changes for reasons the pane does not
 // control: the drawer is dragged wider, the dock is re-split, the window is
 // resized, an ancestor scrolls, a sidebar transition animates. A ResizeObserver
@@ -32,9 +52,11 @@
 // believes it moved the view.
 //
 // WHO DRIVES IT — the app does, and only the app: Back, Forward, Reload (through
-// `embed_eval`) and the address bar (through `embed_navigate`). An agent cannot
-// reach this webview yet; that arrives with a local MCP. The pane says so in the
-// footer rather than implying a capability that does not exist.
+// `embed_eval`) and the address bar (through `embed_navigate`). An agent can drive
+// the PAGE tab through the local MCP bridge; it cannot reach the child webviews
+// from here, and a popup is never an agent target at all (Rust keeps it out of the
+// list the bridge publishes). The pane says so in the footer rather than implying
+// a capability that does not exist.
 //
 // TEARDOWN — a view lives as long as this pane is DRAWN, and the two reasons it
 // stops being drawn are not the same thing. The drawer keeps every tab's body
@@ -44,25 +66,30 @@
 // pane receives `active` (its tab is drawn) and `visible` (the drawer is on
 // screen):
 //
-//   - tab not drawn (`active === false`): the view is CLOSED when the tab leaves
-//     the screen and rebuilt when it comes back. A tab switch is the human saying
-//     they are looking at something else, and a fresh view for each tab is what
-//     keeps four tabs from holding four live pages;
-//   - drawer collapsed (`visible === false`): the view is HIDDEN, never closed.
+//   - tab not drawn (`active === false`): every view is CLOSED when the tab leaves
+//     the screen and the page tab is rebuilt when it comes back. A tab switch is
+//     the human saying they are looking at something else, and a fresh page for
+//     each tab is what keeps four tabs from holding four live pages. A popup open
+//     at that moment goes with its page: an interrupted sign-in is closed, not
+//     resurrected into a tab nobody asked for;
+//   - drawer collapsed (`visible === false`): every view is HIDDEN, never closed.
 //     `embed_set_visible` is the platform's own switch, so the drawer reopening
 //     restores the SAME page — document, history, scroll position and login — over
 //     a re-measured rect. Closing it here is exactly the bug this pane used to
 //     carry one level up: collapsing the drawer restarted every tool.
 //
-// Everything else follows the component: unmount closes the view (closing the pane,
-// quitting), a workspace switch closes it and rebuilds it, and a create that
-// answers after teardown closes the view it just made instead of leaking it.
+// Everything else follows the component: unmount closes every view (closing the
+// pane, quitting), a workspace switch closes them and rebuilds the page, and a
+// create that answers after teardown closes the view it just made instead of
+// leaking it.
 //
 // URL POLICY — `http`, `https` and `about:blank`, nothing else, and the check is
 // LOCAL: a rejected address shows the message and never reaches Rust. A bare host
 // (`example.com`, `localhost:1420`) gains `https://`, which is what a browser's
 // address bar does; `file:`, `javascript:`, `data:` and every other scheme is
-// refused with the same message.
+// refused with the same message. A popup request goes through the same policy in
+// Rust before a webview exists, and no url of a popup is ever logged: a redirect
+// can carry an authorization code.
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   ArrowLeftIcon,
@@ -78,41 +105,55 @@ import {
   embedCreate,
   embedEval,
   embedNavigate,
+  embedPopups,
   embedSetBounds,
   embedSetVisible,
   embedUrl,
   subscribeEmbedNav,
+  subscribeEmbedPopup,
 } from "@/contracts/commands";
-import type { EmbedNavEvent, WorkspaceInfo } from "@/contracts/types";
+import type {
+  EmbedNavEvent,
+  EmbedPopupTab,
+  WorkspaceInfo,
+} from "@/contracts/types";
 import { t } from "@/lib/i18n";
+import {
+  activateTab,
+  closeAllPopups,
+  closeTab,
+  emptyTabs,
+  openTab,
+  stripItems,
+  type BrowserTab,
+  type BrowserTabState,
+} from "./browser-tabs";
+import BrowserTabs from "./BrowserTabs.vue";
 
 const props = defineProps<{
   workspace: WorkspaceInfo | null;
   /**
-   * This pane's tab is the drawn one. `false` closes the child webview (it cannot
-   * be hidden) and `true` builds it again; absent means "drawn", so a pane that
-   * does not know about tabs still works.
+   * This pane's tab is the drawn one. `false` closes the child webviews (they
+   * cannot be hidden) and `true` builds the page again; absent means "drawn", so a
+   * pane that does not know about tabs still works.
    */
   active?: boolean;
   /**
-   * The drawer this pane lives in is on screen. `false` HIDES the child webview
-   * natively (CSS cannot) and `true` shows it again with the same page loaded;
-   * absent means "on screen".
+   * The drawer this pane lives in is on screen. `false` HIDES the child webviews
+   * natively (CSS cannot) and `true` shows the drawn one again with the same page
+   * loaded; absent means "on screen".
    */
   visible?: boolean;
 }>();
 
-/** Whether this pane should have a live view right now (see the teardown note). */
+/** Whether this pane should have live views right now (see the teardown note). */
 const drawn = computed(() => props.active !== false);
 
-/**
- * Whether the drawer is on screen, which is the difference between hiding a view
- * and closing it (see the teardown note).
- */
+/** Whether the drawer is on screen (the difference between hiding and closing). */
 const shown = computed(() => props.visible !== false);
 
-/** What a fresh view shows. The pane offers no generated start page: only the
- *  http(s) addresses Rust accepts, and a blank document until the human types. */
+/** What a fresh page view shows. The pane offers no generated start page: only
+ *  the http(s) addresses Rust accepts, and a blank document until the human types. */
 const START_URL = "about:blank";
 
 /**
@@ -168,23 +209,40 @@ function normalizeAddress(raw: string): string | null {
   return parseHttp(`https://${trimmed}`);
 }
 
-/** The two nodes whose geometry the webview follows. */
+/** The two nodes whose geometry the drawn view follows. */
 const rootEl = ref<HTMLElement | null>(null);
 const bodyEl = ref<HTMLElement | null>(null);
 
-/** The live child webview, or `null` while it is being built (or after a failure). */
-const viewId = ref<string | null>(null);
+/**
+ * The PAGE view: the one this pane created, the one the agent may drive. `null`
+ * while it is being built (or after a failure).
+ */
+const pageViewId = ref<string | null>(null);
+/** The strip (see `browser-tabs.ts`): the page tab and one tab per popup. */
+const tabs = ref<BrowserTabState>(emptyTabs());
+/** The last url of every view, from `embed-nav` and `embed_url`. */
+const urls = ref<Record<string, string>>({});
+/** The view the pane last asked the platform to SHOW. */
+let shownView: string | null = null;
+
 const creating = ref(false);
 const navigating = ref(false);
 
+/** The tab in front: the only view that is placed and shown. */
+const activeViewId = computed(() => tabs.value.activeId);
+
+/** What the drawn tab is showing, as far as this pane knows. */
+const currentUrl = computed(() => {
+  const id = activeViewId.value;
+  return id === null ? START_URL : (urls.value[id] ?? START_URL);
+});
+
 /**
- * What the address bar holds while the human edits it. Kept apart from
- * `currentUrl` so a navigation the page starts on its own (`embed-nav`) never
- * overwrites what is being typed; the field re-syncs when it loses focus.
+ * What the address bar holds while the human edits it. Kept apart from the page's
+ * url so a navigation the page starts on its own (`embed-nav`) never overwrites
+ * what is being typed; the field re-syncs when it loses focus.
  */
 const draft = ref("");
-/** What the page is actually showing, from `embed-nav` and `embed_url`. */
-const currentUrl = ref(START_URL);
 const addressFocused = ref(false);
 
 /** One localized sentence for the last failure, shown in the status row. */
@@ -201,15 +259,47 @@ const addressInvalid = computed(
 /** Go is offered only when there is somewhere to go and a view to go there in. */
 const canGo = computed(
   () =>
-    viewId.value !== null &&
+    activeViewId.value !== null &&
     !creating.value &&
     !navigating.value &&
     !draftEmpty.value,
 );
 
-/** The view has not been sent anywhere yet: the toolbar shows the hint. */
+/** The drawn view has not been sent anywhere yet: the toolbar shows the hint. */
 const showingBlank = computed(
   () => currentUrl.value === "" || currentUrl.value === START_URL,
+);
+
+/** The host of a url, for a tab label: no host, no label. */
+function hostOf(raw: string): string | null {
+  try {
+    const parsed = new URL(raw);
+    return parsed.host === "" ? null : parsed.host;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The text of one tab. The page tab is named by the tool (it is this pane); a
+ * popup is named by the host it is showing, and by its place in the strip while
+ * nothing has loaded yet — the pane never invents a name for a page it cannot see,
+ * and the url never travels further than this label.
+ */
+function tabLabel(tab: BrowserTab): string {
+  if (tab.openerId === null) return t("tools.browser.label");
+  const host = hostOf(urls.value[tab.id] ?? "");
+  if (host !== null) return host;
+  const popups = tabs.value.tabs.filter((candidate) => candidate.openerId !== null);
+  return `#${popups.findIndex((candidate) => candidate.id === tab.id) + 1}`;
+}
+
+/**
+ * What the strip draws, or nothing: a strip with one tab is noise, so it appears
+ * with the first popup.
+ */
+const strip = computed(() =>
+  tabs.value.tabs.length > 1 ? stripItems(tabs.value, tabLabel) : [],
 );
 
 /** Set on unmount: a late answer must never touch a torn-down pane. */
@@ -217,6 +307,8 @@ let disposed = false;
 
 /** The `embed-nav` unsubscribe, once the listener is up. */
 let unsubscribeNav: (() => void) | null = null;
+/** The `embed-popup` unsubscribe, once the listener is up. */
+let unsubscribePopup: (() => void) | null = null;
 
 /**
  * One rect of this pane, in viewport pixels (this webview's CSS pixels ARE the
@@ -241,11 +333,13 @@ let boundsAgain = false;
 let settleTimer: number | null = null;
 
 /**
- * The rect this pane HANDED to the bridge; `null` before the first one and after
- * every teardown. Deliberately not called "applied": `embed_set_bounds` is
- * fire-and-forget, so this is what was asked for, not what the platform did.
+ * The rect this pane HANDED to the bridge for one view, and which view it was for;
+ * `null` before the first one and after every teardown. Deliberately not called
+ * "applied": `embed_set_bounds` is fire-and-forget, so this is what was asked for,
+ * not what the platform did.
  */
 let sentRect: PaneRect | null = null;
+let sentRectView: string | null = null;
 
 let resizeObserver: ResizeObserver | null = null;
 
@@ -324,26 +418,40 @@ function isDeadView(cause: unknown): boolean {
   return commandErrorMessage(cause).includes(DEAD_VIEW_MESSAGE);
 }
 
+/** Records the url one view is showing. */
+function urlTo(viewId: string, url: string): void {
+  urls.value = { ...urls.value, [viewId]: url };
+}
+
+/** Forgets everything known about one view. */
+function urlForget(viewId: string): void {
+  if (urls.value[viewId] === undefined) return;
+  const next = { ...urls.value };
+  delete next[viewId];
+  urls.value = next;
+}
+
 /**
- * Drops a view the platform says is gone, and rebuilds it once if the pane is drawn.
+ * Drops the page view the platform says is gone, and rebuilds it once if the pane
+ * is drawn.
  *
- * Clearing `viewId` is what heals the pane, and it heals three things at once: the
- * placeholder (`v-if="viewId === null && !creating"`) becomes visible again, so the
- * body stops reserving gray space for a webview nobody paints; the bounds loop
- * stops, because `syncBounds` returns early on a null id and the pending frame
- * then finds nothing to place; and the toolbar controls go back to disabled instead
- * of calling into a dead id.
+ * Clearing `pageViewId` is what heals the pane, and it heals three things at once:
+ * the placeholder (`v-if="pageViewId === null && !creating"`) becomes visible
+ * again, so the body stops reserving gray space for a webview nobody paints; the
+ * bounds loop stops, because `syncBounds` returns early on a null id and the
+ * pending frame then finds nothing to place; and the toolbar controls go back to
+ * disabled instead of calling into a dead id.
  *
  * The rebuild is ONE attempt through the existing `createView`, never a retry loop:
  * `createView` bails out while a view exists or while one is being built, so a
  * second failure lands in its own `catch` — the placeholder and the creation error,
  * which is the honest state. A pane that is not drawn, or whose drawer is collapsed,
- * has no view by design (see the teardown note), so nothing is rebuilt there and the
- * watcher that owns that state builds it when it comes back.
+ * has no view by design (see the teardown note), so nothing is rebuilt there and
+ * the watcher that owns that state builds it when it comes back.
  *
- * The new view starts at `START_URL`, because the page went away with the webview:
- * there is nothing left to restore, and pretending otherwise would mean a second
- * creation path carrying a url this pane can no longer verify.
+ * The new page view starts at `START_URL`, because the page went away with the
+ * webview: there is nothing left to restore, and its popups went with it — a tab
+ * must never outlive the tab that opened it.
  *
  * The CLOSE comes before the id is forgotten, and it is the whole point of this
  * path for an orphan: "no embedded browser <id>" is what the platform says both
@@ -351,29 +459,49 @@ function isDeadView(cause: unknown): boolean {
  * driver evicts an entry it believes is dead). The first case costs a no-op; the
  * second is a live child webview still floating above the app with nobody able to
  * close it — the opaque rectangle over the chat. `embed_close` closes by LABEL for
- * exactly that case.
+ * exactly that case, and it takes the page's popups with it.
  */
 function healDeadView(): void {
-  const id = viewId.value;
-  if (id === null) return;
-  viewId.value = null;
-  // Nothing is known about the view that replaces this one.
-  sentRect = null;
+  if (pageViewId.value === null) return;
+  // Nothing known survives: the page and its popup tabs go together.
   status.value = null;
-  // Best effort: a view that is really gone answers `false`.
-  void embedClose(id).catch(() => {});
-  debugLog(`browser pane: dropping dead view ${id} (closed by label)`);
+  void closeAllViews();
+  debugLog("browser pane: dropping a dead page view (closed by label)");
   if (disposed || !drawn.value || !shown.value) return;
   void createView();
 }
 
 /**
- * Applies the rect now, serialized: a second request while one is in flight is
- * remembered and re-run afterwards rather than stacked, so a drag cannot leave the
- * webview on a stale rect because the newest call resolved first.
+ * Handles a view the platform reports as gone. The page is rebuilt; a popup just
+ * closes — it has no page of its own to rebuild, and the tab it was opened from is
+ * still there.
+ */
+function forgetView(viewId: string): void {
+  if (viewId === pageViewId.value) {
+    healDeadView();
+    return;
+  }
+  const result = closeTab(tabs.value, viewId);
+  if (result.closed.length === 0) return;
+  tabs.value = result.state;
+  if (shownView === viewId) shownView = null;
+  for (const gone of result.closed) urlForget(gone);
+  debugLog(`browser pane: tab ${viewId} is gone`);
+}
+
+/** The rect handed to the platform for one view, or `null` when none was. */
+function sentFor(viewId: string): PaneRect | null {
+  return sentRectView === viewId ? sentRect : null;
+}
+
+/**
+ * Applies the body rect to the DRAWN view now, serialized: a second request while
+ * one is in flight is remembered and re-run afterwards rather than stacked, so a
+ * drag cannot leave the webview on a stale rect because the newest call resolved
+ * first.
  */
 async function syncBounds(): Promise<void> {
-  const id = viewId.value;
+  const id = activeViewId.value;
   if (id === null || disposed) return;
   if (boundsInFlight) {
     boundsAgain = true;
@@ -385,17 +513,19 @@ async function syncBounds(): Promise<void> {
   // Already asked for: a colour transition or a scroll that moved nothing must
   // not cost a bridge call. The settle pass clears this once, so the LAST rect of
   // a gesture is always placed again even if this shortcut would have skipped it.
-  if (sentRect !== null && sameRect(sentRect, rect)) return;
+  const sent = sentFor(id);
+  if (sent !== null && sameRect(sent, rect)) return;
   boundsInFlight = true;
   try {
     await embedSetBounds(id, rect.x, rect.y, rect.width, rect.height);
     sentRect = rect;
+    sentRectView = id;
   } catch (cause) {
     if (!disposed) {
       // A view that is gone is not a layout failure: healing it is what stops the
       // pane repeating this error over an empty rect forever.
       if (isDeadView(cause)) {
-        healDeadView();
+        forgetView(id);
       } else {
         status.value = t("tools.browser.layoutError", {
           message: commandErrorMessage(cause),
@@ -487,22 +617,23 @@ function scheduleSettle(): void {
     // Forgetting what was sent is what makes this pass unconditional: the rect may
     // be exactly the one above, and that is the case this pass exists for.
     sentRect = null;
+    sentRectView = null;
     void syncBounds();
   }, SETTLE_MS);
 }
 
 /**
- * One layout signal from an observer. A size change is also the moment a view
+ * One layout signal from an observer. A size change is also the moment a page view
  * that could not be built (the pane was collapsed to zero when it mounted) has
  * somewhere to live, so creation is retried here.
  */
 function onLayoutSignal(): void {
   if (disposed) return;
-  if (viewId.value === null && !creating.value) void createView();
+  if (pageViewId.value === null && !creating.value) void createView();
   scheduleBounds();
 }
 
-/** Samples the rect while a transition runs, so the view follows it. */
+/** Samples the rect while a transition runs, so the drawn view follows it. */
 function burstTick(): void {
   if (disposed) {
     burstTimer = null;
@@ -567,27 +698,124 @@ function unwatchLayout(): void {
   }
 }
 
-/** Puts the address bar back in sync with the page, unless it is being edited. */
-function syncAddress(url: string): void {
-  currentUrl.value = url;
-  if (addressFocused.value) return;
-  draft.value = url === START_URL ? "" : url;
-}
-
-/** Every navigation of every view arrives here; only ours is kept. */
+/** Every navigation of every view arrives here; only this pane's tabs are kept. */
 function handleNav(event: EmbedNavEvent): void {
-  if (disposed || event.viewId !== viewId.value) return;
-  syncAddress(event.url);
+  if (disposed) return;
+  if (!tabs.value.tabs.some((tab) => tab.id === event.viewId)) return;
+  urlTo(event.viewId, event.url);
 }
 
 /**
- * Builds the child webview over the measured body rect. The registry entry is
- * created before the platform webview, so a create that fails leaves nothing
- * behind; a create that answers after teardown closes what it built.
+ * A page asked for a new window and got a hidden child webview: it becomes a tab of
+ * this pane and takes the focus (see the module note).
+ *
+ * A popup whose opener is not a tab here is CLOSED instead of drawn: the pane has
+ * nowhere to return to, and a hidden webview nobody draws would hold a provider's
+ * session until the app quits.
+ */
+function handlePopup(popup: EmbedPopupTab): void {
+  if (disposed) return;
+  const result = openTab(tabs.value, {
+    id: popup.viewId,
+    openerId: popup.openerId,
+  });
+  if (!result.opened) {
+    void embedClose(popup.viewId).catch(() => {});
+    debugLog(
+      `browser pane: popup ${popup.viewId} is not a tab of ${popup.openerId}`,
+    );
+    return;
+  }
+  tabs.value = result.state;
+  void embedUrl(popup.viewId)
+    .then((url) => {
+      if (!disposed) urlTo(popup.viewId, url);
+    })
+    .catch(() => {});
+  debugLog(`browser pane: popup ${popup.viewId} opened a tab of ${popup.openerId}`);
+}
+
+/**
+ * Adopts the popups that were opened while no listener was up (a dev reload, a
+ * pane rebuilt from its tab). The event is the live signal; this is the catch-up.
+ */
+async function adoptPendingPopups(): Promise<void> {
+  if (pageViewId.value === null) return;
+  const pending = await embedPopups().catch(() => [] as EmbedPopupTab[]);
+  for (const popup of pending) {
+    if (disposed) return;
+    handlePopup(popup);
+  }
+}
+
+/** Hides one view without closing it; a view that is gone is forgotten instead. */
+async function hideView(viewId: string): Promise<void> {
+  try {
+    await embedSetVisible(viewId, false);
+  } catch (cause) {
+    if (!disposed && isDeadView(cause)) forgetView(viewId);
+  }
+}
+
+/**
+ * Places one view on the body rect and SHOWS it, in that order.
+ *
+ * The placement comes first because the platform still holds whatever rect the view
+ * had while it was hidden or absent: showing it before would flash the page at the
+ * old position. Two placements, one frame apart, because `syncBounds` is
+ * serialized — a call that lands while another is in flight is remembered and
+ * re-run, not applied now — so the second pass is what guarantees the rect is on
+ * the platform before the page becomes visible. Nothing is reloaded: the same view,
+ * the same document.
+ */
+async function placeAndShow(viewId: string): Promise<void> {
+  if (disposed || !drawn.value || !shown.value) return;
+  await nextTick();
+  await nextFrame();
+  if (disposed || activeViewId.value !== viewId || !shown.value) return;
+  // Unknown until the fresh rect is applied: the drawer's width survived, but the
+  // chat column it shared the row with did not, and another tab was placed since.
+  sentRect = null;
+  sentRectView = null;
+  await syncBounds();
+  await nextFrame();
+  if (disposed || activeViewId.value !== viewId || !shown.value) return;
+  await syncBounds();
+  if (disposed || activeViewId.value !== viewId || !shown.value) return;
+  try {
+    await embedSetVisible(viewId, true);
+    shownView = viewId;
+  } catch (cause) {
+    if (disposed) return;
+    if (isDeadView(cause)) {
+      // Showing a view that is gone is the same dead view the bounds sync heals:
+      // one code path, one rebuild — never a second creation path.
+      forgetView(viewId);
+      return;
+    }
+    status.value = t("tools.browser.createError", {
+      message: commandErrorMessage(cause),
+    });
+  }
+}
+
+/** Hides every tab's view (the drawer is going away). */
+async function hideAllViews(): Promise<void> {
+  const ids = tabs.value.tabs.map((tab) => tab.id);
+  shownView = null;
+  for (const id of ids) {
+    await hideView(id);
+  }
+}
+
+/**
+ * Builds the PAGE view over the measured body rect. The registry entry is created
+ * before the platform webview, so a create that fails leaves nothing behind; a
+ * create that answers after teardown closes what it built.
  */
 async function createView(): Promise<void> {
   if (
-    viewId.value !== null ||
+    pageViewId.value !== null ||
     creating.value ||
     disposed ||
     !drawn.value ||
@@ -623,14 +851,21 @@ async function createView(): Promise<void> {
       void embedClose(id).catch(() => {});
       return;
     }
-    viewId.value = id;
+    pageViewId.value = id;
+    // The strip starts over: the page tab, and nothing else. A popup cannot have
+    // outlived the page view it was opened from (Rust closes them with it).
+    tabs.value = openTab(emptyTabs(), { id, openerId: null }).state;
+    urlTo(id, await embedUrl(id).catch(() => START_URL));
     sentRect = rect;
-    syncAddress(await embedUrl(id).catch(() => START_URL));
-    // The rect may have moved while the platform was building the webview.
-    scheduleBounds();
+    sentRectView = id;
+    // The tab is the drawn one, so the watcher on the drawn tab places and shows
+    // it — one path for `create` and for switching tabs.
     debugLog(
       `browser pane: created ${id} at ${rect.width}x${rect.height} @${rect.x},${rect.y}`,
     );
+    // A popup that landed while no listener was up is still a tab waiting for its
+    // page (S3).
+    void adoptPendingPopups();
   } catch (cause) {
     if (disposed) return;
     status.value = t("tools.browser.createError", {
@@ -641,24 +876,71 @@ async function createView(): Promise<void> {
   }
 }
 
-/** Closes the view this pane owns, if any. Idempotent by construction. */
-async function closeView(): Promise<void> {
-  const id = viewId.value;
-  viewId.value = null;
+/**
+ * Closes every view this pane holds and forgets the whole strip.
+ *
+ * The PAGE goes first: Rust closes a page's popups with it, because the page and the
+ * tabs it opened are one thing to the human. The popup labels are closed as well, by
+ * label, as the second sweep — a popup the registry already dropped (the MCP driver
+ * evicts entries it believes are dead) is still a child webview floating above the
+ * app, and `embed_close` is by label for exactly that case. Both sweeps are
+ * idempotent, so the double close costs nothing.
+ */
+async function closeAllViews(): Promise<void> {
+  const page = pageViewId.value;
+  const popups = closeAllPopups(tabs.value).closed;
+  pageViewId.value = null;
+  tabs.value = emptyTabs();
+  urls.value = {};
+  shownView = null;
   // The next view is created over a fresh rect, so nothing is known about it.
   sentRect = null;
-  if (id === null) return;
-  debugLog(`browser pane: closing ${id}`);
-  try {
-    await embedClose(id);
-  } catch {
-    // A view that is already gone is the outcome teardown wanted.
+  sentRectView = null;
+  if (page !== null) {
+    debugLog(`browser pane: closing ${page}`);
+    try {
+      await embedClose(page);
+    } catch {
+      // A view that is already gone is the outcome teardown wanted.
+    }
+  }
+  for (const popup of popups) {
+    void embedClose(popup).catch(() => {});
   }
 }
 
 /**
- * Navigates to what the address bar holds. The url is validated HERE first, so a
- * refused scheme shows its message and never crosses the bridge.
+ * Draws another tab: the pane places its view and shows it, and hides the one that
+ * was drawn. A tab that is not there changes nothing.
+ */
+function drawTab(id: string): void {
+  tabs.value = activateTab(tabs.value, id);
+}
+
+/**
+ * Closes a popup tab by hand — the documented end of an OAuth popup
+ * (`docs/ai/browser-popups.md`: macOS reports no `window.close()`), so the tab is
+ * closed here, its view with it, and the focus returns to the tab that opened it.
+ */
+async function closePopupTab(id: string): Promise<void> {
+  const result = closeTab(tabs.value, id);
+  if (result.closed.length === 0) return;
+  tabs.value = result.state;
+  for (const gone of result.closed) {
+    if (shownView === gone) shownView = null;
+    urlForget(gone);
+    try {
+      await embedClose(gone);
+    } catch {
+      // Already gone is what a close wants.
+    }
+  }
+  debugLog(`browser pane: closed tab ${id}`);
+}
+
+/**
+ * Navigates the drawn tab to what the address bar holds. The url is validated HERE
+ * first, so a refused scheme shows its message and never crosses the bridge.
  */
 async function go(): Promise<void> {
   if (draftEmpty.value) return;
@@ -667,7 +949,7 @@ async function go(): Promise<void> {
     status.value = t("tools.browser.urlInvalid");
     return;
   }
-  const id = viewId.value;
+  const id = activeViewId.value;
   if (id === null || navigating.value) return;
   status.value = null;
   navigating.value = true;
@@ -675,7 +957,7 @@ async function go(): Promise<void> {
     await embedNavigate(id, target);
     // The event confirms it; setting it now keeps the toolbar honest even if the
     // page is slow to report. `embed-nav` overwrites this with the real url.
-    syncAddress(target);
+    urlTo(id, target);
   } catch (cause) {
     if (disposed) return;
     status.value = t("tools.browser.navigateError", {
@@ -687,12 +969,12 @@ async function go(): Promise<void> {
 }
 
 /**
- * Runs one page-level control inside the view. Back, Forward and Reload have no
- * command of their own, so they are `history.back()`, `history.forward()` and
+ * Runs one page-level control inside the drawn tab. Back, Forward and Reload have
+ * no command of their own, so they are `history.back()`, `history.forward()` and
  * `location.reload()` evaluated in the page.
  */
 async function control(script: string): Promise<void> {
-  const id = viewId.value;
+  const id = activeViewId.value;
   if (id === null) return;
   status.value = null;
   try {
@@ -708,16 +990,22 @@ async function control(script: string): Promise<void> {
   }
 }
 
-/** Subscribes to the navigation stream, then builds the view. */
+/** Subscribes to the streams this pane needs, then builds the page view. */
 async function start(): Promise<void> {
   watchLayout();
   try {
-    const off = await subscribeEmbedNav(handleNav);
+    const offNav = await subscribeEmbedNav(handleNav);
     if (disposed) {
-      off();
+      offNav();
       return;
     }
-    unsubscribeNav = off;
+    unsubscribeNav = offNav;
+    const offPopup = await subscribeEmbedPopup(handlePopup);
+    if (disposed) {
+      offPopup();
+      return;
+    }
+    unsubscribePopup = offPopup;
   } catch (cause) {
     if (!disposed) {
       status.value = t("tools.browser.syncError", {
@@ -730,19 +1018,28 @@ async function start(): Promise<void> {
 
 /**
  * Rebuilds the pane for another folder. A workspace switch keeps this component
- * mounted (its tool context carries no path), so the view is closed here instead
+ * mounted (its tool context carries no path), so the views are closed here instead
  * of surviving into the next workspace's session.
  */
 async function reset(): Promise<void> {
   if (disposed) return;
-  await closeView();
-  syncAddress(START_URL);
+  await closeAllViews();
   draft.value = "";
   status.value = null;
   await createView();
 }
 
-// A workspace switch closes the view and builds a fresh one for the new folder.
+// The address bar follows the drawn page, unless the human is typing in it.
+watch(
+  currentUrl,
+  (url) => {
+    if (addressFocused.value) return;
+    draft.value = url === START_URL ? "" : url;
+  },
+  { immediate: true },
+);
+
+// A workspace switch closes the views and builds a fresh page for the new folder.
 watch(
   () => props.workspace?.path ?? null,
   (next, previous) => {
@@ -752,48 +1049,25 @@ watch(
 );
 
 /**
- * Brings an already built view back on screen without rebuilding it.
- *
- * The platform still holds the rect from before the drawer collapsed, so the rect
- * is re-measured and applied FIRST and the view is shown afterwards: showing it
- * before would flash the page at the old position. Nothing is reloaded — the same
- * view, the same document.
+ * The drawn tab changed. The tab that was drawn is hidden (never closed: it comes
+ * back with its document intact) and the new one is placed and shown.
  */
-async function revealView(): Promise<void> {
-  const id = viewId.value;
-  if (id === null || disposed) return;
-  // Unknown until the fresh rect is applied: the drawer's width survived, but the
-  // chat column it shared the row with did not.
-  sentRect = null;
-  await nextTick();
-  await nextFrame();
-  if (disposed || viewId.value !== id || !shown.value) return;
-  await syncBounds();
-  // `syncBounds` is serialized: a call that lands while another one is in flight
-  // is remembered and re-run, not applied now. A second pass one frame later means
-  // the rect is on the platform before the view is shown.
-  await nextFrame();
-  if (disposed || viewId.value !== id) return;
-  await syncBounds();
-  if (disposed || viewId.value !== id) return;
-  try {
-    await embedSetVisible(id, true);
-  } catch (cause) {
+watch(
+  activeViewId,
+  (id, previous) => {
     if (disposed) return;
-    if (isDeadView(cause)) {
-      // Showing a view that is gone is the same dead view the bounds sync heals:
-      // one code path, one rebuild — never a second creation path.
-      healDeadView();
-      return;
+    if (previous !== null && previous !== id && shownView === previous) {
+      shownView = null;
+      void hideView(previous);
     }
-    status.value = t("tools.browser.createError", {
-      message: commandErrorMessage(cause),
-    });
-  }
-}
+    if (id === null) return;
+    void placeAndShow(id);
+  },
+  { flush: "post" },
+);
 
 /**
- * A hidden tab closes its view and a drawn one builds a fresh view. `post` so the
+ * A hidden tab closes its views and a drawn one builds a fresh page. `post` so the
  * parent has already applied `v-show` and the body has a measurable rect.
  */
 watch(
@@ -801,11 +1075,12 @@ watch(
   (isDrawn) => {
     if (disposed) return;
     if (!isDrawn) {
-      void closeView();
+      void closeAllViews();
       return;
     }
     // Nothing queued from the hidden period would measure anything useful.
     sentRect = null;
+    sentRectView = null;
     cancelFrame();
     void createView();
   },
@@ -813,31 +1088,27 @@ watch(
 );
 
 /**
- * The drawer collapsed or reopened. This is NOT a close: the view is hidden with
- * the platform's own switch and shown again over a re-measured rect, so the page
- * the human was reading is still there (the reported bug: closing and reopening the
- * drawer restarted every tool). `viewId === null` means nothing is built yet and
- * creation is already gated on `shown`, so there is nothing to do.
+ * The drawer collapsed or reopened. This is NOT a close: every view is hidden with
+ * the platform's own switch and the drawn one is shown again over a re-measured
+ * rect, so the page the human was reading is still there (the reported bug: closing
+ * and reopening the drawer restarted every tool). `pageViewId === null` means
+ * nothing is built yet and creation is already gated on `shown`, so there is
+ * nothing to do.
  */
 watch(
   shown,
   (visible) => {
     if (disposed) return;
-    const id = viewId.value;
-    if (id === null) return;
-    debugLog(`browser pane: ${visible ? "revealing" : "hiding"} ${id}`);
-    if (visible) {
-      void revealView();
+    if (pageViewId.value === null) return;
+    debugLog(
+      `browser pane: ${visible ? "revealing" : "hiding"} ${tabs.value.tabs.length} view(s)`,
+    );
+    if (!visible) {
+      void hideAllViews();
       return;
     }
-    void embedSetVisible(id, false).catch((cause: unknown) => {
-      // The drawer is already hidden, so a status line here would be shown to
-      // nobody. Showing the view again re-issues the call, and that path does
-      // report its own failure — except for a view that is already gone, which is
-      // cleared here so reopening the drawer builds a fresh one instead of trying
-      // to show a dead id (and painting over the app while it does).
-      if (!disposed && isDeadView(cause)) healDeadView();
-    });
+    const id = activeViewId.value;
+    if (id !== null) void placeAndShow(id);
   },
   { flush: "post" },
 );
@@ -853,25 +1124,35 @@ onBeforeUnmount(() => {
     unsubscribeNav();
     unsubscribeNav = null;
   }
-  const id = viewId.value;
-  viewId.value = null;
-  if (id !== null) {
-    // Best effort: `embed_close` is idempotent, and no child webview may outlive
-    // the pane that placed it.
-    void embedClose(id).catch(() => {});
+  if (unsubscribePopup !== null) {
+    unsubscribePopup();
+    unsubscribePopup = null;
   }
+  // Every view this pane owns goes: the page, and the popup tabs it opened. The
+  // page close cascades in Rust, and the popup labels are closed too — closing by
+  // label is what reaches a view the registry no longer holds.
+  void closeAllViews();
 });
 </script>
 
 <template>
   <div ref="rootEl" class="flex min-h-0 flex-1 flex-col">
+    <!-- The strip (S3/L3): the page, plus one tab per popup it opened. It appears
+         with the first popup, because a strip with one tab is noise. -->
+    <BrowserTabs
+      v-if="strip.length > 0"
+      :items="strip"
+      @select="drawTab"
+      @close="closePopupTab"
+    />
+
     <!-- Toolbar: real HTML, and the only part of this pane the webview never
-         covers. Back/Forward/Reload act on the page, the field navigates. -->
+         covers. Back/Forward/Reload act on the drawn tab, the field navigates. -->
     <div class="flex shrink-0 items-center gap-1 border-b px-1.5 py-1">
       <Button
         variant="ghost"
         size="icon-xs"
-        :disabled="viewId === null"
+        :disabled="activeViewId === null"
         :aria-label="t('tools.browser.back')"
         :title="t('tools.browser.back')"
         @click="control('history.back()')"
@@ -881,7 +1162,7 @@ onBeforeUnmount(() => {
       <Button
         variant="ghost"
         size="icon-xs"
-        :disabled="viewId === null"
+        :disabled="activeViewId === null"
         :aria-label="t('tools.browser.forward')"
         :title="t('tools.browser.forward')"
         @click="control('history.forward()')"
@@ -891,7 +1172,7 @@ onBeforeUnmount(() => {
       <Button
         variant="ghost"
         size="icon-xs"
-        :disabled="viewId === null"
+        :disabled="activeViewId === null"
         :aria-label="t('tools.browser.reload')"
         :title="t('tools.browser.reload')"
         @click="control('location.reload()')"
@@ -947,19 +1228,20 @@ onBeforeUnmount(() => {
       {{ currentUrl }}
     </p>
 
-    <!-- BODY: the rect the child webview covers. Nothing here is visible under a
-         live view, so the pane keeps one placeholder for the state where there is
-         no webview at all. -->
+    <!-- BODY: the rect every child webview of this pane covers. Nothing here is
+         visible under a live view, so the pane keeps one placeholder for the state
+         where there is no webview at all. -->
     <div ref="bodyEl" class="relative min-h-0 flex-1 overflow-hidden">
       <p
-        v-if="viewId === null && !creating"
+        v-if="pageViewId === null && !creating"
         class="flex h-full items-center justify-center p-4 text-center text-xs text-muted-foreground"
       >
         {{ status ?? t("tools.browser.hint") }}
       </p>
     </div>
 
-    <!-- The honest half: the app drives this view, an agent cannot reach it yet. -->
+    <!-- The honest half: the app drives these views, and the agent drives the page
+         tab through a local MCP bridge. A popup is never an agent target. -->
     <p class="shrink-0 border-t px-2 py-1.5 text-xs text-muted-foreground">
       {{ t("tools.browser.agentNote") }}
     </p>

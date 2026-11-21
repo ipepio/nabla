@@ -267,6 +267,7 @@
   "chat.queue.heading": "Queued ({count})",
   "chat.queue.list": "Queued prompts",
   "chat.queue.remove": "Remove queued prompt {index}",
+  "chat.transcript.showOlder": "Show earlier turns ({count})",
   "message.copy": "Copy message",
   "chat.permissionMode.read": "Read",
   "chat.permissionMode.write": "Write",

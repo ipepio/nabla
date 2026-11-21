@@ -47,6 +47,31 @@
 // one-way request — "a tool needs a view" — that the MCP bridge emits and the app
 // UI answers by creating the pane, with its own rect (`auto-open-pane.md`, S3).
 // The wait for that answer is [`EmbedSessions::wait_for_first_view`].
+//
+// Popups (`drawer-responsiveness-oauth.md`, S3/L3) — a page that calls
+// `window.open` or clicks `target=_blank` gets a tab INSIDE the browser pane, not
+// a drawer tab and not a window of its own:
+// - `on_new_window` intercepts the request on the page view. The response cannot
+//   be a child webview, so the shape is two steps: build a `WebviewWindow` with
+//   `window_features` (macOS needs the opener's own `WKWebViewConfiguration`, or
+//   WebKit refuses the webview and there is no `window.opener`), then
+//   `Webview::reparent` it into the main window. `tests/browser-popup-probe/`
+//   proves both steps, `window.opener`/`postMessage` in both directions, and that
+//   closing the emptied host window leaves the reparented page running.
+// - The popup is a registered view like any other, with one extra field: the id of
+//   the view that opened it. That link is what the UI turns into a strip tab,
+//   what a close follows (a page takes its popups with it), and what keeps the
+//   popup out of `ready_views` — the list the MCP bridge gives the agent.
+// - **The popup cannot close itself.** macOS never tells wry that a page called
+//   `window.close()` (no `webViewDidClose:` in `wry-0.57.2`), so there is no native
+//   signal to react to; the human closes the tab, and that is the documented end of
+//   a popup's life (`docs/ai/browser-popups.md`).
+// - **Nothing here logs a url.** A popup request is where a provider's redirect
+//   lands, and a redirect can carry an authorization code: every line below names
+//   ids and reasons only, never a url.
+// - `NewWindowResponse::Allow` is never returned: wry's own window panics on the
+//   first `tauri://` navigation, and it gives the app no handle to manage. A
+//   request that fails or is refused answers `Deny`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -55,7 +80,7 @@ use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, Url};
 
 #[cfg(desktop)]
-use tauri::webview::WebviewBuilder;
+use tauri::webview::{NewWindowFeatures, NewWindowResponse, WebviewBuilder, WebviewWindowBuilder};
 #[cfg(desktop)]
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Rect, WebviewUrl};
 
@@ -74,9 +99,9 @@ macro_rules! debug_line {
     };
 }
 
-/// How many embedded browsers may exist at once. The pane shows one panel; four
-/// is room for a second look and a third without letting a stuck UI leak a
-/// webview per click.
+/// How many embedded browsers may exist at once, popups included. The pane shows
+/// one panel; four is room for a second look, a third, and an OAuth popup next to
+/// the page that opened it, without letting a stuck UI leak a webview per click.
 pub const MAX_VIEWS: usize = 4;
 
 /// What a view shows before it is navigated anywhere.
@@ -96,6 +121,21 @@ pub const NAV_EVENT: &str = "embed-nav";
 /// emitted with `()` and answered by a `reserve` — the UI creates the pane, and
 /// the view inside it, with the rect only the UI can measure.
 pub const NEED_VIEW_EVENT: &str = "embed-need-view";
+
+/// Channel the new-window handler reports on: a page asked for a new window, and
+/// the popup is now a hidden child webview the pane can adopt as a tab. Payload is
+/// a [`PopupTab`] — ids only, never a url.
+pub const POPUP_EVENT: &str = "embed-popup";
+
+/// The title of the invisible window a popup is handed back in. It is never on
+/// screen (it exists for as long as it takes to move the webview into the main
+/// window) and it names no page.
+#[cfg(desktop)]
+pub const POPUP_WINDOW_TITLE: &str = "Nabla popup";
+
+/// How many new-window requests the handler has seen. Only the dev line uses it:
+/// it separates "the page asked for nothing" from "the request was refused".
+static POPUP_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
 /// How long `embed_eval` waits for the page to answer. A page that is loading or
 /// gone never answers, and a command must not hang the caller forever.
@@ -122,6 +162,27 @@ pub struct EmbeddedView {
     /// Last url the navigation handler reported (requirement 7). It is the url
     /// the human is looking at, not the one that was last requested.
     pub url: String,
+    /// The view that opened this one, when this is a **popup**: the page called
+    /// `window.open` or clicked `target=_blank`. `None` is a page view — the one
+    /// the human drives and the agent may target.
+    pub opener: Option<String>,
+}
+
+impl EmbeddedView {
+    /// Whether this view came from a page opening a new window.
+    pub fn is_popup(&self) -> bool {
+        self.opener.is_some()
+    }
+}
+
+/// What the app UI needs to adopt a popup as a tab of its pane: the view, and the
+/// view that opened it. Ids only — a popup's url is a redirect url, and a redirect
+/// url can carry an authorization code, so it is never part of this payload.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PopupTab {
+    pub view_id: String,
+    pub opener_id: String,
 }
 
 /// What the navigation handler emits on [`NAV_EVENT`]: `{ viewId, url }`.
@@ -234,6 +295,25 @@ fn navigation_allowed(url: &str) -> bool {
         .starts_with("file:")
 }
 
+/// Which new-window requests are adopted as a tab of the pane.
+///
+/// Same policy as [`validate_url`] and for the same reason: what this pane shows is
+/// a page on the web. `about:blank` is the exception it must keep — providers open
+/// an empty window and then navigate it themselves. Everything else is refused
+/// before any webview exists, and `tauri://` is refused hardest: a popup webview
+/// that loads an app url is the one shape that aborts this process (wry's own
+/// window panics on it), so it never reaches the platform.
+fn popup_allowed(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case(DEFAULT_URL) {
+        return true;
+    }
+    match Url::parse(trimmed) {
+        Ok(parsed) => matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some(),
+        Err(_) => false,
+    }
+}
+
 /// A position or size the platform accepts: a collapsed panel reports 0.
 fn extent(value: f64) -> f64 {
     if value.is_finite() && value >= MIN_EXTENT {
@@ -341,21 +421,59 @@ impl EmbedSessions {
     ///
     /// The MCP server's list is this one, because it is the only list a tool can
     /// act on: a view that is merely reserved has no webview to navigate or
-    /// evaluate in.
+    /// evaluate in. **Popups are not in it**: a popup carries the human's live
+    /// provider session (`drawer-responsiveness-oauth.md`, S3: protect human auth
+    /// and agent target), so it is never offered to a tool — the page that opened
+    /// it is the agent's target, and stays the only one.
     pub fn ready_views(&self) -> Vec<EmbeddedView> {
         lock(&self.inner.views)
             .iter()
-            .filter(|entry| entry.ready)
+            .filter(|entry| entry.ready && !entry.view.is_popup())
             .map(|entry| entry.view.clone())
             .collect()
     }
 
-    /// Whether one id names a view the platform has finished building.
+    /// Whether one id names a view a tool may drive: a PAGE the platform has
+    /// finished building.
+    ///
+    /// A popup answers `false` even when its webview exists (see
+    /// [`Self::ready_views`]): the MCP driver checks this before every act, so a
+    /// guessed popup id is refused instead of driving a page the human is signing
+    /// in on.
     pub fn is_ready(&self, view_id: &str) -> bool {
         lock(&self.inner.views)
             .iter()
             .find(|entry| entry.view.id == view_id)
-            .is_some_and(|entry| entry.ready)
+            .is_some_and(|entry| entry.ready && !entry.view.is_popup())
+    }
+
+    /// The ready popups, with the view that opened each one.
+    ///
+    /// The pane adopts these on mount as well as from [`POPUP_EVENT`]: the event
+    /// can fire while the UI is not listening (a reload of the dev shell, a pane
+    /// that is being rebuilt), and a popup nobody adopted would stay a hidden
+    /// webview with no tab.
+    pub fn open_popup_tabs(&self) -> Vec<PopupTab> {
+        lock(&self.inner.views)
+            .iter()
+            .filter(|entry| entry.ready)
+            .filter_map(|entry| {
+                entry.view.opener.as_ref().map(|opener| PopupTab {
+                    view_id: entry.view.id.clone(),
+                    opener_id: opener.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// The popups one view opened, in creation order.
+    #[cfg(test)]
+    fn popups_of(&self, opener_id: &str) -> Vec<EmbeddedView> {
+        lock(&self.inner.views)
+            .iter()
+            .filter(|entry| entry.view.opener.as_deref() == Some(opener_id))
+            .map(|entry| entry.view.clone())
+            .collect()
     }
 
     /// How many views are registered.
@@ -416,7 +534,10 @@ impl EmbedSessions {
             if self.inner.closed.load(Ordering::SeqCst) != closed_before {
                 return false;
             }
-            if views.iter().any(|entry| entry.ready) {
+            if views
+                .iter()
+                .any(|entry| entry.ready && !entry.view.is_popup())
+            {
                 return true;
             }
             let elapsed = started.elapsed();
@@ -438,6 +559,21 @@ impl EmbedSessions {
     /// exists, so the navigation handler always finds its own id. Refuses over
     /// the cap without allocating anything.
     fn reserve(&self, url: String) -> Result<EmbeddedView, EmbedError> {
+        self.reserve_with(url, None)
+    }
+
+    /// The popup half of [`Self::reserve`]: same cap, same monotonic label, and the
+    /// opener recorded — which is what the pane turns into a tab next to its page,
+    /// what a close follows, and what keeps the popup out of the agent's list.
+    fn reserve_popup(&self, url: String, opener_id: &str) -> Result<EmbeddedView, EmbedError> {
+        self.reserve_with(url, Some(opener_id.to_string()))
+    }
+
+    fn reserve_with(
+        &self,
+        url: String,
+        opener: Option<String>,
+    ) -> Result<EmbeddedView, EmbedError> {
         let mut views = lock(&self.inner.views);
         if views.len() >= MAX_VIEWS {
             return Err(EmbedError::TooMany(MAX_VIEWS));
@@ -451,7 +587,7 @@ impl EmbedSessions {
                 break candidate;
             }
         };
-        let view = EmbeddedView { id, url };
+        let view = EmbeddedView { id, url, opener };
         views.push(Registered {
             view: view.clone(),
             // The platform has not built anything yet: the entry exists for the
@@ -497,6 +633,62 @@ impl EmbedSessions {
         // the waiter re-checks the registry and the close counter under the lock.
         self.inner.changed.notify_all();
         take(&mut views, view_id)
+    }
+
+    /// Removes every popup opened by `roots`, transitively, and answers them.
+    ///
+    /// The registry half of a close: a page and the tabs it opened are one thing to
+    /// the human, so closing the page closes its popups instead of leaving hidden
+    /// webviews holding a provider's live session that nobody can reach. Transitive
+    /// because a popup may itself have opened one.
+    fn take_popups_of(&self, roots: &[String]) -> Vec<EmbeddedView> {
+        let mut views = lock(&self.inner.views);
+        let mut openers: Vec<String> = roots.to_vec();
+        let mut taken: Vec<EmbeddedView> = Vec::new();
+        loop {
+            let index = views.iter().position(|entry| {
+                entry
+                    .view
+                    .opener
+                    .as_ref()
+                    .is_some_and(|opener| openers.iter().any(|id| id == opener))
+            });
+            let Some(index) = index else { break };
+            let entry = views.remove(index);
+            openers.push(entry.view.id.clone());
+            taken.push(entry.view);
+        }
+        if !taken.is_empty() {
+            // Closing something is the human's no, exactly as `forget` reports it:
+            // a tool waiting for a pane must not keep waiting on it.
+            self.inner.closed.fetch_add(1, Ordering::SeqCst);
+            self.inner.changed.notify_all();
+        }
+        taken
+    }
+
+    /// Removes and answers the popups whose opener is no longer registered.
+    ///
+    /// Such a popup is unreachable: the pane has no tab to return to, because the
+    /// tab that opened it is gone. The sweep runs when a page view is created, which
+    /// is the moment a stale popup would otherwise stay hidden forever (the MCP
+    /// driver can evict a page, and a close can race a popup being built).
+    fn reap_orphans(&self) -> Vec<EmbeddedView> {
+        let mut views = lock(&self.inner.views);
+        let mut removed: Vec<EmbeddedView> = Vec::new();
+        loop {
+            let live: Vec<String> = views.iter().map(|entry| entry.view.id.clone()).collect();
+            let index = views.iter().position(|entry| match &entry.view.opener {
+                Some(opener) => !live.iter().any(|id| id == opener),
+                None => false,
+            });
+            let Some(index) = index else { break };
+            removed.push(views.remove(index).view);
+        }
+        if !removed.is_empty() {
+            self.inner.changed.notify_all();
+        }
+        removed
     }
 
     /// Drops a registry entry whose webview no longer exists, and answers what was
@@ -548,6 +740,168 @@ fn close_label(app: &AppHandle, view_id: &str) -> bool {
     }
 }
 
+/// Closes the invisible window a popup was handed back in, if it is still there.
+///
+/// A popup exists as a top-level window for a moment, because that is the only
+/// thing WebKit accepts from a new-window request; the webview is then moved into
+/// the main window, so what is left is an EMPTY window. Closing it destroys nothing
+/// of the popup (proven: the reparented page kept evaluating after the host window
+/// raised `CloseRequested` and `Destroyed`), and it keeps the app from accumulating
+/// one hidden window per OAuth flow. A page view has no window of this name, so the
+/// same call is a no-op for it.
+#[cfg(desktop)]
+fn close_popup_window(app: &AppHandle, view_id: &str) {
+    if let Some(window) = app.get_window(view_id) {
+        let _ = window.close();
+    }
+}
+
+/// Questions a page's new-window request and answers WebKit.
+///
+/// Called ON the main thread, inside WebKit's own delegate for
+/// `webView:createWebViewWithConfiguration:…`, so two things shape it: it must
+/// return a webview synchronously (that is the whole contract), and it must not
+/// wait for the event loop (which is what `reparent` does). So the window is built
+/// here — the documented shape does not deadlock; the probe measured 9 ms — and the
+/// move into the drawer happens on a thread of its own, which then tells the UI.
+///
+/// `Allow` is never returned: wry's own native window panics on the first
+/// `tauri://` navigation and gives the app no handle at all, so a request that is
+/// refused or fails answers `Deny` — `window.open` then returns `null`, which every
+/// provider page already handles.
+#[cfg(desktop)]
+fn popup_request(
+    app: &AppHandle,
+    embeds: &EmbedSessions,
+    opener_id: &str,
+    url: Url,
+    features: NewWindowFeatures,
+) -> NewWindowResponse<tauri::Wry> {
+    let request = POPUP_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+    // Ids and reasons only: this is where a provider's redirect lands, and a
+    // redirect can carry an authorization code.
+    if !popup_allowed(url.as_str()) {
+        debug_line!("popup request {request} from {opener_id} refused by the url policy");
+        return NewWindowResponse::Deny;
+    }
+    let Ok(view) = embeds.reserve_popup(DEFAULT_URL.to_string(), opener_id) else {
+        debug_line!("popup request {request} from {opener_id} refused: no free view slot");
+        return NewWindowResponse::Deny;
+    };
+    let label = view.id.clone();
+    // `about:blank` and not the requested url: WebKit performs that navigation
+    // itself the moment it has the webview back, and loading the url here too would
+    // load the provider page twice.
+    let Ok(started) = Url::parse(DEFAULT_URL) else {
+        embeds.forget(&view.id);
+        return NewWindowResponse::Deny;
+    };
+    let registry = embeds.clone();
+    let emitter = app.clone();
+    let navigated_id = label.clone();
+    let built = WebviewWindowBuilder::new(app, label.clone(), WebviewUrl::External(started))
+        // The opener's own webview configuration travels here. On macOS WebKit
+        // refuses a webview built with anything else, and a popup without it has no
+        // `window.opener` — which is the half of S3 the provider page needs.
+        .window_features(features)
+        // Invisible: this window exists for the microsecond it takes WebKit to hand
+        // the webview back, and the webview is moved into the main window right
+        // after. The pane shows it only once it has placed it on a measured rect.
+        .visible(false)
+        .title(POPUP_WINDOW_TITLE)
+        // A popup navigates on its own: the provider's redirect arrives here, so the
+        // url bookkeeping is the same as a page view's (recorded, reported, never
+        // logged).
+        .on_navigation(move |url| {
+            if !navigation_allowed(url.as_str()) {
+                return false;
+            }
+            let url = url.to_string();
+            registry.set_url(&navigated_id, &url);
+            let _ = emitter.emit(
+                NAV_EVENT,
+                EmbedNavEvent {
+                    view_id: navigated_id.clone(),
+                    url,
+                },
+            );
+            true
+        })
+        .build();
+    match built {
+        Ok(window) => {
+            let app = app.clone();
+            let embeds = embeds.clone();
+            // Off the main thread on purpose: `reparent` sends a message to the
+            // event loop and waits for it, so waiting for it HERE — inside the
+            // delegate that runs on that thread — would deadlock the app.
+            std::thread::spawn(move || adopt_popup(app, embeds, label));
+            NewWindowResponse::Create { window }
+        }
+        Err(err) => {
+            embeds.forget(&view.id);
+            debug_line!("popup request {request} from {opener_id} could not be built: {err}");
+            NewWindowResponse::Deny
+        }
+    }
+}
+
+/// The second half of a popup: move the webview into the main window, keep it
+/// hidden, drop the window that only existed to hand it to WebKit, and tell the
+/// pane that a tab is waiting for it.
+///
+/// The order is the point. Hiding BEFORE the move keeps a page nobody has placed yet
+/// from painting over the whole app; the placeholder rect keeps the platform from
+/// holding a rect the pane never measured; `mark_ready` before the event means the
+/// pane is never handed an id whose webview is not there yet.
+#[cfg(desktop)]
+fn adopt_popup(app: AppHandle, embeds: EmbedSessions, view_id: String) {
+    let give_up = |reason: &str| {
+        debug_line!("popup {view_id} abandoned: {reason}");
+        embeds.forget(&view_id);
+        close_label(&app, &view_id);
+        close_popup_window(&app, &view_id);
+    };
+    let Some(window) = app.get_window(MAIN_WINDOW_LABEL) else {
+        return give_up("no main window");
+    };
+    let Some(webview) = app.get_webview(&view_id) else {
+        return give_up("no webview behind the popup window");
+    };
+    if let Err(err) = webview.hide() {
+        return give_up(&format!("could not hide it: {err}"));
+    }
+    if let Err(err) = webview.reparent(&window) {
+        return give_up(&format!("could not move it into the main window: {err}"));
+    }
+    // One pixel, at the origin, hidden: the pane places the tab on the rect it
+    // measured before it shows anything. Until then the platform has a placement it
+    // asked for, so no layer is left guessing.
+    let _ = webview.set_bounds(Rect {
+        position: LogicalPosition::new(0.0, 0.0).into(),
+        size: LogicalSize::new(MIN_EXTENT, MIN_EXTENT).into(),
+    });
+    close_popup_window(&app, &view_id);
+    if !embeds.mark_ready(&view_id) {
+        // Closed while the platform was building it: a late readiness report must
+        // not resurrect the entry, and nothing may stay on screen either.
+        close_label(&app, &view_id);
+        return;
+    }
+    let Some(opener_id) = embeds.get(&view_id).and_then(|view| view.opener) else {
+        // Evicted or reaped between the reservation and here: nothing to adopt.
+        return give_up("no opener is registered");
+    };
+    debug_line!("popup {view_id} adopted by {opener_id}");
+    let _ = app.emit(
+        POPUP_EVENT,
+        PopupTab {
+            view_id,
+            opener_id,
+        },
+    );
+}
+
 /// The one removal step [`EmbedSessions::forget`] and [`EmbedSessions::evict`]
 /// share: taken by id, under the registry lock.
 fn take(views: &mut Vec<Registered>, view_id: &str) -> Option<EmbeddedView> {
@@ -586,6 +940,10 @@ impl EmbedSessions {
     /// can fire while the webview is still being built, and it must find the id
     /// it is supposed to report on. A refused or failed build removes the entry
     /// again, so a failed call never uses up a slot.
+    ///
+    /// The webview also answers `window.open` and `target=_blank`
+    /// ([`popup_request`]): a second window is not a new pane, it is a tab of this
+    /// one (`drawer-responsiveness-oauth.md`, S3/L3).
     pub fn create(
         &self,
         app: &AppHandle,
@@ -615,6 +973,9 @@ impl EmbedSessions {
         let registry = self.clone();
         let emitter = app.clone();
         let navigated_id = view.id.clone();
+        let popup_app = app.clone();
+        let popup_registry = self.clone();
+        let opener_id = view.id.clone();
         let builder = WebviewBuilder::new(view.id.clone(), WebviewUrl::External(parsed))
             .on_navigation(move |url| {
                 // Only an accepted navigation is recorded and reported: a refused
@@ -633,6 +994,12 @@ impl EmbedSessions {
                     },
                 );
                 true
+            })
+            // The popup half of S3: the page asks for a window and gets a tab of
+            // this pane instead. The handler runs on WebKit's delegate thread, so
+            // it only builds the window and returns it.
+            .on_new_window(move |url, features| {
+                popup_request(&popup_app, &popup_registry, &opener_id, url, features)
             });
         match window.add_child(
             builder,
@@ -647,6 +1014,14 @@ impl EmbedSessions {
                 if !self.mark_ready(&view.id) {
                     webview.close().map_err(|err| EmbedError::Create(err.to_string()))?;
                     return Err(EmbedError::UnknownView(view.id));
+                }
+                // A popup whose opener is gone is unreachable: no tab can return to
+                // it, so it would stay a hidden webview holding somebody's session.
+                // A new page view is the moment to sweep those.
+                for orphan in self.reap_orphans() {
+                    debug_line!("reaping popup {} whose opener is gone", orphan.id);
+                    close_label(app, &orphan.id);
+                    close_popup_window(app, &orphan.id);
                 }
                 debug_line!(
                     "create {} ready at {}x{} @{},{} (was reserved before the platform)",
@@ -773,7 +1148,14 @@ impl EmbedSessions {
         // Forget first: a navigation handler firing during the close must find
         // nothing to update, and a second close answers `false`.
         let known = self.forget(view_id).is_some();
-        let closed = close_label(app, view_id);
+        let mut closed = close_label(app, view_id);
+        // The page and the tabs it opened are one thing to the human: closing the
+        // page closes its popups, instead of leaving hidden webviews that hold a
+        // provider's live session nobody can reach any more.
+        for popup in self.take_popups_of(&[view_id.to_string()]) {
+            closed |= close_label(app, &popup.id);
+            close_popup_window(app, &popup.id);
+        }
         debug_line!(
             "close {view_id}: entry={known} webview={closed}{}",
             if known { "" } else { " (orphan, closed by label)" }
@@ -808,9 +1190,22 @@ impl EmbedSessions {
                 orphans += 1;
             }
         }
+        // A popup's host window is named after its view, so the same prefix sweeps
+        // the invisible windows a reparent left behind (a close that failed halfway,
+        // or a popup nobody adopted). Closing such a window destroys an empty one —
+        // its webview was moved into the main window.
+        let mut windows = 0;
+        for (label, window) in app.windows() {
+            if !is_view_label(&label) {
+                continue;
+            }
+            if window.close().is_ok() {
+                windows += 1;
+            }
+        }
         closed += orphans;
         debug_line!(
-            "close_all: entries={} closed={closed} orphans={orphans}",
+            "close_all: entries={} closed={closed} orphans={orphans} popup windows={windows}",
             views.len()
         );
         closed
@@ -1380,6 +1775,269 @@ mod tests {
 
         assert!(sessions.wait_for_first_view(Duration::from_secs(10)));
         ui.join().expect("the creating thread panicked");
+    }
+
+    // ── popups: tabs inside the pane (`drawer-responsiveness-oauth.md`, S3/L3) ──
+    //
+    // A page that calls `window.open` or clicks `target=_blank` gets a child
+    // webview of the main window like any other view, with the one difference that
+    // decides everything else: it is registered with the view that opened it. That
+    // link is what the pane turns into a strip tab, what a close follows, and what
+    // keeps the popup out of the agent's list. Nothing below needs a window; the
+    // native half (create, reparent, hide, close) was proven by the probe in
+    // `tests/browser-popup-probe/` and is manually verified in `npm run tauri dev`
+    // (`docs/ai/browser-popups.md`).
+
+    #[test]
+    fn a_popup_is_registered_with_the_view_that_opened_it() {
+        let sessions = EmbedSessions::new();
+        let page = sessions.reserve(DEFAULT_URL.into()).expect("page");
+        let popup = sessions
+            .reserve_popup(DEFAULT_URL.into(), &page.id)
+            .expect("popup");
+
+        assert_eq!(popup.opener.as_deref(), Some(page.id.as_str()));
+        assert!(popup.is_popup());
+        assert!(!page.is_popup(), "the page the human drives is not a popup");
+        assert_eq!(sessions.get(&popup.id), Some(popup.clone()));
+        // A popup is a view like any other for the close sweep: its label is what
+        // `close_all` matches and what the pane calls `embed_close` with.
+        assert!(is_view_label(&popup.id));
+        assert_ne!(popup.id, page.id, "a popup has a label of its own");
+    }
+
+    // S3's last clause: the popup carries the human's live provider session, so it
+    // must never become an agent target. `ready_views` is the list the MCP bridge
+    // gives a tool, and `is_ready` is what the driver checks before acting.
+    #[test]
+    fn a_ready_popup_is_neither_listed_nor_driveable() {
+        let sessions = EmbedSessions::new();
+        let popup = sessions
+            .reserve_popup("https://accounts.example.com/".into(), "embed-404")
+            .expect("popup");
+        assert!(sessions.mark_ready(&popup.id), "the platform built it");
+
+        assert!(sessions.ready_views().is_empty(), "the agent never sees it");
+        assert!(!sessions.is_ready(&popup.id), "and never drives it");
+
+        // A tool waiting for a pane is not answered by a popup either: the wait is
+        // about a view the agent can act on.
+        let started = Instant::now();
+        assert!(!sessions.wait_for_first_view(Duration::from_millis(60)));
+        assert!(started.elapsed() >= Duration::from_millis(60));
+
+        // The page view the human does drive is still listed after a popup exists.
+        let page = sessions.reserve(DEFAULT_URL.into()).expect("page");
+        assert!(sessions.mark_ready(&page.id));
+        assert_eq!(sessions.ready_views(), vec![page.clone()]);
+        assert!(sessions.is_ready(&page.id));
+    }
+
+    #[test]
+    fn closing_a_page_takes_the_popups_it_opened() {
+        let sessions = EmbedSessions::new();
+        let page = sessions.reserve(DEFAULT_URL.into()).expect("page");
+        let first = sessions
+            .reserve_popup(DEFAULT_URL.into(), &page.id)
+            .expect("first");
+        let second = sessions
+            .reserve_popup(DEFAULT_URL.into(), &page.id)
+            .expect("second");
+        let nested = sessions
+            .reserve_popup(DEFAULT_URL.into(), &first.id)
+            .expect("nested");
+
+        let mut closed: Vec<String> = sessions
+            .take_popups_of(std::slice::from_ref(&page.id))
+            .into_iter()
+            .map(|view| view.id)
+            .collect();
+        closed.sort();
+        let mut expected = vec![first.id.clone(), second.id.clone(), nested.id.clone()];
+        expected.sort();
+        assert_eq!(closed, expected, "the page and its popups are one thing");
+        assert_eq!(sessions.get(&page.id), Some(page), "the page itself is not touched");
+        assert_eq!(sessions.len(), 1, "nothing else was registered");
+    }
+
+    // Which popups belong to which view: the pane draws a tab under the tab that
+    // opened it, so "the popups of this view" has to be exactly that view's.
+    #[test]
+    fn popups_of_names_only_the_popups_of_its_opener() {
+        let sessions = EmbedSessions::new();
+        let page = sessions.reserve(DEFAULT_URL.into()).expect("page");
+        let first = sessions
+            .reserve_popup(DEFAULT_URL.into(), &page.id)
+            .expect("first");
+        let second = sessions
+            .reserve_popup(DEFAULT_URL.into(), &page.id)
+            .expect("second");
+        let nested = sessions
+            .reserve_popup(DEFAULT_URL.into(), &first.id)
+            .expect("nested");
+
+        assert_eq!(sessions.popups_of(&page.id), vec![first.clone(), second.clone()]);
+        assert_eq!(sessions.popups_of(&first.id), vec![nested]);
+        assert!(sessions.popups_of(&second.id).is_empty());
+        assert!(sessions.popups_of("embed-99").is_empty());
+    }
+
+    #[test]
+    fn closing_a_popup_takes_the_popups_it_opened() {
+        let sessions = EmbedSessions::new();
+        let page = sessions.reserve(DEFAULT_URL.into()).expect("page");
+        let popup = sessions
+            .reserve_popup(DEFAULT_URL.into(), &page.id)
+            .expect("popup");
+        let nested = sessions
+            .reserve_popup(DEFAULT_URL.into(), &popup.id)
+            .expect("nested");
+        let sibling = sessions
+            .reserve_popup(DEFAULT_URL.into(), &page.id)
+            .expect("sibling");
+
+        let closed: Vec<String> = sessions
+            .take_popups_of(std::slice::from_ref(&popup.id))
+            .into_iter()
+            .map(|view| view.id)
+            .collect();
+        assert_eq!(closed, vec![nested.id.clone()], "a popup's own popups go with it");
+        assert_eq!(
+            sessions.get(&sibling.id),
+            Some(sibling),
+            "a sibling popup is not a child"
+        );
+        assert_eq!(sessions.get(&popup.id), Some(popup));
+    }
+
+    #[test]
+    fn open_popup_tabs_lists_only_the_popups_the_platform_built() {
+        let sessions = EmbedSessions::new();
+        let page = sessions.reserve(DEFAULT_URL.into()).expect("page");
+        assert!(sessions.mark_ready(&page.id));
+        let popup = sessions
+            .reserve_popup(DEFAULT_URL.into(), &page.id)
+            .expect("popup");
+
+        // Reserved is not built: the pane could not place a view that has no
+        // webview yet, so it is not adopted early.
+        assert!(sessions.open_popup_tabs().is_empty());
+
+        assert!(sessions.mark_ready(&popup.id));
+        assert_eq!(
+            sessions.open_popup_tabs(),
+            vec![PopupTab {
+                view_id: popup.id.clone(),
+                opener_id: page.id.clone(),
+            }]
+        );
+        // The payload carries ids only: a popup's url is a redirect url, and a
+        // redirect url can carry a code.
+        assert_eq!(
+            serde_json::to_string(&sessions.open_popup_tabs()[0]).expect("json"),
+            format!(
+                "{{\"viewId\":\"{}\",\"openerId\":\"{}\"}}",
+                popup.id, page.id
+            )
+        );
+    }
+
+    // A popup can outlive the entry that opened it: the MCP driver evicts a view
+    // whose webview it believes is gone, and a page can be closed by hand while its
+    // popup was being built. Such a popup is unreachable — the pane has no tab to
+    // return to — so the next creation reaps it instead of leaving a hidden webview
+    // holding somebody's session.
+    #[test]
+    fn a_popup_whose_opener_left_is_reaped() {
+        let sessions = EmbedSessions::new();
+        let page = sessions.reserve(DEFAULT_URL.into()).expect("page");
+        let popup = sessions
+            .reserve_popup(DEFAULT_URL.into(), &page.id)
+            .expect("popup");
+        let nested = sessions
+            .reserve_popup(DEFAULT_URL.into(), &popup.id)
+            .expect("nested");
+        let other_page = sessions.reserve(DEFAULT_URL.into()).expect("other page");
+
+        assert_eq!(sessions.forget(&page.id), Some(page));
+        let mut reaped: Vec<String> = sessions
+            .reap_orphans()
+            .into_iter()
+            .map(|view| view.id)
+            .collect();
+        reaped.sort();
+        let mut expected = vec![popup.id.clone(), nested.id.clone()];
+        expected.sort();
+        assert_eq!(reaped, expected, "the child of an orphan is an orphan too");
+        assert_eq!(
+            sessions.views(),
+            vec![other_page],
+            "what still has its opener stays"
+        );
+        assert!(sessions.reap_orphans().is_empty(), "nothing left to reap");
+    }
+
+    #[test]
+    fn popups_count_against_the_view_cap() {
+        let sessions = EmbedSessions::new();
+        let page = sessions.reserve(DEFAULT_URL.into()).expect("page");
+        for _ in 1..MAX_VIEWS {
+            sessions
+                .reserve_popup(DEFAULT_URL.into(), &page.id)
+                .expect("room for one more");
+        }
+        assert_eq!(
+            sessions.reserve_popup(DEFAULT_URL.into(), &page.id),
+            Err(EmbedError::TooMany(MAX_VIEWS)),
+            "a popup is a webview: the cap is the cap"
+        );
+        assert_eq!(sessions.len(), MAX_VIEWS, "a refused popup leaves nothing");
+    }
+
+    // The url policy of a popup request. `tauri://` is the one that matters most:
+    // a popup that loads an app url is the shape that aborts this process, so it is
+    // refused before any webview exists rather than trusted.
+    #[test]
+    fn only_web_popups_are_adopted() {
+        for allowed in [
+            "https://accounts.example.com/authorize?client_id=abc",
+            "http://127.0.0.1:8080/callback",
+            "about:blank",
+            "  about:blank  ",
+        ] {
+            assert!(popup_allowed(allowed), "expected {allowed:?} to be adopted");
+        }
+        for denied in [
+            "tauri://localhost/index.html",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html,<h1>x</h1>",
+            "about:config",
+            "https://",
+            "",
+        ] {
+            assert!(!popup_allowed(denied), "expected {denied:?} to be refused");
+        }
+    }
+
+    // A late navigation of a popup that is gone must not resurrect it, exactly as
+    // for a page: the navigation handler of a closed webview can still fire.
+    #[test]
+    fn a_closed_popup_is_not_resurrected_by_a_late_navigation() {
+        let sessions = EmbedSessions::new();
+        let page = sessions.reserve(DEFAULT_URL.into()).expect("page");
+        let popup = sessions
+            .reserve_popup(DEFAULT_URL.into(), &page.id)
+            .expect("popup");
+        let closed: Vec<String> = sessions
+            .take_popups_of(std::slice::from_ref(&page.id))
+            .into_iter()
+            .map(|view| view.id)
+            .collect();
+        assert_eq!(closed, vec![popup.id.clone()]);
+        assert!(!sessions.set_url(&popup.id, "https://example.com/"));
+        assert_eq!(sessions.get(&popup.id), None);
+        assert!(sessions.open_popup_tabs().is_empty());
     }
 
     // Nothing below runs without a real window: `embed_create`, `set_bounds`,

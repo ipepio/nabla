@@ -30,8 +30,11 @@
 //     pane the panel did not draw impossible to reach.
 //  3. reconciling the model with reality (`applyDock`): a new active workspace
 //     clears the tabs, a disabled tool closes its panes;
-//  4. the "no tabs" empty state, which is what the drawer shows before the first
-//     `+` — nothing is opened for the human, by design.
+//  4. the "no tabs" empty state, which is what the drawer shows after the human
+//     closes its last tab. The drawer does NOT start there: opening it seeds one
+//     empty tab (`openDrawer` in `./dock.ts`), so the tool chooser is the first
+//     thing on screen (S1 of `drawer-responsiveness-oauth.md`) and the empty state
+//     is the state the human chose, never the startup state.
 //
 // EVERY TAB BODY IS RENDERED, AND ONLY ONE IS SHOWN (`v-show`). That is the rule
 // that keeps tool state across switches for free: a Terminal's pty lives in its
@@ -251,8 +254,9 @@ function start(tabId: string, toolId: ToolDefinition["id"]): void {
       </div>
     </template>
 
-    <!-- No tab at all: the drawer's starting face, and what closing the last tab
-         returns to. Nothing is opened for the human. -->
+    <!-- No tab at all: what closing the last tab returns to. The drawer's first
+         open seeds one empty tab instead (`openDrawer`), so this is a state the
+         human reached, not where the drawer starts. -->
     <div
       v-else
       class="flex flex-1 flex-col items-center justify-center gap-2 p-4 text-center"

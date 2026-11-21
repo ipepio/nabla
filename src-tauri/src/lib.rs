@@ -361,6 +361,10 @@ pub fn run() {
             commands::embed_eval,
             commands::embed_close,
             commands::embed_url,
+            // The popups of S3 (`drawer-responsiveness-oauth.md`): a page that asks
+            // for a new window gets a tab inside the browser pane, and this is the
+            // list the pane adopts (`embed-popup` is the live signal).
+            commands::embed_popups,
             commands::embed_close_all,
             // Debug-only: one line from the webview on the dev terminal, so a
             // `.vue` handler is visible from the shell that runs `tauri dev`.
