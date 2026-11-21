@@ -3,6 +3,9 @@ mod cli;
 mod commands;
 // The embedded browser: one child webview per view, added to the main window.
 mod embed;
+// The composer's image input: format sniffing, base64 and the per-turn bounds
+// (`odd/tasks/composer-image-input.md`).
+mod image_input;
 mod mcp;
 // The other end of MCP: a local server pi connects to in order to drive the
 // embedded webview (`webview-control.md`).
@@ -290,6 +293,9 @@ pub fn run() {
             commands::load_session_preview,
             commands::live_session_ids,
             commands::send_prompt,
+            // S1 of `composer-image-input.md`: the composer reads a picked or
+            // dropped image through Rust (sniffed format, bounded size).
+            commands::read_image_attachment,
             // S2/S3 of `composer-inputs.md`: the effort selector and the `/`
             // completion. The level is applied live and kept as the next
             // session's default; the commands are pi's own list, proxied.

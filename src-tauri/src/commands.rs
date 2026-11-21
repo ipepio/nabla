@@ -12,6 +12,7 @@ use tauri::State;
 use tauri_plugin_opener::OpenerExt;
 
 use crate::cli::{self, CliSessions, CliSink, PiAuthStatus, PiCliResult};
+use crate::image_input::{self, ImageAttachment, PromptImage};
 use crate::mcp::{self, McpAddDraft, McpScope, McpServerSummary};
 use crate::mcp_server::{REGISTRATION_WAIT, RegistrationGate, RegistrationOutcome};
 use crate::process::{ProcessManager, SessionModel, StartupOutcome};
@@ -948,39 +949,194 @@ pub async fn start_session(
 
 /// Sends a prompt to the session's pi process. The answer that matters is the
 /// forwarded event stream (S6); this only reports that pi accepted the request.
+///
+/// S1-S2 of `odd/tasks/composer-image-input.md`: `images` are pi's own
+/// `ImageContent` payloads. They are bounded and normalized here (never trusted
+/// from the webview) and the model is asked whether it accepts image input before
+/// anything is sent, because a silent model switch is exactly what the feature
+/// refuses.
 #[tauri::command]
 pub fn send_prompt(
     state: State<'_, AppState>,
     workspace_id: i64,
     session_id: i64,
     text: String,
+    images: Option<Vec<PromptImage>>,
 ) -> Result<(), String> {
-    if text.trim().is_empty() {
+    let paths = ImageCapabilityPaths {
+        config_dir: &state.config_dir,
+        models: &models_path(&state),
+        catalog: &catalog_path(&state),
+        credentials: &credentials_path(&state),
+    };
+    send_prompt_for(
+        &state.store,
+        &paths,
+        &state.runtime,
+        workspace_id,
+        session_id,
+        text,
+        images.unwrap_or_default(),
+    )
+}
+
+/// S1 of `composer-image-input.md`: reads one image the human picked or dropped.
+///
+/// The format comes from the bytes and the file is bounded before it is read
+/// (`image_input::read_image_attachment`), so this is the only path a filesystem
+/// path a webview produced turns into image data.
+#[tauri::command]
+pub fn read_image_attachment(path: String) -> Result<ImageAttachment, String> {
+    image_input::read_image_attachment(Path::new(&path)).map_err(display_err)
+}
+
+/// The files the image-capability preflight reads. Grouped so the helper that
+/// sends a prompt keeps a readable argument list.
+struct ImageCapabilityPaths<'a> {
+    /// `settings.json`: the persisted provider/model a non-live session would use.
+    config_dir: &'a Path,
+    /// pi's `models.json`, with the models it declares.
+    models: &'a Path,
+    /// pi's cached catalogue, which `models.json` alone does not cover.
+    catalog: &'a Path,
+    /// pi's credentials: a catalogue-only provider counts only once signed in.
+    credentials: &'a Path,
+}
+
+/// S2: what a model that is really running says about image input.
+///
+/// pi is asked (`get_state`) instead of being assumed: the model of a live session
+/// may have been switched in the composer, and the persisted pair would then name
+/// a different capability. `None` means "this pi does not say" — the caller falls
+/// back to the catalogue — not "text only".
+fn live_model_accepts_images(runtime: &ProcessManager, key: &str) -> Option<bool> {
+    let status = runtime.status(key)?.status;
+    if !matches!(status, RuntimeStatus::Ready | RuntimeStatus::Running) {
+        return None;
+    }
+    let response = runtime
+        .send(key, "get_state", serde_json::Map::new())
+        .ok()?;
+    if !response.success {
+        return None;
+    }
+    let model = response.data.as_ref()?.get("model")?;
+    image_input::model_input_has_image(model)
+}
+
+/// S2: whether the persisted pair declares image input in pi's own catalogue.
+/// `None` when the catalogue does not describe that model at all, which is not
+/// evidence of anything; the caller refuses instead of guessing.
+fn catalogue_model_accepts_images(
+    paths: &ImageCapabilityPaths<'_>,
+    provider: &str,
+    model_id: &str,
+) -> Option<bool> {
+    if provider.trim().is_empty() || model_id.trim().is_empty() {
+        return None;
+    }
+    let providers =
+        crate::providers::read_provider_models_with_catalog(paths.models, paths.catalog, paths.credentials)
+            .ok()?;
+    let provider_entry = providers
+        .iter()
+        .find(|entry| entry.provider == provider)?;
+    let model = provider_entry
+        .models
+        .iter()
+        .find(|entry| entry.id == model_id)?;
+    Some(
+        model
+            .modalities
+            .iter()
+            .any(|modality| modality.eq_ignore_ascii_case("image")),
+    )
+}
+
+/// The title of a session opened by an image-only turn: there is no text to
+/// derive one from, and an empty drawer row would say nothing at all.
+fn image_only_title(count: usize) -> String {
+    match count {
+        1 => "Image".to_string(),
+        other => format!("{other} images"),
+    }
+}
+
+/// The body of `send_prompt`, split out so the tests drive the real validation and
+/// the real wire line without a Tauri `State`.
+fn send_prompt_for(
+    store: &Store,
+    paths: &ImageCapabilityPaths<'_>,
+    runtime: &ProcessManager,
+    workspace_id: i64,
+    session_id: i64,
+    text: String,
+    images: Vec<PromptImage>,
+) -> Result<(), String> {
+    let images = image_input::validate_prompt_images(&images).map_err(display_err)?;
+    // S2: a turn needs something to say, and images are something. An image-only
+    // prompt is allowed ("image-only"); an empty turn is still refused.
+    if text.trim().is_empty() && images.is_empty() {
         return Err("prompt text is empty".to_string());
     }
-    ensure_session_in_workspace(&state.store, workspace_id, session_id)?;
+    ensure_session_in_workspace(store, workspace_id, session_id)?;
+
+    if !images.is_empty() {
+        let settings = settings::load(&settings_file(paths.config_dir)).map_err(display_err)?;
+        let supported = match live_model_accepts_images(runtime, &session_id.to_string()) {
+            Some(supported) => supported,
+            None => catalogue_model_accepts_images(
+                paths,
+                &settings.provider,
+                &settings.model,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "cannot confirm that model {}/{} accepts image input; pick a model that does",
+                    settings.provider, settings.model
+                )
+            })?,
+        };
+        if !supported {
+            return Err(format!(
+                "model {}/{} does not accept image input; switch models to send images",
+                settings.provider, settings.model
+            ));
+        }
+    }
 
     // The first prompt names the session: the drawer shows this alias instead of
     // a generic label, and the row keeps `title = None` until then. A failure
     // here must never block the prompt, so it is deliberately ignored.
-    if let Ok(Some(row)) = state.store.session_by_id(session_id)
+    if let Ok(Some(row)) = store.session_by_id(session_id)
         && row.title.is_none()
     {
-        let _ = state
-            .store
-            .set_session_title(session_id, &derive_session_title(&text));
+        let title = derive_session_title(&text);
+        let title = if title.is_empty() && !images.is_empty() {
+            image_only_title(images.len())
+        } else {
+            title
+        };
+        let _ = store.set_session_title(session_id, &title);
     }
 
     let mut fields = serde_json::Map::new();
     fields.insert("message".to_string(), serde_json::Value::String(text));
-    let response = state
-        .runtime
+    // The `images` key is absent for a text-only prompt, so that line is byte for
+    // byte the one this path sent before images existed.
+    if !images.is_empty() {
+        fields.insert(
+            "images".to_string(),
+            serde_json::Value::Array(image_input::wire_images(&images)),
+        );
+    }
+    let response = runtime
         .send(&session_id.to_string(), "prompt", fields)
         .map_err(display_err)?;
     if response.success {
         // A sent prompt is activity: the drawer sorts by `updated_at`, so the
         // session in use must climb to the top instead of sinking by creation.
-        let _ = state.store.touch_session(session_id);
+        let _ = store.touch_session(session_id);
         Ok(())
     } else {
         Err(response
@@ -3710,6 +3866,27 @@ while IFS= read -r line; do
 done
 "#;
 
+    /// A fake pi that answers the startup readiness probe and then reports its
+    /// own model on `get_state`, which is what the image-capability preflight
+    /// reads. `@INPUT@` is the model's `input` array as pi would send it, so one
+    /// script covers a vision model and a text-only one. Every other request is
+    /// accepted, and the model's prompt is recorded on stdin like any other.
+    const FAKE_IMAGE_PI: &str = r#"#!/bin/sh
+printf '%s\n' "$@" >> '@ARGS@'
+printf 'attempt\n' >> '@ATTEMPTS@'
+printf '%s\n' '{"type":"response","id":"__startup_probe__","command":"get_state","success":true,"data":{}}'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '@LINES@'
+  id=`printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'`
+  case "$line" in
+    *'"type":"get_state"'*)
+      printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"get_state\",\"success\":true,\"data\":{\"model\":{\"provider\":\"nan\",\"id\":\"vision\",\"name\":\"Vision\",\"input\":@INPUT@}}}" ;;
+    *)
+      printf '%s\n' "{\"type\":\"response\",\"id\":\"$id\",\"command\":\"prompt\",\"success\":true,\"data\":{\"disposition\":\"started\"}}" ;;
+  esac
+done
+"#;
+
     /// A fake pi for the on-demand command probe: it records that it started and
     /// its argv, creates the session file it was told to write (what pi itself
     /// does), answers the startup probe, and answers `get_commands` after
@@ -3819,12 +3996,37 @@ exit 1
 
         #[cfg(unix)]
         fn write_fake_pi(&self, name: &str) -> std::path::PathBuf {
-            use std::os::unix::fs::PermissionsExt;
             let path = self.path(name);
             let body = FAKE_SESSION_PI
                 .replace("@ARGS@", &path.with_extension("args").display().to_string())
                 .replace("@ATTEMPTS@", &self.path("attempts").display().to_string())
                 .replace("@LINES@", &path.with_extension("lines").display().to_string());
+            self.write_script(name, &body)
+        }
+
+        /// A fake pi that reports a model on `get_state`: `input` is the `input`
+        /// array pi sends, so `["text","image"]` and `["text"]` are the two
+        /// capability answers the preflight has to tell apart.
+        #[cfg(unix)]
+        fn write_image_pi(&self, name: &str, input: &str) -> std::path::PathBuf {
+            let path = self.path(name);
+            // The model's `input` array is inside a shell double-quoted string, so
+            // its own quotes are escaped before insertion.
+            let input = input.replace('"', "\\\"");
+            let body = FAKE_IMAGE_PI
+                .replace("@ARGS@", &path.with_extension("args").display().to_string())
+                .replace("@ATTEMPTS@", &self.path("attempts").display().to_string())
+                .replace("@LINES@", &path.with_extension("lines").display().to_string())
+                .replace("@INPUT@", &input);
+            self.write_script(name, &body)
+        }
+
+        /// Writes one executable stand-in script. Every fake pi goes through here,
+        /// so the permission that makes it runnable is set once.
+        #[cfg(unix)]
+        fn write_script(&self, name: &str, body: &str) -> std::path::PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.path(name);
             std::fs::write(&path, body).expect("write fake pi");
             let mut perms = std::fs::metadata(&path)
                 .expect("stat fake pi")
@@ -5921,5 +6123,327 @@ exit 1
         assert_eq!(transcript[0].text, "review the diff");
         assert_eq!(transcript[1].role, "assistant");
         assert_eq!(transcript[1].text, "nothing to fix");
+    }
+
+    // ── S1-S2 of `composer-image-input.md`: prompts that carry images ─────────
+
+    /// The paths the image preflight reads, rooted in the fixture's own home.
+    fn image_paths(
+        fixture: &SessionFixture,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let home = fixture.path("home");
+        (
+            fixture.config_dir(),
+            models_file(&home),
+            catalog_file(&home),
+            credentials_file(&home),
+        )
+    }
+
+    /// S2: the image-only turn reaches the child as pi's own `ImageContent`, and
+    /// the session it opens is titled from what it carried (there is no text to
+    /// derive a title from).
+    #[cfg(unix)]
+    #[test]
+    fn send_prompt_carries_the_images_pi_expects() {
+        let fixture = SessionFixture::new("prompt_images");
+        let script = fixture.write_image_pi("fake-pi.sh", r#"["text","image"]"#);
+        fixture.write_settings(&script);
+        let row = fixture.add_session("s1.jsonl", true, "");
+        let runtime = lifecycle_runtime();
+        let key = row.id.to_string();
+        block_on(open_session_core(
+            &fixture.store,
+            &runtime,
+            &fixture.config_dir(),
+            &registered_gate(),
+            &key,
+        ))
+        .expect("open session");
+
+        let (config_dir, models, catalog, credentials) = image_paths(&fixture);
+        let paths = ImageCapabilityPaths {
+            config_dir: &config_dir,
+            models: &models,
+            catalog: &catalog,
+            credentials: &credentials,
+        };
+        send_prompt_for(
+            &fixture.store,
+            &paths,
+            &runtime,
+            fixture.workspace_id,
+            row.id,
+            String::new(),
+            vec![PromptImage {
+                mime_type: "image/jpg".to_string(),
+                data: "Zm9v".to_string(),
+            }],
+        )
+        .expect("send the image-only prompt");
+
+        let sent = recorded_stdin(&fixture, "fake-pi.sh");
+        let request = sent
+            .iter()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+            .find(|value| value["type"] == "prompt")
+            .expect("the child must receive the prompt");
+        assert_eq!(request["message"], "", "an image-only turn has no text");
+        assert_eq!(
+            request["images"],
+            serde_json::json!([{"type": "image", "data": "Zm9v", "mimeType": "image/jpeg"}]),
+            "got: {request}"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .session_by_id(row.id)
+                .expect("session row")
+                .expect("row")
+                .title
+                .as_deref(),
+            Some("Image"),
+            "an image-only first prompt still names the session"
+        );
+
+        runtime.stop_all();
+    }
+
+    // S1-S2: a text-only prompt is the same protocol line this path sent before
+    // images existed — no empty `images` key, so nothing about it changed.
+    #[cfg(unix)]
+    #[test]
+    fn send_prompt_keeps_the_text_only_wire_line_unchanged() {
+        let fixture = SessionFixture::new("prompt_text_only");
+        let script = fixture.write_image_pi("fake-pi.sh", r#"["text","image"]"#);
+        fixture.write_settings(&script);
+        let row = fixture.add_session("s1.jsonl", true, "");
+        let runtime = lifecycle_runtime();
+        let key = row.id.to_string();
+        block_on(open_session_core(
+            &fixture.store,
+            &runtime,
+            &fixture.config_dir(),
+            &registered_gate(),
+            &key,
+        ))
+        .expect("open session");
+
+        let (config_dir, models, catalog, credentials) = image_paths(&fixture);
+        let paths = ImageCapabilityPaths {
+            config_dir: &config_dir,
+            models: &models,
+            catalog: &catalog,
+            credentials: &credentials,
+        };
+        send_prompt_for(
+            &fixture.store,
+            &paths,
+            &runtime,
+            fixture.workspace_id,
+            row.id,
+            "Fix the drawer".to_string(),
+            Vec::new(),
+        )
+        .expect("send the text prompt");
+
+        let sent = recorded_stdin(&fixture, "fake-pi.sh");
+        let request = sent
+            .iter()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+            .find(|value| value["type"] == "prompt")
+            .expect("the child must receive the prompt");
+        assert_eq!(request["message"], "Fix the drawer");
+        assert!(
+            request.get("images").is_none(),
+            "a text-only prompt carries no images key: {request}"
+        );
+
+        runtime.stop_all();
+    }
+
+    // S2: the live model is asked, and a model that declares text only is a
+    // refusal *before* the prompt leaves — no silent model switch, no dropped
+    // image. The session keeps its untitled row: nothing was sent.
+    #[cfg(unix)]
+    #[test]
+    fn send_prompt_refuses_images_for_a_text_only_model() {
+        let fixture = SessionFixture::new("prompt_images_refused");
+        let script = fixture.write_image_pi("fake-pi.sh", r#"["text"]"#);
+        fixture.write_settings(&script);
+        let row = fixture.add_session("s1.jsonl", true, "");
+        let runtime = lifecycle_runtime();
+        let key = row.id.to_string();
+        block_on(open_session_core(
+            &fixture.store,
+            &runtime,
+            &fixture.config_dir(),
+            &registered_gate(),
+            &key,
+        ))
+        .expect("open session");
+
+        let (config_dir, models, catalog, credentials) = image_paths(&fixture);
+        let paths = ImageCapabilityPaths {
+            config_dir: &config_dir,
+            models: &models,
+            catalog: &catalog,
+            credentials: &credentials,
+        };
+        let err = send_prompt_for(
+            &fixture.store,
+            &paths,
+            &runtime,
+            fixture.workspace_id,
+            row.id,
+            "look".to_string(),
+            vec![PromptImage {
+                mime_type: "image/png".to_string(),
+                data: "Zm9v".to_string(),
+            }],
+        )
+        .expect_err("a text-only model refuses the image");
+        assert!(
+            err.contains("does not accept image input"),
+            "the refusal explains the capability, not a protocol error: {err}"
+        );
+
+        let sent = recorded_stdin(&fixture, "fake-pi.sh");
+        assert!(
+            !sent.iter().any(|line| line.contains("\"type\":\"prompt\"")),
+            "nothing reached the child as a prompt: {sent:?}"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .session_by_id(row.id)
+                .expect("session row")
+                .expect("row")
+                .title,
+            None,
+            "a refused prompt does not title the session"
+        );
+
+        runtime.stop_all();
+    }
+
+    // S2: the bounds are validated before anything is sent or titled, and each
+    // rejection names its own reason. No session is needed: the validation comes
+    // first, which is what keeps a bad payload away from the child.
+    #[test]
+    fn send_prompt_rejects_an_empty_turn_and_malformed_images() {
+        let fixture = SessionFixture::new("prompt_images_bounds");
+        let (config_dir, models, catalog, credentials) = image_paths(&fixture);
+        let paths = ImageCapabilityPaths {
+            config_dir: &config_dir,
+            models: &models,
+            catalog: &catalog,
+            credentials: &credentials,
+        };
+        let runtime = lifecycle_runtime();
+        let key = "999";
+
+        let empty = send_prompt_for(
+            &fixture.store,
+            &paths,
+            &runtime,
+            fixture.workspace_id,
+            key.parse().expect("id"),
+            "   ".to_string(),
+            Vec::new(),
+        )
+        .expect_err("an empty turn is refused");
+        assert_eq!(empty, "prompt text is empty");
+
+        let too_many = vec![
+            PromptImage {
+                mime_type: "image/png".to_string(),
+                data: "Zm9v".to_string(),
+            };
+            image_input::MAX_PROMPT_IMAGES + 1
+        ];
+        let err = send_prompt_for(
+            &fixture.store,
+            &paths,
+            &runtime,
+            fixture.workspace_id,
+            key.parse().expect("id"),
+            "look".to_string(),
+            too_many,
+        )
+        .expect_err("too many images are refused");
+        assert!(err.contains("at most 4 images"), "{err}");
+
+        for (mime, data, expected) in [
+            ("text/plain", "Zm9v", "unsupported image format"),
+            ("image/png", "not base64!", "invalid image data"),
+            ("image/png", "", "invalid image data"),
+        ] {
+            let err = send_prompt_for(
+                &fixture.store,
+                &paths,
+                &runtime,
+                fixture.workspace_id,
+                key.parse().expect("id"),
+                "look".to_string(),
+                vec![PromptImage {
+                    mime_type: mime.to_string(),
+                    data: data.to_string(),
+                }],
+            )
+            .expect_err("a malformed image is refused");
+            assert!(err.contains(expected), "{mime:?}/{data:?}: {err}");
+        }
+    }
+
+    // S2: with no live child (or a pi that does not report its model), the answer
+    // comes from pi's own catalogue. A model the catalogue does not describe is
+    // not guessed: the caller refuses instead.
+    #[test]
+    fn image_capability_falls_back_to_pis_catalogue() {
+        let fixture = SessionFixture::new("image_catalogue");
+        let (config_dir, models, catalog, credentials) = image_paths(&fixture);
+        std::fs::create_dir_all(models.parent().expect("models parent"))
+            .expect("create pi agent dir");
+        std::fs::write(
+            &models,
+            r#"{"providers":{"nan":{"name":"NaN","baseUrl":"https://nan.test/v1","apiKey":"sk-nan","models":[{"id":"vision","name":"Vision","input":["text","image"]},{"id":"plain","name":"Plain","input":["text"]}]}}}"#,
+        )
+        .expect("write models.json");
+        settings::save(
+            &settings_file(&config_dir),
+            &Settings {
+                provider: "nan".to_string(),
+                model: "vision".to_string(),
+                ..Settings::default()
+            },
+        )
+        .expect("save settings");
+        let paths = ImageCapabilityPaths {
+            config_dir: &config_dir,
+            models: &models,
+            catalog: &catalog,
+            credentials: &credentials,
+        };
+
+        assert_eq!(
+            catalogue_model_accepts_images(&paths, "nan", "vision"),
+            Some(true)
+        );
+        assert_eq!(
+            catalogue_model_accepts_images(&paths, "nan", "plain"),
+            Some(false)
+        );
+        assert_eq!(
+            catalogue_model_accepts_images(&paths, "nan", "missing"),
+            None,
+            "a model the catalogue does not describe is not guessed"
+        );
+        assert_eq!(catalogue_model_accepts_images(&paths, "", "vision"), None);
     }
 }

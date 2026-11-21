@@ -441,6 +441,35 @@ export interface SessionModelInfo {
   name: string;
 }
 
+// ── composer image input (S1-S2 of `odd/tasks/composer-image-input.md`) ─────
+
+/**
+ * One image a prompt carries, exactly pi's `ImageContent`: the base64 payload and
+ * its media type, so the wire line has nothing to translate. Mirrors
+ * `PromptImage` in `src-tauri/src/image_input.rs`.
+ */
+export interface PromptImage {
+  /** One of `image/png`, `image/jpeg`, `image/gif`, `image/webp`. */
+  mimeType: string;
+  /** Base64-encoded image data; never a data-url prefix. */
+  data: string;
+}
+
+/**
+ * One image file Rust read for the composer, after it sniffed the real format.
+ * The mime type comes from the bytes, not from the file extension, so the
+ * preview and the wire payload agree with what pi will receive. Mirrors
+ * `ImageAttachment` in `src-tauri/src/image_input.rs`.
+ */
+export interface ImageAttachment {
+  /** File name, shown as the preview's label. */
+  name: string;
+  mimeType: string;
+  data: string;
+  /** Decoded size in bytes, checked against the same ceiling as the payload. */
+  byteLength: number;
+}
+
 // ── pi CLI bridge (S1-S4 of `odd/tasks/pi-cli-bridge.md`) ────────────────────
 
 /**

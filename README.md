@@ -105,11 +105,14 @@ everything.
 
 ```bash
 pnpm run build                        # frontend gate: vue-tsc --noEmit + vite build
+node --test tests/                    # Node tests for the pure modules and composables
 cd src-tauri && cargo test            # Rust tests
 cd src-tauri && cargo clippy          # Rust lint
 ```
 
-There is no frontend test runner; UI behaviour is verified by hand.
+Vue components are still checked by hand (`pnpm tauri dev`): the Node suite covers
+the pure modules, and the window-level states — a pasted screenshot, a dropped
+file, a removable preview — are exercised there.
 
 ### Rust build cache and dev diagnostics
 
@@ -144,7 +147,8 @@ confusion.
 
 ## What to try, and what will bite you
 
-Worth exercising: delegate to a subagent and watch its session appear nested under the
+Worth exercising: paste a screenshot into the composer (or drop one on it) and ask a
+question about it; delegate to a subagent and watch its session appear nested under the
 chat that started it; open that child and watch it work, read-only; stop the parent and
 see the children die with it; ask the agent to drive the embedded browser pane.
 

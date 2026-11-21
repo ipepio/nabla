@@ -25,6 +25,13 @@ import SubagentView from "@/components/chat/SubagentView.vue";
 import TurnGroup from "@/components/chat/TurnGroup.vue";
 import OlderTurnsControl from "@/components/chat/OlderTurnsControl.vue";
 import { deriveTurnGroups } from "@/components/chat/turn-groups";
+import {
+  COMPOSER_IMAGE_LIMIT,
+  COMPOSER_IMAGE_MAX_BYTES,
+  parseImageDataUrl,
+  type ImageCandidate,
+  type ImageRejection,
+} from "@/components/chat/composer-images";
 import { draftKeyFor, usePromptDraft } from "@/components/chat/use-prompt-draft";
 import { useThrottledText } from "@/components/chat/use-throttled-text";
 import { createTranscriptFollow } from "@/components/chat/transcript-follow";
@@ -37,6 +44,8 @@ import {
   commandErrorMessage,
   debugLog,
   getSettings,
+  pickImageFiles,
+  readImageAttachment,
   saveSettings,
   sessionStatus,
   setSessionModel,
@@ -51,6 +60,14 @@ import type {
 } from "@/contracts/types";
 import { useAppearance } from "@/lib/appearance";
 import { takeBootSettings } from "@/lib/boot-settings";
+import {
+  addAttachments,
+  attachmentsFor,
+  attachmentsToPromptImages,
+  clearAttachments,
+  moveAttachments,
+  removeAttachment,
+} from "@/lib/composer-attachments";
 import { t } from "@/lib/i18n";
 import {
   COMPOSER_MAX_WIDTH,
@@ -123,6 +140,12 @@ const sending = ref(false);
  * while a send is in flight.
  */
 const inFlightPrompt = ref<string | null>(null);
+/**
+ * How many images that in-flight send carries. The text alone cannot tell a new
+ * prompt from the one already on its way when the turn is image-only (both have
+ * empty text), so ownership is the pair.
+ */
+const inFlightImages = ref(0);
 /** Same latch for the "there is no session yet" half of the first send. */
 const starting = ref(false);
 const stopping = ref(false);
@@ -168,6 +191,111 @@ const draftKey = computed<string | null>(() =>
  */
 const draft = usePromptDraft(() => draftKey.value);
 const prompt = draft.text;
+
+/**
+ * S1-S2 of `odd/tasks/composer-image-input.md`: the images attached to the draft on
+ * screen. They belong to the same key the text is persisted under, so switching
+ * conversations switches them too (`src/lib/composer-attachments.ts`), and they
+ * live in memory only — no base64 ever reaches localStorage, a log line or SQLite.
+ */
+const images = computed(() => [...attachmentsFor(draftKey.value)]);
+
+/**
+ * Why an image was not attached, as the human reads it. `composer-images.ts`
+ * owns the bounds; this only turns a rejection into words.
+ */
+function rejectionMessage(rejection: ImageRejection): string {
+  switch (rejection) {
+    case "too-many":
+      return t("chat.composer.imageTooMany", { count: COMPOSER_IMAGE_LIMIT });
+    case "too-large":
+      return t("chat.composer.imageTooLarge", {
+        limit: Math.round(COMPOSER_IMAGE_MAX_BYTES / (1024 * 1024)),
+      });
+    default:
+      return t("chat.composer.imageUnsupportedType");
+  }
+}
+
+/** Adds accepted candidates to the draft and reports the first rejection. */
+function attachCandidates(candidates: ImageCandidate[]): void {
+  const key = draftKey.value;
+  if (key === null || candidates.length === 0) return;
+  const { added, rejection } = addAttachments(key, candidates);
+  debugLog(
+    `composer images: +${added}${rejection === null ? "" : ` (${rejection}, ${candidates.length} offered)`}`,
+  );
+  if (rejection !== null) panelError.value = rejectionMessage(rejection);
+}
+
+/**
+ * Reads the files Rust was asked for and attaches them. Rust sniffs the format from
+ * the bytes and enforces the size ceiling, so one unreadable or oversized file
+ * reports its own reason without discarding the others.
+ */
+async function addImagePaths(paths: string[]): Promise<void> {
+  if (paths.length === 0) return;
+  const candidates: ImageCandidate[] = [];
+  for (const path of paths) {
+    try {
+      const file = await readImageAttachment(path);
+      candidates.push({
+        name: file.name,
+        mimeType: file.mimeType,
+        data: file.data,
+      });
+    } catch (cause) {
+      panelError.value = commandErrorMessage(cause);
+    }
+  }
+  attachCandidates(candidates);
+}
+
+/** S1: the `+` button — the system picker, filtered to pi's inline formats. */
+async function handlePickImages(): Promise<void> {
+  panelError.value = null;
+  try {
+    await addImagePaths(await pickImageFiles());
+  } catch (cause) {
+    panelError.value = commandErrorMessage(cause);
+  }
+}
+
+/** Reads one pasted `Blob` as the data url `parseImageDataUrl` expects. */
+function readFileAsDataUrl(file: Blob): Promise<string | null> {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onerror = () => resolve(null);
+    reader.onload = () =>
+      resolve(typeof reader.result === "string" ? reader.result : null);
+    reader.readAsDataURL(file);
+  });
+}
+
+/** S1: a screenshot pasted into the composer (text pastes keep their path). */
+async function handlePasteImages(files: File[]): Promise<void> {
+  const candidates: ImageCandidate[] = [];
+  for (const file of files) {
+    const url = await readFileAsDataUrl(file);
+    const image = url === null ? null : parseImageDataUrl(url);
+    if (image === null) {
+      panelError.value = t("chat.composer.imageUnsupportedType");
+      continue;
+    }
+    candidates.push({ name: file.name, mimeType: image.mimeType, data: image.data });
+  }
+  attachCandidates(candidates);
+}
+
+/** S1: files dropped on the composer, read through the same path as the picker. */
+function handleDropFiles(paths: string[]): void {
+  void addImagePaths(paths);
+}
+
+/** S1: the preview's own undo — the image simply was not sent. */
+function handleRemoveImage(id: string): void {
+  removeAttachment(draftKey.value, id);
+}
 
 /**
  * The buffer of the session on screen. Everything below — transcript, streaming
@@ -402,6 +530,35 @@ const enabledModelCount = computed(() =>
   ),
 );
 
+/**
+ * S2 of `odd/tasks/composer-image-input.md`: the input modalities of the model the
+ * composer names, as pi's own catalogue reports them for the persisted pair.
+ * `null` while the catalogue does not answer, which is not evidence either way.
+ */
+const selectedModelModalities = computed<string[] | null>(() => {
+  const provider = providerModels.value.find(
+    (entry) => entry.provider === providerId.value,
+  );
+  const model = provider?.models.find((entry) => entry.id === modelId.value);
+  return model?.modalities ?? null;
+});
+
+/**
+ * S2: the images cannot be sent as things stand, and the reason is explained
+ * before anything leaves. Never a model switch: the human chooses the model, and
+ * this panel only refuses to pretend.
+ *
+ * `null` modalities means the catalogue has not answered yet; the authoritative
+ * check is Rust's (the live model's own `input` list), and this notice would
+ * otherwise flash on every mount.
+ */
+const imageInputUnsupported = computed(
+  () =>
+    images.value.length > 0 &&
+    selectedModelModalities.value !== null &&
+    !selectedModelModalities.value.includes("image"),
+);
+
 // S2/S4 of `theme-modes-and-resizable-drawer.md`: the appearance state lives in
 // one module so the sidebar, the empty state and this panel all agree on the
 // mode (the logo variant follows it); `src/lib/theme.ts` stays the only module
@@ -454,7 +611,11 @@ const agentWorking = computed(
  * the turn is over.
  */
 const canSend = computed(
-  () => props.workspace !== null && prompt.value.trim() !== "" && !agentWorking.value,
+  () =>
+    props.workspace !== null &&
+    (prompt.value.trim() !== "" || images.value.length > 0) &&
+    !imageInputUnsupported.value &&
+    !agentWorking.value,
 );
 
 /**
@@ -467,7 +628,8 @@ const canSend = computed(
 const submittingSamePrompt = computed(
   () =>
     inFlightPrompt.value !== null &&
-    prompt.value.trim() === inFlightPrompt.value,
+    prompt.value.trim() === inFlightPrompt.value &&
+    images.value.length === inFlightImages.value,
 );
 
 /**
@@ -489,7 +651,8 @@ const canQueue = computed(
     !submittingSamePrompt.value &&
     currentSession.value !== null &&
     props.workspace !== null &&
-    prompt.value.trim() !== "",
+    (prompt.value.trim() !== "" || images.value.length > 0) &&
+    !imageInputUnsupported.value,
 );
 
 /** Prompts of the session on screen that are waiting for a turn to end (S3). */
@@ -973,7 +1136,14 @@ async function handleSend() {
     return;
   }
   const text = prompt.value.trim();
-  if (text === "") return;
+  // S1-S2: the images of this draft travel with the text, and an image-only turn
+  // is a turn. The wire copy is taken now, before a send can clear the draft.
+  const attached = attachmentsToPromptImages(draftKey.value);
+  if (text === "" && attached.length === 0) return;
+  if (imageInputUnsupported.value) {
+    debugLog("chat send: images attached but the named model takes none");
+    return;
+  }
   // The key the text was typed under, before a send can create its session.
   const originKey = draftKey.value;
   // S3: with the queue preference on, a prompt typed while the agent works is
@@ -992,25 +1162,44 @@ async function handleSend() {
   // From here until pi accepts it, this text belongs to the send: a submit of the
   // SAME text must not queue it a second time, and a different one may.
   inFlightPrompt.value = text;
+  inFlightImages.value = attached.length;
   panelError.value = null;
   try {
     const current = await ensureSession();
     if (current === null) return;
+    // The session exists now, so the draft (and its images) live under its key.
+    // Moving them keeps the previews on screen while the send is in flight and
+    // keeps a rejected send's images with the text that is still in the composer.
+    moveAttachments(originKey, draftKey.value);
     if (isSessionSpawning(current.sessionId)) {
-      enqueuePrompt(current.sessionId, text, current.workspaceId);
-      draft.clear(originKey);
+      enqueuePrompt(current.sessionId, text, current.workspaceId, attached);
+      forgetSentDraft(originKey);
       return;
     }
-    await sendUserTurn(current.sessionId, current.workspaceId, text);
-    draft.clear(originKey);
+    await sendUserTurn(current.sessionId, current.workspaceId, text, attached);
+    forgetSentDraft(originKey);
   } catch (cause) {
-    // The composer keeps the text: a prompt that never left is still the
-    // human's to resend.
+    // The composer keeps the text and the images: a prompt that never left is
+    // still the human's to resend.
     panelError.value = commandErrorMessage(cause);
   } finally {
     sending.value = false;
     inFlightPrompt.value = null;
+    inFlightImages.value = 0;
   }
+}
+
+/**
+ * Forgets a draft that is no longer unsent (sent or queued), including its
+ * pending images. The extra key covers the first send of a workspace: its session
+ * was created during the send, so the text and the images were typed under the
+ * workspace key and now live under the session's.
+ */
+function forgetSentDraft(originKey: string | null): void {
+  const sessionKey = draftKey.value;
+  draft.clear(originKey);
+  clearAttachments(originKey);
+  clearAttachments(sessionKey);
 }
 
 /**
@@ -1026,6 +1215,7 @@ async function handleSend() {
 function handleQueue() {
   const current = currentSession.value;
   const text = prompt.value.trim();
+  const attached = attachmentsToPromptImages(draftKey.value);
   // Ownership, not the latch (see `canQueue`): the text of the send that is in
   // flight is already on its way and must not also enter the queue; a prompt
   // typed after that click is somebody else's text and is queued now.
@@ -1033,18 +1223,24 @@ function handleQueue() {
     debugLog("chat queue: ignored, this text belongs to the in-flight send");
     return;
   }
-  if (current === null || text === "" || !queueMessages.value) {
+  if (
+    current === null ||
+    (text === "" && attached.length === 0) ||
+    !queueMessages.value ||
+    imageInputUnsupported.value
+  ) {
     debugLog(
-      `chat queue: nothing to queue (session=${current !== null} text=${text !== ""} pref=${queueMessages.value})`,
+      `chat queue: nothing to queue (session=${current !== null} text=${text !== ""} images=${attached.length} pref=${queueMessages.value})`,
     );
     return;
   }
   // The panel knows the workspace of the session it renders, so the queued
   // prompt is addressable the moment the turn ends — even if the human has
   // moved to another workspace by then.
-  enqueuePrompt(current.sessionId, text, current.workspaceId);
+  enqueuePrompt(current.sessionId, text, current.workspaceId, attached);
   // P2: a queued prompt is not unsent either, so the session's draft goes too.
   draft.clear();
+  clearAttachments(draftKey.value);
   debugLog(
     `chat queue: enqueued, ${queuedCount(current.sessionId)} waiting in this session`,
   );
@@ -1346,10 +1542,16 @@ onUnmounted(() => {
             :queued-count="queuedForSession"
             :model-disabled="savingModel || enabledModelCount === 0"
             :can-stop="currentSession !== null && !stopping"
+            :images="images"
+            :image-input-unsupported="imageInputUnsupported"
             @select-model="handleSelectModel"
             @send="handleSend"
             @queue="handleQueue"
             @stop="handleStop"
+            @pick-images="handlePickImages"
+            @remove-image="handleRemoveImage"
+            @paste-images="handlePasteImages"
+            @drop-files="handleDropFiles"
           />
         </div>
       </template>
@@ -1563,10 +1765,16 @@ onUnmounted(() => {
           :queued-count="queuedForSession"
           :model-disabled="savingModel || enabledModelCount === 0"
           :can-stop="currentSession !== null && !stopping"
+          :images="images"
+          :image-input-unsupported="imageInputUnsupported"
           @select-model="handleSelectModel"
           @send="handleSend"
           @queue="handleQueue"
           @stop="handleStop"
+          @pick-images="handlePickImages"
+          @remove-image="handleRemoveImage"
+          @paste-images="handlePasteImages"
+          @drop-files="handleDropFiles"
         />
         <p class="mt-2 text-center text-xs text-muted-foreground">
           {{ t("chat.turnsAndSteps", { turns, steps }) }}

@@ -146,6 +146,30 @@ that make it safe to have a live auth window sitting next to the agent's page ar
   popup tab's close button is the end of its life — stated in [browser-popups.md](browser-popups.md) and
   in the component's own notes, instead of pretending the tab ends itself.
 
+## Composer images — three seams
+
+Attaching, previewing and sending an image (`odd/tasks/composer-image-input.md`, S1-S2) is split the
+same way, so no layer guesses at another's rule:
+
+| Layer | Owns | Contract |
+| --- | --- | --- |
+| `src/components/chat/composer-images.ts` | What the composer accepts | The four formats pi sends inline (`image/png`, `image/jpeg`, `image/gif`, `image/webp`); `COMPOSER_IMAGE_LIMIT` images per turn and `COMPOSER_IMAGE_MAX_BYTES` per image; base64 shape and decoded size; *a clipboard with text pastes its text*, only an image-only clipboard becomes attachments; the label a transcript keeps (never the payload). Pinned by `tests/composer-images.test.ts`. |
+| `src/lib/composer-attachments.ts` | Where a pending image belongs | One list per draft key (`nabla.draft.<sessionId>` or `nabla.draft.new.<workspaceId>`), in memory only: switching conversations switches images, a rejected send keeps them with the text (`moveAttachments` covers the key the first send creates), and nothing ever writes base64 to `localStorage`, a log line or SQLite. |
+| `src-tauri/src/image_input.rs` | What a file and a prompt may carry | The format is sniffed from the bytes, never the extension; the metadata size is checked before the file is read; at most `MAX_PROMPT_IMAGES` per prompt and `MAX_IMAGE_BYTES` per image; the payload leaves as pi's own `ImageContent` (`type: "image"`, `data`, `mimeType`). `send_prompt` runs the same bounds again, so the webview is never the authority. |
+
+`Composer.vue` only wires the entry points: the `+` button asks the system picker (through
+`src/contracts/`), a paste is filtered by the clipboard rule, and a desktop drop arrives from the
+window because Tauri hands the OS paths there, not to the DOM (`onFileDrop`, positioned against the
+card's rectangle). `ChatPanel.vue` turns every candidate into a pending attachment and sends or queues
+the whole turn (text plus images, or images alone) through the same `sendUserTurn` / `enqueuePrompt`
+path a text prompt uses.
+
+**The capability preflight is two-layered on purpose.** The composer shows the notice as soon as the
+named model's catalogue entry lacks `image` in its `input` list, and Rust refuses before writing to the
+child when the *live* model's own `get_state` says the same (falling back to the catalogue when pi
+reports no model). Nothing switches models automatically: the human picks, and a refused turn keeps
+the draft.
+
 ## Long conversations — three seams
 
 A conversation that has run for hours is a long list of turns, a growing answer and a scroll column that

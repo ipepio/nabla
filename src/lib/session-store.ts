@@ -29,12 +29,15 @@ import {
 import type { AgentEvent, RuntimeStatus, StopReason } from "../contracts/agent-events";
 import type {
   PreviewMessage,
+  PromptImage,
   SessionDto,
   SessionSummary,
   TranscriptMessage,
   TranscriptRole,
   UiAnswer,
 } from "../contracts/types";
+import { appendImageLabel } from "../components/chat/composer-images";
+import { t } from "./i18n";
 import { queueMessages } from "./preferences";
 import {
   forgetSavedPreview,
@@ -194,6 +197,12 @@ export interface QueuedPrompt {
   id: string;
   /** What pi will receive when the queue drains. */
   text: string;
+  /**
+   * S1-S2 of `odd/tasks/composer-image-input.md`: the images that travel with this
+   * prompt, already pi's `ImageContent`. Held in memory with the queue — a queued
+   * screenshot is not persisted anywhere, exactly like an attached one.
+   */
+  images: PromptImage[];
   /**
    * The prompt was typed before its pi process existed (`spawning`), so it waits
    * for the process, not for a turn. It is the one entry a drain may send with
@@ -697,6 +706,17 @@ function dropTranscriptMessage(buffer: SessionBuffer, id: string): void {
 }
 
 /**
+ * What a transcript entry (or a queued row) says for a prompt that carries
+ * images: the typed text, with the image count under it, or the count alone for
+ * an image-only turn. The payload never enters the transcript: what is kept is
+ * the label, and the images themselves live only in memory.
+ */
+function promptDisplayText(text: string, imageCount: number): string {
+  if (imageCount === 0) return text;
+  return appendImageLabel(text, t("chat.message.images", { count: imageCount }));
+}
+
+/**
  * Clears the pending mark of a prompt that really went out. This is the whole of
  * the "it was sent" bookkeeping: the message is already in the transcript, in the
  * position the human typed it, so sending it must never add another one.
@@ -722,7 +742,7 @@ function settleQueuedMessage(
   buffer.transcript.push({
     id: entry.id,
     role: "user",
-    text: entry.text,
+    text: promptDisplayText(entry.text, entry.images.length),
     at: new Date().toISOString(),
   });
 }
@@ -762,9 +782,11 @@ export function enqueuePrompt(
   sessionId: string,
   text: string,
   workspaceId: number | null = null,
+  images: PromptImage[] = [],
 ): void {
   const prompt = text.trim();
-  if (prompt === "") return;
+  // S2 of `composer-image-input.md`: an image-only prompt is a prompt.
+  if (prompt === "" && images.length === 0) return;
   const buffer = ensureBuffer(sessionId, workspaceId);
   // Queueing does not enter the conversation: the prompt lives in the queue
   // strip above the composer until it is actually handed to pi, which is the
@@ -772,14 +794,17 @@ export function enqueuePrompt(
   buffer.queue.push({
     id: nextMessageId(sessionId),
     text: prompt,
+    // A copy of the payload: the composer's draft is cleared as soon as the
+    // prompt is queued, and the queue is what keeps its images.
+    images: [...images],
     // Why it waits decides what may drain it: a session that is still spawning
     // has no stdin yet, which is not something the preference can switch off.
     awaitingProcess: buffer.status === "spawning",
   });
-  // Debug-only, structure only (no prompt text): the queue is the half of S3 that
-  // has no UI of its own until it drains.
+  // Debug-only, structure only (no prompt text, no payload): the queue is the
+  // half of S3 that has no UI of its own until it drains.
   debugLog(
-    `store queue: +1 (${buffer.queue.length} waiting, awaitingProcess=${buffer.status === "spawning"}, status=${buffer.status ?? "none"})`,
+    `store queue: +1 (${buffer.queue.length} waiting, images=${images.length}, awaitingProcess=${buffer.status === "spawning"}, status=${buffer.status ?? "none"})`,
   );
 }
 
@@ -813,7 +838,9 @@ export function isSessionSpawning(sessionId: string | null): boolean {
 export function queuedPrompts(sessionId: string | null): string[] {
   const buffer = sessionBuffer(sessionId);
   if (buffer === null) return [];
-  return buffer.queue.map((entry) => entry.text);
+  return buffer.queue.map((entry) =>
+    promptDisplayText(entry.text, entry.images.length),
+  );
 }
 
 /**
@@ -1051,7 +1078,12 @@ async function sendQueuedTurn(
 ): Promise<void> {
   buffer.busy = true;
   try {
-    await sendPrompt(workspaceId, Number(sessionId), entry.text);
+    await sendPrompt(
+      workspaceId,
+      Number(sessionId),
+      entry.text,
+      entry.images,
+    );
   } catch (cause) {
     buffer.busy = false;
     buffer.queue.unshift(entry);
@@ -1657,9 +1689,11 @@ export async function sendUserTurn(
   sessionId: string,
   workspaceId: number,
   text: string,
+  images: PromptImage[] = [],
 ): Promise<void> {
   const prompt = text.trim();
-  if (prompt === "") return;
+  // S2 of `composer-image-input.md`: an image-only prompt is a prompt.
+  if (prompt === "" && images.length === 0) return;
   const buffer = ensureBuffer(sessionId, workspaceId);
   // A session the runtime no longer hosts — stopped, crashed, or its child
   // gone — has no stdin to receive this prompt: sending would only fail and
@@ -1673,14 +1707,14 @@ export async function sendUserTurn(
     const opened = await openSession(sessionId);
     markLive(sessionId, opened.status);
     if (opened.status === "spawning") {
-      enqueuePrompt(sessionId, prompt, workspaceId);
+      enqueuePrompt(sessionId, prompt, workspaceId, images);
       return;
     }
   }
-  const id = pushUserTurn(sessionId, buffer, prompt);
+  const id = pushUserTurn(sessionId, buffer, promptDisplayText(prompt, images.length));
   buffer.busy = true;
   try {
-    await sendPrompt(workspaceId, Number(sessionId), prompt);
+    await sendPrompt(workspaceId, Number(sessionId), prompt, images);
   } catch (cause) {
     buffer.busy = false;
     dropTranscriptMessage(buffer, id);

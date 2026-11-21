@@ -1,6 +1,6 @@
 <script setup lang="ts">
-// Composer card (spec S2): auto-growing prompt, inert "+" and scope chip, the
-// provider → model picker and the circular send/stop control.
+// Composer card (spec S2): auto-growing prompt, the image button, the scope chip,
+// the provider → model picker and the circular send/stop control.
 //
 // Presentation only: every action is emitted, so ChatPanel keeps the single
 // `sendPrompt` / `stopSession` path and this card never touches the contracts
@@ -11,13 +11,20 @@
 // themselves live in `composer-completion.ts` (what is a trigger, what a pick
 // inserts) and in the two small components this card renders, so the wiring here
 // is only "what did the textarea just ask for, and what does that pick mean".
-import { computed, nextTick, onMounted, ref, watch } from "vue";
+//
+// S1-S2 of `odd/tasks/composer-image-input.md`: the `+` button, a screenshot
+// paste and a desktop drop all ask the panel to attach an image; the previews and
+// their remove controls are drawn here, from the list the panel owns. What counts
+// as an image, how many fit and what a clipboard paste means are rules of
+// `composer-images.ts`, never restated in this template.
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   ArrowUpIcon,
   CheckIcon,
   ChevronDownIcon,
   PlusIcon,
   SquareIcon,
+  XIcon,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import {
@@ -49,6 +56,12 @@ import {
 } from "@/components/chat/composer-completion";
 import ComposerEffort from "@/components/chat/ComposerEffort.vue";
 import ComposerSuggestions from "@/components/chat/ComposerSuggestions.vue";
+import {
+  isInsideDropTarget,
+  shouldAttachFromClipboard,
+  type ComposerImage,
+} from "@/components/chat/composer-images";
+import { onFileDrop } from "@/contracts/window";
 import { activeSession } from "@/lib/session-store";
 import PermissionModeChip from "@/components/chat/PermissionModeChip.vue";
 
@@ -125,6 +138,18 @@ const props = withDefaults(
      * is always `COMPOSER_MIN_WIDTH`, because it is the chat section's minimum.
      */
     maxWidth?: number;
+    /**
+     * S1-S2 of `odd/tasks/composer-image-input.md`: the images of the draft on
+     * screen, oldest first. The panel owns them (they belong to the draft key, see
+     * `src/lib/composer-attachments.ts`); the card paints and removes them.
+     */
+    images: ComposerImage[];
+    /**
+     * S2: the active model reports no image input, so this turn would be refused
+     * before it left. The notice explains it and submit stays inert — never a
+     * silent model switch, which is what this flag exists to prevent.
+     */
+    imageInputUnsupported: boolean;
   }>(),
   { maxWidth: COMPOSER_MAX_WIDTH },
 );
@@ -135,6 +160,10 @@ const emit = defineEmits<{
   (e: "send"): void;
   (e: "queue"): void;
   (e: "stop"): void;
+  (e: "pickImages"): void;
+  (e: "removeImage", id: string): void;
+  (e: "pasteImages", files: File[]): void;
+  (e: "dropFiles", paths: string[]): void;
 }>();
 
 /**
@@ -158,7 +187,10 @@ const queueing = computed(() => props.streaming && props.canQueue);
  */
 const canSubmit = computed(() => {
   if (props.disabled) return false;
-  if (props.modelValue.trim() === "") return false;
+  // S2 of `composer-image-input.md`: an image-only turn is a turn. The typed text
+  // is not the only thing that can make a prompt worth sending.
+  if (props.modelValue.trim() === "" && props.images.length === 0) return false;
+  if (props.imageInputUnsupported) return false;
   return props.streaming ? props.canQueue : props.canSend;
 });
 
@@ -174,17 +206,88 @@ const canSubmit = computed(() => {
 function submit(): void {
   if (!canSubmit.value) {
     debugLog(
-      `composer submit: nothing to do (text=${props.modelValue.trim() !== ""} streaming=${props.streaming} canQueue=${props.canQueue} canSend=${props.canSend} disabled=${props.disabled})`,
+      `composer submit: nothing to do (text=${props.modelValue.trim() !== ""} images=${props.images.length} streaming=${props.streaming} canQueue=${props.canQueue} canSend=${props.canSend} disabled=${props.disabled})`,
     );
     return;
   }
   // The draft is leaving the composer: a list built from it has nothing left to
   // complete.
   closeCompletion();
-  debugLog(`composer submit: ${props.streaming ? "queue" : "send"}`);
+  debugLog(
+    `composer submit: ${props.streaming ? "queue" : "send"} (images=${props.images.length})`,
+  );
   if (props.streaming) emit("queue");
   else emit("send");
 }
+
+// ── image input (S1-S2 of `composer-image-input.md`) ───────────────────────
+
+/** The card, so a native drop can be told whether it landed on the composer. */
+const card = ref<HTMLElement | null>(null);
+
+/**
+ * S1: a screenshot paste. `shouldAttachFromClipboard` owns the rule, which is what
+ * keeps pasting text untouched: only an image-only clipboard is an attachment,
+ * and only then is the browser's own paste cancelled.
+ */
+function handlePaste(event: ClipboardEvent): void {
+  if (props.disabled) return;
+  const data = event.clipboardData;
+  if (data === null) return;
+  if (!shouldAttachFromClipboard({ items: data.items, text: data.getData("text/plain") })) {
+    return;
+  }
+  const files: File[] = [];
+  for (const item of data.items) {
+    if (item.kind !== "file") continue;
+    const file = item.getAsFile();
+    if (file !== null) files.push(file);
+  }
+  if (files.length === 0) return;
+  event.preventDefault();
+  emit("pasteImages", files);
+}
+
+/**
+ * S1: a desktop drop. On Tauri the OS delivers the paths and the position to the
+ * window instead of the DOM, so the subscription is window-wide and this decides
+ * whether it landed here (`isInsideDropTarget`, physical pixels against the
+ * card's CSS rectangle).
+ */
+let stopDropListener: (() => void) | null = null;
+/** Set when the card goes away while the subscription is still being installed. */
+let dropListenerDisposed = false;
+
+onMounted(async () => {
+  const stop = await onFileDrop((event) => {
+    if (props.disabled || event.paths.length === 0) return;
+    const element = card.value;
+    if (element === null) return;
+    if (
+      event.position !== null &&
+      !isInsideDropTarget(
+        event.position,
+        element.getBoundingClientRect(),
+        window.devicePixelRatio,
+      )
+    ) {
+      return;
+    }
+    emit("dropFiles", event.paths);
+  });
+  // A card that unmounted while the subscription was resolving keeps nothing.
+  if (dropListenerDisposed) {
+    stop();
+    return;
+  }
+  stopDropListener = stop;
+});
+
+onUnmounted(() => {
+  dropListenerDisposed = true;
+  stopDropListener?.();
+  stopDropListener = null;
+});
 
 // ── autocompletes (/ commands, @ workspace paths) ──────────────────────────
 //
@@ -704,6 +807,7 @@ watch(() => props.workspaceId, prewarmCommands);
   <!-- `relative` is the anchor of the autocomplete list: it opens ABOVE the card
        and out of the layout flow, so typing `/` or `@` never moves the text. -->
   <div
+    ref="card"
     class="relative mx-auto w-full min-w-0 rounded-2xl border border-border bg-card/60 shadow-sm"
     :style="{ maxWidth: `${maxWidth}px`, minWidth: `${COMPOSER_MIN_WIDTH}px` }"
   >
@@ -718,6 +822,47 @@ watch(() => props.workspaceId, prewarmCommands);
       @highlight="activeIndex = $event"
     />
 
+    <!-- S1-S2: the images of this draft, before the text they travel with. The
+         preview is the same base64 the model will receive, so nothing extra is
+         stored; removing one only forgets it, which is the undo the human asked
+         for. -->
+    <div
+      v-if="images.length > 0"
+      class="flex flex-wrap items-start gap-1.5 px-3 pt-2"
+      :aria-label="t('chat.composer.attachedImages')"
+    >
+      <div
+        v-for="image in images"
+        :key="image.id"
+        class="relative size-14 overflow-hidden rounded-md border border-border"
+      >
+        <img
+          :src="`data:${image.mimeType};base64,${image.data}`"
+          :alt="image.name"
+          class="size-full object-cover"
+        />
+        <button
+          type="button"
+          class="absolute top-0.5 right-0.5 rounded-full bg-background/80 p-0.5 text-foreground shadow-sm hover:bg-background"
+          :aria-label="t('chat.composer.removeImage', { name: image.name })"
+          @click="emit('removeImage', image.id)"
+        >
+          <XIcon class="size-3" />
+        </button>
+      </div>
+    </div>
+
+    <!-- S2: the explanation that replaces a silent model switch. It is a notice,
+         not a dialog: the images and the text stay exactly where the human left
+         them. -->
+    <p
+      v-if="imageInputUnsupported"
+      class="px-3.5 pt-1.5 text-xs text-warning"
+      role="status"
+    >
+      {{ t("chat.composer.imageUnsupported") }}
+    </p>
+
     <Textarea
       :model-value="modelValue"
       :aria-label="t('chat.composer.prompt')"
@@ -728,15 +873,17 @@ watch(() => props.workspaceId, prewarmCommands);
       @input="handleInput"
       @keydown="onKeydown"
       @click="handleInput"
+      @paste="handlePaste"
     />
 
     <div class="flex min-w-0 items-center gap-1 px-2 pb-2">
-      <!-- Seam: attaching files/context is not wired yet. -->
+      <!-- S1: attaching an image (a file, a screenshot via paste, or a drop). -->
       <Button
         variant="ghost"
         size="icon-sm"
-        :aria-label="t('chat.composer.addContext')"
+        :aria-label="t('chat.composer.addImage')"
         :disabled="disabled"
+        @click="emit('pickImages')"
       >
         <PlusIcon />
       </Button>

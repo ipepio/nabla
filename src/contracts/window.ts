@@ -9,6 +9,7 @@
  * composer and the tools panel use.
  */
 import { LogicalSize } from "@tauri-apps/api/dpi";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 /**
@@ -24,5 +25,41 @@ export async function applyWindowMinimums(
   } catch {
     // Browser dev server, missing capability, or a platform that ignores it:
     // the static values in `tauri.conf.json` remain the fallback.
+  }
+}
+
+/** One native drop: the OS paths it carried and where it happened. */
+export interface FileDropEvent {
+  /** Absolute paths of the dropped files. */
+  paths: string[];
+  /** Drop point in physical pixels, when the platform reports one. */
+  position: { x: number; y: number } | null;
+}
+
+/**
+ * S1 of `odd/tasks/composer-image-input.md`: a desktop file drop.
+ *
+ * On macOS (and on every Tauri window with drag-drop enabled) the OS hands the
+ * paths to the window, not to the DOM: the webview's own `drop` event never fires
+ * for a Finder drag, so a listener here is the only way the composer can accept
+ * one. The event is window-wide, which is why the position travels with it — the
+ * caller decides whether the drop landed on its own surface.
+ *
+ * Resolves with an unsubscribe function and never rejects: outside Tauri (browser
+ * dev) or on a platform that does not report drops, the app keeps working.
+ */
+export async function onFileDrop(
+  handler: (event: FileDropEvent) => void,
+): Promise<() => void> {
+  try {
+    return await getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type !== "drop") return;
+      handler({
+        paths: [...(event.payload.paths ?? [])],
+        position: event.payload.position ?? null,
+      });
+    });
+  } catch {
+    return () => {};
   }
 }

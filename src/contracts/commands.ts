@@ -14,6 +14,7 @@ import type {
   FsEntry,
   FsPreview,
   GitEntry,
+  ImageAttachment,
   McpAddDraft,
   McpEndpoint,
   McpScope,
@@ -25,6 +26,7 @@ import type {
   PiCliEvent,
   PiCliResult,
   PreviewMessage,
+  PromptImage,
   ProviderDraft,
   ProviderModel,
   ProviderModelDraft,
@@ -453,6 +455,24 @@ export async function pickDirectory(title: string): Promise<string | null> {
 }
 
 /**
+ * S1 of `odd/tasks/composer-image-input.md`: the composer's `+` opens the system
+ * file picker filtered to the formats pi sends inline, and answers the absolute
+ * paths (an empty list when the human dismissed it, which is not an error).
+ *
+ * The files are read by Rust (`readImageAttachment`) and not from the webview: a
+ * selected path is a path, and the webview never gets filesystem access.
+ */
+export async function pickImageFiles(): Promise<string[]> {
+  const selected = await openDialog({
+    multiple: true,
+    directory: false,
+    filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "webp"] }],
+  });
+  if (selected === null) return [];
+  return Array.isArray(selected) ? selected : [selected];
+}
+
+/**
  * S1 of `tool-drawer-and-mcp.md`: shows one absolute path in the system file
  * manager, with the file already selected.
  *
@@ -628,8 +648,26 @@ export function sendPrompt(
   workspaceId: number,
   sessionId: number,
   text: string,
+  images: PromptImage[] = [],
 ): Promise<void> {
-  return invoke<void>("send_prompt", { workspaceId, sessionId, text });
+  // `images` always crosses as an array: the Rust side takes an optional list, and
+  // an empty array is the explicit "text only" the protocol line then omits.
+  return invoke<void>("send_prompt", { workspaceId, sessionId, text, images });
+}
+
+/**
+ * S1-S2 of `odd/tasks/composer-image-input.md`: reads one image file the human
+ * picked or dropped, with the format sniffed from its bytes (not from the file
+ * extension) and the payload base64-encoded in Rust.
+ *
+ * Rust is the authority on both: it rejects a file that is not one of pi's inline
+ * formats and one that exceeds the size ceiling before sending anything to the
+ * webview. The path is one the human picked or dropped — this command never lists
+ * directories — and the bytes it may answer with are an image of bounded size, not
+ * arbitrary file content.
+ */
+export function readImageAttachment(path: string): Promise<ImageAttachment> {
+  return invoke<ImageAttachment>("read_image_attachment", { path });
 }
 
 export function stopSession(
