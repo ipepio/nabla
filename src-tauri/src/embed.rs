@@ -59,6 +59,21 @@ use tauri::webview::WebviewBuilder;
 #[cfg(desktop)]
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Rect, WebviewUrl};
 
+/// One line on the dev terminal: `pnpm tauri dev` forwards this process's stderr,
+/// which is the only place a native action can be watched from (the webview's own
+/// console belongs to the DevTools pane).
+///
+/// Debug-only: in a release build `cfg!` is a compile-time `false`, so nothing is
+/// printed and the format arguments are never evaluated. Nothing logged here
+/// carries a prompt, a url or a token — only view ids, rects and booleans.
+macro_rules! debug_line {
+    ($($arg:tt)*) => {
+        if cfg!(debug_assertions) {
+            eprintln!("[nabla:embed] {}", format!($($arg)*));
+        }
+    };
+}
+
 /// How many embedded browsers may exist at once. The pane shows one panel; four
 /// is room for a second look and a third without letting a stuck UI leak a
 /// webview per click.
@@ -261,14 +276,23 @@ pub fn place(x: f64, y: f64, width: f64, height: f64) -> Placed {
 
 /// The child webviews this app created, by id. Cloneable because the navigation
 /// handler outlives the command that built it and needs the same registry.
+///
+/// Two states per entry, and the difference is what a tool waits on. **Reserved**
+/// is a label the registry holds before the platform has built the webview
+/// (`create` reserves first, so the navigation handler already finds its id), and
+/// **ready** is that same entry once `Window::add_child` answered. Only a ready
+/// view is driveable: a tool that acted on a reserved one reached the platform
+/// before its webview existed, which is how the FIRST `navigate` after an
+/// auto-open used to fail.
 #[derive(Clone)]
 pub struct EmbedSessions {
     inner: Arc<Inner>,
 }
 
 struct Inner {
-    /// Registered views, in creation order.
-    views: Mutex<Vec<EmbeddedView>>,
+    /// Registered views, in creation order, each with whether the platform has
+    /// finished building it.
+    views: Mutex<Vec<Registered>>,
     /// Counter behind `embed-<n>`. Monotonic, so a label that was closed is not
     /// handed out again while the app runs.
     next_index: AtomicUsize,
@@ -298,14 +322,40 @@ impl EmbedSessions {
         }
     }
 
-    /// Every registered view, in creation order. A copy, so a caller never holds
-    /// the registry lock while it talks to a webview.
+    /// Every registered view, in creation order — reserved ones included. A copy,
+    /// so a caller never holds the registry lock while it talks to a webview.
     ///
-    /// The app itself addresses one view by id; the caller that needs the whole
-    /// list is the MCP server, which has to tell the agent which views exist
-    /// before it can drive one (`webview-control.md` T1).
+    /// This is the metadata list, not the drivable one: a label reserved for a
+    /// webview the platform is still building names nothing yet. Callers that
+    /// drive a view ask [`Self::ready_views`], which is why this one is only read
+    /// by the tests that assert the difference.
+    #[cfg(test)]
     pub fn views(&self) -> Vec<EmbeddedView> {
-        lock(&self.inner.views).clone()
+        lock(&self.inner.views)
+            .iter()
+            .map(|entry| entry.view.clone())
+            .collect()
+    }
+
+    /// The views the platform has finished building, in creation order.
+    ///
+    /// The MCP server's list is this one, because it is the only list a tool can
+    /// act on: a view that is merely reserved has no webview to navigate or
+    /// evaluate in.
+    pub fn ready_views(&self) -> Vec<EmbeddedView> {
+        lock(&self.inner.views)
+            .iter()
+            .filter(|entry| entry.ready)
+            .map(|entry| entry.view.clone())
+            .collect()
+    }
+
+    /// Whether one id names a view the platform has finished building.
+    pub fn is_ready(&self, view_id: &str) -> bool {
+        lock(&self.inner.views)
+            .iter()
+            .find(|entry| entry.view.id == view_id)
+            .is_some_and(|entry| entry.ready)
     }
 
     /// How many views are registered.
@@ -323,8 +373,8 @@ impl EmbedSessions {
     pub fn get(&self, view_id: &str) -> Option<EmbeddedView> {
         lock(&self.inner.views)
             .iter()
-            .find(|view| view.id == view_id)
-            .cloned()
+            .find(|entry| entry.view.id == view_id)
+            .map(|entry| entry.view.clone())
     }
 
     /// Records the url the navigation handler just saw. `false` when the id was
@@ -332,23 +382,23 @@ impl EmbedSessions {
     /// resurrect a view.
     pub fn set_url(&self, view_id: &str, url: &str) -> bool {
         let mut views = lock(&self.inner.views);
-        match views.iter_mut().find(|view| view.id == view_id) {
-            Some(view) => {
-                view.url = url.to_string();
+        match views.iter_mut().find(|entry| entry.view.id == view_id) {
+            Some(entry) => {
+                entry.view.url = url.to_string();
                 true
             }
             None => false,
         }
     }
 
-    /// Waits at most `timeout` for a view to be registered, and answers whether
-    /// one is there.
+    /// Waits at most `timeout` for a READY view, and answers whether one is there.
     ///
     /// This is the tool-facing half of `auto-open-pane.md` (S1, S3, S4): the MCP
     /// bridge emits [`NEED_VIEW_EVENT`] and waits here while the app UI creates the
     /// pane — and therefore the view, whose registry entry `reserve` writes before
-    /// the webview exists. Nothing here invents geometry: the answer is only
-    /// whether a view exists.
+    /// the webview exists and [`Self::mark_ready`] flips once the platform has it.
+    /// Nothing here invents geometry: the answer is only whether a view the tool
+    /// can actually drive exists.
     ///
     /// A close wins over a view that appeared. `forget`/`drain` (and therefore
     /// `close`/`close_all`) is the human saying the pane is not there, so it
@@ -366,7 +416,7 @@ impl EmbedSessions {
             if self.inner.closed.load(Ordering::SeqCst) != closed_before {
                 return false;
             }
-            if !views.is_empty() {
+            if views.iter().any(|entry| entry.ready) {
                 return true;
             }
             let elapsed = started.elapsed();
@@ -397,16 +447,42 @@ impl EmbedSessions {
         let id = loop {
             let next = self.inner.next_index.fetch_add(1, Ordering::Relaxed) + 1;
             let candidate = format!("{VIEW_PREFIX}{next}");
-            if !views.iter().any(|view| view.id == candidate) {
+            if !views.iter().any(|entry| entry.view.id == candidate) {
                 break candidate;
             }
         };
         let view = EmbeddedView { id, url };
-        views.push(view.clone());
+        views.push(Registered {
+            view: view.clone(),
+            // The platform has not built anything yet: the entry exists for the
+            // navigation handler and for the id, not for a tool to drive.
+            ready: false,
+        });
         // Woken while the lock is still held: a waiter cannot miss this
-        // notification, because it re-checks the registry under the lock.
+        // notification, because it re-checks the registry under the lock. A
+        // waiter looks for a READY entry, so this wake-up is a re-check, not an
+        // answer.
         self.inner.changed.notify_all();
         Ok(view)
+    }
+
+    /// Marks a reserved view as built, which is what answers a tool waiting for a
+    /// pane. `false` when the id is no longer registered: a late readiness report
+    /// of a view that was closed while the platform built it must never resurrect
+    /// the entry.
+    pub fn mark_ready(&self, view_id: &str) -> bool {
+        let mut views = lock(&self.inner.views);
+        let ready = match views.iter_mut().find(|entry| entry.view.id == view_id) {
+            Some(entry) => {
+                entry.ready = true;
+                true
+            }
+            None => false,
+        };
+        if ready {
+            self.inner.changed.notify_all();
+        }
+        ready
     }
 
     /// Removes one view from the registry and answers it, so the caller can
@@ -448,15 +524,46 @@ impl EmbedSessions {
         let drained = std::mem::take(&mut *views);
         self.inner.closed.fetch_add(1, Ordering::SeqCst);
         self.inner.changed.notify_all();
-        drained
+        drained.into_iter().map(|entry| entry.view).collect()
+    }
+}
+
+/// One registry entry, and whether the platform has finished building it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Registered {
+    view: EmbeddedView,
+    /// `Window::add_child` answered: the label names a live child webview.
+    ready: bool,
+}
+
+/// Closes the child webview a label names, and answers whether one was there.
+///
+/// A label with no webview behind it is not a failure: the id was already gone,
+/// which is the state a close wants.
+#[cfg(desktop)]
+fn close_label(app: &AppHandle, view_id: &str) -> bool {
+    match app.get_webview(view_id) {
+        Some(webview) => webview.close().is_ok(),
+        None => false,
     }
 }
 
 /// The one removal step [`EmbedSessions::forget`] and [`EmbedSessions::evict`]
 /// share: taken by id, under the registry lock.
-fn take(views: &mut Vec<EmbeddedView>, view_id: &str) -> Option<EmbeddedView> {
-    let index = views.iter().position(|view| view.id == view_id)?;
-    Some(views.remove(index))
+fn take(views: &mut Vec<Registered>, view_id: &str) -> Option<EmbeddedView> {
+    let index = views.iter().position(|entry| entry.view.id == view_id)?;
+    Some(views.remove(index).view)
+}
+
+/// Whether a webview label is one this app created (`embed-<n>`).
+///
+/// Used to sweep orphans, so it must be true for every label [`EmbedSessions`]
+/// hands out and false for the window's own webview (`main`): a sweep that
+/// matched it would close the app.
+pub fn is_view_label(label: &str) -> bool {
+    label
+        .strip_prefix(VIEW_PREFIX)
+        .is_some_and(|rest| !rest.is_empty())
 }
 
 /// One lock helper for the whole module, so a poisoned mutex is a panic here
@@ -534,8 +641,25 @@ impl EmbedSessions {
             LogicalPosition::new(placed.x, placed.y),
             LogicalSize::new(placed.width, placed.height),
         ) {
-            Ok(_webview) => Ok(view.id),
+            Ok(webview) => {
+                // Ready HERE, not when it was reserved: a tool that waited for a
+                // pane must never act on a label the platform has not built yet.
+                if !self.mark_ready(&view.id) {
+                    webview.close().map_err(|err| EmbedError::Create(err.to_string()))?;
+                    return Err(EmbedError::UnknownView(view.id));
+                }
+                debug_line!(
+                    "create {} ready at {}x{} @{},{} (was reserved before the platform)",
+                    view.id,
+                    placed.width,
+                    placed.height,
+                    placed.x,
+                    placed.y
+                );
+                Ok(view.id)
+            }
             Err(err) => {
+                debug_line!("create {} failed", view.id);
                 self.forget(&view.id);
                 Err(EmbedError::Create(err.to_string()))
             }
@@ -636,30 +760,59 @@ impl EmbedSessions {
         })
     }
 
-    /// Closes one view and forgets it. Idempotent: an unknown id answers `false`
-    /// rather than an error.
+    /// Closes one view and forgets it. Idempotent: a view that is already gone
+    /// answers `false` rather than an error.
+    ///
+    /// The LABEL closes the child webview, and the registry is not the only way
+    /// one can exist: the MCP driver evicts an entry whose webview it believes is
+    /// gone, so a live webview can outlive the entry that described it. Such an
+    /// orphan floats ABOVE the HTML and keeps painting over the app — the opaque
+    /// rectangle — and an entry-only close could never reach it. So the close is
+    /// by label, and the entry is merely forgotten first.
     pub fn close(&self, app: &AppHandle, view_id: &str) -> bool {
         // Forget first: a navigation handler firing during the close must find
         // nothing to update, and a second close answers `false`.
-        let Some(view) = self.forget(view_id) else {
-            return false;
-        };
-        if let Some(webview) = app.get_webview(&view.id) {
-            let _ = webview.close();
-        }
-        true
+        let known = self.forget(view_id).is_some();
+        let closed = close_label(app, view_id);
+        debug_line!(
+            "close {view_id}: entry={known} webview={closed}{}",
+            if known { "" } else { " (orphan, closed by label)" }
+        );
+        known || closed
     }
 
     /// Closes every view and answers how many were closed. Bound to the app's
     /// exit in `lib.rs`, so no webview outlives the app.
+    ///
+    /// Two sources, because a label is not the same thing as a registry entry: the
+    /// entries this registry holds, and any child webview of ours the registry does
+    /// NOT hold. The second sweep is what stops an evicted-but-alive view from
+    /// keeping the app covered after a quit path started from a clean registry.
     pub fn close_all(&self, app: &AppHandle) -> usize {
         let views = self.drain();
-        let closed = views.len();
-        for view in views {
-            if let Some(webview) = app.get_webview(&view.id) {
-                let _ = webview.close();
+        let mut closed = 0;
+        for view in &views {
+            if close_label(app, &view.id) {
+                closed += 1;
             }
         }
+        let mut orphans = 0;
+        for (label, webview) in app.webviews() {
+            if !is_view_label(&label) {
+                continue;
+            }
+            if views.iter().any(|view| view.id == label) {
+                continue;
+            }
+            if webview.close().is_ok() {
+                orphans += 1;
+            }
+        }
+        closed += orphans;
+        debug_line!(
+            "close_all: entries={} closed={closed} orphans={orphans}",
+            views.len()
+        );
         closed
     }
 
@@ -1035,7 +1188,8 @@ mod tests {
     #[test]
     fn waiting_for_first_view_answers_at_once_when_one_is_open() {
         let sessions = EmbedSessions::new();
-        sessions.reserve(DEFAULT_URL.into()).expect("an open view");
+        let view = sessions.reserve(DEFAULT_URL.into()).expect("an open view");
+        assert!(sessions.mark_ready(&view.id), "the platform built it");
 
         let started = Instant::now();
         assert!(sessions.wait_for_first_view(Duration::from_secs(10)));
@@ -1046,15 +1200,45 @@ mod tests {
         );
     }
 
+    // The reservation is not the view. `create` registers the label BEFORE
+    // `add_child` runs (so the navigation handler finds its id), and a tool that
+    // acted on that reservation reached the platform before the webview existed —
+    // the first `navigate` after an auto-open failed, the registry then dropped the
+    // entry as dead, and the webview that DID get built stayed on screen with
+    // nobody able to close it: the opaque rectangle over the app.
     #[test]
-    fn waiting_for_first_view_resolves_when_a_view_is_reserved_elsewhere() {
+    fn a_reserved_view_does_not_answer_the_wait_for_a_pane() {
+        let sessions = EmbedSessions::new();
+        sessions.reserve(DEFAULT_URL.into()).expect("reserved");
+
+        let started = Instant::now();
+        let opened = sessions.wait_for_first_view(Duration::from_millis(120));
+        let waited = started.elapsed();
+
+        assert!(
+            !opened,
+            "a label the platform has not built is not a view a tool can drive"
+        );
+        assert!(
+            waited >= Duration::from_millis(120),
+            "the wait runs to its bound instead of believing the reservation, took {waited:?}"
+        );
+    }
+
+    #[test]
+    fn mark_ready_answers_the_wait_a_reservation_only_woke() {
         let sessions = EmbedSessions::new();
         let creating = sessions.clone();
         let ui = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(60));
+            std::thread::sleep(Duration::from_millis(50));
             // What the pane's `embed_create` does first: the view exists in the
             // registry before the webview does.
-            creating.reserve(DEFAULT_URL.into()).expect("the pane's create")
+            let reserved = creating.reserve(DEFAULT_URL.into()).expect("the pane's create");
+            assert!(!creating.is_ready(&reserved.id), "reserved first");
+            std::thread::sleep(Duration::from_millis(50));
+            // ... and this is `add_child` answering.
+            assert!(creating.mark_ready(&reserved.id));
+            reserved
         });
 
         let started = Instant::now();
@@ -1062,11 +1246,56 @@ mod tests {
         let waited = started.elapsed();
         ui.join().expect("the creating thread panicked");
 
-        assert!(opened, "a registered view answers the wait");
+        assert!(opened, "the built view answers the wait");
         assert!(
-            waited >= Duration::from_millis(30),
-            "it waited for the registration instead of guessing, returned after {waited:?}"
+            waited >= Duration::from_millis(90),
+            "it waited for the platform, not for the label, returned after {waited:?}"
         );
+    }
+
+    // The MCP driver lists and drives ready views only: a reserved label names no
+    // webview yet, so listing it would hand the model an id that answers
+    // "no embedded browser" the moment it is used.
+    #[test]
+    fn ready_views_lists_only_what_the_platform_has_built() {
+        let sessions = EmbedSessions::new();
+        let reserved = sessions.reserve(DEFAULT_URL.into()).expect("reserved");
+        let built = sessions.reserve("https://example.com/".into()).expect("built");
+        assert!(sessions.mark_ready(&built.id));
+
+        assert_eq!(sessions.views(), vec![reserved.clone(), built.clone()]);
+        assert_eq!(sessions.ready_views(), vec![built.clone()]);
+        assert!(sessions.is_ready(&built.id));
+        assert!(!sessions.is_ready(&reserved.id));
+        assert!(!sessions.is_ready("embed-99"), "an unknown id is never ready");
+    }
+
+    // A creation racing a close: the platform answers after the pane is gone. The
+    // late report must not resurrect the entry, or the next tool would resolve a
+    // view the human already closed.
+    #[test]
+    fn a_late_readiness_report_does_not_resurrect_a_closed_view() {
+        let sessions = EmbedSessions::new();
+        let view = sessions.reserve(DEFAULT_URL.into()).expect("reserved");
+        assert!(sessions.forget(&view.id).is_some());
+
+        assert!(!sessions.mark_ready(&view.id), "nothing to mark");
+        assert_eq!(sessions.get(&view.id), None);
+        assert!(sessions.ready_views().is_empty());
+    }
+
+    // Only labels `create` hands out are ours: the sweep `close_all` runs closes
+    // every `embed-` webview it finds, so matching the window's own webview would
+    // close the app.
+    #[test]
+    fn only_embed_labels_belong_to_this_app() {
+        assert!(is_view_label("embed-1"));
+        assert!(is_view_label("embed-42"));
+        assert!(!is_view_label(MAIN_WINDOW_LABEL));
+        assert!(!is_view_label("embed"));
+        assert!(!is_view_label("embed-"));
+        assert!(!is_view_label(""));
+        assert!(!is_view_label("my-embed-1"));
     }
 
     #[test]
@@ -1145,7 +1374,8 @@ mod tests {
         let creating = sessions.clone();
         let ui = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(60));
-            creating.reserve(DEFAULT_URL.into()).expect("a later view")
+            let view = creating.reserve(DEFAULT_URL.into()).expect("a later view");
+            assert!(creating.mark_ready(&view.id));
         });
 
         assert!(sessions.wait_for_first_view(Duration::from_secs(10)));

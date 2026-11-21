@@ -34,6 +34,7 @@ import { t } from "@/lib/i18n";
 import { COMPOSER_MAX_WIDTH, COMPOSER_MIN_WIDTH } from "@/lib/layout";
 import type { FsEntry, ProviderModels, SessionCommand } from "@/contracts/types";
 import {
+  debugLog,
   fsListDir,
   listWorkspaces,
   sessionCommands,
@@ -145,20 +146,42 @@ const emit = defineEmits<{
 const queueing = computed(() => props.streaming && props.canQueue);
 
 /**
- * The submit control is live only when the click has somewhere to go: a send
- * while the agent is idle, a queued prompt while it works. With the queue off,
- * working means neither — the control is disabled, as it was before S3.
+ * Whether a submit has somewhere to go: a send while the agent is idle, a queued
+ * prompt while it works. One function, read by the button's disabled state AND by
+ * the handler below, so the two can never disagree about what a click means —
+ * which is what a click that reached an enabled-looking control and returned
+ * silently used to look like.
+ *
+ * The empty-draft and no-workspace checks live here rather than being inherited
+ * from `canSend`/`canQueue`: the same list of reasons the control is inert now
+ * answers a click and paints the button.
  */
-const canSubmit = computed(() =>
-  props.streaming ? queueing.value : props.canSend,
-);
+const canSubmit = computed(() => {
+  if (props.disabled) return false;
+  if (props.modelValue.trim() === "") return false;
+  return props.streaming ? props.canQueue : props.canSend;
+});
 
-/** The button and the Enter key share this, so they can never disagree. */
+/**
+ * What one submit means. The button and the Enter key share this, so they can
+ * never disagree, and it is the only place that decides between sending and
+ * queueing.
+ *
+ * A submit that has nowhere to go is logged instead of vanishing: "my click did
+ * nothing" is the report this answers, and the dev terminal is where it can be
+ * answered (structure only — never the prompt).
+ */
 function submit(): void {
-  if (!canSubmit.value) return;
+  if (!canSubmit.value) {
+    debugLog(
+      `composer submit: nothing to do (text=${props.modelValue.trim() !== ""} streaming=${props.streaming} canQueue=${props.canQueue} canSend=${props.canSend} disabled=${props.disabled})`,
+    );
+    return;
+  }
   // The draft is leaving the composer: a list built from it has nothing left to
   // complete.
   closeCompletion();
+  debugLog(`composer submit: ${props.streaming ? "queue" : "send"}`);
   if (props.streaming) emit("queue");
   else emit("send");
 }
@@ -825,7 +848,13 @@ watch(() => props.workspaceId, prewarmCommands);
         <!-- S3: stop and submit sit side by side while the agent works, so a
              prompt can still be queued for the turn after the current one.
              With the queue off, submit is disabled while working: the old
-             behaviour, unchanged. -->
+             behaviour, unchanged.
+
+             `mousedown.prevent` keeps the focus in the composer and keeps the
+             press and the release on the same element: a click whose two halves
+             land on different nodes never fires, and the row under the pointer
+             is the one that gains a Stop button and a queue strip at the edge of
+             a turn. Preventing the default here does not cancel the click. -->
         <Button
           v-if="streaming && canStop"
           variant="outline"
@@ -843,6 +872,7 @@ watch(() => props.workspaceId, prewarmCommands);
             queueing ? t('chat.composer.queue') : t('chat.composer.send')
           "
           :disabled="!canSubmit"
+          @mousedown.prevent
           @click="submit"
         >
           <ArrowUpIcon />

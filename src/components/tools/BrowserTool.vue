@@ -73,6 +73,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   commandErrorMessage,
+  debugLog,
   embedClose,
   embedCreate,
   embedEval,
@@ -343,13 +344,25 @@ function isDeadView(cause: unknown): boolean {
  * The new view starts at `START_URL`, because the page went away with the webview:
  * there is nothing left to restore, and pretending otherwise would mean a second
  * creation path carrying a url this pane can no longer verify.
+ *
+ * The CLOSE comes before the id is forgotten, and it is the whole point of this
+ * path for an orphan: "no embedded browser <id>" is what the platform says both
+ * for a webview that is gone and for one the registry no longer holds (the MCP
+ * driver evicts an entry it believes is dead). The first case costs a no-op; the
+ * second is a live child webview still floating above the app with nobody able to
+ * close it — the opaque rectangle over the chat. `embed_close` closes by LABEL for
+ * exactly that case.
  */
 function healDeadView(): void {
-  if (viewId.value === null) return;
+  const id = viewId.value;
+  if (id === null) return;
   viewId.value = null;
   // Nothing is known about the view that replaces this one.
   sentRect = null;
   status.value = null;
+  // Best effort: a view that is really gone answers `false`.
+  void embedClose(id).catch(() => {});
+  debugLog(`browser pane: dropping dead view ${id} (closed by label)`);
   if (disposed || !drawn.value || !shown.value) return;
   void createView();
 }
@@ -615,6 +628,9 @@ async function createView(): Promise<void> {
     syncAddress(await embedUrl(id).catch(() => START_URL));
     // The rect may have moved while the platform was building the webview.
     scheduleBounds();
+    debugLog(
+      `browser pane: created ${id} at ${rect.width}x${rect.height} @${rect.x},${rect.y}`,
+    );
   } catch (cause) {
     if (disposed) return;
     status.value = t("tools.browser.createError", {
@@ -632,6 +648,7 @@ async function closeView(): Promise<void> {
   // The next view is created over a fresh rect, so nothing is known about it.
   sentRect = null;
   if (id === null) return;
+  debugLog(`browser pane: closing ${id}`);
   try {
     await embedClose(id);
   } catch {
@@ -808,6 +825,7 @@ watch(
     if (disposed) return;
     const id = viewId.value;
     if (id === null) return;
+    debugLog(`browser pane: ${visible ? "revealing" : "hiding"} ${id}`);
     if (visible) {
       void revealView();
       return;

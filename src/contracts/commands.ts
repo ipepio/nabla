@@ -54,6 +54,23 @@ export function commandErrorMessage(error: unknown): string {
   return "Unexpected bridge error.";
 }
 
+/**
+ * One structural line from the webview on the dev terminal, through Rust.
+ *
+ * The webview's own `console` only exists inside the DevTools pane, while `pnpm
+ * tauri dev` shows the app process's stderr; this is the seam that puts a UI
+ * handler on that terminal. Debug-only on both halves: `import.meta.env.DEV` is
+ * folded away in a release build and the Rust command prints nothing there.
+ *
+ * Callers pass structure — a handler name, a count, a view id, a boolean — never a
+ * prompt, a page url or a token, and a failure here is swallowed: a log is never a
+ * reason to break a send.
+ */
+export function debugLog(message: string): void {
+  if (!import.meta.env.DEV) return;
+  void invoke("debug_log", { message }).catch(() => {});
+}
+
 export function listWorkspaces(): Promise<WorkspaceInfo[]> {
   return invoke<WorkspaceInfo[]>("list_workspaces");
 }

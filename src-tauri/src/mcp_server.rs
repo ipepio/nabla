@@ -39,6 +39,21 @@ use tauri::Emitter;
 use crate::embed::EmbedError;
 use crate::websearch::{self, SearchGateway, SearchHit};
 
+/// One line on the dev terminal: `pnpm tauri dev` forwards the child's stderr,
+/// which is where a native action can be watched from a shell (the webview's own
+/// console belongs to the DevTools pane).
+///
+/// Debug-only: in a release build `cfg!` is a compile-time `false`, so nothing is
+/// printed and the arguments are never evaluated. Nothing logged here carries a
+/// prompt, a page url or a token — only tool names, view ids and booleans.
+macro_rules! debug_line {
+    ($($arg:tt)*) => {
+        if cfg!(debug_assertions) {
+            eprintln!("[nabla:mcp] {}", format!($($arg)*));
+        }
+    };
+}
+
 /// The name pi will see in `tools/list` sources and in its own tool names
 /// (`mcp__nabla-browser__navigate`).
 pub const SERVER_NAME: &str = "nabla-browser";
@@ -69,11 +84,14 @@ pub trait WebviewDriver: Send + Sync + 'static {
     /// Every open view, in a stable order.
     fn views(&self) -> Vec<LiveView>;
 
-    /// Asks the app to open the browser pane and waits at most `timeout` for the
-    /// view to exist (`auto-open-pane.md`, S1/S3/S4). `true` means a view is there.
+    /// Asks the app to open the browser pane and waits at most `timeout` for a
+    /// view the platform has actually built to exist (`auto-open-pane.md`,
+    /// S1/S3/S4). `true` means a view is there and driveable.
     ///
-    /// Required, not defaulted: a driver that cannot open a pane must say so,
-    /// otherwise a tool would report "no view" without ever having asked.
+    /// "Built" is the point: the app registers the label before the child webview
+    /// exists, and a tool that acted on that reservation reached the platform
+    /// too early. Required, not defaulted: a driver that cannot open a pane must
+    /// say so, otherwise a tool would report "no view" without ever having asked.
     fn ensure_view(&self, timeout: Duration) -> bool;
 
     /// Navigates one existing view. The url is validated by the driver, which is
@@ -2777,22 +2795,24 @@ impl EmbedDriver {
     /// be resolved, listed or driven twice. Nothing else is evicted: a script error
     /// or a refused url leaves a perfectly good view in place.
     fn failure(&self, view_id: &str, error: EmbedError) -> DriverFailure {
-        if self.embeds.get(view_id).is_some() && !missing_webview(&error) {
+        if self.embeds.is_ready(view_id) && !missing_webview(&error) {
             return DriverFailure::Other(error.to_string());
         }
         // The registry is the thing being corrected, not the webview: the webview
         // is already gone (that is why we are here), while the entry would keep
         // answering `views()` and keep being resolved by the next tool call.
+        debug_line!("evicting missing view {view_id}");
         self.embeds.evict(view_id);
         DriverFailure::ViewGone
     }
 
     /// Whether a call may run at all: the registry is checked first, before the
-    /// platform is asked anything, because it is the primary signal.
+    /// platform is asked anything, because it is the primary signal. A reserved
+    /// entry is not enough — `mark_ready` is what says the webview exists.
     fn driveable(&self, view_id: &str) -> Result<(), DriverFailure> {
-        match self.embeds.get(view_id) {
-            Some(_) => Ok(()),
-            None => Err(DriverFailure::ViewGone),
+        match self.embeds.is_ready(view_id) {
+            true => Ok(()),
+            false => Err(DriverFailure::ViewGone),
         }
     }
 }
@@ -2823,8 +2843,11 @@ fn missing_webview(error: &EmbedError) -> bool {
 
 impl WebviewDriver for EmbedDriver {
     fn views(&self) -> Vec<LiveView> {
+        // The READY views: a label reserved for a webview the platform is still
+        // building names nothing a tool can drive, and listing it would hand the
+        // model an id that answers "no embedded browser" on first use.
         self.embeds
-            .views()
+            .ready_views()
             .into_iter()
             .map(|view| LiveView {
                 id: view.id,
@@ -2836,11 +2859,20 @@ impl WebviewDriver for EmbedDriver {
     fn ensure_view(&self, timeout: Duration) -> bool {
         // Ask, then wait, in that order. The app UI owns the geometry (S3): this
         // only says "a tool needs a view", and the pane that opens creates it with
-        // the rect it measured, registering it before the webview exists — which
-        // is what wakes the wait. A failed emit is not special-cased: the wait
-        // then answers the same way as a pane nobody opened.
+        // the rect it measured. The wait answers on a view the platform has BUILT
+        // (see `EmbedSessions::mark_ready`), so the tool that follows cannot reach
+        // a label whose webview is still being created. A failed emit is not
+        // special-cased: the wait then answers the same way as a pane nobody
+        // opened.
         let _ = self.app.emit(crate::embed::NEED_VIEW_EVENT, ());
-        self.embeds.wait_for_first_view(timeout)
+        let started = Instant::now();
+        let opened = self.embeds.wait_for_first_view(timeout);
+        let ids: Vec<String> = self.views().into_iter().map(|view| view.id).collect();
+        debug_line!(
+            "ensure_view asked, answer={opened} after {}ms, ready views={ids:?}",
+            started.elapsed().as_millis()
+        );
+        opened
     }
 
     fn navigate(&self, view_id: &str, url: &str) -> Result<(), DriverFailure> {

@@ -2953,6 +2953,23 @@ pub fn shell_close(state: State<'_, AppState>, session_id: String) -> Result<boo
 // story: macOS first, the Webview2 caveat on Windows, and no multiwebview API at
 // all on mobile.
 
+/// One line from the webview on the dev terminal.
+///
+/// The webview's `console` belongs to the DevTools pane, while `pnpm tauri dev`
+/// shows this process's stderr. A UI-only puzzle — which handler ran, which view
+/// id was dropped — is invisible from a shell without this, and the composer and
+/// the browser pane are wired in the webview.
+///
+/// Debug-only on both sides: the frontend wrapper is compiled out of a release
+/// build (`import.meta.env.DEV`) and this prints nothing there. The caller sends
+/// structure only — no prompt, no page url, no token.
+#[tauri::command]
+pub fn debug_log(message: String) {
+    if cfg!(debug_assertions) {
+        eprintln!("[nabla:ui] {message}");
+    }
+}
+
 /// Creates a child webview in the main window at a logical position and size and
 /// answers its id (`embed-<n>`). `url` defaults to `about:blank`.
 ///
@@ -3054,7 +3071,13 @@ pub async fn embed_eval(
         .map_err(display_err)
 }
 
-/// Closes one view and forgets it. Idempotent: an unknown id answers `false`.
+/// Closes one view and forgets it. Idempotent: a view that is already gone
+/// answers `false`.
+///
+/// The close is by **label**, not by registry entry: a live child webview can
+/// outlive the entry that described it (the MCP driver evicts one it believes is
+/// dead), and such an orphan floats above the HTML painting over the app. An
+/// id-only close could never reach it — see `embed::EmbedSessions::close`.
 #[tauri::command]
 pub fn embed_close(state: State<'_, AppState>, app: tauri::AppHandle, view_id: String) -> bool {
     state.embeds.close(&app, &view_id)

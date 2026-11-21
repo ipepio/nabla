@@ -16,6 +16,7 @@
 import { computed, reactive, ref } from "vue";
 import {
   commandErrorMessage,
+  debugLog,
   liveSessionIds,
   loadSessionPreview,
   openSession,
@@ -768,6 +769,11 @@ export function enqueuePrompt(
     // has no stdin yet, which is not something the preference can switch off.
     awaitingProcess: buffer.status === "spawning",
   });
+  // Debug-only, structure only (no prompt text): the queue is the half of S3 that
+  // has no UI of its own until it drains.
+  debugLog(
+    `store queue: +1 (${buffer.queue.length} waiting, awaitingProcess=${buffer.status === "spawning"}, status=${buffer.status ?? "none"})`,
+  );
 }
 
 /** How many prompts of one session are waiting; `0` when there are none. */
@@ -998,7 +1004,12 @@ function drainQueue(sessionId: string, buffer: SessionBuffer): void {
   if (workspaceId === null) return;
   const head = buffer.queue[0];
   if (head === undefined) return;
-  if (!queueMessages.value && !head.awaitingProcess) return;
+  if (!queueMessages.value && !head.awaitingProcess) {
+    debugLog(
+      `store drain: held (${buffer.queue.length} waiting, queue pref is off)`,
+    );
+    return;
+  }
   const next = buffer.queue.shift();
   if (next === undefined) return;
   // Belt to the guard above: an entry that was already handed to pi is never
@@ -1038,8 +1049,12 @@ async function sendQueuedTurn(
     buffer.busy = false;
     buffer.queue.unshift(entry);
     buffer.error = commandErrorMessage(cause);
+    debugLog(`store drain: send failed, prompt put back (${buffer.queue.length} waiting)`);
     return;
   }
+  debugLog(
+    `store drain: sent one queued prompt (${buffer.queue.length} still waiting, awaitingProcess=${entry.awaitingProcess})`,
+  );
   settleQueuedMessage(sessionId, buffer, entry);  // The drawer sorts by activity, so a queued turn is activity too.
   sessionGeneration.value += 1;
 }

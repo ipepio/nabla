@@ -32,6 +32,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   answerUiRequest,
   commandErrorMessage,
+  debugLog,
   getSettings,
   saveSettings,
   sessionStatus,
@@ -107,6 +108,17 @@ interface StatusAlert {
  * send/queue decision and disabled state all derive from.
  */
 const sending = ref(false);
+/**
+ * The prompt an accepted send is waiting on, or `null`.
+ *
+ * `sending` covers the whole round-trip (session creation plus the first RPC),
+ * and the composer still holds that send's text until pi accepts it — so "a send
+ * is in flight" alone cannot say whether the text on screen belongs to it or is a
+ * new prompt the human typed after clicking. Comparing the text is what tells the
+ * two apart, and it is the only thing that may keep a new prompt out of the queue
+ * while a send is in flight.
+ */
+const inFlightPrompt = ref<string | null>(null);
 /** Same latch for the "there is no session yet" half of the first send. */
 const starting = ref(false);
 const stopping = ref(false);
@@ -458,21 +470,35 @@ const canSend = computed(
 );
 
 /**
+ * The composer holds the text of the send that is in flight, not a new prompt.
+ *
+ * Declared before the computeds that read it, like every other state in this
+ * panel: `canQueue` and `handleQueue` both consult it, so the control and the
+ * handler cannot disagree about whether this text has already left.
+ */
+const submittingSamePrompt = computed(
+  () =>
+    inFlightPrompt.value !== null &&
+    prompt.value.trim() === inFlightPrompt.value,
+);
+
+/**
  * S3: the prompt can be queued instead of sent — the agent is working, the
  * preference is on, there is a session to queue it against and there is
  * something to queue. The store keeps the queue per session; the panel only
  * decides which event the composer emits.
  *
- * `sending`/`starting` keep it off while a click is being accepted: the text is
- * still in the composer then, and it belongs to that send — queueing it as well
- * would show the same prompt twice.
+ * The in-flight send is handled by OWNERSHIP ([`submittingSamePrompt`]), not by
+ * the latch: a prompt typed after the click is a different text and belongs in the
+ * queue even while the send's round-trip is still open. Refusing every submit
+ * during that window was the first-click drop — the control said "queue", the
+ * latch said no, and only the click after the round-trip did anything.
  */
 const canQueue = computed(
   () =>
     queueMessages.value &&
     agentWorking.value &&
-    !sending.value &&
-    !starting.value &&
+    !submittingSamePrompt.value &&
     currentSession.value !== null &&
     props.workspace !== null &&
     prompt.value.trim() !== "",
@@ -966,10 +992,16 @@ async function handleSend() {
   // "Encolar mensajes" and this path ignored it. The queue is the same one the
   // explicit action fills, so a queued prompt looks and drains the same way.
   if (agentWorking.value) {
+    debugLog(
+      `chat send: agent working, queue pref=${queueMessages.value} canQueue=${canQueue.value}`,
+    );
     if (queueMessages.value) handleQueue();
     return;
   }
   sending.value = true;
+  // From here until pi accepts it, this text belongs to the send: a submit of the
+  // SAME text must not queue it a second time, and a different one may.
+  inFlightPrompt.value = text;
   panelError.value = null;
   try {
     const current = await ensureSession();
@@ -987,6 +1019,7 @@ async function handleSend() {
     panelError.value = commandErrorMessage(cause);
   } finally {
     sending.value = false;
+    inFlightPrompt.value = null;
   }
 }
 
@@ -1003,16 +1036,28 @@ async function handleSend() {
 function handleQueue() {
   const current = currentSession.value;
   const text = prompt.value.trim();
-  // The latch check matters: while a send is being accepted the text belongs to
-  // that send, and queueing it too would show one prompt twice.
-  if (sending.value || starting.value) return;
-  if (current === null || text === "" || !queueMessages.value) return;
+  // Ownership, not the latch (see `canQueue`): the text of the send that is in
+  // flight is already on its way and must not also enter the queue; a prompt
+  // typed after that click is somebody else's text and is queued now.
+  if (submittingSamePrompt.value) {
+    debugLog("chat queue: ignored, this text belongs to the in-flight send");
+    return;
+  }
+  if (current === null || text === "" || !queueMessages.value) {
+    debugLog(
+      `chat queue: nothing to queue (session=${current !== null} text=${text !== ""} pref=${queueMessages.value})`,
+    );
+    return;
+  }
   // The panel knows the workspace of the session it renders, so the queued
   // prompt is addressable the moment the turn ends — even if the human has
   // moved to another workspace by then.
   enqueuePrompt(current.sessionId, text, current.workspaceId);
   // P2: a queued prompt is not unsent either, so the session's draft goes too.
   draft.clear();
+  debugLog(
+    `chat queue: enqueued, ${queuedCount(current.sessionId)} waiting in this session`,
+  );
 }
 
 /**

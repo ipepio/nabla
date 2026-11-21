@@ -362,6 +362,9 @@ pub fn run() {
             commands::embed_close,
             commands::embed_url,
             commands::embed_close_all,
+            // Debug-only: one line from the webview on the dev terminal, so a
+            // `.vue` handler is visible from the shell that runs `tauri dev`.
+            commands::debug_log,
             // `webview-control.md` T1: the local MCP endpoint the agent connects
             // to so it can drive those views.
             commands::mcp_endpoint
