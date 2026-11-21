@@ -111,6 +111,25 @@ cd src-tauri && cargo clippy          # Rust lint
 
 There is no frontend test runner; UI behaviour is verified by hand.
 
+### Rust build cache and dev diagnostics
+
+`src-tauri/target/` is a rebuildable Cargo cache, not the installed app or your
+sessions. Check it with `du -sh src-tauri/target`. Desktop builds only produce the
+Rust library the executable links, not mobile FFI libraries. Dev builds keep
+file/line backtraces and incremental compilation, but omit full variable debug
+information. For a debugger session that needs locals, use
+`CARGO_PROFILE_DEV_DEBUG=2 pnpm tauri dev` (expect larger artifacts).
+
+On one macOS checkout, a fresh `cargo build` used 1.4 GiB, or 2.2 GiB after tests
+and Clippy. These are observations, not limits. Changing profiles does not remove
+old artifacts. To reclaim the old cache, stop `pnpm tauri dev` and other Cargo
+jobs, then run `(cd src-tauri && cargo clean)`; the next build will be cold.
+
+For first-click queue problems or an embedded browser that opens blank, watch
+the terminal running `pnpm tauri dev`. Debug traces report queue decisions and
+native view creation/cleanup. A visible Browser tab alone does not mean its
+native view is ready. These diagnostics are not a release logging feature.
+
 ## Build a desktop app
 
 ```bash
