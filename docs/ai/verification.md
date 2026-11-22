@@ -58,6 +58,8 @@ and stays manual until GUI automation exists.
 - Typed command errors: no contract on either side, so only message text can be asserted (F1).
 - Frontend component tests: no runner mounts Vue components (F2). The Node suite covers pure modules
   and composables; rendered behavior is checked by `vue-tsc` and manual passes.
+- Frontend unit tests: `node --test tests/` runs the pure modules (no framework is a dependency);
+  Vue components and composables still rest on `vue-tsc` and a manual pass.
 - End-to-end desktop automation and CI: absent; nothing enforces these checks automatically.
 - Runtime behavior: covered by fake `pi` scripts that emit known NDJSON (see the `FAKE_*_PI` scripts in
   `src-tauri/src/commands.rs`); a real pi binary and the network never run in tests.

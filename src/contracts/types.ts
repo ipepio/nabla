@@ -252,6 +252,14 @@ export interface AppSettings {
    * or refuse the JSON API.
    */
   webSearchInstance: string;
+  /**
+   * `web-search.md`: the optional credential of that instance, mirrored from
+   * `Settings.web_search_credentials`. `user:password` becomes
+   * `Authorization: Basic`, any other value `Authorization: Bearer`, and an empty
+   * value sends no header at all. Rust stores it in the same plain `settings.json`
+   * as every other preference — unencrypted, no extra trust assumption.
+   */
+  webSearchCredentials: string;
 }
 
 /**

@@ -283,9 +283,7 @@ pub enum AgentEvent {
     /// Wire reference: pi docs/json.md:124 — `{type, level}`. `level` is a string
     /// rather than an enum so a word from a newer pi still reaches the selector
     /// instead of demoting the frame to `Other` and leaving it stale.
-    ThinkingLevelChanged {
-        level: String,
-    },
+    ThinkingLevelChanged { level: String },
     /// Any pi event Nabla does not model yet, kept by its wire `type` so a newer
     /// pi degrades to "unhandled" instead of "dropped without a trace".
     Other { kind: String },
@@ -451,7 +449,11 @@ impl FrameCodec {
 
     /// Encodes `command` plus `fields` as one NDJSON line and allocates its id.
     /// The id is always ours: pi never invents one for a request.
-    pub fn encode_request(&mut self, command: &str, mut fields: Map<String, Value>) -> EncodedRequest {
+    pub fn encode_request(
+        &mut self,
+        command: &str,
+        mut fields: Map<String, Value>,
+    ) -> EncodedRequest {
         let id = self.next_id.to_string();
         self.next_id += 1;
         // The allocated id wins over any caller-supplied one: a clobbered id
@@ -511,7 +513,11 @@ impl FrameCodec {
         // A response is an object tagged `type: "response"` that echoes our id.
         // An event may carry an `id` of its own (extension_ui_request), so `id`
         // alone never decides the split. Mirror: `pi-rpc-manager.ts` handleLine.
-        let Some(kind) = value.get("type").and_then(Value::as_str).map(str::to_string) else {
+        let Some(kind) = value
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
             return Some(Frame::InvalidLine {
                 line: line.to_string(),
                 reason: "missing type field".to_string(),
@@ -560,10 +566,7 @@ mod tests {
     #[test]
     fn encode_request_is_one_lf_terminated_json_line_with_incremental_id() {
         let mut codec = FrameCodec::new();
-        let first = codec.encode_request(
-            "prompt",
-            fields(&[("message", json!("hello"))]),
-        );
+        let first = codec.encode_request("prompt", fields(&[("message", json!("hello"))]));
         assert_eq!(first.id, "1", "ids start at 1");
         assert!(first.line.ends_with('\n'), "one line, LF terminated");
         assert_eq!(
@@ -625,11 +628,14 @@ mod tests {
         };
         assert_eq!(event, &expected, "typed fields must mirror pi's frame");
         // The typed event must serialize back to the same wire shape R4 mirrors.
-        assert_eq!(serde_json::to_value(event).unwrap(), json!({
-            "type": "message_update",
-            "message": {"role": "assistant"},
-            "assistantMessageEvent": {"type": "text_delta", "delta": "Hel", "contentIndex": 0},
-        }));
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            json!({
+                "type": "message_update",
+                "message": {"role": "assistant"},
+                "assistantMessageEvent": {"type": "text_delta", "delta": "Hel", "contentIndex": 0},
+            })
+        );
     }
 
     #[test]
@@ -657,35 +663,53 @@ mod tests {
     fn decode_tool_execution_events_typed_fields() {
         let mut codec = FrameCodec::new();
         let input = concat!(
-            r#"{"type":"tool_execution_start","toolCallId":"call-1","toolName":"read","args":{"path":"a.txt"}}"#, "\n",
-            r#"{"type":"tool_execution_update","toolCallId":"call-1","toolName":"read","args":{"path":"a.txt"},"partialResult":{"content":[{"type":"text","text":"a"}]}}"#, "\n",
-            r#"{"type":"tool_execution_end","toolCallId":"call-1","toolName":"read","result":{"content":[{"type":"text","text":"a"}]},"isError":false}"#, "\n",
+            r#"{"type":"tool_execution_start","toolCallId":"call-1","toolName":"read","args":{"path":"a.txt"}}"#,
+            "\n",
+            r#"{"type":"tool_execution_update","toolCallId":"call-1","toolName":"read","args":{"path":"a.txt"},"partialResult":{"content":[{"type":"text","text":"a"}]}}"#,
+            "\n",
+            r#"{"type":"tool_execution_end","toolCallId":"call-1","toolName":"read","result":{"content":[{"type":"text","text":"a"}]},"isError":false}"#,
+            "\n",
         );
         let frames = codec.push_bytes(input.as_bytes());
         assert_eq!(frames.len(), 3);
-        let Frame::Event(start) = &frames[0] else { panic!("start") };
-        assert_eq!(serde_json::to_value(start).unwrap(), json!({
-            "type": "tool_execution_start",
-            "toolCallId": "call-1",
-            "toolName": "read",
-            "args": {"path": "a.txt"},
-        }));
-        let Frame::Event(update) = &frames[1] else { panic!("update") };
-        assert_eq!(serde_json::to_value(update).unwrap(), json!({
-            "type": "tool_execution_update",
-            "toolCallId": "call-1",
-            "toolName": "read",
-            "args": {"path": "a.txt"},
-            "partialResult": {"content": [{"type": "text", "text": "a"}]},
-        }));
-        let Frame::Event(end) = &frames[2] else { panic!("end") };
-        assert_eq!(serde_json::to_value(end).unwrap(), json!({
-            "type": "tool_execution_end",
-            "toolCallId": "call-1",
-            "toolName": "read",
-            "result": {"content": [{"type": "text", "text": "a"}]},
-            "isError": false,
-        }));
+        let Frame::Event(start) = &frames[0] else {
+            panic!("start")
+        };
+        assert_eq!(
+            serde_json::to_value(start).unwrap(),
+            json!({
+                "type": "tool_execution_start",
+                "toolCallId": "call-1",
+                "toolName": "read",
+                "args": {"path": "a.txt"},
+            })
+        );
+        let Frame::Event(update) = &frames[1] else {
+            panic!("update")
+        };
+        assert_eq!(
+            serde_json::to_value(update).unwrap(),
+            json!({
+                "type": "tool_execution_update",
+                "toolCallId": "call-1",
+                "toolName": "read",
+                "args": {"path": "a.txt"},
+                "partialResult": {"content": [{"type": "text", "text": "a"}]},
+            })
+        );
+        let Frame::Event(end) = &frames[2] else {
+            panic!("end")
+        };
+        assert_eq!(
+            serde_json::to_value(end).unwrap(),
+            json!({
+                "type": "tool_execution_end",
+                "toolCallId": "call-1",
+                "toolName": "read",
+                "result": {"content": [{"type": "text", "text": "a"}]},
+                "isError": false,
+            })
+        );
     }
 
     #[test]
@@ -738,8 +762,10 @@ mod tests {
     fn response_is_separated_from_events_and_ids_are_kept() {
         let mut codec = FrameCodec::new();
         let chunk = concat!(
-            r#"{"type":"response","command":"prompt","id":"7","success":true,"data":null}"#, "\n",
-            r#"{"type":"extension_ui_request","id":"ui-1","method":"confirm","message":"sure?"}"#, "\n"
+            r#"{"type":"response","command":"prompt","id":"7","success":true,"data":null}"#,
+            "\n",
+            r#"{"type":"extension_ui_request","id":"ui-1","method":"confirm","message":"sure?"}"#,
+            "\n"
         );
         let frames = codec.push_bytes(chunk.as_bytes());
         assert_eq!(frames.len(), 2);
@@ -767,7 +793,8 @@ mod tests {
         let mut codec = FrameCodec::new();
         let line = concat!(
             r#"{"type":"extension_ui_request","id":"ui-select","method":"select","#,
-            r#""title":"Allow dangerous command?","options":["Allow","Block"]}"#, "\n"
+            r#""title":"Allow dangerous command?","options":["Allow","Block"]}"#,
+            "\n"
         );
         let frames = codec.push_bytes(line.as_bytes());
         assert_eq!(frames.len(), 1);
@@ -784,13 +811,16 @@ mod tests {
         };
         assert_eq!(event, &expected, "typed fields must mirror pi's frame");
         // The webview mirrors this exact shape (R4, B3), so pin it here.
-        assert_eq!(serde_json::to_value(event).unwrap(), json!({
-            "type": "extension_ui_request",
-            "id": "ui-select",
-            "method": "select",
-            "title": "Allow dangerous command?",
-            "options": ["Allow", "Block"],
-        }));
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            json!({
+                "type": "extension_ui_request",
+                "id": "ui-select",
+                "method": "select",
+                "title": "Allow dangerous command?",
+                "options": ["Allow", "Block"],
+            })
+        );
     }
 
     #[test]
@@ -798,19 +828,23 @@ mod tests {
         let mut codec = FrameCodec::new();
         let line = concat!(
             r#"{"type":"extension_ui_request","id":"ui-confirm","method":"confirm","#,
-            r#""title":"Clear session?","message":"All messages will be lost."}"#, "\n"
+            r#""title":"Clear session?","message":"All messages will be lost."}"#,
+            "\n"
         );
         let frames = codec.push_bytes(line.as_bytes());
         let Frame::Event(event) = &frames[0] else {
             panic!("expected event, got {:?}", frames[0]);
         };
-        assert_eq!(serde_json::to_value(event).unwrap(), json!({
-            "type": "extension_ui_request",
-            "id": "ui-confirm",
-            "method": "confirm",
-            "title": "Clear session?",
-            "message": "All messages will be lost.",
-        }));
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            json!({
+                "type": "extension_ui_request",
+                "id": "ui-confirm",
+                "method": "confirm",
+                "title": "Clear session?",
+                "message": "All messages will be lost.",
+            })
+        );
     }
 
     #[test]
@@ -818,33 +852,41 @@ mod tests {
         let mut codec = FrameCodec::new();
         let chunk = concat!(
             r#"{"type":"extension_ui_request","id":"ui-input","method":"input","#,
-            r#""title":"Enter a value","placeholder":"type something..."}"#, "\n",
+            r#""title":"Enter a value","placeholder":"type something..."}"#,
+            "\n",
             r#"{"type":"extension_ui_request","id":"ui-input-2","method":"input","#,
-            r#""title":"Enter a value"}"#, "\n",
+            r#""title":"Enter a value"}"#,
+            "\n",
         );
         let frames = codec.push_bytes(chunk.as_bytes());
         assert_eq!(frames.len(), 2);
         let Frame::Event(with_placeholder) = &frames[0] else {
             panic!("expected event, got {:?}", frames[0]);
         };
-        assert_eq!(serde_json::to_value(with_placeholder).unwrap(), json!({
-            "type": "extension_ui_request",
-            "id": "ui-input",
-            "method": "input",
-            "title": "Enter a value",
-            "placeholder": "type something...",
-        }));
+        assert_eq!(
+            serde_json::to_value(with_placeholder).unwrap(),
+            json!({
+                "type": "extension_ui_request",
+                "id": "ui-input",
+                "method": "input",
+                "title": "Enter a value",
+                "placeholder": "type something...",
+            })
+        );
         // Without a placeholder the field is absent on the wire and stays absent
         // in the mirror: never `null`, which a TS optional would also reject.
         let Frame::Event(without) = &frames[1] else {
             panic!("expected event, got {:?}", frames[1]);
         };
-        assert_eq!(serde_json::to_value(without).unwrap(), json!({
-            "type": "extension_ui_request",
-            "id": "ui-input-2",
-            "method": "input",
-            "title": "Enter a value",
-        }));
+        assert_eq!(
+            serde_json::to_value(without).unwrap(),
+            json!({
+                "type": "extension_ui_request",
+                "id": "ui-input-2",
+                "method": "input",
+                "title": "Enter a value",
+            })
+        );
     }
 
     #[test]
@@ -854,7 +896,8 @@ mod tests {
         let mut codec = FrameCodec::new();
         let line = concat!(
             r#"{"type":"extension_ui_request","id":"ui-timed","method":"confirm","#,
-            r#""title":"Timed","message":"Five seconds.","timeout":5000}"#, "\n"
+            r#""title":"Timed","message":"Five seconds.","timeout":5000}"#,
+            "\n"
         );
         let frames = codec.push_bytes(line.as_bytes());
         assert!(matches!(
@@ -871,11 +914,16 @@ mod tests {
         // Typing them would put a question in the chat that nobody can answer.
         let mut codec = FrameCodec::new();
         let chunk = concat!(
-            r#"{"type":"extension_ui_request","id":"n-1","method":"notify","message":"hi","notifyType":"info"}"#, "\n",
-            r#"{"type":"extension_ui_request","id":"s-1","method":"setStatus","statusKey":"k","statusText":"t"}"#, "\n",
-            r#"{"type":"extension_ui_request","id":"w-1","method":"setWidget","widgetKey":"k","widgetLines":["a"]}"#, "\n",
-            r#"{"type":"extension_ui_request","id":"t-1","method":"setTitle","title":"pi"}"#, "\n",
-            r#"{"type":"extension_ui_request","id":"e-1","method":"set_editor_text","text":"x"}"#, "\n",
+            r#"{"type":"extension_ui_request","id":"n-1","method":"notify","message":"hi","notifyType":"info"}"#,
+            "\n",
+            r#"{"type":"extension_ui_request","id":"s-1","method":"setStatus","statusKey":"k","statusText":"t"}"#,
+            "\n",
+            r#"{"type":"extension_ui_request","id":"w-1","method":"setWidget","widgetKey":"k","widgetLines":["a"]}"#,
+            "\n",
+            r#"{"type":"extension_ui_request","id":"t-1","method":"setTitle","title":"pi"}"#,
+            "\n",
+            r#"{"type":"extension_ui_request","id":"e-1","method":"set_editor_text","text":"x"}"#,
+            "\n",
         );
         let frames = codec.push_bytes(chunk.as_bytes());
         assert_eq!(frames.len(), 5);
@@ -892,7 +940,12 @@ mod tests {
         // One line, LF terminated, no allocated request id: pi answers nothing
         // and the id is the one pi chose (S2).
         assert_eq!(
-            encode_ui_response("3f9c-uuid", &UiAnswer::Value { value: "Allow".into() }),
+            encode_ui_response(
+                "3f9c-uuid",
+                &UiAnswer::Value {
+                    value: "Allow".into()
+                }
+            ),
             "{\"type\":\"extension_ui_response\",\"id\":\"3f9c-uuid\",\"value\":\"Allow\"}\n"
         );
         assert_eq!(
@@ -913,7 +966,11 @@ mod tests {
                 value: "a \"quoted\"\nsecond line".into(),
             },
         );
-        assert_eq!(line.matches('\n').count(), 1, "exactly one newline: {line:?}");
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "exactly one newline: {line:?}"
+        );
         let parsed: Value = serde_json::from_str(line.trim_end()).expect("valid json");
         assert_eq!(parsed["type"], "extension_ui_response");
         assert_eq!(parsed["value"], "a \"quoted\"\nsecond line");
@@ -924,7 +981,9 @@ mod tests {
     fn ui_answer_deserializes_the_three_documented_shapes() {
         assert_eq!(
             serde_json::from_value::<UiAnswer>(json!({"value": "Allow"})).unwrap(),
-            UiAnswer::Value { value: "Allow".into() }
+            UiAnswer::Value {
+                value: "Allow".into()
+            }
         );
         assert_eq!(
             serde_json::from_value::<UiAnswer>(json!({"confirmed": false})).unwrap(),
@@ -944,7 +1003,9 @@ mod tests {
     #[test]
     fn response_without_id_or_error_still_decodes() {
         let mut codec = FrameCodec::new();
-        let frames = codec.push_bytes(b"{\"type\":\"response\",\"success\":false,\"error\":\"unknown command\"}\n");
+        let frames = codec.push_bytes(
+            b"{\"type\":\"response\",\"success\":false,\"error\":\"unknown command\"}\n",
+        );
         let Frame::Response(response) = &frames[0] else {
             panic!("expected response, got {:?}", frames[0]);
         };
@@ -977,8 +1038,10 @@ mod tests {
     fn decode_agent_end_and_turn_end_arrays() {
         let mut codec = FrameCodec::new();
         let chunk = concat!(
-            r#"{"type":"agent_end","messages":[{"role":"assistant"}]}"#, "\n",
-            r#"{"type":"turn_end","message":{"role":"assistant"},"toolResults":[]}"#, "\n"
+            r#"{"type":"agent_end","messages":[{"role":"assistant"}]}"#,
+            "\n",
+            r#"{"type":"turn_end","message":{"role":"assistant"},"toolResults":[]}"#,
+            "\n"
         );
         let frames = codec.push_bytes(chunk.as_bytes());
         let Frame::Event(AgentEvent::AgentEnd { messages }) = &frames[0] else {
@@ -1009,7 +1072,13 @@ mod tests {
     // to `Other` and losing the turn.
     #[test]
     fn turn_end_projects_the_stop_reason_out_of_the_message() {
-        for word in ["aborted", "length", "error", "stop", "a_reason_from_the_future"] {
+        for word in [
+            "aborted",
+            "length",
+            "error",
+            "stop",
+            "a_reason_from_the_future",
+        ] {
             let mut codec = FrameCodec::new();
             let line = format!(
                 concat!(
@@ -1087,7 +1156,10 @@ mod tests {
             ("error", StopReason::Error),
             ("aborted", StopReason::Aborted),
             ("deferred", StopReason::Deferred),
-            ("word_from_the_future", StopReason::Unknown("word_from_the_future".into())),
+            (
+                "word_from_the_future",
+                StopReason::Unknown("word_from_the_future".into()),
+            ),
         ] {
             assert_eq!(StopReason::from_wire(word), reason);
             assert_eq!(reason.as_wire(), word);
@@ -1110,8 +1182,10 @@ mod tests {
         // `Other` and the level was lost with its payload.
         let mut codec = FrameCodec::new();
         let chunk = concat!(
-            r#"{"type":"thinking_level_changed","level":"high"}"#, "\n",
-            r#"{"type":"thinking_level_changed","level":"off"}"#, "\n",
+            r#"{"type":"thinking_level_changed","level":"high"}"#,
+            "\n",
+            r#"{"type":"thinking_level_changed","level":"off"}"#,
+            "\n",
         );
         let frames = codec.push_bytes(chunk.as_bytes());
         assert_eq!(frames.len(), 2);
@@ -1143,8 +1217,8 @@ mod tests {
         // A level pi introduces later must not demote the whole frame to `Other`
         // and leave the selector stale: the field is a string, so it crosses.
         let mut codec = FrameCodec::new();
-        let frames = codec
-            .push_bytes(b"{\"type\":\"thinking_level_changed\",\"level\":\"ultra\"}\n");
+        let frames =
+            codec.push_bytes(b"{\"type\":\"thinking_level_changed\",\"level\":\"ultra\"}\n");
         assert!(matches!(
             &frames[0],
             Frame::Event(AgentEvent::ThinkingLevelChanged { level }) if level == "ultra"
@@ -1158,20 +1232,26 @@ mod tests {
             status: RuntimeStatus::Crashed,
             error: Some("boom".into()),
         };
-        assert_eq!(serde_json::to_value(&status).unwrap(), json!({
-            "type": "process_status",
-            "status": "crashed",
-            "error": "boom",
-        }));
+        assert_eq!(
+            serde_json::to_value(&status).unwrap(),
+            json!({
+                "type": "process_status",
+                "status": "crashed",
+                "error": "boom",
+            })
+        );
         let exit = AgentEvent::ProcessExit {
             code: Some(2),
             stderr_tail: vec!["line one".into()],
         };
-        assert_eq!(serde_json::to_value(&exit).unwrap(), json!({
-            "type": "process_exit",
-            "code": 2,
-            "stderrTail": ["line one"],
-        }));
+        assert_eq!(
+            serde_json::to_value(&exit).unwrap(),
+            json!({
+                "type": "process_exit",
+                "code": 2,
+                "stderrTail": ["line one"],
+            })
+        );
         // No stderr tail and no code -> both fields are omitted, never null.
         assert_eq!(
             serde_json::to_value(AgentEvent::ProcessExit {

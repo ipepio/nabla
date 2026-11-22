@@ -17,9 +17,19 @@
 //! implementation of `Searcher`, [`SearxngSearcher`], is the only thing in this
 //! file that touches the network, and nothing constructs it but
 //! [`SettingsSearch::searcher`].
+//!
+//! **Credentials.** An instance behind nginx Basic auth answers `401` to
+//! every anonymous request, so the human may store one optional secret beside the
+//! instance (`webSearchCredentials`). It becomes exactly one header
+//! ([`authorization_header`]) and it only ever travels to the instance the human
+//! configured ([`credentials_for`]): the public fallback walks servers they never
+//! named, and a header sent to one of those would hand the secret to a third
+//! party.
 
 use std::path::PathBuf;
 use std::time::Duration;
+
+use base64::prelude::{BASE64_STANDARD, Engine as _};
 
 /// How long one search may take. Short on purpose: a tool call that hangs is
 /// worse than one that answers "the instance did not respond", and the next
@@ -105,8 +115,68 @@ impl SearchGateway for SettingsSearch {
     }
 
     fn searcher(&self, instance: &str) -> Box<dyn Searcher> {
-        Box::new(SearxngSearcher::new(instance))
+        // Credentials: they live in the same file as the instance, so the gateway
+        // reads them here instead of widening `SearchGateway` — the dispatcher's seam
+        // keeps its shape, and a searcher for a public candidate is built with no
+        // secret at all ([`credentials_for`]). A file that cannot be read sends
+        // nothing, like every other read in this module.
+        let credentials = match crate::settings::load(&self.path) {
+            Ok(settings) => credentials_for(
+                &settings.web_search_instance,
+                instance,
+                &settings.web_search_credentials,
+            ),
+            Err(_) => String::new(),
+        };
+        Box::new(SearxngSearcher::with_credentials(instance, &credentials))
     }
+}
+
+/// Credentials: the `Authorization` header one configured value is worth, or
+/// `None`.
+///
+/// The rule is the shape of what the human typed, because that is the only signal
+/// there is and it is the one every tool uses:
+///
+/// - `user:password` (it contains a colon) → `Basic base64(user:password)`, which is
+///   what an nginx in front of a SearXNG instance asks for;
+/// - anything else → `Bearer <value>`, for an instance behind a token;
+/// - empty (or only spaces) → `None`: no header at all, never an empty one, so an
+///   anonymous instance sees exactly the request it saw before this field existed.
+///
+/// Only the surrounding spaces are trimmed; the value itself is data, so a password
+/// keeps its colons and a token keeps its characters and its case.
+pub fn authorization_header(credentials: &str) -> Option<String> {
+    let trimmed = credentials.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains(':') {
+        // The whole `user:password` is what Basic auth encodes, so a password with a
+        // colon in it keeps working.
+        Some(format!("Basic {}", BASE64_STANDARD.encode(trimmed)))
+    } else {
+        Some(format!("Bearer {trimmed}"))
+    }
+}
+
+/// The credentials, but only for the instance the human configured.
+///
+/// Both sides are compared normalized, because `searx.example`, `searx.example/`
+/// and `https://searx.example` are one instance to [`normalize_instance`]. Every
+/// other case answers an empty string, which [`authorization_header`] then turns
+/// into no header: no instance configured, a public fallback candidate, or nothing
+/// stored at all.
+pub fn credentials_for(configured: &str, instance: &str, credentials: &str) -> String {
+    let trimmed = credentials.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let configured = normalize_instance(configured);
+    if configured.is_empty() || configured != normalize_instance(instance) {
+        return String::new();
+    }
+    trimmed.to_string()
 }
 
 /// Well-known public SearXNG endpoints, tried in this order when the human
@@ -200,16 +270,24 @@ pub fn normalize_instance(raw: &str) -> String {
 
 /// S2: the real searcher — `GET {instance}/search?q=…&format=json`.
 ///
-/// A struct per instance, built by [`SettingsSearch::searcher`]: the instance is
-/// the whole state, so two instances can be in flight without sharing anything.
+/// A struct per instance, built by [`SettingsSearch::searcher`]: the instance and
+/// the one header derived from the configured credentials are the whole state, so
+/// two instances can be in flight without sharing anything.
 pub struct SearxngSearcher {
     instance: String,
+    /// The `Authorization` header already built, or `None` for an anonymous
+    /// instance. Built once, in [`SearxngSearcher::with_credentials`], so a request
+    /// can never re-encode a secret differently from the one next to it.
+    authorization: Option<String>,
 }
 
 impl SearxngSearcher {
-    pub fn new(instance: &str) -> SearxngSearcher {
+    /// The searcher for an instance, carrying the header its credentials are
+    /// worth (none for an empty value, which is the anonymous case).
+    pub fn with_credentials(instance: &str, credentials: &str) -> SearxngSearcher {
         SearxngSearcher {
             instance: normalize_instance(instance),
+            authorization: authorization_header(credentials),
         }
     }
 
@@ -232,7 +310,7 @@ impl Searcher for SearxngSearcher {
             return Err("no instance was configured".to_string());
         }
         let endpoint = self.endpoint(query);
-        let body = fetch(&endpoint)?;
+        let body = fetch(&endpoint, self.authorization.as_deref())?;
         parse_results(&body, clamp_limit(limit))
     }
 }
@@ -245,8 +323,13 @@ impl Searcher for SearxngSearcher {
 /// else. A short-lived OS thread owns its own current-thread runtime instead, so
 /// the search blocks one thread that exists only for it. `reqwest`'s blocking
 /// client is not an option: this crate enables no `blocking` feature for it.
-fn fetch(endpoint: &str) -> Result<String, String> {
+///
+/// `authorization` is the header already built for this instance, moved into the
+/// thread because that is what it ends up as: a borrowed string could not outlive
+/// the call.
+fn fetch(endpoint: &str, authorization: Option<&str>) -> Result<String, String> {
     let url = endpoint.to_string();
+    let authorization = authorization.map(str::to_string);
     let handle = std::thread::Builder::new()
         .name("nabla-web-search".to_string())
         .spawn(move || {
@@ -254,7 +337,7 @@ fn fetch(endpoint: &str) -> Result<String, String> {
                 .enable_all()
                 .build()
                 .map_err(|error| format!("could not start the search runtime: {error}"))?;
-            runtime.block_on(async move { get_json(&url).await })
+            runtime.block_on(async move { get_json(&url, authorization.as_deref()).await })
         })
         .map_err(|error| format!("could not start the search thread: {error}"))?;
     handle
@@ -262,23 +345,25 @@ fn fetch(endpoint: &str) -> Result<String, String> {
         .map_err(|_| "the search thread stopped without an answer".to_string())?
 }
 
-/// The request itself: one JSON GET with [`SEARCH_TIMEOUT`] as the whole budget.
-async fn get_json(url: &str) -> Result<String, String> {
+/// The request itself: one JSON GET with [`SEARCH_TIMEOUT`] as the whole budget,
+/// and the `Authorization` header when one was configured.
+async fn get_json(url: &str, authorization: Option<&str>) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(SEARCH_TIMEOUT)
         .build()
         .map_err(|error| format!("could not build the search client: {error}"))?;
-    let response = client
+    let mut request = client
         .get(url)
         .header("Accept", "application/json")
-        .header("User-Agent", concat!("nabla/", env!("CARGO_PKG_VERSION")))
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
+        .header("User-Agent", concat!("nabla/", env!("CARGO_PKG_VERSION")));
+    if let Some(authorization) = authorization {
+        request = request.header("Authorization", authorization);
+    }
+    let response = request.send().await.map_err(|error| error.to_string())?;
     let status = response.status();
     let body = response.text().await.map_err(|error| error.to_string())?;
     if !status.is_success() {
-        return Err(http_status_error(status.as_u16()));
+        return Err(http_status_error(status.as_u16(), authorization.is_some()));
     }
     Ok(body)
 }
@@ -286,9 +371,24 @@ async fn get_json(url: &str) -> Result<String, String> {
 /// S3: a refusal, said plainly. The two that matter are the ones a public
 /// instance usually answers with, and they are the reason the fix is "configure
 /// your own instance" rather than "try again".
-fn http_status_error(code: u16) -> String {
+///
+/// `401`/`403` mean two different things depending on what was sent: with
+/// credentials the instance rejected them — an expired token, a wrong password, a
+/// `user:password` shape where it wanted a token — and without them it refused the
+/// anonymous JSON request, which is the truth for a public instance that blocks the
+/// API. Saying "rejected the credentials" when none were sent would send the human
+/// hunting for a field that is already empty.
+fn http_status_error(code: u16, credentials_sent: bool) -> String {
     match code {
-        401 | 403 => format!("HTTP {code}: the instance refuses the JSON API"),
+        401 | 403 if credentials_sent => format!(
+            "HTTP {code}: the instance rejected the credentials from Settings > Web search \
+             (check the user:password or the token, and that this instance is the one \
+             expecting them)"
+        ),
+        401 | 403 => format!(
+            "HTTP {code}: the instance refuses the JSON API, and may require credentials \
+             — set them in Settings > Web search if it does"
+        ),
         429 => format!("HTTP {code}: the instance is rate-limiting requests"),
         _ => format!("HTTP {code}"),
     }
@@ -404,12 +504,12 @@ mod tests {
     // S2: the url one instance is asked at, from what the human typed.
     #[test]
     fn the_endpoint_is_built_from_the_normalized_instance() {
-        let bare = SearxngSearcher::new("  searx.be/  ");
+        let bare = SearxngSearcher::with_credentials("  searx.be/  ", "");
         assert_eq!(
             bare.endpoint("a&b"),
             "https://searx.be/search?q=a%26b&format=json"
         );
-        let full = SearxngSearcher::new("https://searx.example/base/");
+        let full = SearxngSearcher::with_credentials("https://searx.example/base/", "");
         assert_eq!(
             full.endpoint("rust"),
             "https://searx.example/base/search?q=rust&format=json"
@@ -468,8 +568,7 @@ mod tests {
         assert!(reason.contains("not JSON"), "{reason}");
         assert!(reason.contains("JSON API"), "{reason}");
 
-        let no_results =
-            parse_results(r#"{"error":"nope"}"#, 5).expect_err("no results array");
+        let no_results = parse_results(r#"{"error":"nope"}"#, 5).expect_err("no results array");
         assert!(no_results.contains("results"), "{no_results}");
     }
 
@@ -513,6 +612,175 @@ mod tests {
         assert_eq!(DEFAULT_LIMIT.clamp(1, MAX_LIMIT), DEFAULT_LIMIT);
     }
 
+    // ── configured credentials ───────────────────────────────────────────────
+
+    // The credentials the human configured become exactly one header. A value
+    // with a colon is `user:password` — the Basic auth an nginx in front of
+    // SearXNG asks for — and anything else is a bearer token. Nothing configured
+    // is no header at all, never an empty one.
+    #[test]
+    fn credentials_become_one_authorization_header() {
+        assert_eq!(authorization_header(""), None);
+        assert_eq!(authorization_header("   \n\t"), None);
+        assert_eq!(authorization_header("u:s").as_deref(), Some("Basic dTpz"));
+        // Split at the first colon only: a password may contain one, and the whole
+        // value is what Basic auth encodes.
+        assert_eq!(
+            authorization_header("user:pa:ss").as_deref(),
+            Some("Basic dXNlcjpwYTpzcw==")
+        );
+        assert_eq!(
+            authorization_header("tok123").as_deref(),
+            Some("Bearer tok123")
+        );
+        // Surrounding spaces are dropped; nothing else is touched.
+        assert_eq!(
+            authorization_header("  u:s  ").as_deref(),
+            Some("Basic dTpz")
+        );
+        assert_eq!(
+            authorization_header("  a b  ").as_deref(),
+            Some("Bearer a b")
+        );
+    }
+
+    // The leak rule: the credentials belong to the instance the human named.
+    // The public fallback walks instances they never named, and a header sent to
+    // one of them would hand the secret to a third party.
+    #[test]
+    fn credentials_only_travel_to_the_configured_instance() {
+        assert_eq!(
+            credentials_for("https://searx.example", "https://searx.example/", " u:p "),
+            "u:p",
+            "a trailing slash is the same instance"
+        );
+        assert_eq!(
+            credentials_for("searx.example", "https://searx.example", "u:p"),
+            "u:p",
+            "a bare host and its url are the same instance"
+        );
+        assert_eq!(
+            credentials_for("", "https://searx.be", "u:p"),
+            "",
+            "no configured instance means no instance may receive the secret"
+        );
+        assert_eq!(
+            credentials_for("https://searx.example", "https://searx.be", "u:p"),
+            "",
+            "a public candidate gets nothing"
+        );
+        assert_eq!(
+            credentials_for("https://searx.example", "https://searx.example", "  "),
+            "",
+            "nothing configured is nothing sent"
+        );
+    }
+
+    // A 401/403 means the instance rejected what was sent. With credentials the
+    // message says so; without them it says the JSON API was refused, because
+    // that is the truthful reading of an anonymous refusal.
+    #[test]
+    fn a_401_names_the_credentials_when_some_were_sent() {
+        let rejected = http_status_error(401, true);
+        assert!(rejected.contains("401"), "{rejected}");
+        assert!(rejected.contains("rejected the credentials"), "{rejected}");
+
+        let anonymous = http_status_error(403, false);
+        assert!(anonymous.contains("403"), "{anonymous}");
+        assert!(anonymous.contains("JSON API"), "{anonymous}");
+        assert!(
+            !anonymous.contains("rejected the credentials"),
+            "{anonymous}"
+        );
+
+        // A rate limit is about volume, not about who is asking.
+        assert_eq!(http_status_error(429, true), http_status_error(429, false));
+        assert!(http_status_error(429, false).contains("rate-limiting"));
+        assert_eq!(http_status_error(500, true), "HTTP 500");
+    }
+
+    /// A one-request HTTP server on loopback, for the probes that must observe the
+    /// wire. It answers `answer` to whatever it is asked and hands the request head
+    /// back through the channel, so a test can read the headers that were really
+    /// sent. Nothing leaves the machine and no port is fixed.
+    fn serve_once(answer: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("one connection");
+            let mut head: Vec<u8> = Vec::new();
+            let mut buffer = [0u8; 1024];
+            // The request head ends at the blank line; the body of a GET is empty.
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => head.extend_from_slice(&buffer[..read]),
+                }
+            }
+            let _ = sender.send(String::from_utf8_lossy(&head).to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                answer.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+        (format!("http://{addr}"), receiver)
+    }
+
+    // The header really reaches the instance. Both shapes are observed on the
+    // wire — through the searcher the dispatcher would build, against a fake
+    // server — not only in the helper's return value. A searcher with no
+    // credentials sends no `Authorization` header at all.
+    #[test]
+    fn the_authorization_header_reaches_the_instance() {
+        const ANSWER: &str =
+            r#"{"results":[{"title":"Rust","url":"https://rust-lang.org/","content":""}]}"#;
+
+        let (base, seen) = serve_once(ANSWER);
+        let basic = SearxngSearcher::with_credentials(&format!("{base}/"), "u:s");
+        assert_eq!(basic.search("rust", 5).expect("the fake answers").len(), 1);
+        let request = seen.recv().expect("one request");
+        // Header names travel lowercase on the wire (http::HeaderName).
+        assert!(
+            request.to_lowercase().contains("authorization: basic dtpz"),
+            "{request}"
+        );
+        assert!(
+            request.starts_with("GET /search?q=rust&format=json HTTP/1.1"),
+            "{request}"
+        );
+
+        let (base, seen) = serve_once(ANSWER);
+        let bearer = SearxngSearcher::with_credentials(&base, "tok123");
+        assert_eq!(bearer.search("rust", 5).expect("the fake answers").len(), 1);
+        let request = seen.recv().expect("one request");
+        assert!(
+            request
+                .to_lowercase()
+                .contains("authorization: bearer tok123"),
+            "{request}"
+        );
+
+        let (base, seen) = serve_once(ANSWER);
+        assert_eq!(
+            SearxngSearcher::with_credentials(&base, "")
+                .search("rust", 5)
+                .expect("the fake answers")
+                .len(),
+            1
+        );
+        let request = seen.recv().expect("one request");
+        assert!(
+            !request.to_lowercase().contains("authorization"),
+            "no credentials, no header: {request}"
+        );
+    }
+
     // S2/L4: the public list is the best-effort fallback, and it holds real
     // endpoints (no placeholders a reader would have to decode).
     #[test]
@@ -521,7 +789,10 @@ mod tests {
         assert!(instances.len() >= 3, "{instances:?}");
         for instance in instances {
             assert!(instance.starts_with("https://"), "{instance}");
-            assert!(!instance.ends_with('/'), "a slash would double up: {instance}");
+            assert!(
+                !instance.ends_with('/'),
+                "a slash would double up: {instance}"
+            );
         }
     }
 }

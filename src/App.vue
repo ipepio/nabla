@@ -15,8 +15,15 @@ import { Button } from "./components/ui/button";
 import { SidebarInset, SidebarProvider } from "./components/ui/sidebar";
 import { subscribeEmbedNeedView } from "./contracts/commands";
 import type { WorkspaceInfo } from "./contracts/types";
+import { setWebviewZoom } from "./contracts/window";
 import { t } from "./lib/i18n";
 import { enabledTools, isToolEnabled } from "./lib/preferences";
+import {
+  applyDocumentZoom,
+  createZoomController,
+  detectPlatform,
+  zoomAction,
+} from "./lib/zoom";
 
 const activeWorkspace = ref<WorkspaceInfo | null>(null);
 // Right tools drawer (S6): collapsed by default; the chat header and the empty
@@ -75,7 +82,34 @@ let unsubscribeNeedView: (() => void) | null = null;
 /** Set on unmount: a subscribe that answers afterwards releases itself. */
 let disposed = false;
 
+/**
+ * Zoom (`⌘`/`Ctrl` `+`, `-`, `0`; the whole policy is `src/lib/zoom.ts`).
+ *
+ * The listener is document-level and lives in the shell because zoom is not a
+ * panel's concern: whichever pane has focus — the composer, a terminal, a dialog
+ * — the chord is the app's. The platform is read once, from the webview's user
+ * agent: macOS takes `⌘`, Windows and Linux take `Ctrl`.
+ *
+ * The native port is the main webview's page zoom; the document-level fallback is
+ * only reached when that refuses (a plain browser during `vite dev`, or a build
+ * without it). A chord we do not own is never `preventDefault`ed, so typing
+ * `=` or `-` stays typing.
+ */
+const zoomPlatform = detectPlatform(navigator.userAgent, navigator.platform);
+const zoom = createZoomController({
+  setNative: (scale) => setWebviewZoom(scale),
+  setDocument: (scale) => applyDocumentZoom(document.documentElement, scale),
+});
+
+function onZoomKeydown(event: KeyboardEvent): void {
+  const action = zoomAction(event, zoomPlatform);
+  if (action === null) return;
+  event.preventDefault();
+  void zoom.apply(action);
+}
+
 onMounted(async () => {
+  document.addEventListener("keydown", onZoomKeydown);
   const off = await subscribeEmbedNeedView(() => void openBrowserPane());
   if (disposed) {
     off();
@@ -85,6 +119,7 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  document.removeEventListener("keydown", onZoomKeydown);
   disposed = true;
   unsubscribeNeedView?.();
   unsubscribeNeedView = null;

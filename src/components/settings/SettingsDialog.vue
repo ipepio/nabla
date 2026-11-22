@@ -66,8 +66,10 @@
  * General pane; the header no longer repeats it.
  *
  * S5 of `settings-dialog.md`: the nav lists only the sections the app can drive
- * — permissions, font size, work details, code view and shortcuts have no
- * backend yet, so they are not painted as if they worked. S1 of
+ * — permissions, font size, work details and code view have no backend yet, so
+ * they are not painted as if they worked. Shortcuts left that list when the zoom
+ * chords landed: the General pane shows them read-only, because a chord is not a
+ * preference (`src/lib/zoom.ts` owns the listener and the labels). S1 of
  * `tool-drawer-and-mcp.md` added the third one: MCP, a pane of its own rather
  * than a block inside Providers, because servers and providers are two different
  * things pi reads from two different files.
@@ -90,7 +92,7 @@
  * `useAppearance().setMode`, the only path that touches the palette. Every
  * user-visible string comes from the catalogue in `src/lib/i18n.ts` (S2).
  */
-import { computed, ref, watch } from "vue";
+import { computed, ref, watch, type Ref } from "vue";
 import {
   BlocksIcon,
   BotIcon,
@@ -128,18 +130,22 @@ import { useAppearance } from "@/lib/appearance";
 import {
   applyPreferences,
   isToolEnabled,
+  preferenceDraftCommit,
   queueMessages,
   setQueueMessages,
   setShowReasoning,
   setToolEnabled,
+  setWebSearchCredentials,
   setWebSearchEnabled,
   setWebSearchInstance,
   showReasoning,
+  webSearchCredentials,
   webSearchEnabled,
   webSearchInstance,
   type ToolPreferenceId,
 } from "@/lib/preferences";
 import { useI18n, type Locale, type MessageKey } from "@/lib/i18n";
+import { detectPlatform, zoomShortcutLabels } from "@/lib/zoom";
 import {
   invalidateProviderModels,
   loadProviderModels,
@@ -202,6 +208,30 @@ const LANGUAGE_OPTIONS: { value: Locale; labelKey: MessageKey }[] = [
   { value: "es", labelKey: "settings.general.language.spanish" },
 ];
 
+/**
+ * The zoom chords this build listens to, labelled for the platform it runs on.
+ *
+ * Read-only on purpose: a chord is not a preference yet, and `src/lib/zoom.ts`
+ * owns both the listener and these labels, so this list cannot describe a key the
+ * app ignores. The platform is read once, exactly as `App.vue` reads it.
+ */
+const SHORTCUT_PLATFORM = detectPlatform(navigator.userAgent, navigator.platform);
+const ZOOM_SHORTCUT_LABELS = zoomShortcutLabels(SHORTCUT_PLATFORM);
+const SHORTCUT_ROWS: { labelKey: MessageKey; keys: string }[] = [
+  {
+    labelKey: "settings.general.shortcuts.zoomIn",
+    keys: ZOOM_SHORTCUT_LABELS.in,
+  },
+  {
+    labelKey: "settings.general.shortcuts.zoomOut",
+    keys: ZOOM_SHORTCUT_LABELS.out,
+  },
+  {
+    labelKey: "settings.general.shortcuts.zoomReset",
+    keys: ZOOM_SHORTCUT_LABELS.reset,
+  },
+];
+
 /** Persisted preferences, `null` until the file is read on open. */
 const settings = ref<AppSettings | null>(null);
 /** S1 of `providers-pane.md`: the providers pi knows, as Rust summarizes them. */
@@ -219,6 +249,21 @@ const showProviderForm = ref(false);
 const keyTarget = ref<string | null>(null);
 /** The key being typed. Always empty when the editor opens: never prefilled. */
 const keyDraft = ref("");
+/**
+ * S3 of `web-search.md`: the two web-search text fields are edited as drafts of
+ * their own and written when they are committed, so typing is never a write.
+ *
+ * A draft, not the shared ref, is what the field is bound to, and that is the fix
+ * for the field that wiped itself while typing: `Input` renders a native input
+ * with its own internal `v-model` (`src/components/ui/input/Input.vue`), and Vue
+ * re-syncs an input's `value` from its props on every patch — so a `:value` bound
+ * to a ref that the same keystroke re-renders (through the input's own model) is
+ * written back to the DOM mid-typing. Binding the input's own model to a local
+ * draft removes the second writer: the only thing that moves the field is what the
+ * human types, and the only thing that moves the file is a commit.
+ */
+const webSearchInstanceDraft = ref("");
+const webSearchCredentialsDraft = ref("");
 /** A key write is in flight. */
 const savingKey = ref(false);
 /** The provider the removal confirmation is about, `null` when it is closed. */
@@ -375,6 +420,12 @@ async function loadPreferences() {
     setMode(loaded.theme);
     setLocale(loaded.language);
     applyPreferences(loaded);
+    // S3 of `web-search.md`: the two text fields of the pane are drafts, so they
+    // are seeded from what the file just answered — on every open, which is also
+    // how a hand edit of `settings.json` reaches the fields. Nothing else writes
+    // them while the pane is open: a keystroke only moves the draft.
+    webSearchInstanceDraft.value = webSearchInstance.value;
+    webSearchCredentialsDraft.value = webSearchCredentials.value;
   } catch (cause) {
     settings.value = null;
     error.value = commandErrorMessage(cause);
@@ -539,13 +590,50 @@ function handleWebSearchToggle(next: boolean) {
 }
 
 /**
- * S3: the instance url, written when the field is committed (blur or Enter)
- * rather than per keystroke: a half-typed host is not a preference, and a save per
- * character would rewrite `settings.json` a dozen times for one url.
+ * S3: one text draft of this pane, committed on blur or Enter.
+ *
+ * `preferenceDraftCommit` answers what the draft is worth (trimmed) or `null` when
+ * the file already holds it, so a commit that changes nothing writes nothing. The
+ * field is then left showing what was stored: the trimmed value the human meant,
+ * never the stray spaces they did not. The write is fire-and-forget like every
+ * other preference in this dialog — the shared setter updates the live value first
+ * and persists behind it, and a failed write leaves the field as typed.
  */
-function handleWebSearchInstance(event: Event) {
-  const target = event.target as HTMLInputElement | null;
-  void setWebSearchInstance(target?.value ?? "");
+function commitTextDraft(
+  draft: Ref<string>,
+  stored: Ref<string>,
+  write: (next: string) => Promise<void>,
+): void {
+  const next = preferenceDraftCommit(draft.value, stored.value);
+  if (next === null) {
+    draft.value = stored.value;
+    return;
+  }
+  void write(next).then(() => {
+    draft.value = stored.value;
+  });
+}
+
+/** S3: the instance url, written when the field is committed (blur or Enter). */
+function commitWebSearchInstance() {
+  commitTextDraft(
+    webSearchInstanceDraft,
+    webSearchInstance,
+    setWebSearchInstance,
+  );
+}
+
+/**
+ * The credential, same commit rule as the instance. The field is a password
+ * input and starts from the stored value, because a human re-editing a token needs
+ * to see what is there to correct it; it is their own file.
+ */
+function commitWebSearchCredentials() {
+  commitTextDraft(
+    webSearchCredentialsDraft,
+    webSearchCredentials,
+    setWebSearchCredentials,
+  );
 }
 
 /**
@@ -1084,9 +1172,12 @@ watch(open, (isOpen) => {
                 >
                   {{ t("settings.general.webSearch.instance") }}
                 </label>
+                <!-- S3: bound to the pane's own draft, never to the shared ref:
+                     the input carries its own model, and two writers of one value
+                     is what made the field erase itself while typing. -->
                 <Input
                   id="settings-web-search-instance"
-                  :value="webSearchInstance"
+                  v-model="webSearchInstanceDraft"
                   type="text"
                   inputmode="url"
                   autocomplete="off"
@@ -1096,10 +1187,39 @@ watch(open, (isOpen) => {
                     t('settings.general.webSearch.instance.placeholder')
                   "
                   :aria-label="t('settings.general.webSearch.instance')"
-                  @change="handleWebSearchInstance"
+                  @change="commitWebSearchInstance"
+                  @keydown.enter="commitWebSearchInstance"
                 />
                 <p class="text-xs text-muted-foreground">
                   {{ t("settings.general.webSearch.instance.hint") }}
+                </p>
+              </div>
+
+              <div class="space-y-1.5">
+                <label
+                  class="text-sm"
+                  for="settings-web-search-credentials"
+                >
+                  {{ t("settings.general.webSearch.credentials") }}
+                </label>
+                <!-- One optional secret, in the shape the instance wants:
+                     `user:contraseña` for Basic auth, a token for Bearer. -->
+                <Input
+                  id="settings-web-search-credentials"
+                  v-model="webSearchCredentialsDraft"
+                  type="password"
+                  autocomplete="off"
+                  spellcheck="false"
+                  class="h-8 text-sm"
+                  :placeholder="
+                    t('settings.general.webSearch.credentials.placeholder')
+                  "
+                  :aria-label="t('settings.general.webSearch.credentials')"
+                  @change="commitWebSearchCredentials"
+                  @keydown.enter="commitWebSearchCredentials"
+                />
+                <p class="text-xs text-muted-foreground">
+                  {{ t("settings.general.webSearch.credentials.hint") }}
                 </p>
               </div>
             </section>
@@ -1142,6 +1262,36 @@ watch(open, (isOpen) => {
                   </SelectItem>
                 </SelectContent>
               </Select>
+            </section>
+
+            <!-- The zoom chords are the only shortcuts with a backend, and they
+                 are the app's, not a preference: a read-only list instead of a
+                 control. S5 of `settings-dialog.md` still holds for the rest
+                 (font size, work details, code view). -->
+            <section class="space-y-2">
+              <div>
+                <h3 class="text-sm font-medium">
+                  {{ t("settings.general.shortcuts") }}
+                </h3>
+                <p class="mt-0.5 text-xs text-muted-foreground">
+                  {{ t("settings.general.shortcuts.description") }}
+                </p>
+              </div>
+              <ul class="divide-y rounded-md border">
+                <li
+                  v-for="row in SHORTCUT_ROWS"
+                  :key="row.labelKey"
+                  class="flex items-center justify-between gap-4 px-3 py-2"
+                >
+                  <span class="text-xs">{{ t(row.labelKey) }}</span>
+                  <kbd
+                    class="rounded-sm bg-muted px-1.5 py-0.5 font-sans text-[0.7rem] font-medium text-muted-foreground"
+                  >{{ row.keys }}</kbd>
+                </li>
+              </ul>
+              <p class="text-xs text-muted-foreground">
+                {{ t("settings.general.shortcuts.zoomScope") }}
+              </p>
             </section>
 
             <!-- S4: the only configuration-file action, at the end of the pane. -->

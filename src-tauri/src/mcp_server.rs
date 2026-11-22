@@ -33,7 +33,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tauri::Emitter;
 
 use crate::embed::EmbedError;
@@ -390,7 +390,12 @@ impl Action {
             Action::Type { selector, text } => {
                 run_script(driver, view, &type_script(selector, text))
             }
-            Action::Back => history(driver, view, "history.back()", "went back one history entry"),
+            Action::Back => history(
+                driver,
+                view,
+                "history.back()",
+                "went back one history entry",
+            ),
             Action::Forward => history(
                 driver,
                 view,
@@ -528,9 +533,10 @@ const NO_VIEW_ERROR: &str = "no browser view is open and none appeared: the brow
 /// by the human respectively.
 fn resolve_view<'a>(views: &'a [LiveView], asked: Option<&str>) -> Result<&'a LiveView, String> {
     if let Some(asked) = asked {
-        return views.iter().find(|view| view.id == asked).ok_or_else(|| {
-            format!("no view with id `{asked}`; open now: {}", open_views(views))
-        });
+        return views
+            .iter()
+            .find(|view| view.id == asked)
+            .ok_or_else(|| format!("no view with id `{asked}`; open now: {}", open_views(views)));
     }
     match views {
         [only] => Ok(only),
@@ -548,11 +554,7 @@ fn open_views(views: &[LiveView]) -> String {
     if views.is_empty() {
         return "none".to_string();
     }
-    views
-        .iter()
-        .map(describe)
-        .collect::<Vec<_>>()
-        .join(", ")
+    views.iter().map(describe).collect::<Vec<_>>().join(", ")
 }
 
 /// One line per view, the shape `list_targets` and every "open now" message
@@ -888,7 +890,8 @@ fn public_instances_failure(failures: &[String]) -> String {
 
 /// A `tools/call` result. `isError` is how MCP reports a tool that ran but failed,
 /// which is a different thing from a broken request.
-fn tool_result(id: &Value, text: &str, is_error: bool) -> Value {    json!({
+fn tool_result(id: &Value, text: &str, is_error: bool) -> Value {
+    json!({
         "jsonrpc": "2.0",
         "id": id,
         "result": {
@@ -1194,10 +1197,7 @@ mod tests {
         /// What the real driver does with a `ViewGone`: the dead entry leaves the
         /// registry before the failure is answered.
         fn evict(&self, view_id: &str) {
-            self.views
-                .lock()
-                .unwrap()
-                .retain(|view| view.id != view_id);
+            self.views.lock().unwrap().retain(|view| view.id != view_id);
         }
 
         /// The views the app registers once a tool asks for a pane, on an open
@@ -1408,7 +1408,10 @@ mod tests {
         assert_eq!(answer["id"], json!(7));
         assert_eq!(answer["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(answer["result"]["serverInfo"]["name"], SERVER_NAME);
-        assert_eq!(answer["result"]["capabilities"]["tools"]["listChanged"], false);
+        assert_eq!(
+            answer["result"]["capabilities"]["tools"]["listChanged"],
+            false
+        );
     }
 
     // A notification never gets a body: `notifications/initialized` after the
@@ -1455,8 +1458,19 @@ mod tests {
 
         // No mandatory argument, deliberately: `viewId` is the common case
         // omitted, and list_targets answers *with* the registry.
-        for name in ["get_url", "get_title", "back", "forward", "reload", "list_targets"] {
-            assert_eq!(required(name), json!([]), "{name} takes no mandatory argument");
+        for name in [
+            "get_url",
+            "get_title",
+            "back",
+            "forward",
+            "reload",
+            "list_targets",
+        ] {
+            assert_eq!(
+                required(name),
+                json!([]),
+                "{name} takes no mandatory argument"
+            );
         }
 
         // S3 of `web-search.md`: the search tool declares the one thing it cannot
@@ -1468,12 +1482,19 @@ mod tests {
             .find(|tool| tool["name"] == "web_search")
             .expect("web_search is in the catalog");
         let description = search["description"].as_str().expect("a description");
-        for claim in ["titles, urls and snippets", "does NOT open", "navigate", "eval"] {
-            assert!(description.contains(claim), "missing {claim:?}: {description}");
+        for claim in [
+            "titles, urls and snippets",
+            "does NOT open",
+            "navigate",
+            "eval",
+        ] {
+            assert!(
+                description.contains(claim),
+                "missing {claim:?}: {description}"
+            );
         }
         assert_eq!(
-            search["inputSchema"]["properties"]["limit"]["type"],
-            "integer",
+            search["inputSchema"]["properties"]["limit"]["type"], "integer",
             "`limit` is a number, not a string"
         );
     }
@@ -1509,8 +1530,12 @@ mod tests {
         let driver = FakeDriver::one();
         let search = FakeSearch::off().answering([Ok(two_hits())]);
 
-        let answer = super::dispatch(&driver, &search, &search_request(json!({ "query": "rust" })))
-            .expect("answer");
+        let answer = super::dispatch(
+            &driver,
+            &search,
+            &search_request(json!({ "query": "rust" })),
+        )
+        .expect("answer");
 
         assert_eq!(answer["result"]["isError"], true);
         assert_eq!(
@@ -1540,7 +1565,12 @@ mod tests {
         )
         .expect("answer");
 
-        assert_eq!(answer["result"]["isError"], false, "{}", answer_text(&answer));
+        assert_eq!(
+            answer["result"]["isError"],
+            false,
+            "{}",
+            answer_text(&answer)
+        );
         assert_eq!(
             answer_text(&answer),
             "Rust\nhttps://rust-lang.org/\nA language.\n\nDocs\nhttps://doc.rust-lang.org/\nThe book."
@@ -1555,16 +1585,23 @@ mod tests {
     #[test]
     fn a_failing_configured_instance_is_surfaced_without_fallback() {
         let driver = FakeDriver::one();
-        let search = FakeSearch::configured("https://searx.example")
-            .answering([Err("HTTP 429: the instance is rate-limiting requests".to_string())]);
+        let search = FakeSearch::configured("https://searx.example").answering([Err(
+            "HTTP 429: the instance is rate-limiting requests".to_string(),
+        )]);
 
-        let answer =
-            super::dispatch(&driver, &search, &search_request(json!({ "query": "rust" })))
-                .expect("answer");
+        let answer = super::dispatch(
+            &driver,
+            &search,
+            &search_request(json!({ "query": "rust" })),
+        )
+        .expect("answer");
 
         assert_eq!(answer["result"]["isError"], true);
         let text = answer_text(&answer);
-        assert!(text.contains("https://searx.example"), "names the instance: {text}");
+        assert!(
+            text.contains("https://searx.example"),
+            "names the instance: {text}"
+        );
         assert!(text.contains("HTTP 429"), "keeps the reason: {text}");
         assert!(text.contains("Settings"), "says where the fix is: {text}");
         assert_eq!(
@@ -1584,18 +1621,30 @@ mod tests {
             Ok(two_hits()),
         ]);
 
-        let answer =
-            super::dispatch(&driver, &search, &search_request(json!({ "query": "rust" })))
-                .expect("answer");
+        let answer = super::dispatch(
+            &driver,
+            &search,
+            &search_request(json!({ "query": "rust" })),
+        )
+        .expect("answer");
 
-        assert_eq!(answer["result"]["isError"], false, "{}", answer_text(&answer));
+        assert_eq!(
+            answer["result"]["isError"],
+            false,
+            "{}",
+            answer_text(&answer)
+        );
         let public = crate::websearch::public_instances();
         assert_eq!(
             search.asked(),
             public[..2].to_vec(),
             "the first candidate, then the second, in list order"
         );
-        assert_eq!(search.calls().len(), 2, "one attempt per candidate, no more");
+        assert_eq!(
+            search.calls().len(),
+            2,
+            "one attempt per candidate, no more"
+        );
     }
 
     // S3/S4: when every public instance fails, the answer says what the fix is
@@ -1607,9 +1656,12 @@ mod tests {
             "HTTP 429: the instance is rate-limiting requests".to_string(),
         )]);
 
-        let answer =
-            super::dispatch(&driver, &search, &search_request(json!({ "query": "rust" })))
-                .expect("answer");
+        let answer = super::dispatch(
+            &driver,
+            &search,
+            &search_request(json!({ "query": "rust" })),
+        )
+        .expect("answer");
 
         assert_eq!(answer["result"]["isError"], true);
         let text = answer_text(&answer);
@@ -1619,7 +1671,10 @@ mod tests {
             "every candidate was tried exactly once"
         );
         assert!(text.contains("public SearXNG instance"), "{text}");
-        assert!(text.contains("configured instance"), "names the fix: {text}");
+        assert!(
+            text.contains("configured instance"),
+            "names the fix: {text}"
+        );
         assert!(text.contains("Settings"), "says where: {text}");
         assert!(text.contains("HTTP 429"), "keeps the reasons: {text}");
     }
@@ -1629,8 +1684,14 @@ mod tests {
     #[test]
     fn the_limit_is_clamped_before_the_instance_is_asked() {
         let driver = FakeDriver::one();
-        for (asked, expected) in [(json!(0), 1), (json!(1), 1), (json!(10), 10), (json!(99), 10)] {
-            let search = FakeSearch::configured("https://searx.example").answering([Ok(two_hits())]);
+        for (asked, expected) in [
+            (json!(0), 1),
+            (json!(1), 1),
+            (json!(10), 10),
+            (json!(99), 10),
+        ] {
+            let search =
+                FakeSearch::configured("https://searx.example").answering([Ok(two_hits())]);
             super::dispatch(
                 &driver,
                 &search,
@@ -1645,8 +1706,12 @@ mod tests {
         }
 
         let search = FakeSearch::configured("https://searx.example").answering([Ok(two_hits())]);
-        super::dispatch(&driver, &search, &search_request(json!({ "query": "rust" })))
-            .expect("answer");
+        super::dispatch(
+            &driver,
+            &search,
+            &search_request(json!({ "query": "rust" })),
+        )
+        .expect("answer");
         assert_eq!(
             search.calls(),
             vec![("rust".to_string(), crate::websearch::DEFAULT_LIMIT)]
@@ -1667,7 +1732,8 @@ mod tests {
             json!({ "query": "rust", "limit": 2.5 }),
             json!({ "query": "rust", "limit": -3 }),
         ] {
-            let search = FakeSearch::configured("https://searx.example").answering([Ok(two_hits())]);
+            let search =
+                FakeSearch::configured("https://searx.example").answering([Ok(two_hits())]);
             let answer = super::dispatch(&driver, &search, &search_request(arguments.clone()))
                 .expect("answer");
             assert_eq!(answer["error"]["code"], -32602, "{arguments}");
@@ -1688,11 +1754,19 @@ mod tests {
         }]);
         let search = FakeSearch::configured("https://searx.example").answering([Ok(two_hits())]);
 
-        let answer =
-            super::dispatch(&driver, &search, &search_request(json!({ "query": "rust" })))
-                .expect("answer");
+        let answer = super::dispatch(
+            &driver,
+            &search,
+            &search_request(json!({ "query": "rust" })),
+        )
+        .expect("answer");
 
-        assert_eq!(answer["result"]["isError"], false, "{}", answer_text(&answer));
+        assert_eq!(
+            answer["result"]["isError"],
+            false,
+            "{}",
+            answer_text(&answer)
+        );
         assert_eq!(driver.asks(), 0, "search opens no pane");
         assert!(driver.views().is_empty(), "and creates no view");
         assert!(driver.navigated.lock().unwrap().is_empty());
@@ -1706,16 +1780,18 @@ mod tests {
         let driver = FakeDriver::one();
         let search = FakeSearch::configured("https://searx.example").answering([Ok(Vec::new())]);
 
-        let answer =
-            super::dispatch(&driver, &search, &search_request(json!({ "query": "ñandú zzz" })))
-                .expect("answer");
+        let answer = super::dispatch(
+            &driver,
+            &search,
+            &search_request(json!({ "query": "ñandú zzz" })),
+        )
+        .expect("answer");
 
         assert_eq!(answer["result"]["isError"], false);
         let text = answer_text(&answer);
         assert!(text.contains("no results"), "{text}");
         assert!(text.contains("ñandú zzz"), "names the query: {text}");
     }
-
 
     // S5: the tool reaches the view the human is looking at without the model
     // having to name it, which is the common case (one pane, one view).
@@ -1771,7 +1847,10 @@ mod tests {
         let empty = FakeDriver::with_views(Vec::new());
         let no_view = dispatch(
             &empty,
-            &request("tools/call", json!({ "name": "eval", "arguments": { "script": "1" } })),
+            &request(
+                "tools/call",
+                json!({ "name": "eval", "arguments": { "script": "1" } }),
+            ),
         )
         .expect("answer");
         assert_eq!(no_view["result"]["isError"], true);
@@ -1784,12 +1863,21 @@ mod tests {
         );
 
         let two = FakeDriver::with_views(vec![
-            LiveView { id: "embed-1".to_string(), url: "https://a.example/".to_string() },
-            LiveView { id: "embed-2".to_string(), url: "https://b.example/".to_string() },
+            LiveView {
+                id: "embed-1".to_string(),
+                url: "https://a.example/".to_string(),
+            },
+            LiveView {
+                id: "embed-2".to_string(),
+                url: "https://b.example/".to_string(),
+            },
         ]);
         let ambiguous = dispatch(
             &two,
-            &request("tools/call", json!({ "name": "eval", "arguments": { "script": "1" } })),
+            &request(
+                "tools/call",
+                json!({ "name": "eval", "arguments": { "script": "1" } }),
+            ),
         )
         .expect("answer");
         assert_eq!(ambiguous["result"]["isError"], true);
@@ -1815,7 +1903,9 @@ mod tests {
     #[test]
     fn a_failing_script_is_a_tool_error_not_a_protocol_error() {
         let driver = FakeDriver::one();
-        driver.answer_eval(Err(DriverFailure::other("ReferenceError: foo is not defined")));
+        driver.answer_eval(Err(DriverFailure::other(
+            "ReferenceError: foo is not defined",
+        )));
         let answer = dispatch(
             &driver,
             &request(
@@ -1825,7 +1915,10 @@ mod tests {
         )
         .expect("answer");
 
-        assert!(answer["error"].is_null(), "a failed tool keeps the protocol clean");
+        assert!(
+            answer["error"].is_null(),
+            "a failed tool keeps the protocol clean"
+        );
         assert_eq!(answer["result"]["isError"], true);
         assert_eq!(
             answer["result"]["content"][0]["text"],
@@ -1843,7 +1936,10 @@ mod tests {
 
         let tool = dispatch(
             &driver,
-            &request("tools/call", json!({ "name": "screenshot", "arguments": {} })),
+            &request(
+                "tools/call",
+                json!({ "name": "screenshot", "arguments": {} }),
+            ),
         )
         .expect("answer");
         assert_eq!(tool["error"]["code"], -32602);
@@ -1870,7 +1966,10 @@ mod tests {
         ] {
             let answer = dispatch(
                 &driver,
-                &request("tools/call", json!({ "name": name, "arguments": arguments })),
+                &request(
+                    "tools/call",
+                    json!({ "name": name, "arguments": arguments }),
+                ),
             )
             .expect("answer");
             assert_eq!(answer["error"]["code"], -32602, "{name}");
@@ -1919,7 +2018,10 @@ mod tests {
         // the model sent — and the naive splice is not in the script.
         let escaped = serde_json::to_string(selector).expect("a JSON literal");
         for script in [click_script, type_script] {
-            assert!(script.contains(&escaped), "escaped literal missing: {script}");
+            assert!(
+                script.contains(&escaped),
+                "escaped literal missing: {script}"
+            );
             assert_eq!(literal_after(script, "selector = "), selector, "{script}");
         }
         assert_eq!(literal_after(type_script, "text = "), text, "{type_script}");
@@ -2006,7 +2108,9 @@ mod tests {
     #[test]
     fn a_click_the_page_cannot_satisfy_is_a_tool_error_naming_the_selector() {
         let driver = FakeDriver::one();
-        driver.answer_eval(Ok("{\"error\":\"nothing matches the selector #nope\"}".to_string()));
+        driver.answer_eval(Ok(
+            "{\"error\":\"nothing matches the selector #nope\"}".to_string()
+        ));
         let page = dispatch(
             &driver,
             &request(
@@ -2015,7 +2119,10 @@ mod tests {
             ),
         )
         .expect("answer");
-        assert!(page["error"].is_null(), "a failed tool keeps the protocol clean");
+        assert!(
+            page["error"].is_null(),
+            "a failed tool keeps the protocol clean"
+        );
         assert_eq!(page["result"]["isError"], true);
         assert_eq!(
             page["result"]["content"][0]["text"],
@@ -2024,7 +2131,9 @@ mod tests {
 
         // A driver failure of its own is preserved verbatim.
         let broken = FakeDriver::one();
-        broken.answer_eval(Err(DriverFailure::other("embed-1 did not answer within 10s")));
+        broken.answer_eval(Err(DriverFailure::other(
+            "embed-1 did not answer within 10s",
+        )));
         let answer = dispatch(
             &broken,
             &request(
@@ -2045,7 +2154,10 @@ mod tests {
     #[test]
     fn get_url_and_list_targets_answer_from_the_registry_without_a_script() {
         let driver = FakeDriver::with_views(vec![
-            LiveView { id: "embed-1".to_string(), url: "https://a.example/".to_string() },
+            LiveView {
+                id: "embed-1".to_string(),
+                url: "https://a.example/".to_string(),
+            },
             LiveView {
                 id: "embed-2".to_string(),
                 url: "https://b.example/page".to_string(),
@@ -2061,11 +2173,17 @@ mod tests {
         )
         .expect("answer");
         assert_eq!(url["result"]["isError"], false);
-        assert_eq!(url["result"]["content"][0]["text"], "https://b.example/page");
+        assert_eq!(
+            url["result"]["content"][0]["text"],
+            "https://b.example/page"
+        );
 
         let targets = dispatch(
             &driver,
-            &request("tools/call", json!({ "name": "list_targets", "arguments": {} })),
+            &request(
+                "tools/call",
+                json!({ "name": "list_targets", "arguments": {} }),
+            ),
         )
         .expect("answer");
         assert_eq!(targets["result"]["isError"], false);
@@ -2093,14 +2211,19 @@ mod tests {
         .expect("answer");
 
         assert_eq!(answer["result"]["isError"], true);
-        let text = answer["result"]["content"][0]["text"].as_str().expect("text");
+        let text = answer["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text");
         assert!(text.contains("open the browser pane"), "{text}");
         assert!(driver.evaluated.lock().unwrap().is_empty());
 
         // An empty list of targets is an answer, not a failure.
         let targets = dispatch(
             &driver,
-            &request("tools/call", json!({ "name": "list_targets", "arguments": {} })),
+            &request(
+                "tools/call",
+                json!({ "name": "list_targets", "arguments": {} }),
+            ),
         )
         .expect("answer");
         assert_eq!(targets["result"]["isError"], false);
@@ -2119,15 +2242,15 @@ mod tests {
         driver.answer_eval(Ok("\"Example Domain\"".to_string()));
         let answer = dispatch(
             &driver,
-            &request("tools/call", json!({ "name": "get_title", "arguments": {} })),
+            &request(
+                "tools/call",
+                json!({ "name": "get_title", "arguments": {} }),
+            ),
         )
         .expect("answer");
 
         assert_eq!(answer["result"]["isError"], false);
-        assert_eq!(
-            answer["result"]["content"][0]["text"],
-            "\"Example Domain\""
-        );
+        assert_eq!(answer["result"]["content"][0]["text"], "\"Example Domain\"");
         assert_eq!(
             driver.evaluated.lock().unwrap().as_slice(),
             [("embed-1".to_string(), "document.title".to_string())]
@@ -2167,7 +2290,14 @@ mod tests {
 
     /// The nine tools that act on a view, with the least arguments they accept.
     const VIEW_TOOLS: [&str; 9] = [
-        "navigate", "eval", "get_url", "get_title", "click", "type", "back", "forward",
+        "navigate",
+        "eval",
+        "get_url",
+        "get_title",
+        "click",
+        "type",
+        "back",
+        "forward",
         "reload",
     ];
 
@@ -2198,7 +2328,10 @@ mod tests {
         arguments["viewId"] = json!(view_id);
         dispatch(
             driver,
-            &request("tools/call", json!({ "name": name, "arguments": arguments })),
+            &request(
+                "tools/call",
+                json!({ "name": name, "arguments": arguments }),
+            ),
         )
         .expect("answer")
     }
@@ -2221,13 +2354,22 @@ mod tests {
 
         let answer = call(&driver, "navigate");
 
-        assert_eq!(answer["result"]["isError"], false, "{}", answer_text(&answer));
+        assert_eq!(
+            answer["result"]["isError"],
+            false,
+            "{}",
+            answer_text(&answer)
+        );
         assert_eq!(
             *driver.ensured.lock().unwrap(),
             vec![VIEW_WAIT],
             "the tool waits with the shared bound"
         );
-        assert_eq!(VIEW_WAIT, Duration::from_secs(10), "≈10s, like REGISTRATION_WAIT");
+        assert_eq!(
+            VIEW_WAIT,
+            Duration::from_secs(10),
+            "≈10s, like REGISTRATION_WAIT"
+        );
         assert_eq!(
             driver.navigated.lock().unwrap().as_slice(),
             [("embed-7".to_string(), "https://example.org/".to_string())],
@@ -2245,15 +2387,24 @@ mod tests {
 
         assert_eq!(answer["result"]["isError"], true);
         let text = answer_text(&answer);
-        assert!(text.contains("browser pane"), "names the pane cause: {text}");
+        assert!(
+            text.contains("browser pane"),
+            "names the pane cause: {text}"
+        );
         assert!(text.contains("closed"), "names the closed pane: {text}");
         assert!(
             text.contains("disabled") && text.contains("Settings"),
             "names the switch that can turn the tool off: {text}"
         );
-        assert!(text.contains("ask the human"), "says whose move it is: {text}");
+        assert!(
+            text.contains("ask the human"),
+            "says whose move it is: {text}"
+        );
         assert_eq!(driver.asks(), 1, "it asked once, then answered");
-        assert!(driver.evaluated.lock().unwrap().is_empty(), "no page was touched");
+        assert!(
+            driver.evaluated.lock().unwrap().is_empty(),
+            "no page was touched"
+        );
         assert!(driver.navigated.lock().unwrap().is_empty());
     }
 
@@ -2264,13 +2415,17 @@ mod tests {
             let empty = FakeDriver::opening(Vec::new());
             let answer = call(&empty, name);
             assert_eq!(empty.asks(), 1, "{name} asks when no view is open");
-            assert_eq!(answer["result"]["isError"], true, "{name}: no view, no work");
+            assert_eq!(
+                answer["result"]["isError"], true,
+                "{name}: no view, no work"
+            );
 
             let open = FakeDriver::one();
             let answer = call(&open, name);
             assert_eq!(open.asks(), 0, "{name} does not ask when a view is open");
             assert_eq!(
-                answer["result"]["isError"], false,
+                answer["result"]["isError"],
+                false,
                 "{name}: {}",
                 answer_text(&answer)
             );
@@ -2285,7 +2440,10 @@ mod tests {
 
         let answer = call(&driver, "list_targets");
 
-        assert_eq!(answer["result"]["isError"], false, "an empty list is an answer");
+        assert_eq!(
+            answer["result"]["isError"], false,
+            "an empty list is an answer"
+        );
         assert!(answer_text(&answer).contains("open the browser pane"));
         assert_eq!(driver.asks(), 0, "the registry answers; nothing waits");
     }
@@ -2367,9 +2525,21 @@ mod tests {
 
         let answer = call(&driver, "navigate");
 
-        assert_eq!(answer["result"]["isError"], false, "{}", answer_text(&answer));
-        assert_eq!(answer_text(&answer), "navigated `embed-7` to https://example.org/");
-        assert_eq!(driver.asks(), 1, "the tool asked the app for a pane exactly once");
+        assert_eq!(
+            answer["result"]["isError"],
+            false,
+            "{}",
+            answer_text(&answer)
+        );
+        assert_eq!(
+            answer_text(&answer),
+            "navigated `embed-7` to https://example.org/"
+        );
+        assert_eq!(
+            driver.asks(),
+            1,
+            "the tool asked the app for a pane exactly once"
+        );
         assert_eq!(
             driver.navigated.lock().unwrap().as_slice(),
             [
@@ -2386,7 +2556,11 @@ mod tests {
             driver.registered()
         );
         assert_eq!(
-            driver.views().iter().map(|view| view.id.as_str()).collect::<Vec<_>>(),
+            driver
+                .views()
+                .iter()
+                .map(|view| view.id.as_str())
+                .collect::<Vec<_>>(),
             ["embed-7"]
         );
     }
@@ -2405,7 +2579,11 @@ mod tests {
         let answer = call(&driver, "navigate");
 
         assert_eq!(answer["result"]["isError"], true);
-        assert_eq!(answer_text(&answer), NO_VIEW_ERROR, "the honest answer, verbatim");
+        assert_eq!(
+            answer_text(&answer),
+            NO_VIEW_ERROR,
+            "the honest answer, verbatim"
+        );
         assert_eq!(driver.asks(), 1, "one re-open ask, not one per attempt");
         assert_eq!(
             driver.navigated.lock().unwrap().len(),
@@ -2425,14 +2603,20 @@ mod tests {
     #[test]
     fn a_script_error_is_an_answer_not_a_retry() {
         let driver = FakeDriver::one();
-        driver.answer_eval(Err(DriverFailure::other("ReferenceError: foo is not defined")));
+        driver.answer_eval(Err(DriverFailure::other(
+            "ReferenceError: foo is not defined",
+        )));
 
         let answer = call(&driver, "eval");
 
         assert_eq!(answer["result"]["isError"], true);
         assert_eq!(answer_text(&answer), "ReferenceError: foo is not defined");
         assert_eq!(driver.asks(), 0, "nothing was asked for a pane");
-        assert_eq!(driver.evaluated.lock().unwrap().len(), 1, "the script ran once");
+        assert_eq!(
+            driver.evaluated.lock().unwrap().len(),
+            1,
+            "the script ran once"
+        );
     }
 
     // `get_url` answers from the registry, so it is the one tool that can report a
@@ -2458,7 +2642,10 @@ mod tests {
             Action::GetUrl.run(&live, &stale),
             Ok("https://example.com/".to_string())
         );
-        assert!(live.evaluated.lock().unwrap().is_empty(), "the page was not asked");
+        assert!(
+            live.evaluated.lock().unwrap().is_empty(),
+            "the page was not asked"
+        );
     }
 
     // `list_targets` is the tool whose answer IS the registry, and an eviction
@@ -2490,8 +2677,12 @@ mod tests {
         assert!(missing_webview(&EmbedError::UnknownView("embed-1".into())));
         // `tauri::Error::WebviewNotFound`'s `Display`, inside the failure that
         // wraps it.
-        assert!(missing_webview(&EmbedError::Navigate("webview not found".into())));
-        assert!(missing_webview(&EmbedError::Eval("webview not found".into())));
+        assert!(missing_webview(&EmbedError::Navigate(
+            "webview not found".into()
+        )));
+        assert!(missing_webview(&EmbedError::Eval(
+            "webview not found".into()
+        )));
 
         for answer in [
             EmbedError::Eval("ReferenceError: foo is not defined".into()),
@@ -2500,7 +2691,10 @@ mod tests {
             EmbedError::InvalidUrl("file:///etc/passwd".into()),
             EmbedError::Create("no window labelled main".into()),
         ] {
-            assert!(!missing_webview(&answer), "{answer} is an answer, not a retry");
+            assert!(
+                !missing_webview(&answer),
+                "{answer} is an answer, not a retry"
+            );
         }
     }
 
@@ -2568,12 +2762,8 @@ mod tests {
     fn the_endpoint_requires_its_token_and_answers_json_over_http() {
         let driver = Arc::new(FakeDriver::one());
         let token = new_token();
-        let endpoint = start(
-            driver,
-            Arc::new(crate::websearch::NoSearch),
-            token.clone(),
-        )
-        .expect("bind a local port");
+        let endpoint = start(driver, Arc::new(crate::websearch::NoSearch), token.clone())
+            .expect("bind a local port");
         assert!(endpoint.url.starts_with("http://127.0.0.1:"));
 
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }).to_string();
@@ -2643,7 +2833,9 @@ mod tests {
             .write_all(request.as_bytes())
             .expect("write the request");
         let mut response = String::new();
-        stream.read_to_string(&mut response).expect("read the answer");
+        stream
+            .read_to_string(&mut response)
+            .expect("read the answer");
         response
     }
 
@@ -2726,7 +2918,10 @@ mod tests {
         gate.complete(RegistrationOutcome::Skipped);
         gate.complete(RegistrationOutcome::Failed("a late failure".to_string()));
 
-        assert_eq!(gate.wait(Duration::from_secs(30)), RegistrationOutcome::Skipped);
+        assert_eq!(
+            gate.wait(Duration::from_secs(30)),
+            RegistrationOutcome::Skipped
+        );
     }
 
     // The failure is announced once and names its cost: every session start asks
@@ -2759,7 +2954,10 @@ pub fn start(
     token: String,
 ) -> Result<Endpoint, String> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
-    let port = listener.local_addr().map_err(|error| error.to_string())?.port();
+    let port = listener
+        .local_addr()
+        .map_err(|error| error.to_string())?
+        .port();
     let endpoint = Endpoint {
         url: format!("http://127.0.0.1:{port}/mcp"),
         token,

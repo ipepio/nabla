@@ -83,7 +83,9 @@ fn display_err<E: std::fmt::Display>(err: E) -> String {
 /// behind these locks is replaced wholesale, so a poison flag left by an
 /// unrelated panic must not turn every later caller into a failure.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Path of the user-editable preferences file inside a config directory.
@@ -181,10 +183,7 @@ pub fn set_workspace_pinned(
 /// S8: records that the space was just used ("Recientes"). Returns the updated
 /// row; an id that changes no row is an error, not a silent success.
 #[tauri::command]
-pub fn touch_workspace(
-    state: State<'_, AppState>,
-    workspace_id: i64,
-) -> Result<Workspace, String> {
+pub fn touch_workspace(state: State<'_, AppState>, workspace_id: i64) -> Result<Workspace, String> {
     let changed = state
         .store
         .touch_workspace(workspace_id)
@@ -220,7 +219,9 @@ fn agents_path(state: &AppState) -> PathBuf {
 /// (master switch off, no profiles), so a fresh install opens the dialog on
 /// nothing enabled instead of on an error.
 #[tauri::command]
-pub fn get_agents_config(state: State<'_, AppState>) -> Result<crate::agents::AgentsConfig, String> {
+pub fn get_agents_config(
+    state: State<'_, AppState>,
+) -> Result<crate::agents::AgentsConfig, String> {
     crate::agents::load(&agents_path(&state)).map_err(display_err)
 }
 
@@ -366,10 +367,7 @@ pub async fn discover_provider_models(
 /// `list_providers` takes: it never invents an entry). A malformed id is still
 /// rejected before the file is touched.
 #[tauri::command]
-pub fn delete_provider(
-    state: State<'_, AppState>,
-    provider_id: String,
-) -> Result<bool, String> {
+pub fn delete_provider(state: State<'_, AppState>, provider_id: String) -> Result<bool, String> {
     crate::providers::delete_provider(&models_path(&state), &provider_id).map_err(display_err)
 }
 
@@ -406,9 +404,7 @@ pub fn set_provider_key(
 /// the selector can leave a hidden model out. A corrupt settings file cannot blank
 /// the listing: it only hides nothing.
 #[tauri::command]
-pub fn list_provider_models(
-    state: State<'_, AppState>,
-) -> Result<Vec<ProviderModels>, String> {
+pub fn list_provider_models(state: State<'_, AppState>) -> Result<Vec<ProviderModels>, String> {
     let mut providers = crate::providers::read_provider_models_with_catalog(
         &models_path(&state),
         &catalog_path(&state),
@@ -468,10 +464,7 @@ pub fn remove_provider_model(
 }
 
 #[tauri::command]
-pub fn save_settings(
-    state: State<'_, AppState>,
-    settings: Settings,
-) -> Result<Settings, String> {
+pub fn save_settings(state: State<'_, AppState>, settings: Settings) -> Result<Settings, String> {
     let path = settings_path(&state);
     // `settings` is the payload here, so the module is reached by crate path.
     crate::settings::save(&path, &settings).map_err(display_err)?;
@@ -509,9 +502,7 @@ fn set_permission_mode_for(
     mode: &str,
 ) -> Result<String, String> {
     let parsed = PermissionMode::parse(mode).ok_or_else(|| {
-        format!(
-            "unknown permission mode: {mode:?} (expected \"read\", \"write\" or \"yolo\")"
-        )
+        format!("unknown permission mode: {mode:?} (expected \"read\", \"write\" or \"yolo\")")
     })?;
     let path = settings_file(config_dir);
     let mut settings = settings::load(&path).map_err(display_err)?;
@@ -556,10 +547,7 @@ pub fn get_permission_mode(state: State<'_, AppState>) -> Result<String, String>
 /// atomic write, projected for the live gate, and answered as what the file now
 /// holds — so the chip renders the stored value instead of its own guess.
 #[tauri::command]
-pub fn set_permission_mode(
-    state: State<'_, AppState>,
-    mode: String,
-) -> Result<String, String> {
+pub fn set_permission_mode(state: State<'_, AppState>, mode: String) -> Result<String, String> {
     set_permission_mode_for(&state.config_dir, &state.data_dir, &mode)
 }
 
@@ -600,10 +588,7 @@ fn ensure_config_file(path: &Path) -> Result<(), String> {
 /// opener plugin the app already installs. The path is resolved here, so the
 /// webview never needs it to trigger the action.
 #[tauri::command]
-pub fn open_config_file(
-    state: State<'_, AppState>,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
+pub fn open_config_file(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<(), String> {
     let path = settings_path(&state);
     ensure_config_file(&path)?;
     app.opener()
@@ -942,8 +927,8 @@ pub async fn start_session(
         // wait, so it belongs on a worker thread, not on an async one. The MCP
         // registration is waited for on that same thread and before the first
         // byte of pi's argv: pi reads `mcp.json` when it starts (L8).
-        let _ = tauri::async_runtime::spawn_blocking(move || boot_session(spawn, registration))
-            .await;
+        let _ =
+            tauri::async_runtime::spawn_blocking(move || boot_session(spawn, registration)).await;
     });
     Ok(session)
 }
@@ -1240,10 +1225,7 @@ fn session_commands_from_response(data: Option<&serde_json::Value>) -> Vec<Sessi
 /// S2: the levels this session's model accepts, asked of the child that owns the
 /// model. A session with no process is an error: an empty list would claim the
 /// model supports nothing.
-fn session_thinking_levels_for(
-    runtime: &ProcessManager,
-    key: &str,
-) -> Result<Vec<String>, String> {
+fn session_thinking_levels_for(runtime: &ProcessManager, key: &str) -> Result<Vec<String>, String> {
     let response = runtime
         .send(key, "get_available_thinking_levels", serde_json::Map::new())
         .map_err(display_err)?;
@@ -1469,7 +1451,12 @@ pub fn set_session_model(
     model_id: String,
 ) -> Result<SessionModelInfo, String> {
     ensure_session_in_workspace(&state.store, workspace_id, session_id)?;
-    set_session_model_for(&state.runtime, &session_id.to_string(), &provider, &model_id)
+    set_session_model_for(
+        &state.runtime,
+        &session_id.to_string(),
+        &provider,
+        &model_id,
+    )
 }
 
 /// S3: the commands this session offers (extension commands, prompt templates and
@@ -1901,10 +1888,7 @@ const TRASH_DIR: &str = ".trash";
 /// transcript pi never wrote has no file, and a path outside the app data dir is
 /// not ours to move (older rows could point anywhere), so those stay in place.
 /// Only the index row is ever removed for them.
-fn archive_session_file(
-    data_dir: &Path,
-    session_file: &Path,
-) -> std::io::Result<Option<PathBuf>> {
+fn archive_session_file(data_dir: &Path, session_file: &Path) -> std::io::Result<Option<PathBuf>> {
     if !session_file.starts_with(data_dir) {
         return Ok(None);
     }
@@ -1977,12 +1961,8 @@ fn delete_session_core(
     // already stopped) is not an error — the row still has to go.
     let _ = runtime.stop_and_wait(&session_id.to_string());
 
-    archive_session_file(data_dir, Path::new(&row.pi_session_path)).map_err(|err| {
-        format!(
-            "cannot archive session file {}: {err}",
-            row.pi_session_path
-        )
-    })?;
+    archive_session_file(data_dir, Path::new(&row.pi_session_path))
+        .map_err(|err| format!("cannot archive session file {}: {err}", row.pi_session_path))?;
 
     store.delete_session(session_id).map_err(display_err)
 }
@@ -2205,9 +2185,7 @@ fn content_text(content: &serde_json::Value) -> Option<String> {
 fn part_text(part: &serde_json::Value) -> Option<&str> {
     match part {
         serde_json::Value::String(text) => Some(text.as_str()),
-        serde_json::Value::Object(object) => {
-            object.get("text").and_then(serde_json::Value::as_str)
-        }
+        serde_json::Value::Object(object) => object.get("text").and_then(serde_json::Value::as_str),
         _ => None,
     }
 }
@@ -2549,9 +2527,10 @@ fn subagent_sessions_for(
                     .filter(|agent| !agent.trim().is_empty())
                     .or_else(|| row.title.clone())
                     .unwrap_or_default(),
-                status: live.map_or_else(|| "unknown".to_string(), |entry| {
-                    manifest_status(&entry.status)
-                }),
+                status: live.map_or_else(
+                    || "unknown".to_string(),
+                    |entry| manifest_status(&entry.status),
+                ),
                 session_path: row.pi_session_path,
                 started_at: live
                     .and_then(|entry| entry.started_at.clone())
@@ -2571,7 +2550,12 @@ pub fn subagent_sessions(
     workspace_id: i64,
     parent_session_id: i64,
 ) -> Result<Vec<SubagentSession>, String> {
-    subagent_sessions_for(&state.store, &state.data_dir, workspace_id, parent_session_id)
+    subagent_sessions_for(
+        &state.store,
+        &state.data_dir,
+        workspace_id,
+        parent_session_id,
+    )
 }
 
 // ── session preview: the instant first paint ────────────────────────────────
@@ -2626,11 +2610,7 @@ fn preview_is_stale(store: &Store, session_id: i64, snapshotted_at: &str) -> boo
 /// failed — and the caller carries on, because a preview is only a head start on
 /// painting. Messages whose role the transcript cannot render are dropped: they
 /// would cost an open instead of speeding it up.
-fn save_session_preview_for(
-    store: &Store,
-    session_id: i64,
-    messages: &[PreviewMessage],
-) -> bool {
+fn save_session_preview_for(store: &Store, session_id: i64, messages: &[PreviewMessage]) -> bool {
     let mut kept: Vec<PreviewMessage> = messages
         .iter()
         .filter_map(|message| {
@@ -2863,12 +2843,7 @@ fn auth_state_label(state: cli::AuthState) -> &'static str {
 /// of an unknown server exits 0): the badges are read from `list --json`.
 fn mcp_call(state: &AppState, args: &[String], timeout_ms: u64) -> Result<PiCliResult, String> {
     let settings = settings::load(&settings_path(state)).map_err(display_err)?;
-    cli::run(
-        args,
-        Duration::from_millis(timeout_ms),
-        &settings.pi_binary,
-    )
-    .map_err(display_err)
+    cli::run(args, Duration::from_millis(timeout_ms), &settings.pi_binary).map_err(display_err)
 }
 
 /// S1: one reading of a finished `pi mcp list --json`.
@@ -2981,8 +2956,7 @@ pub fn mcp_file_path(state: State<'_, AppState>, scope: McpScope) -> Result<Stri
 /// host process. The bridge inherits it and has no cwd parameter, so this is the
 /// only project a `pi mcp ... -l` call can address.
 fn project_root() -> Result<PathBuf, String> {
-    std::env::current_dir()
-        .map_err(|err| format!("cannot resolve the project directory: {err}"))
+    std::env::current_dir().map_err(|err| format!("cannot resolve the project directory: {err}"))
 }
 
 /// The path resolution behind `mcp_file_path`, split out so it is testable
@@ -3373,8 +3347,8 @@ fn write_registration(
 /// "No such server" is not an error: it is the state the app wants, and on a run
 /// whose registration never happened it is the only state there is.
 pub fn unregister_mcp_server(state: &AppState) -> Result<(), String> {
-    let args = mcp::remove_args(crate::mcp_server::SERVER_NAME, McpScope::Global)
-        .map_err(display_err)?;
+    let args =
+        mcp::remove_args(crate::mcp_server::SERVER_NAME, McpScope::Global).map_err(display_err)?;
     let result = mcp_call(state, &args, cli::DEFAULT_TIMEOUT_MS)?;
     if nothing_to_remove(&result) {
         return Ok(());
@@ -3393,6 +3367,27 @@ fn nothing_to_remove(result: &PiCliResult) -> bool {
         .stderr
         .to_ascii_lowercase()
         .contains("no global mcp server named")
+}
+
+/// The UI's own zoom, applied to the MAIN webview (see `zoom.rs`).
+///
+/// The chord, the step and the list of levels live in `src/lib/zoom.ts`; this
+/// command is the native port that module prefers, and it is the only place a
+/// scale factor crosses the seam. A rejected factor is a plain message the UI
+/// reads, and the window keeps the zoom it had.
+///
+/// `get_webview_window("main")` is the app shell: the embedded browser's child
+/// webviews (`embed-<n>`) are separate `Webview`s, so this call never scales a page
+/// the agent drives. `set_zoom` sends a message to the event loop and does not wait
+/// for the main thread, so it is safe from a synchronous command (unlike
+/// `Window::add_child`, which is why the embed commands are `async`).
+#[tauri::command]
+pub fn set_webview_zoom(app: tauri::AppHandle, scale: f64) -> Result<(), String> {
+    let scale = crate::zoom::validate_scale(scale)?;
+    let Some(window) = tauri::Manager::get_webview_window(&app, "main") else {
+        return Err("zoom: no main window to zoom".to_string());
+    };
+    window.set_zoom(scale).map_err(|err| format!("zoom: {err}"))
 }
 
 #[cfg(test)]
@@ -3546,7 +3541,10 @@ mod tests {
                 .expect("drop the cache table");
         }
 
-        persist_provider_statuses(&store, &[auth_status("openai", cli::AuthState::Ready, true)]);
+        persist_provider_statuses(
+            &store,
+            &[auth_status("openai", cli::AuthState::Ready, true)],
+        );
 
         // No panic: the answer still reaches the UI, the cache just misses. The
         // read is the caller that asks for the cache and hears about it.
@@ -3649,15 +3647,11 @@ mod tests {
             .add_workspace("/tmp/proj-a", None)
             .expect("add workspace");
 
-        store
-            .set_workspace_pinned(workspace.id, true)
-            .expect("pin");
+        store.set_workspace_pinned(workspace.id, true).expect("pin");
         let pinned = workspace_by_id(&store, workspace.id).expect("pinned row");
         assert!(pinned.pinned, "the answer carries the new pin state");
 
-        store
-            .touch_workspace(workspace.id)
-            .expect("touch");
+        store.touch_workspace(workspace.id).expect("touch");
         let touched = workspace_by_id(&store, workspace.id).expect("touched row");
         assert!(
             touched.last_used_at.is_some(),
@@ -3768,7 +3762,8 @@ mod tests {
         let config_dir = fixture.config_dir();
         let data_dir = fixture.path("data");
         set_permission_mode_for(&config_dir, &data_dir, "read").expect("set read");
-        let settings_before = std::fs::read_to_string(settings_file(&config_dir)).expect("settings");
+        let settings_before =
+            std::fs::read_to_string(settings_file(&config_dir)).expect("settings");
 
         for bad in ["", "lectura", "yolo!", "read mode"] {
             let err = set_permission_mode_for(&config_dir, &data_dir, bad).expect_err("reject");
@@ -4058,7 +4053,10 @@ exit 1
             let body = FAKE_PROBE_PI
                 .replace("@ARGS@", &path.with_extension("args").display().to_string())
                 .replace("@ATTEMPTS@", &self.path("attempts").display().to_string())
-                .replace("@LINES@", &path.with_extension("lines").display().to_string())
+                .replace(
+                    "@LINES@",
+                    &path.with_extension("lines").display().to_string(),
+                )
                 .replace("@DELAY@", &delay_secs.to_string());
             std::fs::write(&path, body).expect("write probe pi");
             let mut perms = std::fs::metadata(&path)
@@ -4074,8 +4072,8 @@ exit 1
         fn write_dead_pi(&self, name: &str) -> std::path::PathBuf {
             use std::os::unix::fs::PermissionsExt;
             let path = self.path(name);
-            let body = FAKE_DEAD_PI
-                .replace("@ATTEMPTS@", &self.path("attempts").display().to_string());
+            let body =
+                FAKE_DEAD_PI.replace("@ATTEMPTS@", &self.path("attempts").display().to_string());
             std::fs::write(&path, body).expect("write dead pi");
             let mut perms = std::fs::metadata(&path)
                 .expect("stat dead pi")
@@ -4365,7 +4363,11 @@ exit 1
         gate.complete(RegistrationOutcome::Registered);
         booting.join().expect("the boot thread panicked");
 
-        assert_eq!(process_attempts(&fixture), 1, "pi starts once the entry is there");
+        assert_eq!(
+            process_attempts(&fixture),
+            1,
+            "pi starts once the entry is there"
+        );
         assert_eq!(
             runtime.live_ids(),
             vec![key],
@@ -4387,7 +4389,9 @@ exit 1
         let row = fixture.add_session("s10.jsonl", true, "");
         let runtime = lifecycle_runtime();
         let gate = Arc::new(RegistrationGate::new());
-        gate.complete(RegistrationOutcome::Failed("pi is not installed".to_string()));
+        gate.complete(RegistrationOutcome::Failed(
+            "pi is not installed".to_string(),
+        ));
 
         let dto = block_on(open_session_core(
             &fixture.store,
@@ -4493,7 +4497,11 @@ exit 1
             .store
             .list_sessions(fixture.workspace_id)
             .expect("list sessions");
-        assert_eq!(indexed.len(), 1, "the index row is written before the spawn");
+        assert_eq!(
+            indexed.len(),
+            1,
+            "the index row is written before the spawn"
+        );
         assert_eq!(indexed[0].id.to_string(), pending.session.session_id);
         assert_eq!(indexed[0].pi_session_path, pending.session.pi_session_path);
 
@@ -4627,9 +4635,13 @@ exit 1
         );
         let row = fixture.add_session("s1.jsonl", true, raw);
 
-        let messages = session_transcript_for(&fixture.store, &row.id.to_string())
-            .expect("transcript");
-        assert_eq!(messages.len(), 4, "garbage, unknown roles and empty text are skipped");
+        let messages =
+            session_transcript_for(&fixture.store, &row.id.to_string()).expect("transcript");
+        assert_eq!(
+            messages.len(),
+            4,
+            "garbage, unknown roles and empty text are skipped"
+        );
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].text, "hola");
         assert_eq!(messages[0].at.as_deref(), Some("2026-11-14T10:00:00Z"));
@@ -4640,7 +4652,10 @@ exit 1
         );
         assert_eq!(messages[1].at, None, "a line without a stamp has no `at`");
         assert_eq!(messages[2].role, "user");
-        assert_eq!(messages[2].text, "texto plano", "string content is accepted");
+        assert_eq!(
+            messages[2].text, "texto plano",
+            "string content is accepted"
+        );
         assert_eq!(messages[3].role, "tool");
         assert_eq!(messages[3].text, "salida del tool");
 
@@ -4802,8 +4817,8 @@ exit 1
         }
         let row = fixture.add_session("long.jsonl", true, &raw);
 
-        let messages = session_transcript_for(&fixture.store, &row.id.to_string())
-            .expect("transcript");
+        let messages =
+            session_transcript_for(&fixture.store, &row.id.to_string()).expect("transcript");
         assert_eq!(messages.len(), TRANSCRIPT_MESSAGE_LIMIT, "capped at 400");
         assert_eq!(
             messages.first().map(|message| message.text.as_str()),
@@ -4834,7 +4849,12 @@ exit 1
 
     // ── session preview (instant first paint) ───────────────────────────────
 
-    fn preview(role: &str, text: &str, reasoning: Option<&str>, at: Option<&str>) -> PreviewMessage {
+    fn preview(
+        role: &str,
+        text: &str,
+        reasoning: Option<&str>,
+        at: Option<&str>,
+    ) -> PreviewMessage {
         PreviewMessage {
             role: role.to_string(),
             text: text.to_string(),
@@ -4850,7 +4870,12 @@ exit 1
         let fixture = SessionFixture::new("preview_round_trip");
         let row = fixture.add_session("preview.jsonl", true, "");
         let messages = vec![
-            preview("user", "¿cómo va el chat?", None, Some("2026-05-01T10:00:00Z")),
+            preview(
+                "user",
+                "¿cómo va el chat?",
+                None,
+                Some("2026-05-01T10:00:00Z"),
+            ),
             preview(
                 "assistant",
                 "Pinta desde el preview.",
@@ -4873,7 +4898,10 @@ exit 1
         // A later snapshot of the same session replaces the previous one.
         let shorter = vec![preview("user", "solo esto", None, None)];
         assert!(save_session_preview_for(&fixture.store, row.id, &shorter));
-        assert_eq!(load_session_preview_for(&fixture.store, row.id), Some(shorter));
+        assert_eq!(
+            load_session_preview_for(&fixture.store, row.id),
+            Some(shorter)
+        );
     }
 
     // A snapshot written before pi's file grew is no longer worth painting: the
@@ -4952,8 +4980,8 @@ exit 1
     // exact keys.
     #[test]
     fn preview_message_serializes_as_role_text_reasoning_and_at() {
-        let json = serde_json::to_value(preview("assistant", "hola", None, None))
-            .expect("serialize");
+        let json =
+            serde_json::to_value(preview("assistant", "hola", None, None)).expect("serialize");
         assert_eq!(json["role"], serde_json::json!("assistant"));
         assert_eq!(json["text"], serde_json::json!("hola"));
         assert_eq!(json["reasoning"], serde_json::Value::Null);
@@ -5132,7 +5160,10 @@ exit 1
         let commands = session_commands_from_response(Some(&data));
         assert_eq!(commands.len(), 3, "a command needs a name: {commands:?}");
         assert_eq!(commands[0].name, "fix-tests");
-        assert_eq!(commands[0].description.as_deref(), Some("Fix failing tests"));
+        assert_eq!(
+            commands[0].description.as_deref(),
+            Some("Fix failing tests")
+        );
         assert_eq!(commands[0].source, "prompt");
         // An absent description stays absent instead of becoming an empty string
         // the list would render as a blank line.
@@ -5143,7 +5174,10 @@ exit 1
         // The webview mirrors this shape field by field (R4): no `sourceInfo`,
         // no `null` where pi sent nothing.
         let wire = serde_json::to_value(&commands[1]).expect("serialize");
-        assert_eq!(wire, serde_json::json!({ "name": "skill:commit", "source": "skill" }));
+        assert_eq!(
+            wire,
+            serde_json::json!({ "name": "skill:commit", "source": "skill" })
+        );
 
         // An answer that carries no list at all is empty, never an error: a
         // session that has nothing to offer shows no list.
@@ -5482,12 +5516,9 @@ exit 1
             .add_workspace("/tmp/another-workspace", None)
             .expect("add workspace");
 
-        let err = ensure_session_in_workspace(&fixture.store, other.id, row.id)
-            .expect_err("refuse");
-        assert!(
-            err.contains("is not indexed in workspace"),
-            "got: {err}"
-        );
+        let err =
+            ensure_session_in_workspace(&fixture.store, other.id, row.id).expect_err("refuse");
+        assert!(err.contains("is not indexed in workspace"), "got: {err}");
 
         // The workspace that does index it is accepted: the guard filters, it is
         // not a wall.
@@ -5528,7 +5559,10 @@ exit 1
     fn a_probe_key_can_never_be_a_session_id() {
         for workspace_id in [0, 1, 42, i64::MAX] {
             let key = probe_key(workspace_id);
-            assert!(is_probe_key(&key), "the probe key carries the prefix: {key}");
+            assert!(
+                is_probe_key(&key),
+                "the probe key carries the prefix: {key}"
+            );
             assert!(
                 key.parse::<i64>().is_err(),
                 "a session key is a decimal row id, so this can never be one: {key}"
@@ -5684,7 +5718,10 @@ exit 1
                 .is_empty(),
             "no session row, ever"
         );
-        assert!(!fixture.probe_scratch().exists(), "one cleanup for one probe");
+        assert!(
+            !fixture.probe_scratch().exists(),
+            "one cleanup for one probe"
+        );
         assert!(runtime.live_ids().is_empty(), "no child survives");
         runtime.stop_all();
     }
@@ -5718,7 +5755,10 @@ exit 1
                 .is_empty(),
             "a failed probe still writes no session row"
         );
-        assert!(!fixture.probe_scratch().exists(), "and leaves no scratch file");
+        assert!(
+            !fixture.probe_scratch().exists(),
+            "and leaves no scratch file"
+        );
         assert!(runtime.live_ids().is_empty());
     }
 
@@ -5796,7 +5836,9 @@ exit 1
         fn new(tag: &str) -> Self {
             let dir = TempSeedDir::new(tag);
             let store = dir.store();
-            let workspace = store.add_workspace("/tmp/proj-subagents", None).expect("ws");
+            let workspace = store
+                .add_workspace("/tmp/proj-subagents", None)
+                .expect("ws");
             let parent = store
                 .upsert_session(&SessionNew {
                     workspace_id: workspace.id,
@@ -5853,10 +5895,7 @@ exit 1
         assert_eq!(entries.len(), 2, "both lines parse: {entries:?}");
         assert_eq!(entries[0].name, "review");
         assert_eq!(entries[0].agent, "reviewer");
-        assert_eq!(
-            entries[0].session_path,
-            "/data/sessions/subagents/a.jsonl"
-        );
+        assert_eq!(entries[0].session_path, "/data/sessions/subagents/a.jsonl");
         assert_eq!(entries[0].status, "running");
         assert_eq!(entries[0].ended_at, None);
         assert_eq!(
@@ -5969,7 +6008,10 @@ exit 1
         )
         .expect("second listing");
         assert_eq!(
-            again.iter().map(|child| child.session_id).collect::<Vec<_>>(),
+            again
+                .iter()
+                .map(|child| child.session_id)
+                .collect::<Vec<_>>(),
             ids,
             "re-reading a manifest must not add rows"
         );
@@ -6071,7 +6113,10 @@ exit 1
         .expect("an orphan manifest is not an error");
         assert!(children.is_empty(), "got {children:?}");
         assert_eq!(
-            fixture.store.list_sessions(fixture.workspace_id).expect("list"),
+            fixture
+                .store
+                .list_sessions(fixture.workspace_id)
+                .expect("list"),
             vec![fixture.parent.clone()],
             "nothing was indexed for a manifest the host cannot attribute"
         );
@@ -6125,11 +6170,9 @@ exit 1
             fixture.parent.id,
         )
         .expect("list children");
-        let transcript = session_transcript_for(
-            &fixture.store,
-            &children[0].session_id.to_string(),
-        )
-        .expect("the child transcript");
+        let transcript =
+            session_transcript_for(&fixture.store, &children[0].session_id.to_string())
+                .expect("the child transcript");
 
         assert_eq!(transcript.len(), 2, "got {transcript:?}");
         assert_eq!(transcript[0].role, "user");

@@ -46,7 +46,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtyPair, PtySize};
+use portable_pty::{ChildKiller, CommandBuilder, PtyPair, PtySize, native_pty_system};
 
 /// Cap of each captured stream in `run`, in bytes (S2: "salida acotada", 64 KiB
 /// per stream). Interactive sessions stream line by line instead, so they are not
@@ -81,7 +81,8 @@ pub const PTY_COLS: u16 = 200;
 /// every call must be exactly one of these: nothing is matched by prefix, so
 /// `auth print-api-key` can only ever run if `auth` is allowed — and Nabla never
 /// asks for it.
-pub const ALLOWED_SUBCOMMANDS: &[&str] = &["auth", "models", "config", "mcp", "--version", "--help"];
+pub const ALLOWED_SUBCOMMANDS: &[&str] =
+    &["auth", "models", "config", "mcp", "--version", "--help"];
 
 /// Answer of one non-interactive call. Mirrors the frozen contract:
 /// `{ stdout, stderr, exitCode, timedOut, truncated }` (S1, S2).
@@ -328,11 +329,7 @@ pub fn auth_status_from_result(provider: &str, result: &PiCliResult) -> PiAuthSt
 /// by provider id, but a stable order keeps the batch honest and testable. It
 /// cannot fail per batch — a provider that times out, answers garbage or cannot
 /// even be spawned answers `unknown` for its own slot and never aborts the rest.
-pub fn auth_check_many(
-    providers: &[String],
-    timeout: Duration,
-    binary: &str,
-) -> Vec<PiAuthStatus> {
+pub fn auth_check_many(providers: &[String], timeout: Duration, binary: &str) -> Vec<PiAuthStatus> {
     // Every slot starts `unknown`, so a probe only ever replaces its own entry.
     let mut statuses: Vec<PiAuthStatus> = providers
         .iter()
@@ -948,7 +945,9 @@ fn kill_with_handle(session: &CliSession) {
 /// Locks without panicking: a poisoned lock in a background thread must not turn
 /// into a session the host can no longer address.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -1090,8 +1089,11 @@ exit 0
         use std::os::unix::fs::PermissionsExt;
         let path = scratch.path(name);
         let marker = scratch.path("marker");
-        std::fs::write(&path, body.replace("@MARKER@", &marker.display().to_string()))
-            .expect("write fake pi");
+        std::fs::write(
+            &path,
+            body.replace("@MARKER@", &marker.display().to_string()),
+        )
+        .expect("write fake pi");
         let mut perms = std::fs::metadata(&path)
             .expect("stat fake pi")
             .permissions();
@@ -1226,8 +1228,12 @@ exit 0
         let scratch = Scratch::new("run_ok");
         let script = write_script(&scratch, "pi-ok.sh", FAKE_OK);
 
-        let result = run(&args(&["--version"]), Duration::from_secs(10), binary(&script))
-            .expect("run an allowlisted command");
+        let result = run(
+            &args(&["--version"]),
+            Duration::from_secs(10),
+            binary(&script),
+        )
+        .expect("run an allowlisted command");
 
         assert_eq!(result.stdout, "hello from pi\n");
         assert_eq!(result.stderr, "a warning\n");
@@ -1244,8 +1250,12 @@ exit 0
         let scratch = Scratch::new("run_fail");
         let script = write_script(&scratch, "pi-fail.sh", FAKE_FAIL);
 
-        let result = run(&args(&["auth", "check"]), Duration::from_secs(10), binary(&script))
-            .expect("a non-zero exit is still a result");
+        let result = run(
+            &args(&["auth", "check"]),
+            Duration::from_secs(10),
+            binary(&script),
+        )
+        .expect("a non-zero exit is still a result");
 
         assert_eq!(result.exit_code, Some(7));
         assert_eq!(result.stdout, "partial\n");
@@ -1261,11 +1271,18 @@ exit 0
         let script = write_script(&scratch, "pi-slow.sh", FAKE_SLOW);
 
         let started = Instant::now();
-        let result = run(&args(&["models"]), Duration::from_millis(300), binary(&script))
-            .expect("a timeout is a result, not an error");
+        let result = run(
+            &args(&["models"]),
+            Duration::from_millis(300),
+            binary(&script),
+        )
+        .expect("a timeout is a result, not an error");
         let elapsed = started.elapsed();
 
-        assert!(result.timed_out, "the deadline must be reported: {result:?}");
+        assert!(
+            result.timed_out,
+            "the deadline must be reported: {result:?}"
+        );
         assert_eq!(result.stdout, "started\n", "output before the kill is kept");
         assert!(
             elapsed < Duration::from_secs(5),
@@ -1335,7 +1352,10 @@ exit 0
         let err = run(&[], Duration::from_secs(1), "/nonexistent/pi")
             .expect_err("an empty argv has no allowlisted subcommand");
         assert_eq!(err, CliError::EmptyArgs);
-        assert!(err.to_string().contains("auth"), "the message names the allowlist: {err}");
+        assert!(
+            err.to_string().contains("auth"),
+            "the message names the allowlist: {err}"
+        );
     }
 
     // ── account state (S4) ──────────────────────────────────────────────────
@@ -1372,7 +1392,14 @@ exit 0
     // S4: unparsable input never panics and never invents a state.
     #[test]
     fn parse_auth_check_answers_unknown_for_unparsable_json() {
-        for raw in ["", "not json", "[]", "null", r#"{"status":42}"#, r#"{"status":"nope"}"#] {
+        for raw in [
+            "",
+            "not json",
+            "[]",
+            "null",
+            r#"{"status":42}"#,
+            r#"{"status":"nope"}"#,
+        ] {
             let status = parse_auth_check(raw);
             assert_eq!(status.state, AuthState::Unknown, "raw: {raw:?}");
             assert!(!status.credential, "raw: {raw:?}");
@@ -1628,7 +1655,11 @@ exit 0
         assert_eq!(strip_ansi("loading 10%\rloading 40%\rDone"), "Done");
         assert_eq!(strip_ansi("discarded\rkept"), "kept");
         assert_eq!(strip_ansi("no carriage return"), "no carriage return");
-        assert_eq!(strip_ansi("\x08\x08ok"), "ok", "a backspace erases one char");
+        assert_eq!(
+            strip_ansi("\x08\x08ok"),
+            "ok",
+            "a backspace erases one char"
+        );
     }
 
     // S3: window titles arrive as OSC strings, BEL- or ST-terminated, and carry
@@ -1698,7 +1729,10 @@ exit 0
         let id = sessions
             .start(&args(&["auth"]), binary(&script), collected.sink())
             .expect("start an allowlisted command");
-        assert!(id.starts_with("cli-"), "the id is a session handle, got {id}");
+        assert!(
+            id.starts_with("cli-"),
+            "the id is a session handle, got {id}"
+        );
 
         let events = collected.wait_for("the exit event", |events| {
             events.iter().any(|event| event.stream == CliStream::Exit)
@@ -1776,7 +1810,9 @@ exit 0
             "the prompt is intact: {lines:#?}"
         );
         assert!(
-            lines.contains(&"https://auth.example.test/oauth/authorize?client_id=abc&state=xyz".to_string()),
+            lines.contains(
+                &"https://auth.example.test/oauth/authorize?client_id=abc&state=xyz".to_string()
+            ),
             "the URL survives byte for byte: {lines:#?}"
         );
         assert!(
@@ -1830,12 +1866,18 @@ exit 0
         let sessions = CliSessions::new();
         let collected = Arc::new(Collected::default());
         let id = sessions
-            .start(&args(&["auth", "login", "nan", "--no-browser"]), binary(&script), collected.sink())
+            .start(
+                &args(&["auth", "login", "nan", "--no-browser"]),
+                binary(&script),
+                collected.sink(),
+            )
             .expect("start the login flow");
 
         // The greeting proves the child is up and reading before we write.
         collected.wait_for("the greeting", |events| {
-            lines_of(events, CliStream::Stdout).iter().any(|line| line == "ready line")
+            lines_of(events, CliStream::Stdout)
+                .iter()
+                .any(|line| line == "ready line")
         });
 
         assert!(
@@ -1939,7 +1981,10 @@ exit 0
     /// killed child left nothing behind.
     #[cfg(unix)]
     fn is_running(script: &Path) -> (bool, String) {
-        let name = script.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        let name = script
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
         let output = Command::new("ps")
             .args(["-A", "-o", "command="])
             .output()

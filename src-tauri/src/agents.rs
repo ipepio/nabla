@@ -205,8 +205,8 @@ pub fn load(path: &Path) -> AgentsResult<AgentsConfig> {
 /// helper the settings file already uses.
 pub fn save(path: &Path, config: &AgentsConfig) -> AgentsResult<()> {
     config.validate()?;
-    let json = serde_json::to_string_pretty(config)
-        .map_err(|e| AgentsError::Parse(e.to_string()))?;
+    let json =
+        serde_json::to_string_pretty(config).map_err(|e| AgentsError::Parse(e.to_string()))?;
     settings::write_atomic(path, &json).map_err(|e| AgentsError::Io(e.to_string()))
 }
 
@@ -515,7 +515,10 @@ mod tests {
         assert_eq!(loaded.profiles.len(), 1);
         assert_eq!(loaded.profiles[0].name, "explorer");
         assert!(loaded.profiles[0].enabled);
-        assert_eq!(loaded.model_default, None, "an absent field takes its default");
+        assert_eq!(
+            loaded.model_default, None,
+            "an absent field takes its default"
+        );
     }
 
     // S3/S8: the extension is loaded only when there is something to offer. Off,

@@ -77,6 +77,24 @@ path in `settings.json`:
 Conversation content lives only in Pi's JSONL files; the database is a rebuildable
 index, never a second copy. To start from zero: quit Nabla and remove that folder.
 
+## Keyboard shortcuts
+
+Zoom is the one shortcut shipped so far. The modifier is the platform's own: `⌘` on
+macOS, `Ctrl` on Windows and Linux.
+
+| Shortcut | macOS | Windows / Linux |
+| --- | --- | --- |
+| Zoom in | `⌘ +` | `Ctrl +` |
+| Zoom out | `⌘ −` | `Ctrl −` |
+| Zoom back to 100% | `⌘ 0` | `Ctrl 0` |
+
+The zoom walks a fixed list of levels (50% → 200%) one step per press and clamps at
+both ends; it is not persisted, so a fresh launch starts at 100%. What scales is the
+app's own interface — the main webview. The embedded browser's panes are separate
+webviews and keep the page at its own size, so an agent-driven page never jumps
+because you zoomed the shell around it. The same three chords are listed in
+Settings → General.
+
 ## Turning capabilities on
 
 A fresh install starts with everything optional **off**. That is the intended
@@ -95,6 +113,12 @@ The two features ship off because both leave your machine:
   itself is never opened by the search. The switch gives the agent the tool; the
   composer's per-turn *web search* request stays disabled until the SearXNG round trip
   is verified end to end (see below).
+
+  itself is never opened by the search. A configured instance is used and nothing else:
+  if it fails, the answer says so instead of quietly searching somewhere you did not
+  name. See [your own instance](#your-own-instance) for the credentials field and the
+  loopback pattern.
+
 - **Subagents** — Settings → Subagents. One master switch, then one switch per
   profile. With it off the agent has no delegation tools at all. Templates (explorer,
   researcher, worker, judge, judge-2) arrive written and disabled; enable the ones you
@@ -118,18 +142,53 @@ SearXNG instance answers a query, so the row stays visible and disabled with
 "End-to-end search verification pending" until that round trip has been verified.
 Otherwise the row stays visible, disabled, with the reason.
 
+### Your own instance
+
+A public SearXNG instance owes you no JSON API: most rate-limit it, some disable it.
+Pointing Settings → Web search at your own instance is the reliable path, and the two
+fields are deliberately independent: the switch turns the capability on, the instance
+says where the query goes.
+
+| Field | What |
+| --- | --- |
+| SearXNG instance | `https://searx.example`, or a bare `searx.example` (the scheme is added) |
+| Access key / user:password | Optional. `user:password` → HTTP Basic auth; any other value → `Authorization: Bearer <value>`; empty → no header at all |
+
+**The credential travels to that instance and to nothing else.** When no instance is
+set, the search walks the public list — servers you never named — and those requests
+carry no credentials, so a secret can never leak to a third party through the
+fallback. Both text fields are written when you leave the field or press Enter, not on
+every keystroke.
+
+It is stored **unencrypted** in `settings.json`, beside the rest of your preferences:
+the same file, the same trust level (anything running as your user can read it), no
+keychain and no new crypto machinery. If that is not acceptable for a given token,
+keep the instance unauthenticated on your machine and reach it over loopback instead.
+
+**The loopback-only pattern** (what a self-hosted setup should look like):
+
+1. Run SearXNG on `127.0.0.1:8888` and do not publish the port beyond the machine —
+   no public reverse proxy, no `0.0.0.0`.
+2. Enable its JSON API (`search: formats: [html, json]` in `settings.yml`).
+3. In Settings → Web search, set the instance to `http://127.0.0.1:8888` and leave the
+   credentials field empty: nothing leaves the machine, so nothing needs a secret.
+4. If you do put an authenticating proxy in front of it, the 401 the instance answers
+   now names the credentials in the error the agent reads, instead of blaming the JSON
+   API.
+
+
 ## Checks
 
 ```bash
 pnpm run build                        # frontend gate: vue-tsc --noEmit + vite build
 node --test tests/                    # Node tests for the pure modules and composables
+
 cd src-tauri && cargo test            # Rust tests
 cd src-tauri && cargo clippy          # Rust lint
 ```
 
-Vue components are still checked by hand (`pnpm tauri dev`): the Node suite covers
-the pure modules, and the window-level states — a pasted screenshot, a dropped
-file, a removable preview — are exercised there.
+The `tests/` files are the frontend's unit tests, run by Node's own runner; a screen still has to be
+looked at by hand in `pnpm run tauri dev`.
 
 ### Rust build cache and dev diagnostics
 
