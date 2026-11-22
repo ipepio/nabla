@@ -907,7 +907,7 @@ watch(() => props.workspaceId, prewarmCommands);
        and out of the layout flow, so typing `/` or `@` never moves the text. -->
   <div
     ref="card"
-    class="relative mx-auto w-full min-w-0 rounded-2xl border border-border bg-card/60 shadow-sm"
+    class="relative mx-auto w-full min-w-0 rounded-xl border border-border bg-card shadow-sm transition-colors focus-within:border-primary/45"
     :style="{ maxWidth: `${maxWidth}px`, minWidth: `${COMPOSER_MIN_WIDTH}px` }"
   >
     <!-- S3/S4: the commands of this session, or the entries of the workspace
@@ -1227,7 +1227,7 @@ watch(() => props.workspaceId, prewarmCommands);
           v-if="streaming && canStop"
           variant="outline"
           size="icon-sm"
-          class="rounded-full"
+          class="rounded-lg border-border bg-secondary hover:border-destructive hover:text-destructive"
           :aria-label="t('chat.composer.stop')"
           @click="emit('stop')"
         >
@@ -1235,7 +1235,7 @@ watch(() => props.workspaceId, prewarmCommands);
         </Button>
         <Button
           size="icon-sm"
-          class="rounded-full"
+          class="rounded-lg bg-primary text-primary-foreground hover:bg-primary/90"
           :aria-label="
             queueing ? t('chat.composer.queue') : t('chat.composer.send')
           "

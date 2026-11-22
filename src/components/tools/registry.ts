@@ -86,6 +86,8 @@ export interface ToolDefinition {
   id: ToolId;
   /** The pane label, resolved from the catalogue so both locales apply. */
   labelKey: MessageKey;
+  /** Short description shown in the empty-tab tool chooser. */
+  descriptionKey: MessageKey;
   /** The pane icon; the components themselves are size-agnostic. */
   icon: Component;
   /** Mounted as-is by `DockPane.vue` with the props of its own context. */
@@ -122,6 +124,7 @@ export const TOOLS: readonly ToolDefinition[] = [
   {
     id: "files",
     labelKey: "tools.files.label",
+    descriptionKey: "settings.general.tools.files.description",
     icon: FilesIcon,
     component: FilesTool,
     // One pane, one folder. Splitting a Files pane copies its root and the human
@@ -133,6 +136,7 @@ export const TOOLS: readonly ToolDefinition[] = [
   {
     id: "changes",
     labelKey: "tools.changes.label",
+    descriptionKey: "settings.general.tools.changes.description",
     icon: GitBranchIcon,
     component: ChangesTool,
     singleton: true,
@@ -141,6 +145,7 @@ export const TOOLS: readonly ToolDefinition[] = [
   {
     id: "terminal",
     labelKey: "tools.terminal.label",
+    descriptionKey: "settings.general.tools.terminal.description",
     icon: TerminalIcon,
     component: TerminalTool,
     // A split terminal is a second shell, which is the whole point of splitting
@@ -152,6 +157,7 @@ export const TOOLS: readonly ToolDefinition[] = [
   {
     id: "browser",
     labelKey: "tools.browser.label",
+    descriptionKey: "settings.general.tools.browser.description",
     icon: GlobeIcon,
     component: BrowserTool,
     // A pane owns one page and one session; a second pane — in this tab OR in

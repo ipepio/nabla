@@ -16,13 +16,21 @@ import { asThemeMode, isDarkMode, setThemeMode, type ThemeMode } from "@/lib/the
 /** Live mode; "system" resolves through the media query inside `theme.ts`. */
 const mode = ref<ThemeMode>("dark");
 
+/** Live OS dark preference, updated via `matchMedia` change events. */
+const systemDark = ref<boolean>(isDarkMode("system"));
+
 /** Resolved appearance, i.e. what the palette is actually showing right now. */
-const isDark = computed(() => isDarkMode(mode.value));
+const isDark = computed(() =>
+  mode.value === "system" ? systemDark.value : mode.value === "dark",
+);
 
 /** Applies a mode to the document and republishes it to every consumer. */
 function setMode(next: ThemeMode | string): void {
   const normalized = asThemeMode(next);
   mode.value = normalized;
+  if (normalized === "system") {
+    systemDark.value = isDarkMode("system");
+  }
   setThemeMode(normalized);
 }
 
@@ -33,11 +41,11 @@ function setMode(next: ThemeMode | string): void {
 function followSystemScheme(): void {
   if (typeof window === "undefined" || !window.matchMedia) return;
   const query = window.matchMedia("(prefers-color-scheme: dark)");
-  const sync = (): void => {
+  systemDark.value = query.matches;
+  const sync = (event: MediaQueryListEvent): void => {
+    systemDark.value = event.matches;
     if (mode.value !== "system") return;
     setThemeMode("system");
-    // `setThemeMode` mutates the DOM; nudge the computed by re-reading the mode.
-    mode.value = "system";
   };
   query.addEventListener("change", sync);
 }

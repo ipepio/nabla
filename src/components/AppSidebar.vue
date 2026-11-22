@@ -10,7 +10,7 @@
 // active session lives in the shared `src/lib/session-store.ts` (task N1).
 // Preferences live in `components/settings/SettingsDialog.vue`, which the footer's
 // gear button opens; the drawer only keeps the open flag.
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   CirclePlusIcon,
   FolderPlusIcon,
@@ -42,7 +42,9 @@ import {
   SidebarTrigger,
   useSidebar,
 } from "@/components/ui/sidebar";
-import SettingsDialog from "@/components/settings/SettingsDialog.vue";
+const SettingsDialog = defineAsyncComponent(
+  () => import("@/components/settings/SettingsDialog.vue"),
+);
 import SessionsList from "@/components/sidebar/SessionsList.vue";
 import WorkspaceRow from "@/components/sidebar/WorkspaceRow.vue";
 import { useAppearance } from "@/lib/appearance";
@@ -159,8 +161,21 @@ const wordmarkSource = computed(() => themedBrand("wordmark", isDark.value));
 const { toggleSidebar } = useSidebar();
 
 // S1 of `settings-dialog.md`: the drawer's gear button opens the two-pane
-// settings dialog, which owns the preference reads and writes.
+// settings dialog, which owns the preference reads and writes. Mounted lazily
+// on first open so the settings bundle is never parsed during app startup.
 const settingsOpen = ref(false);
+const settingsLoaded = ref(false);
+function openSettings() {
+  settingsLoaded.value = true;
+  settingsOpen.value = true;
+}
+
+const isMac =
+  typeof navigator !== "undefined" &&
+  /mac/i.test(navigator.platform || navigator.userAgent);
+const newSessionShortcut = isMac ? "⌘ N" : "Ctrl+N";
+
+defineExpose({ openSettings, handleNewSession });
 // S6 (next unit): the ⋯ menu's edit item opens this read-only placeholder.
 const editOpen = ref(false);
 const editingWorkspace = ref<WorkspaceInfo | null>(null);
@@ -663,8 +678,8 @@ onUnmounted(() => {
 
 <template>
   <Sidebar collapsible="icon">
-    <SidebarHeader>
-      <div class="flex items-center gap-2 px-1 py-1">
+    <SidebarHeader class="gap-3 border-b border-sidebar-border px-3 py-3">
+      <div class="flex items-center gap-2">
         <!-- Expanded header, one row: [mark] [wordmark] [collapse control].
              The drawer is still the only place with a collapse control (S8). -->
         <div
@@ -739,25 +754,30 @@ onUnmounted(() => {
            chat follows it; collapsed, the label gives way to the icon. -->
       <Button
         variant="secondary"
-        class="h-9 w-full gap-2 rounded-xl bg-secondary/60 px-3 text-sm font-medium text-secondary-foreground hover:bg-secondary group-data-[collapsible=icon]:size-8 group-data-[collapsible=icon]:self-center group-data-[collapsible=icon]:p-0"
+        class="h-9 w-full justify-start gap-2.5 rounded-lg border border-border bg-secondary px-3 text-xs font-semibold text-secondary-foreground transition-colors hover:border-primary/40 hover:bg-accent group-data-[collapsible=icon]:size-8 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:self-center group-data-[collapsible=icon]:p-0"
         :disabled="activeWorkspaceId === null || creating"
         :aria-label="t('sidebar.newSession')"
         @click="handleNewSession"
       >
-        <CirclePlusIcon class="size-4 shrink-0" aria-hidden="true" />
+        <CirclePlusIcon class="size-4 shrink-0 text-primary" aria-hidden="true" />
         <span class="group-data-[collapsible=icon]:hidden">
           {{ t("sidebar.newSession") }}
         </span>
+        <kbd
+          class="ms-auto rounded border border-border bg-card px-1.5 py-0.5 font-mono text-[10px] font-medium text-muted-foreground group-data-[collapsible=icon]:hidden"
+        >
+          {{ newSessionShortcut }}
+        </kbd>
       </Button>
     </SidebarHeader>
 
     <!-- S1: no separator between the header and the content. -->
-    <SidebarContent>
+    <SidebarContent class="px-2 py-2">
       <!-- S3: section title on the left, the three actions on the right. -->
       <div
-        class="flex items-center justify-between gap-1 px-3 pt-1 pb-1 group-data-[collapsible=icon]:hidden"
+        class="flex items-center justify-between gap-1 px-1.5 pt-2 pb-1.5 group-data-[collapsible=icon]:hidden"
       >
-        <span class="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+        <span class="text-[10px] font-bold tracking-widest text-muted-foreground uppercase">
           {{ t("sidebar.workspaces") }}
         </span>
         <div class="flex items-center gap-0.5">
@@ -831,8 +851,13 @@ onUnmounted(() => {
           {{ t("sidebar.emptySearch") }}
         </p>
 
-        <SidebarMenu>
-          <SidebarMenuItem v-for="workspace in visibleWorkspaces" :key="workspace.id">
+        <SidebarMenu class="gap-1.5">
+          <SidebarMenuItem
+            v-for="workspace in visibleWorkspaces"
+            :key="workspace.id"
+            class="overflow-hidden rounded-lg border border-sidebar-border bg-card/60 transition-colors group-data-[collapsible=icon]:border-transparent group-data-[collapsible=icon]:bg-transparent"
+            :class="workspace.id === activeWorkspaceId ? 'border-border bg-card' : ''"
+          >
             <WorkspaceRow
               :workspace="workspace"
               :active="workspace.id === activeWorkspaceId"
@@ -869,21 +894,21 @@ onUnmounted(() => {
       </Alert>
     </SidebarContent>
 
-    <SidebarFooter>
+    <SidebarFooter class="border-t border-sidebar-border px-2.5 py-2.5">
       <!-- S1 of `settings-dialog.md`: the gear opens the two-pane settings
            dialog; the dialog owns every preference read and write. -->
       <Button
         variant="ghost"
-        class="w-full justify-start gap-2"
+        class="h-8 w-full justify-start gap-2 rounded-lg text-xs text-muted-foreground hover:bg-secondary hover:text-foreground"
         :aria-label="t('sidebar.settings')"
-        @click="settingsOpen = true"
+        @click="openSettings"
       >
         <SettingsIcon />
         <span class="group-data-[collapsible=icon]:hidden">
           {{ t("sidebar.settings") }}
         </span>
       </Button>
-      <SettingsDialog v-model:open="settingsOpen" />
+      <SettingsDialog v-if="settingsLoaded" v-model:open="settingsOpen" />
 
       <!-- S6: read-only placeholder behind the row menu's "Edit workspace".
            Alias editing and the delete confirmation are the next unit. -->

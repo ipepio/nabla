@@ -37,6 +37,8 @@ export const THEME_VARS = {
   VITE_COLOR_ACCENT_FOREGROUND: "--accent-foreground",
   VITE_COLOR_BACKGROUND: "--background",
   VITE_COLOR_FOREGROUND: "--foreground",
+  VITE_COLOR_CARD: "--card",
+  VITE_COLOR_CARD_FOREGROUND: "--card-foreground",
   VITE_COLOR_MUTED: "--muted",
   VITE_COLOR_MUTED_FOREGROUND: "--muted-foreground",
   VITE_COLOR_DESTRUCTIVE: "--destructive",
@@ -46,6 +48,9 @@ export const THEME_VARS = {
   VITE_COLOR_RING: "--ring",
   VITE_COLOR_SIDEBAR: "--sidebar",
   VITE_COLOR_SIDEBAR_FOREGROUND: "--sidebar-foreground",
+  VITE_COLOR_SIDEBAR_ACCENT: "--sidebar-accent",
+  VITE_COLOR_SIDEBAR_ACCENT_FOREGROUND: "--sidebar-accent-foreground",
+  VITE_COLOR_SIDEBAR_BORDER: "--sidebar-border",
   VITE_RADIUS: "--radius",
 } as const;
 

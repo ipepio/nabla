@@ -57,82 +57,153 @@
 }
 
 :root {
+  color-scheme: light;
+  accent-color: var(--primary);
   --radius: 0.625rem;
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
-  /* Extra semantic tokens (hex mirrors `.env.example`; env values win). */
-  --tertiary: #2563eb;
-  --tertiary-foreground: #fafafa;
-  --success: #16a34a;
-  --warning: #d97706;
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
+  --background: #f5f7f6;
+  --foreground: #192621;
+  --card: #ffffff;
+  --card-foreground: #192621;
+  --popover: var(--card);
+  --popover-foreground: var(--card-foreground);
+  --primary: #3d7950;
+  --primary-foreground: #ffffff;
+  --secondary: #f3f5f4;
+  --secondary-foreground: #192621;
+  --muted: #f3f5f4;
+  --muted-foreground: #61716a;
+  --accent: #e9eeeb;
+  --accent-foreground: #192621;
+  /* Extra semantic tokens (`.env` values win at boot, ADR 0009). */
+  --tertiary: #287c8d;
+  --tertiary-foreground: #ffffff;
+  --success: #3d7950;
+  --warning: #ad7827;
+  --destructive: #b34b4b;
+  --border: #dce3df;
+  --input: var(--border);
+  --ring: #3d7950;
   --chart-1: oklch(0.646 0.222 41.116);
   --chart-2: oklch(0.6 0.118 184.704);
   --chart-3: oklch(0.398 0.07 227.392);
   --chart-4: oklch(0.828 0.189 84.429);
   --chart-5: oklch(0.769 0.188 70.08);
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.205 0 0);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.97 0 0);
-  --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
-  --sidebar-ring: oklch(0.708 0 0);
+  --sidebar: #eef1ef;
+  --sidebar-foreground: #192621;
+  --sidebar-primary: var(--primary);
+  --sidebar-primary-foreground: var(--primary-foreground);
+  --sidebar-accent: #e9eeeb;
+  --sidebar-accent-foreground: #192621;
+  --sidebar-border: #e8ede9;
+  --sidebar-ring: var(--ring);
+  --scrollbar-thumb: color-mix(in oklab, var(--muted-foreground) 72%, var(--background));
+  --scrollbar-track: transparent;
 }
 
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.205 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.205 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.922 0 0);
-  --primary-foreground: oklch(0.205 0 0);
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
-  /* Extra semantic tokens (hex mirrors `.env.example`; env values win). */
-  --tertiary: #60a5fa;
-  --tertiary-foreground: #0a0a0a;
-  --success: #4ade80;
-  --warning: #fbbf24;
-  --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.556 0 0);
+  color-scheme: dark;
+  --background: #090b0d;
+  --foreground: #edf2ef;
+  --card: #111518;
+  --card-foreground: #edf2ef;
+  --popover: var(--card);
+  --popover-foreground: var(--card-foreground);
+  --primary: #b7ec8c;
+  --primary-foreground: #152319;
+  --secondary: #171c20;
+  --secondary-foreground: #edf2ef;
+  --muted: #171c20;
+  --muted-foreground: #8b9896;
+  --accent: #1d2327;
+  --accent-foreground: #edf2ef;
+  /* Extra semantic tokens (`.env` values win at boot, ADR 0009). */
+  --tertiary: #8bcdd9;
+  --tertiary-foreground: #09171a;
+  --success: #b7ec8c;
+  --warning: #efc381;
+  --destructive: #ef8c8c;
+  --border: #252c30;
+  --input: var(--border);
+  --ring: #b7ec8c;
   --chart-1: oklch(0.488 0.243 264.376);
   --chart-2: oklch(0.696 0.17 162.48);
   --chart-3: oklch(0.769 0.188 70.08);
   --chart-4: oklch(0.627 0.265 303.9);
   --chart-5: oklch(0.645 0.246 16.439);
-  --sidebar: oklch(0.205 0 0);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.269 0 0);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.556 0 0);
+  --sidebar: #0e1113;
+  --sidebar-foreground: #edf2ef;
+  --sidebar-primary: var(--primary);
+  --sidebar-primary-foreground: var(--primary-foreground);
+  --sidebar-accent: #1d2327;
+  --sidebar-accent-foreground: #edf2ef;
+  --sidebar-border: #1a2023;
+  --sidebar-ring: var(--ring);
+  --scrollbar-thumb: color-mix(in oklab, var(--muted-foreground) 72%, var(--background));
+  --scrollbar-track: transparent;
+}
+
+@keyframes nabla-status-pulse {
+  50% {
+    opacity: 0.45;
+    transform: scale(0.85);
+  }
+}
+
+.nabla-status-pulse {
+  @media (prefers-reduced-motion: no-preference) {
+    animation: nabla-status-pulse 1.8s ease-in-out infinite;
+  }
+}
+
+/* Declarative entry transition using @starting-style (compositor-only opacity +
+   translate). Reduced-motion users get a short fade with no spatial movement. */
+.nabla-enter {
+  opacity: 1;
+  translate: 0 0;
+  transition:
+    opacity 180ms ease-out,
+    translate 180ms ease-out;
+}
+
+@starting-style {
+  .nabla-enter {
+    opacity: 0;
+    translate: 0 6px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nabla-enter {
+    translate: none;
+    transition-duration: 80ms;
+  }
+
+  @starting-style {
+    .nabla-enter {
+      translate: none;
+    }
+  }
+}
+
+/* Discrete disclosure panel transition for v-show (display: none toggles). */
+.nabla-disclosure {
+  opacity: 1;
+  transition:
+    display 160ms ease-out,
+    opacity 160ms ease-out;
+  transition-behavior: allow-discrete;
+}
+
+@starting-style {
+  .nabla-disclosure {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nabla-disclosure {
+    transition-duration: 60ms;
+  }
 }
 
 @layer base {
@@ -146,39 +217,38 @@
     @apply h-full;
   }
   body {
-    @apply bg-background text-foreground overflow-hidden;
+    @apply bg-background text-foreground overflow-hidden antialiased;
+    letter-spacing: -0.012em;
   }
-  /* Native scrollbars, matched to the hairline thumb of `ui/scroll-area`.
-     Why here: the Tauri webview is WebKit, and every `overflow-y-auto` pane
-     (settings, reasoning blocks, model and discovery lists, the empty state)
-     scrolls with the native bar — the shadcn `ScrollArea` only covers the
-     chat transcript, so the global default is what the rest of the app shows.
-     Tokens only: the palette still comes from `.env` (ADR 0009). */
-  * {
-    scrollbar-width: thin;
-    scrollbar-color: color-mix(in oklab, var(--border) 70%, transparent) transparent;
+  ::selection {
+    background-color: color-mix(in oklab, var(--primary) 24%, transparent);
   }
-  /* WebKit ignores the two properties above once the pseudo-elements exist,
-     and the reverse is true in other engines: `@supports` keeps each engine on
-     the syntax it actually honours instead of leaving one of them unstyled. */
-  @supports selector(::-webkit-scrollbar) {
+  /* Standard scrollbar theming with >= 3:1 thumb contrast against the canvas.
+     Never transition scrollbar-color (WebKit flicker bug). */
+  :root {
+    scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+  }
+  /* Legacy WebKit fallback, isolated behind @supports so engines that honour
+     standard scrollbar-color are never overridden by ::-webkit-scrollbar. */
+  @supports not (scrollbar-color: auto) {
     * {
       scrollbar-width: auto;
-      scrollbar-color: auto;
     }
     ::-webkit-scrollbar {
-      width: 4px;
-      height: 4px;
+      width: 8px;
+      height: 8px;
     }
     ::-webkit-scrollbar-track {
-      background: transparent;
+      background: var(--scrollbar-track);
     }
     ::-webkit-scrollbar-thumb {
       border-radius: 9999px;
-      background-color: color-mix(in oklab, var(--border) 70%, transparent);
+      border: 2px solid transparent;
+      background-clip: content-box;
+      background-color: var(--scrollbar-thumb);
     }
     ::-webkit-scrollbar-thumb:hover {
-      background-color: var(--border);
+      background-color: var(--muted-foreground);
     }
   }
 }

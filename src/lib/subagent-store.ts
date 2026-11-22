@@ -181,11 +181,11 @@ export function subagentStatusLabel(status: SubagentStatus): string {
 export function subagentStatusDot(status: SubagentStatus): string {
   switch (status) {
     case "queued":
-      return "bg-muted-foreground/40 animate-pulse";
+      return "bg-muted-foreground/50";
     case "running":
-      return "bg-warning animate-pulse";
+      return "bg-primary nabla-status-pulse";
     case "done":
-      return "bg-muted-foreground/60";
+      return "bg-tertiary";
     case "failed":
       return "bg-destructive";
     case "unknown":

@@ -50,6 +50,11 @@ const failures = computed(
   () => props.tools.filter((tool) => tool.state === "error").length,
 );
 
+/** How many of this turn's calls finished cleanly. */
+const completed = computed(
+  () => props.tools.filter((tool) => tool.state === "done").length,
+);
+
 /**
  * The per-name breakdown (`navigate ×7, eval ×5`).
  *
@@ -73,30 +78,46 @@ function toggle() {
 </script>
 
 <template>
-  <div class="rounded-md border border-border/70 bg-muted/20">
+  <div class="overflow-hidden rounded-xl border border-border bg-card">
     <button
       type="button"
-      class="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:text-foreground"
+      class="flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left transition-colors hover:bg-secondary/70"
       :aria-expanded="expanded"
       :aria-controls="contentId"
       @click="toggle"
     >
       <ChevronRightIcon
-        class="size-3 shrink-0 transition-transform"
+        class="size-3.5 shrink-0 text-muted-foreground transition-transform"
         :class="{ 'rotate-90': expanded }"
         aria-hidden="true"
       />
-      <span class="shrink-0 font-medium">{{ label }}</span>
-      <span v-if="breakdown !== ''" class="min-w-0 truncate"> · {{ breakdown }}</span>
+      <span class="flex min-w-0 flex-1 flex-col gap-0.5">
+        <span class="truncate text-xs font-semibold text-foreground">{{ label }}</span>
+        <span
+          v-if="breakdown !== ''"
+          class="truncate font-mono text-[10px] text-muted-foreground"
+        >
+          {{ breakdown }}
+        </span>
+      </span>
       <!-- Always on the collapsed line: a failure is never behind a summary. -->
-      <span v-if="failures > 0" class="shrink-0 text-destructive">
-        · {{ t("chat.tools.failures", { count: failures }) }}
+      <span
+        v-if="failures > 0"
+        class="shrink-0 rounded border border-destructive/25 bg-destructive/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-destructive"
+      >
+        {{ t("chat.tools.failures", { count: failures }) }}
+      </span>
+      <span
+        v-if="completed > 0"
+        class="shrink-0 rounded border border-primary/25 bg-primary/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-primary"
+      >
+        {{ completed }} OK
       </span>
     </button>
     <div
       v-show="expanded"
       :id="contentId"
-      class="mr-2.5 mb-2 ml-2.5 border-l-2 border-border py-1 pr-1 pl-2.5"
+      class="nabla-disclosure border-t border-sidebar-border px-3.5 py-3"
     >
       <slot />
     </div>

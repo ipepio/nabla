@@ -43,27 +43,28 @@ async function copyText() {
 </script>
 
 <template>
-  <div v-if="role === 'user'" class="flex flex-col items-end gap-1">
+  <div v-if="role === 'user'" class="nabla-enter flex flex-col items-end gap-1">
     <div
-      class="max-w-[75%] rounded-2xl bg-secondary px-3.5 py-2 text-sm whitespace-pre-wrap text-secondary-foreground"
+      class="max-w-[80%] rounded-2xl rounded-br-sm border border-border bg-secondary px-4 py-2.5 text-[13px] leading-relaxed whitespace-pre-wrap text-secondary-foreground"
     >
       {{ text }}
     </div>
-    <div class="flex items-center gap-1 text-xs text-muted-foreground">
+    <div class="flex items-center gap-1 font-mono text-[10px] text-muted-foreground">
       <span v-if="at">{{ at }}</span>
       <Button
         variant="ghost"
         size="icon-xs"
+        class="text-muted-foreground hover:text-foreground"
         :aria-label="t('message.copy')"
         @click="copyText"
       >
-        <CheckIcon v-if="copied" />
+        <CheckIcon v-if="copied" class="text-primary" />
         <CopyIcon v-else />
       </Button>
     </div>
   </div>
 
-  <div v-else class="flex flex-col gap-2 text-sm text-foreground">
+  <div v-else class="nabla-enter flex flex-col gap-2 text-[13px] leading-relaxed text-foreground">
     <AssistantText v-if="text !== ''" :text="text" />
   </div>
 </template>

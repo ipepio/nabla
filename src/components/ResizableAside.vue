@@ -151,12 +151,12 @@ onBeforeUnmount(() => {
     ref="asideEl"
     :aria-label="props.ariaLabel"
     :class="props.class"
-    class="relative shrink-0 flex-col border-l bg-sidebar"
+    class="relative shrink-0 flex-col border-l border-border bg-sidebar [contain:layout_style]"
     :style="{ width: `${width}px` }"
   >
     <!--
-      Drag handle: a 6px strip straddling the left border. Invisible at rest
-      (the border already reads as the seam) and tinted on hover / focus / drag.
+      Drag handle: straddles the left border. Invisible at rest and highlights
+      a hairline in the primary accent on hover / focus / drag.
     -->
     <div
       role="separator"
@@ -166,8 +166,7 @@ onBeforeUnmount(() => {
       :aria-valuemin="MIN_WIDTH"
       :aria-valuemax="maxWidthNow"
       tabindex="0"
-      class="absolute inset-y-0 left-0 z-10 w-1.5 -translate-x-1/2 cursor-col-resize touch-none outline-none transition-colors focus-visible:bg-border"
-      :class="isDragging ? 'bg-border' : 'hover:bg-border'"
+      class="group/resizer absolute inset-y-0 left-0 z-10 w-2 -translate-x-1/2 cursor-col-resize touch-pan-y outline-none"
       @pointerdown="onPointerDown"
       @pointermove="onPointerMove"
       @pointerup="endDrag"
@@ -175,7 +174,13 @@ onBeforeUnmount(() => {
       @lostpointercapture="endDrag"
       @keydown="onKeyDown"
       @dblclick="resetWidth"
-    />
-    <slot />
+    >
+      <span
+        class="pointer-events-none absolute inset-y-0 left-1/2 w-0.5 -translate-x-1/2 transition-colors group-hover/resizer:bg-primary group-focus-visible/resizer:bg-primary"
+        :class="isDragging ? 'bg-primary' : 'bg-transparent'"
+        aria-hidden="true"
+      />
+    </div>
+    <slot :width="width" :reset-width="resetWidth" />
   </aside>
 </template>

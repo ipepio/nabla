@@ -10,7 +10,7 @@
 // session's buffer. Switching sessions (S4) is therefore a pure view change:
 // nothing here starts, stops or resets a process, and the previous session keeps
 // running and keeps accumulating events off screen.
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import {
   PanelRightOpenIcon,
   XIcon,
@@ -21,7 +21,9 @@ import ChatHeader from "@/components/chat/ChatHeader.vue";
 import Composer from "@/components/chat/Composer.vue";
 import QuestionCard from "@/components/chat/QuestionCard.vue";
 import QuestionPrompt from "@/components/chat/QuestionPrompt.vue";
-import SubagentView from "@/components/chat/SubagentView.vue";
+const SubagentView = defineAsyncComponent(
+  () => import("@/components/chat/SubagentView.vue"),
+);
 import TurnGroup from "@/components/chat/TurnGroup.vue";
 import OlderTurnsControl from "@/components/chat/OlderTurnsControl.vue";
 import { deriveTurnGroups } from "@/components/chat/turn-groups";
@@ -98,6 +100,7 @@ import {
 } from "@/lib/provider-models";
 import {
   activeSession,
+  activeSessionTitle,
   ensureSessionEvents,
   enqueuePrompt,
   isSessionSpawning,
@@ -136,7 +139,10 @@ const props = defineProps<{
   toolsOpen: boolean;
 }>();
 
-const emit = defineEmits<{ (e: "toggleTools"): void }>();
+const emit = defineEmits<{
+  (e: "toggleTools"): void;
+  (e: "openSearch"): void;
+}>();
 
 interface StatusAlert {
   type: "info" | "success" | "warning" | "error";
@@ -444,6 +450,18 @@ function handleRemoveImage(id: string): void {
  * session is instant and why a session that was off screen still shows its
  * history when it comes back (S4).
  */
+/** Compact 3-word session title for the topbar breadcrumb beside the workspace. */
+const sessionHeading = computed<string | null>(() => {
+  const raw =
+    activeSessionTitle.value?.trim() ||
+    transcript.value.find((m) => m.role === "user")?.text.trim() ||
+    "";
+  if (raw === "") return null;
+  const words = raw.replace(/\s+/g, " ").split(" ");
+  if (words.length <= 3) return words.join(" ");
+  return `${words.slice(0, 3).join(" ")}…`;
+});
+
 const buffer = computed<SessionBuffer | null>(() =>
   sessionBuffer(currentSession.value?.sessionId ?? null),
 );
@@ -1765,10 +1783,13 @@ onUnmounted(() => {
     <template v-else>
       <ChatHeader
         :title="workspaceName"
+        :session-title="sessionHeading"
+        :working="agentWorking"
         :tools-open="toolsOpen"
         :is-dark="isDark"
         @toggle-tools="emit('toggleTools')"
         @toggle-theme="handleToggleTheme"
+        @open-search="emit('openSearch')"
       />
 
       <!-- No tab strip any more: the panel is one pane, so the `v-else` children
@@ -1781,7 +1802,7 @@ onUnmounted(() => {
       <ScrollArea class="min-h-0 flex-1">
         <div
           ref="transcriptContent"
-          class="mx-auto flex w-full flex-col gap-4 p-4"
+          class="mx-auto flex w-full flex-col gap-5 px-6 py-6"
           :style="{ maxWidth: `${CONVERSATION_TRANSCRIPT_MAX_WIDTH}px` }"
         >
           <Alert
@@ -1889,43 +1910,44 @@ onUnmounted(() => {
         </div>
       </ScrollArea>
 
-      <!-- Composer, pinned under the transcript, plus the turns/steps meta.
-           No rule above it: the conversation and its input read as one
-           surface instead of two panes. -->
-      <div ref="composerSlot" class="px-4 py-3">
+      <!-- Composer, pinned under the transcript, plus the turns/steps meta. -->
+      <div
+        ref="composerSlot"
+        class="border-t border-sidebar-border bg-background px-5 pt-3 pb-3.5"
+      >
         <!-- S3: this session's waiting prompts, directly above the composer and
              capped to three visible rows so the input never leaves the screen.
              Same stack as the empty state above. -->
         <div
           v-if="queuedList.length > 0"
-          class="mx-auto mb-1.5 flex w-full flex-col gap-1"
+          class="mx-auto mb-2.5 flex w-full flex-col overflow-hidden rounded-xl border border-border bg-card"
           :style="{ maxWidth: queueMaxWidth }"
         >
-          <p class="px-1 text-xs text-muted-foreground">
+          <p class="border-b border-sidebar-border px-3 py-2 text-[11px] font-semibold text-foreground">
             {{ t("chat.queue.heading", { count: queuedList.length }) }}
           </p>
           <ul
-            class="max-h-[5rem] overflow-y-auto rounded-md bg-muted/40 p-1"
+            class="max-h-[5.5rem] overflow-y-auto p-1"
             :aria-label="t('chat.queue.list')"
           >
             <li
               v-for="(item, index) in queuedList"
               :key="`${index}-${item}`"
-              class="flex items-center gap-1.5"
+              class="flex items-center gap-2 rounded-md px-2 py-1 hover:bg-secondary"
             >
               <span
-                class="w-4 shrink-0 text-right text-[10px] tabular-nums text-muted-foreground"
+                class="w-4 shrink-0 text-right font-mono text-[10px] tabular-nums text-muted-foreground"
                 aria-hidden="true"
               >
                 {{ index + 1 }}
               </span>
-              <span class="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+              <span class="min-w-0 flex-1 truncate text-xs text-foreground">
                 {{ item }}
               </span>
               <Button
                 variant="ghost"
                 size="icon-xs"
-                class="shrink-0"
+                class="shrink-0 text-muted-foreground hover:text-foreground"
                 :aria-label="t('chat.queue.remove', { index: index + 1 })"
                 @click="handleRemoveQueued(index)"
               >

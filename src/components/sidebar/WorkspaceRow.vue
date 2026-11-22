@@ -46,15 +46,12 @@ const emit = defineEmits<{
 </script>
 
 <template>
-  <div
-    class="group/ws-row relative rounded-md"
-    :class="active ? 'bg-sidebar-accent text-sidebar-accent-foreground' : ''"
-  >
+  <div class="group/ws-row relative">
     <!-- Row click is one intent: select + toggle. The actions below are
          siblings, never nested: a button inside a button is invalid HTML. -->
     <button
       type="button"
-      class="flex w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1.5 pr-9 text-left text-sm outline-hidden hover:bg-sidebar-accent/60 focus-visible:ring-2 focus-visible:ring-sidebar-ring group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0"
+      class="flex w-full min-w-0 items-center gap-2 rounded-md px-2.5 py-2 pr-9 text-left text-xs transition-colors outline-hidden hover:bg-secondary focus-visible:ring-2 focus-visible:ring-sidebar-ring group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0"
       :aria-expanded="expanded"
       @click="emit('activate')"
     >
@@ -64,12 +61,18 @@ const emit = defineEmits<{
         class="size-3.5 shrink-0 text-muted-foreground group-data-[collapsible=icon]:hidden"
         aria-hidden="true"
       />
-      <FolderIcon class="size-4 shrink-0" aria-hidden="true" />
+      <FolderIcon
+        class="size-3.5 shrink-0"
+        :class="active ? 'text-primary' : 'text-muted-foreground'"
+        aria-hidden="true"
+      />
 
-      <span class="flex min-w-0 flex-1 flex-col group-data-[collapsible=icon]:hidden">
+      <span class="flex min-w-0 flex-1 flex-col gap-0.5 group-data-[collapsible=icon]:hidden">
         <!-- S4/S6: the alias if the store has one, else the last path segment. -->
-        <span class="flex min-w-0 items-center gap-1">
-          <span class="truncate leading-5">{{ workspace.name }}</span>
+        <span class="flex min-w-0 items-center gap-1.5">
+          <span class="truncate text-[12.5px] leading-4 font-semibold text-foreground">
+            {{ workspace.name }}
+          </span>
           <PinIcon
             v-if="workspace.pinned"
             class="size-3 shrink-0 fill-current text-primary"
@@ -77,7 +80,7 @@ const emit = defineEmits<{
           />
         </span>
         <!-- S4: the real path is always visible, muted, under the name. -->
-        <span class="truncate text-xs leading-4 text-muted-foreground">
+        <span class="truncate font-mono text-[10px] leading-3.5 text-muted-foreground">
           {{ workspace.path }}
         </span>
       </span>

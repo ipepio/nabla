@@ -19,7 +19,13 @@
 // child's state fresh. Clicking one is emitted like every other row: it opens the
 // read-only view, never a chat.
 import { onMounted, onUnmounted, ref } from "vue";
-import { MessageSquareIcon, MoreHorizontalIcon, PauseIcon, Trash2Icon } from "@lucide/vue";
+import {
+  GitBranchIcon,
+  MessageSquareIcon,
+  MoreHorizontalIcon,
+  PauseIcon,
+  Trash2Icon,
+} from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -177,7 +183,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <SidebarMenuSub class="mx-0 border-l-0 pl-0">
+  <SidebarMenuSub class="mx-0 gap-0.5 border-l-0 px-1.5 pt-0.5 pb-1.5">
     <SidebarMenuSubItem
       v-for="session in sessions"
       :key="session.id"
@@ -188,51 +194,69 @@ onUnmounted(() => {
         type="button"
         size="sm"
         :is-active="String(session.id) === activeSessionId"
-        class="w-full pl-2 pr-6"
+        class="relative h-auto w-full items-center gap-2.5 rounded-lg border border-transparent px-2.5 py-2 pr-7 text-left text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground data-[active=true]:border-border data-[active=true]:bg-sidebar-accent data-[active=true]:text-foreground data-[active=true]:before:absolute data-[active=true]:before:inset-y-2 data-[active=true]:before:-left-1 data-[active=true]:before:w-0.5 data-[active=true]:before:rounded-full data-[active=true]:before:bg-primary"
         @click="emit('select', session)"
       >
-        <MessageSquareIcon class="size-3.5 shrink-0" aria-hidden="true" />
-        <span class="min-w-0 flex-1 truncate">{{ label(session) }}</span>
-        <!-- L4: a running session says so instead of showing its age; the dot
-             carries the state, the word carries it to a screen reader too. -->
-        <!-- Busy agent: a spinning ring, the same affordance a terminal-style
-             harness uses while a turn runs. Live-but-idle keeps the dot. -->
+        <MessageSquareIcon
+          class="size-4 shrink-0 opacity-75"
+          aria-hidden="true"
+        />
+        <span class="flex min-w-0 flex-1 flex-col gap-0.5">
+          <span
+            class="truncate text-[12px] leading-tight font-semibold"
+            :class="
+              String(session.id) === activeSessionId
+                ? 'text-foreground'
+                : 'text-foreground/85'
+            "
+          >
+            {{ label(session) }}
+          </span>
+          <span class="truncate text-[10.5px] leading-tight text-muted-foreground">
+            <template v-if="busySessionIds.includes(String(session.id))">
+              {{ t("session.working") }}
+            </template>
+            <template v-else-if="isRunning(session, liveSessionIds)">
+              {{ t("session.running") }}
+            </template>
+            <time v-else :datetime="session.updatedAt" class="tabular-nums">
+              {{ rowAgeLabel(session.updatedAt) }}
+            </time>
+          </span>
+        </span>
+        <!-- Right-aligned status dot (fades out on hover when row actions appear). -->
         <span
           v-if="busySessionIds.includes(String(session.id))"
-          class="size-3 shrink-0 animate-spin rounded-full border-2 border-warning/30 border-t-warning"
+          class="nabla-status-pulse size-2 shrink-0 rounded-full bg-primary transition-opacity group-focus-within/session-row:opacity-0 group-hover/session-row:opacity-0"
           role="status"
           :aria-label="t('session.working')"
           :title="t('session.working')"
         />
         <span
           v-else-if="isRunning(session, liveSessionIds)"
-          class="flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground"
+          class="size-2 shrink-0 rounded-full bg-primary transition-opacity group-focus-within/session-row:opacity-0 group-hover/session-row:opacity-0"
           :title="t('session.runningTooltip')"
-        >
-          <span class="size-1.5 rounded-full bg-success" aria-hidden="true" />
-          <span>{{ t("session.running") }}</span>
-        </span>
-        <time
+          aria-hidden="true"
+        />
+        <span
           v-else
-          :datetime="session.updatedAt"
-          class="shrink-0 text-[10px] tabular-nums text-muted-foreground"
-        >
-          {{ rowAgeLabel(session.updatedAt) }}
-        </time>
+          class="size-2 shrink-0 rounded-full bg-tertiary/80 transition-opacity group-focus-within/session-row:opacity-0 group-hover/session-row:opacity-0"
+          aria-hidden="true"
+        />
       </SidebarMenuSubButton>
 
-      <!-- Row actions: hover/focus reveal, next to the age label. The button is
-           a sibling of the row (never nested: a button inside a button is
-           invalid HTML) and keeps keyboard reach through focus-within. -->
+      <!-- Row actions: hover/focus reveal, aligned with the session card. The
+           button is a sibling of the row (never nested: a button inside a
+           button is invalid HTML) and keeps keyboard reach through focus-within. -->
       <div
-        class="absolute top-1/2 right-0.5 -translate-y-1/2 opacity-0 transition-opacity group-focus-within/session-row:opacity-100 group-hover/session-row:opacity-100"
+        class="absolute top-2.5 right-1 opacity-0 transition-opacity group-focus-within/session-row:opacity-100 group-hover/session-row:opacity-100"
       >
         <DropdownMenu>
           <DropdownMenuTrigger as-child>
             <Button
               variant="ghost"
               size="icon-xs"
-              class="text-muted-foreground"
+              class="text-muted-foreground hover:bg-accent hover:text-foreground"
               :aria-label="t('common.moreActions', { name: label(session) })"
             >
               <MoreHorizontalIcon />
@@ -256,13 +280,13 @@ onUnmounted(() => {
         </DropdownMenu>
       </div>
 
-      <!-- H4: the chats this one delegated to, nested under it (S2). Indented and
-           with no ⋯ menu: a child is read, never paused or deleted from here — its
-           life belongs to the parent chat that started it. Clicking one opens the
-           read-only view, not a conversation. -->
+      <!-- H4: the chats this one delegated to, nested under it (S2). Indented with
+           a vertical tree line and no ⋯ menu: a child is read, never paused or
+           deleted from here — its life belongs to the parent chat that started it.
+           Clicking one opens the read-only view, not a conversation. -->
       <ul
         v-if="childrenOf(session).length > 0"
-        class="mt-0.5 mb-1 ml-3 flex flex-col gap-0.5 border-l border-border/60 pl-2"
+        class="mt-1 mb-1.5 ml-4 flex flex-col gap-0.5 border-l border-border pl-2.5"
         :aria-label="t('chat.subagent.list')"
       >
         <li v-for="child in childrenOf(session)" :key="child.sessionId">
@@ -271,21 +295,39 @@ onUnmounted(() => {
             type="button"
             size="sm"
             :is-active="child.sessionId === openSubagentId"
-            class="w-full pl-2"
+            class="h-auto w-full items-center gap-2.5 rounded-lg border border-transparent px-2.5 py-2 text-left text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground data-[active=true]:border-border data-[active=true]:bg-sidebar-accent data-[active=true]:text-foreground"
             @click="emit('openSubagent', { child, parent: session })"
           >
-            <span
-              class="size-1.5 shrink-0 rounded-full"
-              :class="subagentStatusDot(child.status)"
+            <GitBranchIcon
+              class="size-3.5 shrink-0"
+              :class="
+                child.sessionId === openSubagentId
+                  ? 'text-primary'
+                  : 'text-muted-foreground'
+              "
               aria-hidden="true"
             />
-            <span class="min-w-0 flex-1 truncate">{{ childLabel(child) }}</span>
-            <span
-              class="shrink-0 text-[10px] text-muted-foreground"
-              :title="subagentStatusLabel(child.status)"
-            >
-              {{ subagentStatusLabel(child.status) }}
+            <span class="flex min-w-0 flex-1 flex-col gap-0.5">
+              <span
+                class="truncate text-[12px] leading-tight font-semibold"
+                :class="
+                  child.sessionId === openSubagentId
+                    ? 'text-foreground'
+                    : 'text-foreground/85'
+                "
+              >
+                {{ childLabel(child) }}
+              </span>
+              <span class="truncate text-[10.5px] leading-tight text-muted-foreground">
+                {{ subagentStatusLabel(child.status) }} · {{ t("chat.subagent.readOnly") }}
+              </span>
             </span>
+            <span
+              class="size-2 shrink-0 rounded-full"
+              :class="subagentStatusDot(child.status)"
+              :title="subagentStatusLabel(child.status)"
+              aria-hidden="true"
+            />
           </SidebarMenuSubButton>
         </li>
       </ul>

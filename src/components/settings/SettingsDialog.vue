@@ -92,7 +92,7 @@
  * `useAppearance().setMode`, the only path that touches the palette. Every
  * user-visible string comes from the catalogue in `src/lib/i18n.ts` (S2).
  */
-import { computed, ref, watch, type Ref } from "vue";
+import { computed, defineAsyncComponent, ref, watch, type Ref } from "vue";
 import {
   BlocksIcon,
   BotIcon,
@@ -129,6 +129,7 @@ import { Separator } from "@/components/ui/separator";
 import { useAppearance } from "@/lib/appearance";
 import {
   applyPreferences,
+  enabledTools,
   isToolEnabled,
   preferenceDraftCommit,
   queueMessages,
@@ -144,6 +145,12 @@ import {
   webSearchInstance,
   type ToolPreferenceId,
 } from "@/lib/preferences";
+import {
+  agentsConfigDirty,
+  agentsConfigSaving,
+  discardAgentsChanges,
+  saveAgentsDraft,
+} from "@/lib/agent-profiles";
 import { useI18n, type Locale, type MessageKey } from "@/lib/i18n";
 import { detectPlatform, zoomShortcutLabels } from "@/lib/zoom";
 import {
@@ -153,11 +160,15 @@ import {
   providerModelsError,
 } from "@/lib/provider-models";
 import type { ThemeMode } from "@/lib/theme";
-import AccountsSection from "./AccountsSection.vue";
-import McpSection from "./McpSection.vue";
-import ProviderForm from "./ProviderForm.vue";
-import ProviderModelsEditor from "./ProviderModelsEditor.vue";
-import SubagentsSection from "./SubagentsSection.vue";
+const AccountsSection = defineAsyncComponent(() => import("./AccountsSection.vue"));
+const McpSection = defineAsyncComponent(() => import("./McpSection.vue"));
+const ProviderForm = defineAsyncComponent(() => import("./ProviderForm.vue"));
+const ProviderModelsEditor = defineAsyncComponent(
+  () => import("./ProviderModelsEditor.vue"),
+);
+const SubagentsSection = defineAsyncComponent(
+  () => import("./SubagentsSection.vue"),
+);
 import {
   commandErrorMessage,
   configFilePath,
@@ -242,6 +253,9 @@ const loading = ref(false);
 const error = ref<string | null>(null);
 /** A write is in flight, so the controls cannot fire twice. */
 const saving = ref(false);
+/** Brief confirmation shown in the modal footer right after a save succeeds. */
+const savedNotice = ref(false);
+let savedNoticeTimer: number | null = null;
 const opening = ref(false);
 /** S2: the inline custom-provider form is open. */
 const showProviderForm = ref(false);
@@ -823,12 +837,72 @@ async function handleOpenConfigFile() {
   }
 }
 
+/** True when any text draft or subagent draft differs from what is stored. */
+const hasUnsavedDrafts = computed(
+  () =>
+    agentsConfigDirty.value ||
+    webSearchInstanceDraft.value.trim() !== webSearchInstance.value ||
+    webSearchCredentialsDraft.value.trim() !== webSearchCredentials.value,
+);
+
+/**
+ * Unified Save action for the persistent modal footer: commits any pending
+ * text drafts, writes the current preferences snapshot to `settings.json`, and
+ * saves the subagent profiles draft to `agents.json` when dirty.
+ */
+async function handleSaveAll(): Promise<void> {
+  if (saving.value || agentsConfigSaving.value) return;
+  saving.value = true;
+  error.value = null;
+  savedNotice.value = false;
+  try {
+    const current = await getSettings();
+    const nextInstance = webSearchInstanceDraft.value.trim();
+    const nextCredentials = webSearchCredentialsDraft.value.trim();
+    const saved = await saveSettings({
+      ...current,
+      theme: mode.value,
+      language: locale.value,
+      showReasoning: showReasoning.value,
+      queueMessages: queueMessages.value,
+      enabledTools: [...enabledTools.value],
+      webSearchEnabled: webSearchEnabled.value,
+      webSearchInstance: nextInstance,
+      webSearchCredentials: nextCredentials,
+    });
+    settings.value = saved;
+    applyPreferences(saved);
+    webSearchInstanceDraft.value = webSearchInstance.value;
+    webSearchCredentialsDraft.value = webSearchCredentials.value;
+    if (agentsConfigDirty.value) {
+      await saveAgentsDraft();
+    }
+    savedNotice.value = true;
+    if (savedNoticeTimer !== null) window.clearTimeout(savedNoticeTimer);
+    savedNoticeTimer = window.setTimeout(() => {
+      savedNotice.value = false;
+      savedNoticeTimer = null;
+    }, 3000);
+  } catch (cause) {
+    error.value = commandErrorMessage(cause);
+  } finally {
+    saving.value = false;
+  }
+}
+
+function handleDiscardAll(): void {
+  if (agentsConfigDirty.value) discardAgentsChanges();
+  webSearchInstanceDraft.value = webSearchInstance.value;
+  webSearchCredentialsDraft.value = webSearchCredentials.value;
+}
+
 // Every open re-reads the file, the provider list and the path, so a human edit
 // outside the app is picked up instead of showing a stale dialog. The inline form
 // starts closed, the way a preferences window does.
 watch(open, (isOpen) => {
   if (!isOpen) return;
   section.value = "general";
+  savedNotice.value = false;
   showProviderForm.value = false;
   closeKeyEditor();
   pendingRemoval.value = null;
@@ -849,7 +923,7 @@ watch(open, (isOpen) => {
   invalidateProviderModels();
   void refreshModels();
   void loadConfigPath();
-});
+}, { immediate: true });
 </script>
 
 <template>
@@ -859,14 +933,19 @@ watch(open, (isOpen) => {
          is off. -->
     <DialogContent
       :show-close-button="false"
-      class="flex max-h-[min(85vh,44rem)] w-full max-w-2xl flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl"
+      class="flex max-h-[min(86vh,46rem)] w-full max-w-3xl flex-col gap-0 overflow-hidden rounded-2xl border border-border bg-card p-0 shadow-2xl sm:max-w-3xl"
     >
-      <DialogHeader class="flex-row items-center justify-between gap-3 px-4 py-3">
-        <DialogTitle>{{ t("settings.title") }}</DialogTitle>
+      <DialogHeader
+        class="flex-row items-center justify-between gap-3 border-b border-border bg-card px-5 py-4"
+      >
+        <DialogTitle class="text-sm font-semibold text-foreground">
+          {{ t("settings.title") }}
+        </DialogTitle>
         <DialogClose as-child>
           <Button
             variant="ghost"
             size="icon-sm"
+            class="text-muted-foreground hover:bg-accent hover:text-foreground"
             :aria-label="t('settings.close')"
           >
             <XIcon />
@@ -879,105 +958,120 @@ watch(open, (isOpen) => {
              it reads as the same kind of selected row as a workspace. -->
         <nav
           :aria-label="t('settings.sections')"
-          class="flex w-44 shrink-0 flex-col gap-0.5 border-r border-border p-2"
+          class="flex w-48 shrink-0 flex-col gap-1 border-r border-sidebar-border bg-sidebar p-3"
         >
           <button
             type="button"
             :aria-current="section === 'general' ? 'page' : undefined"
             :class="[
-              'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+              'flex w-full items-center gap-2.5 rounded-lg border px-3 py-2 text-left text-xs outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
               section === 'general'
-                ? 'bg-sidebar-accent font-medium text-sidebar-accent-foreground'
-                : 'text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground',
+                ? 'border-border bg-sidebar-accent font-semibold text-sidebar-accent-foreground'
+                : 'border-transparent text-muted-foreground hover:bg-secondary hover:text-foreground',
             ]"
             @click="section = 'general'"
           >
-            <SettingsIcon class="size-4 shrink-0" aria-hidden="true" />
+            <SettingsIcon
+              class="size-4 shrink-0"
+              :class="section === 'general' ? 'text-primary' : ''"
+              aria-hidden="true"
+            />
             {{ t("settings.section.general") }}
           </button>
           <button
             type="button"
             :aria-current="section === 'providers' ? 'page' : undefined"
             :class="[
-              'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+              'flex w-full items-center gap-2.5 rounded-lg border px-3 py-2 text-left text-xs outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
               section === 'providers'
-                ? 'bg-sidebar-accent font-medium text-sidebar-accent-foreground'
-                : 'text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground',
+                ? 'border-border bg-sidebar-accent font-semibold text-sidebar-accent-foreground'
+                : 'border-transparent text-muted-foreground hover:bg-secondary hover:text-foreground',
             ]"
             @click="section = 'providers'"
           >
-            <PlugIcon class="size-4 shrink-0" aria-hidden="true" />
+            <PlugIcon
+              class="size-4 shrink-0"
+              :class="section === 'providers' ? 'text-primary' : ''"
+              aria-hidden="true"
+            />
             {{ t("settings.section.providers") }}
           </button>
           <button
             type="button"
             :aria-current="section === 'mcp' ? 'page' : undefined"
             :class="[
-              'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+              'flex w-full items-center gap-2.5 rounded-lg border px-3 py-2 text-left text-xs outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
               section === 'mcp'
-                ? 'bg-sidebar-accent font-medium text-sidebar-accent-foreground'
-                : 'text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground',
+                ? 'border-border bg-sidebar-accent font-semibold text-sidebar-accent-foreground'
+                : 'border-transparent text-muted-foreground hover:bg-secondary hover:text-foreground',
             ]"
             @click="section = 'mcp'"
           >
-            <BlocksIcon class="size-4 shrink-0" aria-hidden="true" />
+            <BlocksIcon
+              class="size-4 shrink-0"
+              :class="section === 'mcp' ? 'text-primary' : ''"
+              aria-hidden="true"
+            />
             {{ t("settings.section.mcp") }}
           </button>
           <button
             type="button"
             :aria-current="section === 'subagents' ? 'page' : undefined"
             :class="[
-              'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+              'flex w-full items-center gap-2.5 rounded-lg border px-3 py-2 text-left text-xs outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
               section === 'subagents'
-                ? 'bg-sidebar-accent font-medium text-sidebar-accent-foreground'
-                : 'text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground',
+                ? 'border-border bg-sidebar-accent font-semibold text-sidebar-accent-foreground'
+                : 'border-transparent text-muted-foreground hover:bg-secondary hover:text-foreground',
             ]"
             @click="section = 'subagents'"
           >
-            <BotIcon class="size-4 shrink-0" aria-hidden="true" />
+            <BotIcon
+              class="size-4 shrink-0"
+              :class="section === 'subagents' ? 'text-primary' : ''"
+              aria-hidden="true"
+            />
             {{ t("settings.section.subagents") }}
           </button>
         </nav>
 
-        <!-- S1: the scrolling pane. One row per setting: label and description
-             on the left, control on the right. Blocks are spaced, not ruled: the
-             only separators are the two between Appearance / Configuration file /
-             Language. -->
-        <div class="min-h-0 flex-1 overflow-y-auto px-4 py-2">
-          <div v-if="loading" class="py-6 text-sm text-muted-foreground">
+        <!-- S1: the scrolling pane. -->
+        <div class="min-h-0 flex-1 overflow-y-auto bg-card px-6 py-5">
+          <div v-if="loading" class="py-6 text-xs text-muted-foreground">
             {{ t("settings.loading") }}
           </div>
 
-          <!-- S3 of `settings-dialog.md`: General — appearance, the configuration
-               file and the language (S2 of `i18n-and-settings-polish.md`). -->
-          <div v-else-if="section === 'general'" class="space-y-6 py-4">
-            <section class="flex flex-wrap items-start justify-between gap-4">
-              <div class="min-w-0">
-                <h3 class="text-sm font-medium">
-                  {{ t("settings.general.appearance") }}
-                </h3>
-                <p class="mt-0.5 text-xs text-muted-foreground">
-                  {{ t("settings.general.appearance.description") }}
-                </p>
-              </div>
-              <div class="flex gap-2">
-                <button
-                  v-for="option in THEME_OPTIONS"
-                  :key="option.mode"
-                  type="button"
-                  :aria-pressed="mode === option.mode"
-                  :disabled="saving"
-                  :class="[
-                    'flex w-16 flex-col items-center gap-1.5 rounded-lg border border-border py-2.5 text-xs outline-hidden transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50',
-                    mode === option.mode
-                      ? 'bg-muted font-medium text-foreground ring-2 ring-ring'
-                      : 'text-muted-foreground',
-                  ]"
-                  @click="handleThemeChange(option.mode)"
-                >
-                  <component :is="option.icon" class="size-4" aria-hidden="true" />
-                  {{ t(option.labelKey) }}
-                </button>
+          <!-- S3 of `settings-dialog.md`: General — appearance, chat, tools,
+               web search, language and shortcuts, framed as clean cards. -->
+          <div v-else-if="section === 'general'" class="space-y-4">
+            <section class="rounded-xl border border-border bg-secondary/40 p-4">
+              <div class="flex flex-wrap items-center justify-between gap-4">
+                <div class="min-w-0">
+                  <h3 class="text-xs font-semibold text-foreground">
+                    {{ t("settings.general.appearance") }}
+                  </h3>
+                  <p class="mt-0.5 text-[11px] text-muted-foreground">
+                    {{ t("settings.general.appearance.description") }}
+                  </p>
+                </div>
+                <div class="flex gap-1.5">
+                  <button
+                    v-for="option in THEME_OPTIONS"
+                    :key="option.mode"
+                    type="button"
+                    :aria-pressed="mode === option.mode"
+                    :disabled="saving"
+                    :class="[
+                      'flex w-16 flex-col items-center gap-1 rounded-lg border py-2 text-[11px] outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50',
+                      mode === option.mode
+                        ? 'border-primary/45 bg-primary/10 font-semibold text-primary'
+                        : 'border-border bg-card text-muted-foreground hover:bg-accent hover:text-foreground',
+                    ]"
+                    @click="handleThemeChange(option.mode)"
+                  >
+                    <component :is="option.icon" class="size-3.5" aria-hidden="true" />
+                    {{ t(option.labelKey) }}
+                  </button>
+                </div>
               </div>
             </section>
 
@@ -988,159 +1082,162 @@ watch(open, (isOpen) => {
                  right (the same `role="switch"` control the model editor uses).
                  Both read the live refs from `src/lib/preferences.ts`, so the
                  chat reflects a flip without a reload. -->
-            <section class="space-y-3">
+            <section class="space-y-3 rounded-xl border border-border bg-secondary/40 p-4">
               <div class="min-w-0">
-                <h3 class="text-sm font-medium">
+                <h3 class="text-xs font-semibold text-foreground">
                   {{ t("settings.general.chat") }}
                 </h3>
-                <p class="mt-0.5 text-xs text-muted-foreground">
+                <p class="mt-0.5 text-[11px] text-muted-foreground">
                   {{ t("settings.general.chat.description") }}
                 </p>
               </div>
 
-              <div class="flex items-start justify-between gap-4">
-                <div class="min-w-0">
-                  <p class="text-sm">
-                    {{ t("settings.general.showReasoning") }}
-                  </p>
-                  <p class="mt-0.5 text-xs text-muted-foreground">
-                    {{ t("settings.general.showReasoning.description") }}
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  role="switch"
-                  :aria-checked="showReasoning"
-                  :aria-label="t('settings.general.showReasoning')"
-                  :class="[
-                    'relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
-                    showReasoning ? 'bg-primary' : 'bg-input',
-                  ]"
-                  @click="handleShowReasoning(!showReasoning)"
-                >
-                  <span
+              <div class="divide-y divide-sidebar-border">
+                <div class="flex items-start justify-between gap-4 py-2.5 first:pt-0 last:pb-0">
+                  <div class="min-w-0">
+                    <p class="text-xs font-medium text-foreground">
+                      {{ t("settings.general.showReasoning") }}
+                    </p>
+                    <p class="mt-0.5 text-[11px] text-muted-foreground">
+                      {{ t("settings.general.showReasoning.description") }}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    :aria-checked="showReasoning"
+                    :aria-label="t('settings.general.showReasoning')"
                     :class="[
-                      'size-4 rounded-full bg-background shadow-sm transition-transform',
-                      showReasoning ? 'translate-x-4.5' : 'translate-x-0.5',
+                      'relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full border outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                      showReasoning
+                        ? 'border-primary/40 bg-primary/15'
+                        : 'border-border bg-accent',
                     ]"
-                    aria-hidden="true"
-                  />
-                </button>
-              </div>
+                    @click="handleShowReasoning(!showReasoning)"
+                  >
+                    <span
+                      :class="[
+                        'size-3.5 rounded-full transition-transform',
+                        showReasoning
+                          ? 'translate-x-4.5 bg-primary'
+                          : 'translate-x-0.5 bg-muted-foreground',
+                      ]"
+                      aria-hidden="true"
+                    />
+                  </button>
+                </div>
 
-              <div class="flex items-start justify-between gap-4">
-                <div class="min-w-0">
-                  <p class="text-sm">
-                    {{ t("settings.general.queueMessages") }}
-                  </p>
-                  <p class="mt-0.5 text-xs text-muted-foreground">
-                    {{ t("settings.general.queueMessages.description") }}
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  role="switch"
-                  :aria-checked="queueMessages"
-                  :aria-label="t('settings.general.queueMessages')"
-                  :class="[
-                    'relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
-                    queueMessages ? 'bg-primary' : 'bg-input',
-                  ]"
-                  @click="handleQueueMessages(!queueMessages)"
-                >
-                  <span
+                <div class="flex items-start justify-between gap-4 py-2.5 first:pt-0 last:pb-0">
+                  <div class="min-w-0">
+                    <p class="text-xs font-medium text-foreground">
+                      {{ t("settings.general.queueMessages") }}
+                    </p>
+                    <p class="mt-0.5 text-[11px] text-muted-foreground">
+                      {{ t("settings.general.queueMessages.description") }}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    :aria-checked="queueMessages"
+                    :aria-label="t('settings.general.queueMessages')"
                     :class="[
-                      'size-4 rounded-full bg-background shadow-sm transition-transform',
-                      queueMessages ? 'translate-x-4.5' : 'translate-x-0.5',
+                      'relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full border outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                      queueMessages
+                        ? 'border-primary/40 bg-primary/15'
+                        : 'border-border bg-accent',
                     ]"
-                    aria-hidden="true"
-                  />
-                </button>
+                    @click="handleQueueMessages(!queueMessages)"
+                  >
+                    <span
+                      :class="[
+                        'size-3.5 rounded-full transition-transform',
+                        queueMessages
+                          ? 'translate-x-4.5 bg-primary'
+                          : 'translate-x-0.5 bg-muted-foreground',
+                      ]"
+                      aria-hidden="true"
+                    />
+                  </button>
+                </div>
               </div>
             </section>
 
-            <!-- S5 of `tool-drawer-and-mcp.md`: the drawer's tools. One row per
-                 tool: label, description and — for the two that execute code —
-                 a warning that only appears while the tool is ON, so the risk is
-                 stated exactly when it is being accepted. Each switch reads the
-                 shared `enabledTools` ref, so the drawer follows without a
-                 reload. -->
-            <section class="space-y-3">
+            <!-- S5 of `tool-drawer-and-mcp.md`: the drawer's tools. -->
+            <section class="space-y-3 rounded-xl border border-border bg-secondary/40 p-4">
               <div class="min-w-0">
-                <h3 class="text-sm font-medium">
+                <h3 class="text-xs font-semibold text-foreground">
                   {{ t("settings.general.tools") }}
                 </h3>
-                <p class="mt-0.5 text-xs text-muted-foreground">
+                <p class="mt-0.5 text-[11px] text-muted-foreground">
                   {{ t("settings.general.tools.description") }}
                 </p>
               </div>
 
-              <div
-                v-for="tool in TOOL_SWITCHES"
-                :key="tool.id"
-                class="flex items-start justify-between gap-4"
-              >
-                <div class="min-w-0">
-                  <p class="text-sm">
-                    {{ t(tool.labelKey) }}
-                  </p>
-                  <p class="mt-0.5 text-xs text-muted-foreground">
-                    {{ t(tool.descriptionKey) }}
-                  </p>
-                  <p
-                    v-if="tool.warningKey && isToolEnabled(tool.id)"
-                    class="mt-0.5 text-xs text-warning"
-                  >
-                    {{ t(tool.warningKey) }}
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  role="switch"
-                  :aria-checked="isToolEnabled(tool.id)"
-                  :aria-label="t(tool.labelKey)"
-                  :class="[
-                    'relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
-                    isToolEnabled(tool.id) ? 'bg-primary' : 'bg-input',
-                  ]"
-                  @click="handleToolToggle(tool.id, !isToolEnabled(tool.id))"
+              <div class="divide-y divide-sidebar-border">
+                <div
+                  v-for="tool in TOOL_SWITCHES"
+                  :key="tool.id"
+                  class="flex items-start justify-between gap-4 py-2.5 first:pt-0 last:pb-0"
                 >
-                  <span
+                  <div class="min-w-0">
+                    <p class="text-xs font-medium text-foreground">
+                      {{ t(tool.labelKey) }}
+                    </p>
+                    <p class="mt-0.5 text-[11px] text-muted-foreground">
+                      {{ t(tool.descriptionKey) }}
+                    </p>
+                    <p
+                      v-if="tool.warningKey && isToolEnabled(tool.id)"
+                      class="mt-1 text-[11px] text-warning"
+                    >
+                      {{ t(tool.warningKey) }}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    :aria-checked="isToolEnabled(tool.id)"
+                    :aria-label="t(tool.labelKey)"
                     :class="[
-                      'size-4 rounded-full bg-background shadow-sm transition-transform',
+                      'relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full border outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
                       isToolEnabled(tool.id)
-                        ? 'translate-x-4.5'
-                        : 'translate-x-0.5',
+                        ? 'border-primary/40 bg-primary/15'
+                        : 'border-border bg-accent',
                     ]"
-                    aria-hidden="true"
-                  />
-                </button>
+                    @click="handleToolToggle(tool.id, !isToolEnabled(tool.id))"
+                  >
+                    <span
+                      :class="[
+                        'size-3.5 rounded-full transition-transform',
+                        isToolEnabled(tool.id)
+                          ? 'translate-x-4.5 bg-primary'
+                          : 'translate-x-0.5 bg-muted-foreground',
+                      ]"
+                      aria-hidden="true"
+                    />
+                  </button>
+                </div>
               </div>
             </section>
 
-            <!-- S3 of `web-search.md`: the agent's web search. Its own block rather
-                 than a row of the drawer tools above: those are panels the human
-                 opens, this is a capability the agent calls, and the query leaves
-                 the machine — which the description says, in those words. The
-                 instance field belongs to the switch, so it sits right under it and
-                 stays useful while the switch is off (turning it on then needs no
-                 typing). -->
-            <section class="space-y-3">
+            <!-- S3 of `web-search.md`: the agent's web search. -->
+            <section class="space-y-3 rounded-xl border border-border bg-secondary/40 p-4">
               <div class="min-w-0">
-                <h3 class="text-sm font-medium">
+                <h3 class="text-xs font-semibold text-foreground">
                   {{ t("settings.general.webSearch") }}
                 </h3>
-                <p class="mt-0.5 text-xs text-muted-foreground">
+                <p class="mt-0.5 text-[11px] text-muted-foreground">
                   {{ t("settings.general.webSearch.description") }}
                 </p>
               </div>
 
               <div class="flex items-start justify-between gap-4">
                 <div class="min-w-0">
-                  <p class="text-sm">
+                  <p class="text-xs font-medium text-foreground">
                     {{ t("settings.general.webSearch.enable") }}
                   </p>
-                  <p class="mt-0.5 text-xs text-muted-foreground">
+                  <p class="mt-0.5 text-[11px] text-muted-foreground">
                     {{ t("settings.general.webSearch.enable.description") }}
                   </p>
                 </div>
@@ -1150,15 +1247,19 @@ watch(open, (isOpen) => {
                   :aria-checked="webSearchEnabled"
                   :aria-label="t('settings.general.webSearch.enable')"
                   :class="[
-                    'relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
-                    webSearchEnabled ? 'bg-primary' : 'bg-input',
+                    'relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full border outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                    webSearchEnabled
+                      ? 'border-primary/40 bg-primary/15'
+                      : 'border-border bg-accent',
                   ]"
                   @click="handleWebSearchToggle(!webSearchEnabled)"
                 >
                   <span
                     :class="[
-                      'size-4 rounded-full bg-background shadow-sm transition-transform',
-                      webSearchEnabled ? 'translate-x-4.5' : 'translate-x-0.5',
+                      'size-3.5 rounded-full transition-transform',
+                      webSearchEnabled
+                        ? 'translate-x-4.5 bg-primary'
+                        : 'translate-x-0.5 bg-muted-foreground',
                     ]"
                     aria-hidden="true"
                   />
@@ -1167,14 +1268,11 @@ watch(open, (isOpen) => {
 
               <div class="space-y-1.5">
                 <label
-                  class="text-sm"
+                  class="text-xs font-medium text-foreground"
                   for="settings-web-search-instance"
                 >
                   {{ t("settings.general.webSearch.instance") }}
                 </label>
-                <!-- S3: bound to the pane's own draft, never to the shared ref:
-                     the input carries its own model, and two writers of one value
-                     is what made the field erase itself while typing. -->
                 <Input
                   id="settings-web-search-instance"
                   v-model="webSearchInstanceDraft"
@@ -1182,7 +1280,7 @@ watch(open, (isOpen) => {
                   inputmode="url"
                   autocomplete="off"
                   spellcheck="false"
-                  class="h-8 text-sm"
+                  class="h-8 bg-card text-xs"
                   :placeholder="
                     t('settings.general.webSearch.instance.placeholder')
                   "
@@ -1190,27 +1288,25 @@ watch(open, (isOpen) => {
                   @change="commitWebSearchInstance"
                   @keydown.enter="commitWebSearchInstance"
                 />
-                <p class="text-xs text-muted-foreground">
+                <p class="text-[11px] text-muted-foreground">
                   {{ t("settings.general.webSearch.instance.hint") }}
                 </p>
               </div>
 
               <div class="space-y-1.5">
                 <label
-                  class="text-sm"
+                  class="text-xs font-medium text-foreground"
                   for="settings-web-search-credentials"
                 >
                   {{ t("settings.general.webSearch.credentials") }}
                 </label>
-                <!-- One optional secret, in the shape the instance wants:
-                     `user:contraseña` for Basic auth, a token for Bearer. -->
                 <Input
                   id="settings-web-search-credentials"
                   v-model="webSearchCredentialsDraft"
                   type="password"
                   autocomplete="off"
                   spellcheck="false"
-                  class="h-8 text-sm"
+                  class="h-8 bg-card text-xs"
                   :placeholder="
                     t('settings.general.webSearch.credentials.placeholder')
                   "
@@ -1218,78 +1314,70 @@ watch(open, (isOpen) => {
                   @change="commitWebSearchCredentials"
                   @keydown.enter="commitWebSearchCredentials"
                 />
-                <p class="text-xs text-muted-foreground">
+                <p class="text-[11px] text-muted-foreground">
                   {{ t("settings.general.webSearch.credentials.hint") }}
                 </p>
               </div>
             </section>
 
-            <!-- One separator only: the blocks above | Language. The
-                 configuration block that used to sit here was
-                 redundant with the single "open configuration file" action at
-                 the end of the pane. -->
-            <Separator />
-
-            <section class="flex flex-wrap items-center justify-between gap-4">
-              <div class="min-w-0">
-                <h3 class="text-sm font-medium">
-                  {{ t("settings.general.language") }}
-                </h3>
-                <p class="mt-0.5 text-xs text-muted-foreground">
-                  {{ t("settings.general.language.description") }}
-                </p>
-              </div>
-              <Select
-                :model-value="locale"
-                :disabled="saving"
-                @update:model-value="handleLanguageChange(String($event))"
-              >
-                <SelectTrigger
-                  class="w-40"
-                  :aria-label="t('settings.general.language')"
+            <section class="rounded-xl border border-border bg-secondary/40 p-4">
+              <div class="flex flex-wrap items-center justify-between gap-4">
+                <div class="min-w-0">
+                  <h3 class="text-xs font-semibold text-foreground">
+                    {{ t("settings.general.language") }}
+                  </h3>
+                  <p class="mt-0.5 text-[11px] text-muted-foreground">
+                    {{ t("settings.general.language.description") }}
+                  </p>
+                </div>
+                <Select
+                  :model-value="locale"
+                  :disabled="saving"
+                  @update:model-value="handleLanguageChange(String($event))"
                 >
-                  <SelectValue
-                    :placeholder="t('settings.general.language.selectPlaceholder')"
-                  />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem
-                    v-for="option in LANGUAGE_OPTIONS"
-                    :key="option.value"
-                    :value="option.value"
+                  <SelectTrigger
+                    class="w-40 bg-card text-xs"
+                    :aria-label="t('settings.general.language')"
                   >
-                    {{ t(option.labelKey) }}
-                  </SelectItem>
-                </SelectContent>
-              </Select>
+                    <SelectValue
+                      :placeholder="t('settings.general.language.selectPlaceholder')"
+                    />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem
+                      v-for="option in LANGUAGE_OPTIONS"
+                      :key="option.value"
+                      :value="option.value"
+                    >
+                      {{ t(option.labelKey) }}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
             </section>
 
-            <!-- The zoom chords are the only shortcuts with a backend, and they
-                 are the app's, not a preference: a read-only list instead of a
-                 control. S5 of `settings-dialog.md` still holds for the rest
-                 (font size, work details, code view). -->
-            <section class="space-y-2">
+            <section class="space-y-2.5 rounded-xl border border-border bg-secondary/40 p-4">
               <div>
-                <h3 class="text-sm font-medium">
+                <h3 class="text-xs font-semibold text-foreground">
                   {{ t("settings.general.shortcuts") }}
                 </h3>
-                <p class="mt-0.5 text-xs text-muted-foreground">
+                <p class="mt-0.5 text-[11px] text-muted-foreground">
                   {{ t("settings.general.shortcuts.description") }}
                 </p>
               </div>
-              <ul class="divide-y rounded-md border">
+              <ul class="divide-y divide-sidebar-border rounded-lg border border-border bg-card">
                 <li
                   v-for="row in SHORTCUT_ROWS"
                   :key="row.labelKey"
                   class="flex items-center justify-between gap-4 px-3 py-2"
                 >
-                  <span class="text-xs">{{ t(row.labelKey) }}</span>
+                  <span class="text-xs text-foreground">{{ t(row.labelKey) }}</span>
                   <kbd
-                    class="rounded-sm bg-muted px-1.5 py-0.5 font-sans text-[0.7rem] font-medium text-muted-foreground"
+                    class="rounded border border-border bg-secondary px-1.5 py-0.5 font-mono text-[10px] font-medium text-muted-foreground"
                   >{{ row.keys }}</kbd>
                 </li>
               </ul>
-              <p class="text-xs text-muted-foreground">
+              <p class="text-[11px] text-muted-foreground">
                 {{ t("settings.general.shortcuts.zoomScope") }}
               </p>
             </section>
@@ -1299,6 +1387,7 @@ watch(open, (isOpen) => {
               <Button
                 variant="outline"
                 size="sm"
+                class="rounded-lg border-border bg-card text-xs hover:border-primary/40 hover:text-primary"
                 :disabled="opening"
                 @click="handleOpenConfigFile"
               >
@@ -1702,9 +1791,57 @@ watch(open, (isOpen) => {
                stored definition, not a preference of the chat. -->
           <SubagentsSection v-else />
 
-          <Alert v-if="error" variant="destructive" class="mb-4">
+          <Alert v-if="error" variant="destructive" class="mt-4">
             <AlertDescription>{{ error }}</AlertDescription>
           </Alert>
+        </div>
+      </div>
+
+      <!-- Persistent modal footer across all sections: status on the left,
+           Discard (when dirty) and Save on the right. -->
+      <div
+        class="flex flex-wrap items-center justify-between gap-3 border-t border-border bg-sidebar px-5 py-3"
+      >
+        <p class="min-w-0 truncate text-xs text-muted-foreground">
+          <template v-if="saving || agentsConfigSaving">
+            {{ t("settings.subagents.saving") }}
+          </template>
+          <template v-else-if="hasUnsavedDrafts">
+            <span class="text-warning">{{ t("settings.subagents.dirty") }}</span>
+          </template>
+          <template v-else-if="savedNotice">
+            <span class="text-primary">{{ t("settings.subagents.saved") }}</span>
+          </template>
+          <span v-else-if="configPath" class="font-mono text-[10.5px]">
+            {{ configPath }}
+          </span>
+        </p>
+
+        <div class="flex shrink-0 items-center gap-2">
+          <Button
+            v-if="hasUnsavedDrafts"
+            type="button"
+            variant="ghost"
+            size="sm"
+            class="text-xs text-muted-foreground hover:text-foreground"
+            :disabled="saving || agentsConfigSaving"
+            @click="handleDiscardAll"
+          >
+            {{ t("settings.subagents.discard") }}
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            class="rounded-lg bg-primary px-4 text-xs font-semibold text-primary-foreground hover:bg-primary/90"
+            :disabled="loading || saving || agentsConfigSaving"
+            @click="handleSaveAll"
+          >
+            {{
+              saving || agentsConfigSaving
+                ? t("settings.subagents.saving")
+                : t("settings.subagents.save")
+            }}
+          </Button>
         </div>
       </div>
 

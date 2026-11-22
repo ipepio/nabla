@@ -55,8 +55,9 @@ defineProps<{
            cannot change anything is noise. -->
       <div class="flex flex-wrap items-center justify-center gap-2">
         <span
-          class="inline-flex items-center gap-1 rounded-full border border-border bg-card/60 px-2.5 py-1 text-xs text-muted-foreground"
+          class="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 font-mono text-[11px] text-muted-foreground"
         >
+          <span class="size-1.5 rounded-full bg-primary" aria-hidden="true" />
           {{ provider }}
         </span>
       </div>

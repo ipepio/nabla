@@ -82,19 +82,15 @@ import {
   AGENT_TOOLS,
   addAgentProfile,
   agentsConfig,
-  agentsConfigDirty,
   agentsConfigLoading,
   agentsConfigReadError,
   agentsConfigSaveError,
-  agentsConfigSaved,
   agentsConfigSaving,
   blankProfile,
-  discardAgentsChanges,
   hasProfileNamed,
   loadAgentsConfig,
   orderedTools,
   removeAgentProfile,
-  saveAgentsDraft,
   setSubagentsEnabled,
   setSubagentsModelDefault,
   updateAgentProfile,
@@ -365,15 +361,6 @@ function handleEffort(value: string): void {
 /** The profile's own switch, inside the editor. */
 function handleEditingEnabled(next: boolean): void {
   patchEditing({ enabled: next });
-}
-
-/** The one write. Rust validates first; its refusal lands in the error line. */
-function handleSave(): void {
-  void saveAgentsDraft();
-}
-
-function handleDiscard(): void {
-  void discardAgentsChanges();
 }
 
 // The pane mounts when the section is selected, which is also when a hand edit of
@@ -743,46 +730,6 @@ onMounted(() => {
       <Alert v-if="agentsConfigSaveError" variant="destructive">
         <AlertDescription>{{ agentsConfigSaveError }}</AlertDescription>
       </Alert>
-
-      <div class="flex flex-wrap items-center justify-between gap-3">
-        <p class="text-xs text-muted-foreground">
-          <template v-if="agentsConfigSaving">
-            {{ t("settings.subagents.saving") }}
-          </template>
-          <template v-else-if="agentsConfigDirty">
-            {{ t("settings.subagents.dirty") }}
-          </template>
-          <template v-else-if="agentsConfigSaved">
-            {{ t("settings.subagents.saved") }}
-          </template>
-          <template v-else>
-            {{ t("settings.subagents.nextSession") }}
-          </template>
-        </p>
-        <div class="flex items-center gap-2">
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            :disabled="!agentsConfigDirty || agentsConfigSaving"
-            @click="handleDiscard"
-          >
-            {{ t("settings.subagents.discard") }}
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            :disabled="!agentsConfigDirty || agentsConfigSaving"
-            @click="handleSave"
-          >
-            {{
-              agentsConfigSaving
-                ? t("settings.subagents.saving")
-                : t("settings.subagents.save")
-            }}
-          </Button>
-        </div>
-      </div>
     </template>
 
     <!-- The editor, as a dialog like the provider one: the list stays a list

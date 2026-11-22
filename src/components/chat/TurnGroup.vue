@@ -147,7 +147,14 @@ const notice = computed<string | null>(() => {
 </script>
 
 <template>
-  <div class="flex flex-col gap-3">
+  <div
+    class="flex flex-col gap-3"
+    :class="
+      !live
+        ? '[content-visibility:auto] [contain-intrinsic-block-size:auto_12rem]'
+        : ''
+    "
+  >
     <!-- S1: the turn opens with what the human said. A settled question is the
          human's side of the exchange, so it opens one too, as its card. -->
     <QuestionCard v-if="question !== null" :question="question" />

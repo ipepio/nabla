@@ -89,18 +89,16 @@ const choices = computed<string[]>(() => {
 
 <template>
   <div
-    class="rounded-lg border p-2.5"
-    :class="
-      pending ? 'border-dashed border-border bg-muted/20' : 'border-border bg-muted/30'
-    "
+    class="nabla-enter rounded-xl border bg-card p-3.5"
+    :class="pending ? 'border-dashed border-primary/40' : 'border-border'"
   >
-    <div class="flex items-start gap-2">
+    <div class="flex items-start gap-2.5">
       <MessageCircleQuestionIcon
-        class="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
+        class="mt-0.5 size-4 shrink-0 text-tertiary"
         aria-hidden="true"
       />
       <div class="min-w-0 flex-1">
-        <p class="text-sm font-medium break-words whitespace-pre-wrap">
+        <p class="text-[13px] font-semibold break-words whitespace-pre-wrap text-foreground">
           {{ headline }}
         </p>
         <!-- `confirm` carries what exactly was confirmed; `input` carries the
@@ -121,23 +119,23 @@ const choices = computed<string[]>(() => {
         <!-- The options, with the one the human picked marked. A pending
              question marks none — nothing has been chosen — and a cancelled one
              marks none either: nothing will be. -->
-        <ul v-if="choices.length > 0" class="mt-1.5 flex flex-col gap-0.5">
+        <ul v-if="choices.length > 0" class="mt-2 flex flex-col gap-1">
           <li
             v-for="choice in choices"
             :key="choice"
             class="flex items-center gap-1.5 text-xs"
             :class="
-              choice === answerText ? 'text-foreground' : 'text-muted-foreground'
+              choice === answerText ? 'font-medium text-primary' : 'text-muted-foreground'
             "
           >
             <CheckIcon
               v-if="!pending && choice === answerText"
-              class="size-3 shrink-0"
+              class="size-3.5 shrink-0 text-primary"
               aria-hidden="true"
             />
             <span
               v-else-if="!pending"
-              class="size-3 shrink-0"
+              class="size-3.5 shrink-0"
               aria-hidden="true"
             />
             <span class="min-w-0 break-words">{{ choice }}</span>
@@ -146,7 +144,7 @@ const choices = computed<string[]>(() => {
         <!-- A typed answer has no option to mark, so it is the line itself. -->
         <p
           v-else-if="answerText !== ''"
-          class="mt-1.5 text-xs break-words whitespace-pre-wrap text-foreground"
+          class="mt-2 text-xs font-medium break-words whitespace-pre-wrap text-primary"
         >
           {{ answerText }}
         </p>
@@ -155,7 +153,7 @@ const choices = computed<string[]>(() => {
              answer goes is the whole job of this line. -->
         <p
           v-if="pending"
-          class="mt-1.5 text-[10px] font-medium tracking-wider text-muted-foreground uppercase"
+          class="mt-2 font-mono text-[10px] font-medium tracking-wider text-muted-foreground uppercase"
         >
           Waiting for your answer
         </p>
@@ -165,8 +163,12 @@ const choices = computed<string[]>(() => {
            yet, so it carries no badge — the hint above already says it waits. -->
       <span
         v-if="!pending"
-        class="shrink-0 text-[10px] font-medium tracking-wider uppercase"
-        :class="cancelled ? 'text-muted-foreground' : 'text-success'"
+        class="shrink-0 rounded border px-1.5 py-0.5 font-mono text-[10px] font-semibold tracking-wide uppercase"
+        :class="
+          cancelled
+            ? 'border-border bg-secondary text-muted-foreground'
+            : 'border-primary/25 bg-primary/10 text-primary'
+        "
       >
         {{ cancelled ? "Cancelled" : "Answered" }}
       </span>

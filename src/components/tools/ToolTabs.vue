@@ -49,7 +49,7 @@
 // pane's header, splits and folder chip belong to `DockPane.vue`; a tab's layout
 // tree is `DockNode.vue`.
 import { computed, watch, type Component } from "vue";
-import { PlusIcon, XIcon } from "@lucide/vue";
+import { ArrowRightIcon, LayoutGridIcon, PlusIcon, XIcon } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import type { WorkspaceInfo } from "@/contracts/types";
 import { t } from "@/lib/i18n";
@@ -139,30 +139,31 @@ function start(tabId: string, toolId: ToolDefinition["id"]): void {
       is reachable with any number of tabs.
     -->
     <div
-      class="flex shrink-0 items-stretch border-b border-sidebar-border bg-sidebar text-sidebar-foreground"
+      class="flex shrink-0 items-center gap-1.5 border-b border-sidebar-border bg-sidebar px-2.5 py-1.5 text-sidebar-foreground"
     >
-      <div class="flex min-w-0 flex-1 items-stretch overflow-x-auto">
+      <div class="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
         <div
           v-for="tab in tabs"
           :key="tab.id"
-          class="group/tab flex min-w-0 shrink-0 items-center border-e border-sidebar-border"
+          class="group/tab flex min-w-0 shrink-0 items-center rounded-md border transition-colors"
           :class="
             tab.id === activeTabId
-              ? 'bg-sidebar-accent text-sidebar-accent-foreground'
-              : 'text-sidebar-foreground/70 hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground'
+              ? 'border-border bg-sidebar-accent text-sidebar-accent-foreground'
+              : 'border-transparent text-muted-foreground hover:bg-secondary hover:text-foreground'
           "
         >
           <button
             type="button"
-            class="flex min-w-0 max-w-40 items-center gap-1 truncate px-1.5 py-1.5 text-xs outline-hidden focus-visible:ring-2 focus-visible:ring-sidebar-ring focus-visible:ring-inset"
-            :class="tab.id === activeTabId ? 'font-medium' : ''"
+            class="flex min-w-0 max-w-40 items-center gap-1.5 truncate py-1 pl-2 pr-1 text-[11px] outline-hidden focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+            :class="tab.id === activeTabId ? 'font-semibold' : 'font-medium'"
             :title="tabLabel(tab)"
             @click="activateTab(tab.id)"
           >
             <component
               :is="tabIcon(tab)"
               v-if="tabIcon(tab) !== null"
-              class="size-3.5 shrink-0 opacity-70"
+              class="size-3.5 shrink-0"
+              :class="tab.id === activeTabId ? 'text-primary' : 'text-muted-foreground'"
               aria-hidden="true"
             />
             <span class="truncate">{{ tabLabel(tab) }}</span>
@@ -170,7 +171,8 @@ function start(tabId: string, toolId: ToolDefinition["id"]): void {
           <Button
             variant="ghost"
             size="icon-xs"
-            class="me-0.5 size-5 shrink-0 opacity-60 group-hover/tab:opacity-100"
+            class="me-0.5 size-5 shrink-0 opacity-40 group-hover/tab:opacity-100"
+            :class="tab.id === activeTabId ? 'opacity-80' : ''"
             :aria-label="t('tools.tabs.close')"
             :title="t('tools.tabs.close')"
             @click.stop="closeTab(tab.id)"
@@ -181,9 +183,9 @@ function start(tabId: string, toolId: ToolDefinition["id"]): void {
       </div>
 
       <Button
-        variant="ghost"
+        variant="outline"
         size="icon-xs"
-        class="m-0.5 size-5 shrink-0 self-center"
+        class="size-7 shrink-0 rounded-md border-border bg-card text-foreground hover:border-primary/40 hover:text-primary"
         :aria-label="t('tools.tabs.new')"
         :title="t('tools.tabs.new')"
         @click="addTab()"
@@ -215,41 +217,69 @@ function start(tabId: string, toolId: ToolDefinition["id"]): void {
              when nothing is enabled the tab says where the switch is. -->
         <div
           v-else
-          class="flex flex-1 flex-col items-center justify-center gap-2 overflow-y-auto p-4"
+          class="flex flex-1 flex-col items-center justify-center overflow-y-auto p-6"
         >
-          <p class="text-center text-xs font-medium text-muted-foreground">
-            {{ t("tools.tabs.chooseTool") }}
-          </p>
-          <template v-if="available.length > 0">
-            <Button
-              v-for="tool in available"
-              :key="tool.id"
-              variant="outline"
-              size="xs"
-              class="w-full justify-start"
-              :title="
-                heldElsewhere(tool) !== undefined
-                  ? t('tools.tabs.openElsewhere')
-                  : undefined
-              "
-              @click="start(tab.id, tool.id)"
-            >
-              <component :is="tool.icon" />
-              <span class="truncate">{{ t(tool.labelKey) }}</span>
-              <!-- An app-wide tool that is already open: one pane exists in the
-                   drawer, and clicking this goes to it instead of duplicating it
-                   (`startToolInTab`). Saying so is what makes it actionable. -->
-              <span
-                v-if="heldElsewhere(tool) !== undefined"
-                class="ms-auto shrink-0 text-[10px] text-muted-foreground"
+          <div class="flex w-full max-w-sm flex-col items-center gap-5">
+            <div class="flex flex-col items-center gap-2 text-center">
+              <div
+                class="grid size-10 place-items-center rounded-xl border border-primary/25 bg-primary/10 text-primary"
+                aria-hidden="true"
               >
-                {{ t("tools.tabs.openElsewhere") }}
-              </span>
-            </Button>
-          </template>
-          <p v-else class="text-center text-xs text-muted-foreground">
-            {{ t("tools.tabs.noTools") }}
-          </p>
+                <LayoutGridIcon class="size-5" />
+              </div>
+              <h3 class="text-sm font-semibold text-foreground">
+                {{ t("tools.tabs.chooseTool") }}
+              </h3>
+            </div>
+
+            <div
+              v-if="available.length > 0"
+              class="flex w-full flex-col gap-2"
+            >
+              <button
+                v-for="tool in available"
+                :key="tool.id"
+                type="button"
+                class="group/card flex w-full items-center gap-3 rounded-xl border border-border bg-card p-3 text-left transition-colors outline-hidden hover:border-primary/45 hover:bg-secondary/70 focus-visible:ring-2 focus-visible:ring-ring"
+                :title="
+                  heldElsewhere(tool) !== undefined
+                    ? t('tools.tabs.openElsewhere')
+                    : undefined
+                "
+                @click="start(tab.id, tool.id)"
+              >
+                <span
+                  class="grid size-9 shrink-0 place-items-center rounded-lg border border-border bg-secondary text-primary transition-colors group-hover/card:border-primary/35 group-hover/card:bg-primary/10"
+                  aria-hidden="true"
+                >
+                  <component :is="tool.icon" class="size-4" />
+                </span>
+                <span class="flex min-w-0 flex-1 flex-col gap-0.5">
+                  <span class="flex items-center gap-2">
+                    <span class="truncate text-xs font-semibold text-foreground">
+                      {{ t(tool.labelKey) }}
+                    </span>
+                    <span
+                      v-if="heldElsewhere(tool) !== undefined"
+                      class="shrink-0 rounded border border-tertiary/30 bg-tertiary/10 px-1.5 py-0.5 font-mono text-[9.5px] font-medium text-tertiary"
+                    >
+                      {{ t("tools.tabs.openElsewhere") }}
+                    </span>
+                  </span>
+                  <span class="line-clamp-2 text-[11px] leading-snug text-muted-foreground">
+                    {{ t(tool.descriptionKey) }}
+                  </span>
+                </span>
+                <ArrowRightIcon
+                  class="size-3.5 shrink-0 text-muted-foreground/50 transition-colors group-hover/card:text-primary"
+                  aria-hidden="true"
+                />
+              </button>
+            </div>
+            <p v-else class="max-w-xs text-center text-xs leading-relaxed text-muted-foreground">
+              {{ t("tools.tabs.noTools") }}
+            </p>
+          </div>
         </div>
       </div>
     </template>
@@ -259,11 +289,24 @@ function start(tabId: string, toolId: ToolDefinition["id"]): void {
          human reached, not where the drawer starts. -->
     <div
       v-else
-      class="flex flex-1 flex-col items-center justify-center gap-2 p-4 text-center"
+      class="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center"
     >
-      <p class="text-xs text-muted-foreground">{{ t("tools.tabs.empty") }}</p>
-      <Button variant="outline" size="xs" @click="addTab()">
-        <PlusIcon />
+      <div
+        class="grid size-10 place-items-center rounded-xl border border-border bg-card text-muted-foreground"
+        aria-hidden="true"
+      >
+        <LayoutGridIcon class="size-5" />
+      </div>
+      <p class="max-w-xs text-xs leading-relaxed text-muted-foreground">
+        {{ t("tools.tabs.empty") }}
+      </p>
+      <Button
+        variant="outline"
+        size="sm"
+        class="gap-1.5 rounded-lg border-border bg-card hover:border-primary/45 hover:text-primary"
+        @click="addTab()"
+      >
+        <PlusIcon class="size-3.5" />
         {{ t("tools.tabs.new") }}
       </Button>
     </div>
