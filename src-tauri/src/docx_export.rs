@@ -52,7 +52,10 @@ pub fn export_markdown_to_docx(
     }
     let input_path = PathBuf::from(input_str);
     if !input_path.is_file() {
-        return Err(format!("input file does not exist: {}", input_path.display()));
+        return Err(format!(
+            "input file does not exist: {}",
+            input_path.display()
+        ));
     }
 
     let output_path = match output_raw.map(normalize_path_arg).filter(|s| !s.is_empty()) {
@@ -96,12 +99,21 @@ pub fn export_markdown_to_docx(
 
 #[derive(Debug, PartialEq, Eq)]
 enum Block {
-    Heading { level: u8, text: String },
+    Heading {
+        level: u8,
+        text: String,
+    },
     Paragraph(String),
     BulletItem(String),
     OrderedItem(String),
-    Image { alt: String, src: String },
-    Table { headers: Vec<String>, rows: Vec<Vec<String>> },
+    Image {
+        alt: String,
+        src: String,
+    },
+    Table {
+        headers: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
 }
 
 fn parse_blocks(markdown: &str) -> Vec<Block> {
@@ -146,10 +158,7 @@ fn parse_blocks(markdown: &str) -> Vec<Block> {
         }
 
         // GFM table: header row + separator row (`| --- | --- |`).
-        if trimmed.contains('|')
-            && i + 1 < lines.len()
-            && is_table_separator(lines[i + 1].trim())
-        {
+        if trimmed.contains('|') && i + 1 < lines.len() && is_table_separator(lines[i + 1].trim()) {
             let headers = split_table_row(trimmed);
             i += 2;
             let mut rows = Vec::new();
@@ -299,7 +308,11 @@ fn emit_run(out: &mut String, text: &str, bold: bool, italic: bool) {
         }
         out.push_str("</w:rPr>");
     }
-    let _ = write!(out, "<w:t xml:space=\"preserve\">{}</w:t></w:r>", xml_escape(text));
+    let _ = write!(
+        out,
+        "<w:t xml:space=\"preserve\">{}</w:t></w:r>",
+        xml_escape(text)
+    );
 }
 
 fn emit_inline(out: &mut String, text: &str, links: &mut Vec<(String, String)>, force_bold: bool) {
@@ -785,13 +798,13 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         // Minimal valid 1x1 PNG header + IHDR bytes.
         let fake_png: [u8; 24] = [
-            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A,
-            0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D', b'R',
-            0x00, 0x00, 0x00, 0x64, // 100px wide
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x64, // 100px wide
             0x00, 0x00, 0x00, 0x32, // 50px high
         ];
         fs::write(dir.join("chart.png"), fake_png).unwrap();
-        let bytes = markdown_to_docx_bytes_with_base("# Doc\n\n![Sales chart](chart.png)\n", Some(&dir));
+        let bytes =
+            markdown_to_docx_bytes_with_base("# Doc\n\n![Sales chart](chart.png)\n", Some(&dir));
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("word/media/image1.png"));
         assert!(text.contains("<w:drawing>"));

@@ -8,7 +8,9 @@
     "dev": "node scripts/dev.mjs",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "prepare:pi-runtime": "node scripts/prepare-pi-runtime.mjs",
+    "tauri": "tauri",
+    "tauri:build:standalone": "node scripts/prepare-pi-runtime.mjs && tauri build --config src-tauri/tauri.bundle.conf.json"
   },
   "dependencies": {
     "@lucide/vue": "^1.73.0",

@@ -1,0 +1,6 @@
+{
+  "bundle": {
+    "externalBin": ["binaries/nabla-node"],
+    "resources": ["resources/pi-runtime"]
+  }
+}

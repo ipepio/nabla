@@ -89,7 +89,9 @@ fn parse_skill(fallback_name: &str, raw: &str, source: &str) -> Option<SkillEntr
     let mut description = String::new();
     let mut body = trimmed;
 
-    if let Some(after_open) = trimmed.strip_prefix("---\n").or_else(|| trimmed.strip_prefix("---\r\n"))
+    if let Some(after_open) = trimmed
+        .strip_prefix("---\n")
+        .or_else(|| trimmed.strip_prefix("---\r\n"))
         && let Some(close_idx) = after_open.find("\n---")
     {
         let header = &after_open[..close_idx];
@@ -181,8 +183,7 @@ pub fn save_skill(
     };
     fs::write(&path, content.as_bytes())
         .map_err(|e| format!("failed to write skill {}: {e}", path.display()))?;
-    parse_skill(&slug, &content, "global")
-        .ok_or_else(|| "failed to parse saved skill".to_string())
+    parse_skill(&slug, &content, "global").ok_or_else(|| "failed to parse saved skill".to_string())
 }
 
 /// Deletes a global skill `.md` file from `<config_dir>/skills/<slug>.md`.
@@ -241,8 +242,13 @@ mod tests {
         let base = std::env::temp_dir().join(format!("nabla-skills-crud-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
 
-        let saved = save_skill(&base, "/Code Review", "Checks diffs", "Inspect every change.")
-            .expect("save skill");
+        let saved = save_skill(
+            &base,
+            "/Code Review",
+            "Checks diffs",
+            "Inspect every change.",
+        )
+        .expect("save skill");
         assert_eq!(saved.name, "code-review");
         assert_eq!(saved.description, "Checks diffs");
         assert_eq!(saved.prompt, "Inspect every change.");

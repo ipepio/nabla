@@ -13,9 +13,9 @@ use tauri_plugin_opener::OpenerExt;
 
 use crate::cli::{self, CliSessions, CliSink, PiAuthStatus, PiCliResult};
 use crate::image_input::{self, ImageAttachment, PromptImage};
-use crate::pdf_input::PdfAttachment;
 use crate::mcp::{self, McpAddDraft, McpScope, McpServerSummary};
 use crate::mcp_server::{REGISTRATION_WAIT, RegistrationGate, RegistrationOutcome};
+use crate::pdf_input::PdfAttachment;
 use crate::process::{ProcessManager, SessionModel, StartupOutcome};
 use crate::providers::{
     ModelInfo as ProviderModelInfo, ModelOption, ProviderDraft, ProviderModelDraft, ProviderModels,
@@ -1035,12 +1035,13 @@ fn catalogue_model_accepts_images(
     if provider.trim().is_empty() || model_id.trim().is_empty() {
         return None;
     }
-    let providers =
-        crate::providers::read_provider_models_with_catalog(paths.models, paths.catalog, paths.credentials)
-            .ok()?;
-    let provider_entry = providers
-        .iter()
-        .find(|entry| entry.provider == provider)?;
+    let providers = crate::providers::read_provider_models_with_catalog(
+        paths.models,
+        paths.catalog,
+        paths.credentials,
+    )
+    .ok()?;
+    let provider_entry = providers.iter().find(|entry| entry.provider == provider)?;
     let model = provider_entry
         .models
         .iter()
@@ -3656,8 +3657,12 @@ pub fn doc_create_temp(state: State<'_, AppState>) -> Result<String, String> {
         std::time::Duration::from_secs(TEMP_DOC_TTL_SECS),
     );
     let dir = temp_docs_dir(&state.data_dir);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("failed to create temp docs directory {}: {e}", dir.display()))?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        format!(
+            "failed to create temp docs directory {}: {e}",
+            dir.display()
+        )
+    })?;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -3754,8 +3759,7 @@ pub fn cancel_subagent(state: State<'_, AppState>, session_path: String) -> Resu
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create subagent cancel dir: {e}"))?;
     }
-    std::fs::write(&path, b"cancel")
-        .map_err(|e| format!("failed to write cancel signal: {e}"))
+    std::fs::write(&path, b"cancel").map_err(|e| format!("failed to write cancel signal: {e}"))
 }
 
 #[cfg(test)]
@@ -3805,10 +3809,7 @@ mod tests {
             0
         );
         assert!(stale.exists());
-        assert_eq!(
-            cleanup_temp_docs(&dir.0, std::time::Duration::ZERO),
-            1
-        );
+        assert_eq!(cleanup_temp_docs(&dir.0, std::time::Duration::ZERO), 1);
         assert!(!stale.exists());
     }
 
@@ -4407,7 +4408,10 @@ exit 1
             let body = FAKE_SESSION_PI
                 .replace("@ARGS@", &path.with_extension("args").display().to_string())
                 .replace("@ATTEMPTS@", &self.path("attempts").display().to_string())
-                .replace("@LINES@", &path.with_extension("lines").display().to_string());
+                .replace(
+                    "@LINES@",
+                    &path.with_extension("lines").display().to_string(),
+                );
             self.write_script(name, &body)
         }
 
@@ -4423,7 +4427,10 @@ exit 1
             let body = FAKE_IMAGE_PI
                 .replace("@ARGS@", &path.with_extension("args").display().to_string())
                 .replace("@ATTEMPTS@", &self.path("attempts").display().to_string())
-                .replace("@LINES@", &path.with_extension("lines").display().to_string())
+                .replace(
+                    "@LINES@",
+                    &path.with_extension("lines").display().to_string(),
+                )
                 .replace("@INPUT@", &input);
             self.write_script(name, &body)
         }

@@ -407,10 +407,22 @@ mod tests {
         let store = MemoryStore::open(&path).expect("open memory store");
 
         let g = store
-            .save("Editor", "Prefers Notion-style blocks", Some("preference"), None, Some("global"))
+            .save(
+                "Editor",
+                "Prefers Notion-style blocks",
+                Some("preference"),
+                None,
+                Some("global"),
+            )
             .expect("save global");
         let w = store
-            .save("Build command", "Run pnpm run build", Some("project"), None, Some("workspace:/nabla"))
+            .save(
+                "Build command",
+                "Run pnpm run build",
+                Some("project"),
+                None,
+                Some("workspace:/nabla"),
+            )
             .expect("save workspace");
 
         let only_ws = store

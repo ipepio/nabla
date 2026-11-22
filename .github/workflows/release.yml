@@ -22,9 +22,9 @@ jobs:
       matrix:
         include:
           - platform: windows-latest
-            args: '--bundles nsis'
+            args: '--config src-tauri/tauri.bundle.conf.json --bundles nsis'
           - platform: ubuntu-22.04
-            args: '--bundles deb'
+            args: '--config src-tauri/tauri.bundle.conf.json --bundles deb'
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 60
 
@@ -72,6 +72,9 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Prepare embedded pi runtime (Node 22 + pi-coding-agent)
+        run: node scripts/prepare-pi-runtime.mjs
+
       # Build the app and attach the bundles to the tag's GitHub release. A
       # third-party action is justified here: it is the documented bundling path
       # for the platform matrix and only wraps `tauri build --bundles`.
@@ -83,8 +86,8 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'Nabla ${{ github.ref_name }}'
           releaseBody: >-
-            Windows installer (.exe, NSIS) and Linux package (.deb).
-            Requires pi on PATH.
+            Standalone Windows installer (.exe, NSIS) and Linux package (.deb)
+            with embedded Node 22 and pi runtime — no external pi installation required.
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}

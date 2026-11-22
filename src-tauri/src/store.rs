@@ -440,9 +440,8 @@ impl Store {
 
     pub fn session_search_mtime(&self, session_id: i64) -> StoreResult<Option<i64>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT mtime_secs FROM session_search_meta WHERE session_id = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT mtime_secs FROM session_search_meta WHERE session_id = ?1")?;
         let mut rows = stmt.query([session_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row.get(0)?))

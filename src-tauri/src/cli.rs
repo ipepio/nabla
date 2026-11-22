@@ -852,13 +852,18 @@ fn check_allowlist(args: &[String]) -> Result<(), CliError> {
 /// both platforms (a Unix pty pair, a Windows ConPTY), so only the argv and the
 /// environment are configured here.
 fn pty_command(binary: &str, args: &[String]) -> CommandBuilder {
-    let mut command = CommandBuilder::new(binary);
+    let resolved = crate::pi_runtime::resolve_pi(binary);
+    let mut command = CommandBuilder::new(&resolved.program);
+    command.args(&resolved.prefix_args);
     command.args(args);
     // The same environment allowlist `run` and the pi runtime use: a login flow
     // can never read more of the host environment than the runtime may.
     command.env_clear();
     for (name, value) in crate::process::forwarded_env(std::env::vars()) {
         command.env(name, value);
+    }
+    if let Some(node_path) = resolved.node_path {
+        command.env("NODE_PATH", node_path);
     }
     command
 }
@@ -867,7 +872,9 @@ fn pty_command(binary: &str, args: &[String]) -> CommandBuilder {
 /// group on Unix (so a kill reaches the whole tree). Every mainstream OS is
 /// covered by the shared branches; only the platform extras are conditional.
 fn build_command(binary: &str, args: &[String]) -> Command {
-    let mut command = Command::new(binary);
+    let resolved = crate::pi_runtime::resolve_pi(binary);
+    let mut command = Command::new(&resolved.program);
+    command.args(&resolved.prefix_args);
     command.args(args);
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
@@ -875,6 +882,9 @@ fn build_command(binary: &str, args: &[String]) -> Command {
     command.env_clear();
     for (name, value) in crate::process::forwarded_env(std::env::vars()) {
         command.env(name, value);
+    }
+    if let Some(node_path) = resolved.node_path {
+        command.env("NODE_PATH", node_path);
     }
     #[cfg(unix)]
     {

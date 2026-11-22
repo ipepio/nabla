@@ -16,6 +16,7 @@ mod pdf_input;
 // The other end of MCP: a local server pi connects to in order to drive the
 // embedded webview (`webview-control.md`).
 mod mcp_server;
+mod pi_runtime;
 mod process;
 mod providers;
 mod rpc;
@@ -105,6 +106,9 @@ pub fn run() {
             // workspace. `app.path()` is Tauri's resolver; `std::env::home_dir`
             // is deprecated and platform-dependent.
             let home = app.path().home_dir()?;
+            if let Ok(resource_dir) = app.path().resource_dir() {
+                pi_runtime::init_resource_dir(resource_dir);
+            }
             commands::seed_default_workspace(&store, &home)?;
             // One supervisor for every pi child (S3). Its sink is the only
             // bridge from a pi process to the webview (S6): each event leaves
@@ -193,12 +197,14 @@ pub fn run() {
             );
             let _ = std::thread::Builder::new()
                 .name("nabla-tmp-cleanup".to_string())
-                .spawn(move || loop {
-                    std::thread::sleep(std::time::Duration::from_secs(30 * 60));
-                    let _ = commands::cleanup_temp_docs(
-                        &cleanup_data_dir,
-                        std::time::Duration::from_secs(commands::TEMP_DOC_TTL_SECS),
-                    );
+                .spawn(move || {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(30 * 60));
+                        let _ = commands::cleanup_temp_docs(
+                            &cleanup_data_dir,
+                            std::time::Duration::from_secs(commands::TEMP_DOC_TTL_SECS),
+                        );
+                    }
                 });
             app.manage(AppState {
                 store,

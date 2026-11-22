@@ -184,8 +184,7 @@ pub fn read_pdf_attachment_with(
     limits: PdfLimits,
 ) -> Result<PdfAttachment, PdfInputError> {
     let display = path.display().to_string();
-    let metadata =
-        std::fs::metadata(path).map_err(|_| PdfInputError::NotAFile(display.clone()))?;
+    let metadata = std::fs::metadata(path).map_err(|_| PdfInputError::NotAFile(display.clone()))?;
     if !metadata.is_file() {
         return Err(PdfInputError::NotAFile(display));
     }
@@ -199,7 +198,8 @@ pub fn read_pdf_attachment_with(
     // The header is checked before the child runs: a renamed text file is refused
     // here, not by poppler's stderr.
     let mut header = [0u8; 8];
-    let mut file = std::fs::File::open(path).map_err(|error| PdfInputError::Io(error.to_string()))?;
+    let mut file =
+        std::fs::File::open(path).map_err(|error| PdfInputError::Io(error.to_string()))?;
     let read = file
         .read(&mut header)
         .map_err(|error| PdfInputError::Io(error.to_string()))?;
@@ -423,8 +423,7 @@ mod tests {
             pages.len()
         ));
         objects.push(
-            "3 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n"
-                .to_string(),
+            "3 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_string(),
         );
         for (index, page) in pages.iter().enumerate() {
             let content = page_ops(page);
@@ -499,7 +498,10 @@ mod tests {
         assert_eq!(attachment.pages[1], "", "the empty page is page 2");
         assert_eq!(attachment.pages[2], "Gamma page three");
         assert!(attachment.has_text);
-        assert_eq!(attachment.byte_length, std::fs::metadata(&path).unwrap().len() as usize);
+        assert_eq!(
+            attachment.byte_length,
+            std::fs::metadata(&path).unwrap().len() as usize
+        );
         assert_eq!(attachment.name, "informe.pdf");
     }
 
@@ -635,7 +637,10 @@ mod tests {
         let started = Instant::now();
         let error = read_pdf_attachment_with(&script, &path, limits)
             .expect_err("a slow extraction must time out");
-        assert!(started.elapsed() < Duration::from_secs(3), "killed promptly");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "killed promptly"
+        );
         assert_eq!(error, PdfInputError::TimedOut { seconds: 0 });
     }
 
@@ -673,7 +678,10 @@ mod tests {
     #[test]
     fn a_flood_of_output_is_cut_at_the_byte_cap() {
         let pdfs = TempPdfs::new("flood");
-        let script = pdfs.script("flood-pdftotext", "printf 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'\n");
+        let script = pdfs.script(
+            "flood-pdftotext",
+            "printf 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'\n",
+        );
         let path = pdfs.write("doc.pdf", &build_pdf(&["Alpha"]));
         let limits = PdfLimits {
             chars: 4,

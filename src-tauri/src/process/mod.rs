@@ -1500,7 +1500,9 @@ fn build_command(
     cwd: &Path,
     layout: SpawnLayout<'_>,
 ) -> Command {
-    let mut command = Command::new(pi_binary);
+    let resolved = crate::pi_runtime::resolve_pi(pi_binary);
+    let mut command = Command::new(&resolved.program);
+    command.args(&resolved.prefix_args);
     command.args(spawn_args(session_file, model, layout));
     command.current_dir(cwd);
     command.stdin(Stdio::piped());
@@ -1509,6 +1511,9 @@ fn build_command(
     command.env_clear();
     for (name, value) in forwarded_env(std::env::vars()) {
         command.env(name, value);
+    }
+    if let Some(node_path) = resolved.node_path {
+        command.env("NODE_PATH", node_path);
     }
     if let Some(dir) = layout.data_dir {
         // L4 of `permission-modes.md`: the gate reads `<data_dir>/permissions.json`

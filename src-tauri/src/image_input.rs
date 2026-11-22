@@ -38,12 +38,8 @@ pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
 /// The formats pi sends inline without converting (`normalizeSupportedImageMimeType`
 /// in pi's `utils/image-process.js`).
-pub const SUPPORTED_IMAGE_MIME_TYPES: [&str; 4] = [
-    "image/png",
-    "image/jpeg",
-    "image/gif",
-    "image/webp",
-];
+pub const SUPPORTED_IMAGE_MIME_TYPES: [&str; 4] =
+    ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
 const BASE64_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -109,7 +105,10 @@ impl fmt::Display for ImageInputError {
                 "the image is {bytes} bytes, over the {limit}-byte limit"
             ),
             ImageInputError::TooMany { count, limit } => {
-                write!(formatter, "a message carries at most {limit} images, got {count}")
+                write!(
+                    formatter,
+                    "a message carries at most {limit} images, got {count}"
+                )
             }
             ImageInputError::InvalidData(reason) => {
                 write!(formatter, "invalid image data: {reason}")
@@ -233,9 +232,8 @@ pub fn validate_prompt_images(images: &[PromptImage]) -> Result<Vec<PromptImage>
     }
     let mut validated = Vec::with_capacity(images.len());
     for image in images {
-        let mime_type = normalize_mime_type(&image.mime_type).ok_or_else(|| {
-            ImageInputError::UnsupportedFormat(image.mime_type.clone())
-        })?;
+        let mime_type = normalize_mime_type(&image.mime_type)
+            .ok_or_else(|| ImageInputError::UnsupportedFormat(image.mime_type.clone()))?;
         let bytes = decoded_base64_len(&image.data)?;
         if bytes > MAX_IMAGE_BYTES {
             return Err(ImageInputError::TooLarge {
@@ -286,7 +284,8 @@ pub fn model_input_has_image(model: &serde_json::Value) -> Option<bool> {
 /// large string in the webview.
 pub fn read_image_attachment(path: &Path) -> Result<ImageAttachment, ImageInputError> {
     let display = path.display().to_string();
-    let metadata = std::fs::metadata(path).map_err(|_| ImageInputError::NotAFile(display.clone()))?;
+    let metadata =
+        std::fs::metadata(path).map_err(|_| ImageInputError::NotAFile(display.clone()))?;
     if !metadata.is_file() {
         return Err(ImageInputError::NotAFile(display));
     }
@@ -385,9 +384,18 @@ mod tests {
         assert_eq!(normalize_mime_type("image/png"), Some("image/png"));
         assert_eq!(normalize_mime_type("IMAGE/JPEG"), Some("image/jpeg"));
         assert_eq!(normalize_mime_type("image/jpg"), Some("image/jpeg"));
-        assert_eq!(normalize_mime_type("image/gif; charset=binary"), Some("image/gif"));
+        assert_eq!(
+            normalize_mime_type("image/gif; charset=binary"),
+            Some("image/gif")
+        );
         assert_eq!(normalize_mime_type("image/webp"), Some("image/webp"));
-        for rejected in ["", "text/plain", "image/svg+xml", "image/bmp", "application/pdf"] {
+        for rejected in [
+            "",
+            "text/plain",
+            "image/svg+xml",
+            "image/bmp",
+            "application/pdf",
+        ] {
             assert_eq!(normalize_mime_type(rejected), None, "{rejected} is refused");
         }
     }
@@ -399,7 +407,10 @@ mod tests {
         assert_eq!(sniff_mime(PNG), Some("image/png"));
         assert_eq!(sniff_mime(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
         assert_eq!(sniff_mime(b"GIF89a\x01\x00"), Some("image/gif"));
-        assert_eq!(sniff_mime(b"RIFF\x24\x00\x00\x00WEBPVP8 "), Some("image/webp"));
+        assert_eq!(
+            sniff_mime(b"RIFF\x24\x00\x00\x00WEBPVP8 "),
+            Some("image/webp")
+        );
         assert_eq!(sniff_mime(b"RIFF\x24\x00\x00\x00WAVEfmt "), None);
         assert_eq!(sniff_mime(b"plain text"), None);
         assert_eq!(sniff_mime(b""), None);
@@ -498,8 +509,7 @@ mod tests {
 
         let attachment = read_image_attachment(&path).expect("read the png");
         assert_eq!(
-            attachment.name,
-            "Screenshot 2026-01-02 at 10.00.png",
+            attachment.name, "Screenshot 2026-01-02 at 10.00.png",
             "the name stays human: it is the preview's label"
         );
         assert_eq!(attachment.mime_type, "image/png");
@@ -564,6 +574,9 @@ mod tests {
             Some(false)
         );
         assert_eq!(model_input_has_image(&serde_json::json!({})), None);
-        assert_eq!(model_input_has_image(&serde_json::json!({ "input": "image" })), None);
+        assert_eq!(
+            model_input_has_image(&serde_json::json!({ "input": "image" })),
+            None
+        );
     }
 }
