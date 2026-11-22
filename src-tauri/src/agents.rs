@@ -20,6 +20,16 @@
 // there is no hot reload, on purpose: the extension is loaded into a pi process
 // with `-e` and pi has no way to unload one.
 //
+// S1 of `agent-profiles-defaults.md`: **on with an empty profile list is the
+// built-in templates**, not "nothing to offer". The five templates Settings offers
+// (`src/lib/agent-profiles.ts`) apply enabled, so turning the master switch on is
+// already a usable configuration. The text is not copied here: it lives in
+// `assets/agent-profile-defaults.json`, embedded at build time and materialized
+// beside the extension, and `tests/agent-profile-defaults.test.ts` fails if it ever
+// differs from the TypeScript templates. A store with anything in it — even a list
+// of profiles the human turned off — is authoritative, and the defaults never
+// reappear beside it.
+//
 // S7: the routing table travels with the same decision (`routing_table_enabled`),
 // so the model only reads how to delegate when it really can.
 
@@ -27,7 +37,8 @@ use std::path::{Path, PathBuf};
 
 use crate::settings;
 
-/// S1: Nabla's profile store, beside the two files the app already owns.
+/// S1 of `agent-profiles-defaults.md`: Nabla's profile store, beside the two files
+/// the app already owns.
 pub fn config_path(data_dir: &Path) -> PathBuf {
     data_dir.join("agents.json")
 }
@@ -69,17 +80,55 @@ pub struct AgentsConfig {
 }
 
 impl AgentsConfig {
+    /// S1 of `agent-profiles-defaults.md`: the profiles this store holds, or — when
+    /// the master switch is on and the list is EMPTY — the five built-in templates.
+    ///
+    /// An empty list is the only state the fallback covers, on purpose: it is what
+    /// "nothing configured yet" looks like, and delegation used to be impossible
+    /// there. The moment the store holds anything, that list is what the human
+    /// wrote: a profile they turned off stays off, and no default appears beside it.
+    fn stored_or_default(&self) -> &[AgentProfile] {
+        if self.enabled && self.profiles.is_empty() {
+            default_profiles()
+        } else {
+            &self.profiles
+        }
+    }
+
     /// S3: delegation is a capability only when the human turned the master
     /// switch on AND there is at least one profile to offer. On with nothing
-    /// enabled would load four tools that can only answer "nothing to run".
+    /// enabled would load four tools that can only answer "nothing to run" —
+    /// except for the empty store, which S1 answers with the built-in templates.
     pub fn delegation_active(&self) -> bool {
         self.enabled && self.enabled_profiles().next().is_some()
     }
 
-    /// S2: the profiles the tools may use, in file order.
+    /// S2: the profiles the tools may use, in file order — the built-in templates
+    /// in their own order when the store is empty (S1).
     pub fn enabled_profiles(&self) -> impl Iterator<Item = &AgentProfile> {
-        self.profiles.iter().filter(|profile| profile.enabled)
+        self.stored_or_default()
+            .iter()
+            .filter(|profile| profile.enabled)
     }
+}
+
+/// S1: the five built-in templates, as data — the one asset the Rust mirror and the
+/// extension share (`process::materialize_subagents_extension` writes the same
+/// bytes beside `nabla-subagents.ts`).
+const DEFAULTS_SOURCE: &str = include_str!("../assets/agent-profile-defaults.json");
+
+/// S1: the asset itself, for the materializer. One `include_str!`, one copy.
+pub fn defaults_source() -> &'static str {
+    DEFAULTS_SOURCE
+}
+
+/// The parsed mirror, once per process. A body this build cannot read is no
+/// defaults at all rather than a panic: the extension then answers honestly that
+/// there is nothing to delegate to, and the drift test is what catches the asset
+/// before a build ships it.
+fn default_profiles() -> &'static [AgentProfile] {
+    static DEFAULTS: std::sync::OnceLock<Vec<AgentProfile>> = std::sync::OnceLock::new();
+    DEFAULTS.get_or_init(|| serde_json::from_str(DEFAULTS_SOURCE).unwrap_or_default())
 }
 
 /// One model's worth of shape checking, shared by the profiles and the default.
@@ -609,5 +658,165 @@ mod tests {
         assert!(!config_for_spawn(Some(&scratch.dir)).delegation_active());
         // And a manager without a data dir never delegates.
         assert!(!config_for_spawn(None).delegation_active());
+    }
+
+    // ── S1: an empty store is the built-in templates ─────────────────────────
+    //
+    // `agent-profiles-defaults.md`: master switch on and an EMPTY profile list
+    // means the five templates Settings offers apply, enabled. Nothing else about
+    // the gate moves: a non-empty list is always what the human wrote, and the
+    // master switch still closes everything on its own.
+
+    /// The five template names, in the order `src/lib/agent-profiles.ts` offers
+    /// them. `tests/agent-profile-defaults.test.ts` is what keeps this list and the
+    /// asset below in step with the TypeScript templates.
+    const DEFAULT_NAMES: [&str; 5] = ["explorer", "researcher", "worker", "judge", "judge-2"];
+
+    /// A store the human turned on and never wrote a profile into.
+    fn enabled_and_empty() -> AgentsConfig {
+        AgentsConfig {
+            enabled: true,
+            model_default: None,
+            profiles: Vec::new(),
+        }
+    }
+
+    // S1: on with nothing stored is the defaults, not "nothing to offer": the
+    // gate opens, the helpers load and the routing table joins the prompt.
+    #[test]
+    fn an_enabled_store_with_no_profiles_is_the_built_in_defaults() {
+        let empty = enabled_and_empty();
+        assert!(
+            empty.delegation_active(),
+            "S1: master on and no stored profile means the five defaults apply"
+        );
+        assert!(routing_table_enabled(&empty));
+        let materialized = Path::new("/data/extensions/nabla-subagents.ts");
+        assert_eq!(
+            extension_for_spawn(&empty, materialized),
+            Some(materialized.to_path_buf()),
+            "S1: the helpers load, because there is something to offer"
+        );
+    }
+
+    // S1: the defaults are the five templates, in template order, enabled, with the
+    // tool list each one lists and no model of their own (a template names no model:
+    // it has to resolve against the account's own catalogue at run time).
+    #[test]
+    fn the_built_in_defaults_are_the_five_templates_in_order() {
+        let empty = enabled_and_empty();
+        let offered: Vec<&AgentProfile> = empty.enabled_profiles().collect();
+        let names: Vec<&str> = offered
+            .iter()
+            .map(|profile| profile.name.as_str())
+            .collect();
+        assert_eq!(names, DEFAULT_NAMES.to_vec());
+
+        let tools: Vec<&Vec<String>> = offered.iter().map(|profile| &profile.tools).collect();
+        assert_eq!(
+            tools,
+            vec![
+                &vec!["read".to_string(), "grep".to_string(), "find".to_string()],
+                &vec![
+                    "read".to_string(),
+                    "grep".to_string(),
+                    "find".to_string(),
+                    "web_search".to_string()
+                ],
+                &vec![
+                    "read".to_string(),
+                    "grep".to_string(),
+                    "find".to_string(),
+                    "edit".to_string(),
+                    "write".to_string(),
+                    "bash".to_string()
+                ],
+                &vec!["read".to_string(), "grep".to_string(), "find".to_string()],
+                &vec!["read".to_string(), "grep".to_string(), "find".to_string()],
+            ]
+        );
+
+        for profile in offered {
+            assert!(profile.enabled, "S1: a default arrives enabled");
+            assert!(!profile.name.trim().is_empty());
+            assert!(
+                !profile.description.trim().is_empty(),
+                "S7: the description is how the model decides to reach for it"
+            );
+            assert!(
+                !profile.instructions.trim().is_empty(),
+                "S4: the instructions are the child's whole system prompt"
+            );
+            assert_eq!(
+                profile.model, None,
+                "a template names no model: it resolves against this session's catalogue"
+            );
+            assert!(profile.effort.is_some(), "each template names an effort");
+        }
+    }
+
+    // S1: the store is authoritative the moment it holds anything. A list whose
+    // profiles are all off stays off — defaults never reappear behind the human's
+    // back — and one stored profile is exactly what is offered.
+    #[test]
+    fn a_non_empty_store_is_authoritative_over_the_defaults() {
+        let all_disabled = AgentsConfig {
+            enabled: true,
+            ..config(vec![AgentProfile {
+                enabled: false,
+                ..profile("explorer")
+            }])
+        };
+        assert!(
+            !all_disabled.delegation_active(),
+            "S1: a deliberately disabled profile keeps the gate closed"
+        );
+        assert_eq!(
+            all_disabled.enabled_profiles().count(),
+            0,
+            "S1: the defaults must never inject themselves beside a stored list"
+        );
+
+        let one = config(vec![profile("ledger")]);
+        let offered: Vec<&str> = one
+            .enabled_profiles()
+            .map(|profile| profile.name.as_str())
+            .collect();
+        assert_eq!(offered, vec!["ledger"], "S1: one profile is the whole list");
+    }
+
+    // S1: the fallback does not touch the master switch. Off is still off, with or
+    // without profiles, and no default is offered while the gate is closed.
+    #[test]
+    fn the_master_switch_still_closes_the_gate_with_no_profiles() {
+        let off = AgentsConfig::default();
+        assert!(!off.enabled);
+        assert!(off.profiles.is_empty());
+        assert!(!off.delegation_active());
+        assert_eq!(
+            off.enabled_profiles().count(),
+            0,
+            "the defaults exist behind the master switch, not in front of it"
+        );
+    }
+
+    // S1: the asset is the single mirror of the templates, embedded at build time.
+    // It answers an array of profiles, all enabled, and each one survives the same
+    // validation a human-written profile does.
+    #[test]
+    fn the_embedded_asset_is_the_profiles_array_the_extension_reads() {
+        let parsed: Vec<AgentProfile> =
+            serde_json::from_str(DEFAULTS_SOURCE).expect("the asset is an array of AgentProfile");
+        assert_eq!(parsed.len(), DEFAULT_NAMES.len());
+        let store = config(parsed.clone());
+        store.validate().expect("the defaults are valid profiles");
+        assert_eq!(
+            default_profiles().len(),
+            DEFAULT_NAMES.len(),
+            "the parsed mirror is the asset"
+        );
+        for profile in default_profiles() {
+            assert!(profile.enabled);
+        }
     }
 }

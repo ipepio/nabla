@@ -1382,6 +1382,11 @@ const PERMISSIONS_EXTENSION_SOURCE: &str = include_str!("../../../resources/nabl
 /// point at a file that matches this build.
 const SUBAGENTS_EXTENSION_SOURCE: &str = include_str!("../../../resources/nabla-subagents.ts");
 
+/// S1 of `agent-profiles-defaults.md`: where the built-in templates are written,
+/// beside the extension that reads them. The name is part of the contract between
+/// the two, so it lives here once.
+pub const AGENT_DEFAULTS_FILE: &str = "agent-profile-defaults.json";
+
 /// Writes the embedded extension into `<data_dir>/extensions/nabla-ask.ts` and
 /// answers its absolute path, which is what `-e` receives at spawn.
 ///
@@ -1408,8 +1413,23 @@ pub fn materialize_permissions_extension(data_dir: &Path) -> std::io::Result<Pat
 /// Writes the subagent helpers into `<data_dir>/extensions/nabla-subagents.ts`
 /// and answers its absolute path, with the same content-idempotent rule as the
 /// two extensions above. On failure sessions run the same, without delegation.
+///
+/// S1 of `agent-profiles-defaults.md`: the five built-in templates travel with it,
+/// as `<data_dir>/extensions/agent-profile-defaults.json` — the same bytes
+/// `agents.rs` embeds, never a second copy of the prose. The extension reads that
+/// file on every tool call, which is how an empty store offers the defaults to
+/// `run_agent`/`run_agents`. Writing the extension first is deliberate: a data dir
+/// that cannot hold the JSON still gets the helpers, and the empty-store case then
+/// answers honestly instead of offering profiles it cannot describe.
 pub fn materialize_subagents_extension(data_dir: &Path) -> std::io::Result<PathBuf> {
-    materialize_extension(data_dir, "nabla-subagents.ts", SUBAGENTS_EXTENSION_SOURCE)
+    let extension =
+        materialize_extension(data_dir, "nabla-subagents.ts", SUBAGENTS_EXTENSION_SOURCE)?;
+    materialize_extension(
+        data_dir,
+        AGENT_DEFAULTS_FILE,
+        crate::agents::defaults_source(),
+    )?;
+    Ok(extension)
 }
 
 /// The one materializer both extensions use: `extensions/<name>` under the data
@@ -2339,6 +2359,14 @@ printf 'exited\n' >> '@MARKER@'
             std::fs::read_to_string(&path).expect("read back"),
             SUBAGENTS_EXTENSION_SOURCE,
             "a stale copy must be replaced by the embedded one"
+        );
+        // S1: the built-in templates land beside the extension, byte for byte the
+        // asset the Rust mirror embeds — no second copy of the prose.
+        let defaults = scratch.dir.join("extensions").join(AGENT_DEFAULTS_FILE);
+        assert_eq!(
+            std::fs::read_to_string(&defaults).expect("the defaults travel with the extension"),
+            crate::agents::defaults_source(),
+            "the extension reads the same bytes `agents.rs` embeds"
         );
     }
 

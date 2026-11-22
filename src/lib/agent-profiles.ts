@@ -24,6 +24,15 @@
 //    added by mounting, reading or saving: the templates are data this module
 //    hands out, and they only join the draft when `addAgentProfile` is called.
 //
+// The templates are also the fallback for an empty store (S1 of
+// `agent-profiles-defaults.md`): with the master switch on and no profile saved,
+// these five are what a child runs with, enabled, without being added here. The
+// TEXT is written once, in this file, and mirrored as data in
+// `src-tauri/assets/agent-profile-defaults.json` — the asset the Rust gate embeds
+// and the host writes beside the subagent extension. Editing a template means
+// editing that asset in the same commit: `tests/agent-profile-defaults.test.ts`
+// fails when names, instructions, tool lists or descriptions disagree.
+//
 // No `watch` anywhere: the pane drives every change through an explicit handler,
 // and `dirty` is a computed over the draft and the last file answer, so no getter
 // runs during setup over state declared below it.

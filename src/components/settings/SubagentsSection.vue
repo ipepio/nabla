@@ -12,6 +12,15 @@
  *   is added without a click. The pane never enables anything on the human's
  *   behalf: it offers, the human turns on and saves.
  *
+ * - **An empty list while the switch is on is the built-in templates (S1 of
+ *   `agent-profiles-defaults.md`).** With the master switch on and nothing saved,
+ *   the five templates apply enabled, so delegation really runs. The list stays
+ *   empty and editable — nothing is written into `agents.json` on the human's
+ *   behalf — but the pane says out loud that the defaults are what a child runs
+ *   with, because an empty-looking list beside spawning children would misdescribe
+ *   the app. The moment one profile is saved, that list is authoritative and the
+ *   defaults stop applying.
+ *
  * - **A change applies to the next session.** The gate is read at spawn time, so
  *   the master switch cannot reach the pi process already running — the line under
  *   the switch says exactly that instead of implying a live reload.
@@ -104,6 +113,15 @@ const masterEnabled = computed<boolean>(() => draft.value?.enabled ?? false);
 /** The profiles in file order; the list and the rows are positional because that
  * is how the file keeps them and how the editor addresses them. */
 const profiles = computed<AgentProfile[]>(() => draft.value?.profiles ?? []);
+
+/**
+ * S1: the fallback is in effect — the master switch is on and nothing is stored,
+ * so the five built-in templates are what a child runs with. The list stays empty
+ * and editable; this flag only changes what the pane SAYS about it.
+ */
+const usingDefaults = computed<boolean>(
+  () => masterEnabled.value && profiles.value.length === 0,
+);
 
 /** The first read is in flight and there is nothing to paint yet. */
 const loading = computed(
@@ -608,8 +626,17 @@ onMounted(() => {
             </div>
           </li>
         </ul>
+        <!-- S1 of `agent-profiles-defaults.md`: an empty list with the switch on is
+             not "nothing configured" — the five built-in templates apply, enabled.
+             Saying "no profile yet" here would misdescribe what the children run
+             with, so the empty state names the defaults instead. Nothing is added
+             to the list on the human's behalf: it stays empty and editable. -->
         <p v-else class="text-xs text-muted-foreground">
-          {{ t("settings.subagents.profiles.empty") }}
+          {{
+            usingDefaults
+              ? t("settings.subagents.profiles.defaultsActive")
+              : t("settings.subagents.profiles.empty")
+          }}
         </p>
 
         <div class="flex flex-wrap items-center gap-2">

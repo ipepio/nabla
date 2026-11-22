@@ -414,6 +414,7 @@
   "settings.subagents.profiles": "Profiles",
   "settings.subagents.profiles.description": "Each one is a name, what it is for, the tools it may use and the model it runs on.",
   "settings.subagents.profiles.empty": "No profile yet. Write one, or start from a template below.",
+  "settings.subagents.profiles.defaultsActive": "No profile saved, so the five built-in templates are in effect: explorer, researcher, worker, judge and judge-2. Delegation already runs with them; the moment you save one profile of your own, this list is what the agent gets instead.",
   "settings.subagents.gateClosed": "The master switch is off, so the agent cannot delegate. The profiles below are kept and can still be edited; nothing is offered to the model until you turn the switch on and save.",
   "settings.subagents.row.enable": "Enable the profile {name}",
   "settings.subagents.row.enabled": "Enabled",

@@ -414,6 +414,7 @@
   "settings.subagents.profiles": "Perfiles",
   "settings.subagents.profiles.description": "Cada uno es un nombre, para qué sirve, las herramientas que puede usar y el modelo con el que corre.",
   "settings.subagents.profiles.empty": "Todavía no hay perfiles. Escriba uno o empiece por una plantilla.",
+  "settings.subagents.profiles.defaultsActive": "No hay ningún perfil guardado, así que están en vigor las cinco plantillas incluidas: explorer, researcher, worker, judge y judge-2. La delegación ya funciona con ellas; en cuanto guarde un perfil propio, esta lista es lo que recibe el agente.",
   "settings.subagents.gateClosed": "El interruptor maestro está apagado, así que el agente no puede delegar. Los perfiles de abajo se conservan y se pueden editar; no se le ofrece ninguno al modelo hasta que active el interruptor y guarde.",
   "settings.subagents.row.enable": "Activar el perfil {name}",
   "settings.subagents.row.enabled": "Activado",

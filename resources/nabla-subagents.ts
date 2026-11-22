@@ -45,12 +45,22 @@
  * with `enabled: true` are offered; when there is none, every tool answers that
  * honestly and points at Settings instead of failing (S3).
  *
+ * AN EMPTY STORE IS THE BUILT-IN TEMPLATES (S1 of `agent-profiles-defaults.md`).
+ * Master switch on and no profile stored means the five templates Settings offers
+ * — explorer, researcher, worker, judge, judge-2 — arrive enabled, so turning the
+ * switch on is already a usable configuration instead of four tools that can only
+ * answer "nothing to run". The text is NOT copied into this file: the host writes
+ * it to `<NABLA_DATA_DIR>/extensions/agent-profile-defaults.json`, from the same
+ * asset the Rust mirror embeds, and this file reads it on every tool call. A store
+ * with anything in it — even a list of profiles the human turned off — is
+ * authoritative, and the defaults never reappear beside it.
+ *
  * WHETHER THIS EXTENSION EXISTS AT ALL is the host's decision, not ours (S3):
- * with the master switch off, or with no enabled profile, the spawn never passes
- * this file to `-e`, so `run_agent` does not exist for the model. A session that
- * is already running keeps what it started with — pi loads an extension once and
- * has no way to unload it — so the master switch is re-read by the host at the
- * next spawn and never here.
+ * with the master switch off, or with a non-empty list where nothing is enabled,
+ * the spawn never passes this file to `-e`, so `run_agent` does not exist for the
+ * model. A session that is already running keeps what it started with — pi loads
+ * an extension once and has no way to unload it — so the master switch is re-read
+ * by the host at the next spawn and never here.
  *
  * NO RECURSION (S5): our own five tool names — `run_agent`, `run_agents` and the
  * three helpers — are removed from every child's list, so a child can never
@@ -180,7 +190,11 @@ interface AgentProfile {
 interface ProfileStore {
   /** S6, second level of the model resolution order. */
   defaultModel?: string;
-  /** Only the profiles with `enabled: true`, in file order. */
+  /**
+   * Only the profiles with `enabled: true`, in file order — or the built-in
+   * templates when the store is empty and the master switch is on (S1 of
+   * `agent-profiles-defaults.md`).
+   */
   profiles: AgentProfile[];
 }
 
@@ -257,6 +271,13 @@ interface ManifestEntry {
 // ── the profile store (S1, S3, S6 of `agent-profiles.md`) ────────────────────
 
 /**
+ * S1 of `agent-profiles-defaults.md`: where the host writes the built-in templates,
+ * beside this extension (`process::materialize_subagents_extension`). One name, one
+ * file, and the same bytes `agents.rs` embeds.
+ */
+const DEFAULTS_FILE = "agent-profile-defaults.json";
+
+/**
  * Reads `<NABLA_DATA_DIR>/agents.json` — the one file Settings → Subagents writes
  * — and answers the profiles this session may actually use.
  *
@@ -264,7 +285,7 @@ interface ManifestEntry {
  * delegation without restarting anything. A missing file, an unreadable one or a
  * body that does not parse is an empty store, never an exception: the tools then
  * answer honestly that there is nothing to delegate to (S3), which is what a
- * fresh install looks like.
+ * fresh install with the master switch off looks like.
  */
 function loadProfiles(): ProfileStore {
   const dir = dataDir();
@@ -283,6 +304,7 @@ function loadProfiles(): ProfileStore {
   }
   if (typeof parsed !== "object" || parsed === null) return { profiles: [] };
   const config = parsed as {
+    enabled?: unknown;
     modelDefault?: unknown;
     profiles?: unknown;
   };
@@ -298,7 +320,40 @@ function loadProfiles(): ProfileStore {
     typeof config.modelDefault === "string" && config.modelDefault.trim() !== ""
       ? config.modelDefault.trim()
       : undefined;
+  // S1 of `agent-profiles-defaults.md`: no profile stored AND the master switch on
+  // is the built-in templates, enabled. The empty LIST is the whole condition: a
+  // list with anything in it is what the human wrote — including a list of
+  // profiles they turned off on purpose, which must stay off — so the defaults
+  // never inject themselves beside it.
+  if (entries.length === 0 && config.enabled === true) {
+    return { defaultModel, profiles: builtInProfiles(dir) };
+  }
   return { defaultModel, profiles };
+}
+
+/**
+ * S1: the built-in templates, read from the file the host materializes beside this
+ * extension. An unreadable or malformed file is no defaults at all, not an
+ * exception: the tools then say honestly that there is nothing to delegate to,
+ * instead of pretending a profile exists. The drift test in `tests/` is what keeps
+ * this file and the Settings templates identical.
+ */
+function builtInProfiles(dir: string): AgentProfile[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(
+      readFileSync(join(dir, "extensions", DEFAULTS_FILE), "utf8"),
+    );
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  const profiles: AgentProfile[] = [];
+  for (const entry of parsed) {
+    const profile = normalizeProfile(entry);
+    if (profile) profiles.push(profile);
+  }
+  return profiles;
 }
 
 /**
@@ -911,7 +966,9 @@ export default function nablaSubagents(pi: ExtensionAPI) {
       "Delegate one task to a specialized agent profile and wait for its answer. " +
       "Profiles are configured by the person in Nabla's Settings → Subagents " +
       "(name, description, tools, optional model and effort, instructions); only " +
-      "the enabled ones exist. The child runs as a separate pi session in this " +
+      "the enabled ones exist, and when the person configured none, five built-in " +
+      "ones do (explorer, researcher, worker, judge, judge-2). The child runs as a " +
+      "separate pi session in this " +
       "same process, with only the tools its profile lists and the human's " +
       "permission mode allows, and writes its own session file, so the human can " +
       "watch it in Nabla's sidebar. This tool BLOCKS until the child finishes, " +
@@ -1106,7 +1163,10 @@ export default function nablaSubagents(pi: ExtensionAPI) {
     description:
       "Delegate several tasks AT THE SAME TIME: up to 4 agent profiles, all " +
       "launched concurrently and awaited together, so two judges cost one wait " +
-      "instead of two. Each child is a separate pi session in this same process " +
+      "instead of two. Each entry names a profile the person enabled in Settings " +
+      "→ Subagents, or one of the five built-ins that apply when they configured " +
+      "none (explorer, researcher, worker, judge, judge-2). Each child is a " +
+      "separate pi session in this same process " +
       "with its own profile, its own session file and its own name, using only the " +
       "tools its profile lists and the human's permission mode allows; the human " +
       "can watch each one in Nabla's sidebar. This tool returns ONE result once " +

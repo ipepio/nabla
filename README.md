@@ -71,7 +71,7 @@ path in `settings.json`:
 | `settings.json` | your preferences, human-editable |
 | `nabla.db` | SQLite index of workspaces and sessions (metadata only) |
 | `sessions/*.jsonl` | the transcripts, written by Pi. These are the source of truth |
-| `agents.json` | subagent profiles (appears once you configure one) |
+| `agents.json` | subagent profiles (written when you configure one; until then the built-in templates apply) |
 | `permissions.json` | the current permission mode, as a projection |
 
 Conversation content lives only in Pi's JSONL files; the database is a rebuildable
@@ -103,7 +103,7 @@ baseline, not a missing feature:
 | Capability | Default | Where |
 | --- | --- | --- |
 | Web search | off | Settings → Web search |
-| Subagents | off (no `agents.json` until you configure one) | Settings → Subagents |
+| Subagents | off until you turn the master switch on; with no profile saved, the five built-in templates run | Settings → Subagents |
 | Permission mode | `write` — edits allowed, commands ask | the chip in the composer |
 
 The two features ship off because both leave your machine:
@@ -120,9 +120,14 @@ The two features ship off because both leave your machine:
   loopback pattern.
 
 - **Subagents** — Settings → Subagents. One master switch, then one switch per
-  profile. With it off the agent has no delegation tools at all. Templates (explorer,
-  researcher, worker, judge, judge-2) arrive written and disabled; enable the ones you
-  want. Changes apply to the **next** session, not the running one.
+  profile. With it off the agent has no delegation tools at all. Turn it on and
+  leave the list empty and the five built-in templates — explorer, researcher,
+  worker, judge, judge-2 — are what it delegates with, already written and already
+  enabled (`agents.json` stays empty; nothing is created on your behalf). The
+  moment you save a profile of your own the list becomes authoritative, so a
+  profile you turn off stays off and the templates never reappear beside it. The
+  same templates are offered as disabled starting points for editing. Changes
+  apply to the **next** session, not the running one.
 
 The permission chip in the composer is the other switch worth knowing: `read` blocks
 shell and file edits, `write` allows edits and asks before commands, `yolo` allows
