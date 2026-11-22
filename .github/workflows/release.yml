@@ -19,6 +19,11 @@ jobs:
   bundle:
     strategy:
       fail-fast: false
+      # One leg at a time: both legs attach to the same tag's release, and two
+      # concurrent "create if missing" calls race on that tag. Serialising
+      # costs a few minutes and removes the 422 that would otherwise lose a
+      # bundle.
+      max-parallel: 1
       matrix:
         include:
           - platform: windows-latest
@@ -91,3 +96,16 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+
+      # The run keeps the bundle it produced, in addition to the release
+      # attachment above: `if-no-files-found: error` turns a leg that bundled
+      # nothing into a red build instead of a release missing an installer.
+      - name: Keep the bundle as a run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nabla-${{ github.ref_name }}-${{ matrix.platform }}
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
+          retention-days: 30
