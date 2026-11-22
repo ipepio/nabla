@@ -126,6 +126,26 @@ be stated once:
 The two frontend rules are pure and covered in `tests/session-refresh.test.ts`; the scan is covered by
 `subagent_sessions_scans_the_manifests_once_per_query` in `src-tauri/src/commands.rs`.
 
+## Sidebar session rows — active children inline, finished children folded
+
+A parent's subagent rows are derived from the status the listing returned, so no component stores group
+membership (`src/components/sidebar/SessionsList.vue`):
+
+- **Active children stay inline.** `activeChildrenOf` keeps the rows whose status is running or queued
+directly under their parent, with the stop button on hover and in the context menu, because the child an
+agent is working in is never behind a disclosure.
+- **Finished children fold into one row.** `finishedChildrenOf` collects everything else behind a single
+disclosure per parent — `chat.subagent.finishedOne` / `chat.subagent.finishedMany` in `src/locales/` —
+closed by default, with a chevron and `aria-expanded`. The expanded set (`expandedFinishedGroups`) is
+keyed by session id and lives in component memory only. A child that finishes moves from the inline list
+into the group on the next listing, since membership is computed and never written.
+- **The tail is removable in one action.** The group row carries a trash button on hover and its own
+context-menu variant (`finishedGroup`) offering show/hide plus
+`chat.subagent.deleteAllFinishedCount`. `handleDeleteAllFinished` closes the read-only subagent view
+first when the open child is inside the set, deletes with `Promise.allSettled` so one failure does not
+strand the rest, forgets the group's expanded state, and force-reloads that parent's children only —
+never the whole drawer.
+
 ## The Browser pane — one pane, N tabs
 
 A page that opens a popup gets a tab **inside the Browser pane** — not a drawer tab and not a window of

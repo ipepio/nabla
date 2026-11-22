@@ -20,6 +20,7 @@
 // read-only view, never a chat.
 import { onMounted, onUnmounted, ref } from "vue";
 import {
+  ChevronRightIcon,
   GitBranchIcon,
   MessageSquareIcon,
   MoreHorizontalIcon,
@@ -145,6 +146,35 @@ function childrenOf(session: SessionSummary): SubagentSession[] {
   return subagentChildrenOf(session.id);
 }
 
+function activeChildrenOf(session: SessionSummary): SubagentSession[] {
+  return childrenOf(session).filter((child) => isSubagentActive(child.status));
+}
+
+function finishedChildrenOf(session: SessionSummary): SubagentSession[] {
+  return childrenOf(session).filter((child) => !isSubagentActive(child.status));
+}
+
+/** Finished subagent groups stay collapsed by default to keep the sidebar tidy. */
+const expandedFinishedGroups = ref<Record<number, boolean>>({});
+const deletingFinishedFor = ref<number | null>(null);
+
+function isFinishedGroupOpen(sessionId: number): boolean {
+  return expandedFinishedGroups.value[sessionId] === true;
+}
+
+function toggleFinishedGroup(sessionId: number): void {
+  expandedFinishedGroups.value = {
+    ...expandedFinishedGroups.value,
+    [sessionId]: !isFinishedGroupOpen(sessionId),
+  };
+}
+
+function finishedGroupLabel(count: number): string {
+  return count === 1
+    ? t("chat.subagent.finishedOne")
+    : t("chat.subagent.finishedMany", { count });
+}
+
 /** What a child row is called: the agent definition it runs. */
 function childLabel(child: SubagentSession): string {
   return child.agent.trim() !== "" ? child.agent : child.name;
@@ -169,9 +199,32 @@ async function handleDeleteChild(
   }
 }
 
+async function handleDeleteAllFinished(parent: SessionSummary): Promise<void> {
+  if (deletingFinishedFor.value === parent.id) return;
+  const finished = finishedChildrenOf(parent);
+  if (finished.length === 0) return;
+  deletingFinishedFor.value = parent.id;
+  try {
+    if (
+      currentOpenSubagentId.value !== null &&
+      finished.some((child) => child.sessionId === currentOpenSubagentId.value)
+    ) {
+      closeSubagentView();
+    }
+    await Promise.allSettled(finished.map((child) => deleteSession(child.sessionId)));
+    const next = { ...expandedFinishedGroups.value };
+    delete next[parent.id];
+    expandedFinishedGroups.value = next;
+    await loadSubagentChildren(parent.workspaceId, [parent.id], { force: true });
+  } finally {
+    deletingFinishedFor.value = null;
+  }
+}
+
 type RowContextMenu =
   | { kind: "session"; x: number; y: number; session: SessionSummary }
-  | { kind: "subagent"; x: number; y: number; child: SubagentSession; parent: SessionSummary };
+  | { kind: "subagent"; x: number; y: number; child: SubagentSession; parent: SessionSummary }
+  | { kind: "finishedGroup"; x: number; y: number; parent: SessionSummary; count: number };
 
 const rowMenu = ref<RowContextMenu | null>(null);
 
@@ -180,7 +233,7 @@ function closeRowMenu(): void {
 }
 
 function clampMenuPos(clientX: number, clientY: number): { x: number; y: number } {
-  const menuW = 200;
+  const menuW = 220;
   const menuH = 160;
   return {
     x: Math.min(clientX, Math.max(8, window.innerWidth - menuW - 8)),
@@ -206,6 +259,18 @@ function openSubagentContextMenu(
   event.stopPropagation();
   const { x, y } = clampMenuPos(event.clientX, event.clientY);
   rowMenu.value = { kind: "subagent", x, y, child, parent };
+}
+
+function openFinishedGroupContextMenu(
+  event: MouseEvent,
+  parent: SessionSummary,
+  count: number,
+): void {
+  if (import.meta.env.DEV && event.shiftKey) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const { x, y } = clampMenuPos(event.clientX, event.clientY);
+  rowMenu.value = { kind: "finishedGroup", x, y, parent, count };
 }
 
 function onWindowKeydown(event: KeyboardEvent): void {
@@ -393,7 +458,7 @@ onUnmounted(() => {
         :aria-label="t('chat.subagent.list')"
       >
         <li
-          v-for="child in childrenOf(session)"
+          v-for="child in activeChildrenOf(session)"
           :key="child.sessionId"
           class="group/subagent-row relative"
         >
@@ -431,19 +496,13 @@ onUnmounted(() => {
               </span>
             </span>
             <span
-              class="size-2 shrink-0 rounded-full transition-opacity"
-              :class="[
-                subagentStatusDot(child.status),
-                isSubagentActive(child.status)
-                  ? 'group-hover/subagent-row:opacity-0'
-                  : '',
-              ]"
+              class="size-2 shrink-0 rounded-full transition-opacity group-hover/subagent-row:opacity-0"
+              :class="subagentStatusDot(child.status)"
               :title="subagentStatusLabel(child.status)"
               aria-hidden="true"
             />
           </SidebarMenuSubButton>
           <button
-            v-if="isSubagentActive(child.status)"
             type="button"
             class="absolute top-1/2 right-1.5 flex size-6 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:bg-destructive/15 hover:text-destructive group-hover/subagent-row:opacity-100 focus-visible:opacity-100"
             :aria-label="t('chat.subagent.cancel')"
@@ -452,6 +511,92 @@ onUnmounted(() => {
           >
             <SquareIcon class="size-3 fill-current" />
           </button>
+        </li>
+
+        <li
+          v-if="finishedChildrenOf(session).length > 0"
+          class="group/finished-group relative"
+        >
+          <div class="relative flex items-center">
+            <button
+              type="button"
+              class="flex w-full items-center gap-1.5 rounded-lg px-2 py-1.5 pr-7 text-left text-[11px] font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+              :aria-expanded="isFinishedGroupOpen(session.id)"
+              @click="toggleFinishedGroup(session.id)"
+              @contextmenu="openFinishedGroupContextMenu($event, session, finishedChildrenOf(session).length)"
+            >
+              <ChevronRightIcon
+                class="size-3.5 shrink-0 transition-transform"
+                :class="isFinishedGroupOpen(session.id) ? 'rotate-90' : ''"
+                aria-hidden="true"
+              />
+              <span class="min-w-0 flex-1 truncate">
+                {{ finishedGroupLabel(finishedChildrenOf(session).length) }}
+              </span>
+            </button>
+            <button
+              type="button"
+              :disabled="deletingFinishedFor === session.id"
+              class="absolute top-1/2 right-1 flex size-6 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:bg-destructive/15 hover:text-destructive group-hover/finished-group:opacity-100 focus-visible:opacity-100 disabled:opacity-40"
+              :aria-label="t('chat.subagent.deleteAllFinishedCount', { count: finishedChildrenOf(session).length })"
+              :title="t('chat.subagent.deleteAllFinishedCount', { count: finishedChildrenOf(session).length })"
+              @click.stop="void handleDeleteAllFinished(session)"
+            >
+              <Trash2Icon class="size-3.5" />
+            </button>
+          </div>
+
+          <ul
+            v-if="isFinishedGroupOpen(session.id)"
+            class="mt-0.5 flex flex-col gap-0.5 pl-2"
+          >
+            <li
+              v-for="child in finishedChildrenOf(session)"
+              :key="child.sessionId"
+              class="group/subagent-row relative"
+            >
+              <SidebarMenuSubButton
+                as="button"
+                type="button"
+                size="sm"
+                :is-active="child.sessionId === openSubagentId"
+                class="h-auto w-full items-center gap-2.5 rounded-lg border border-transparent px-2.5 py-1.5 text-left text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground data-[active=true]:border-border data-[active=true]:bg-sidebar-accent data-[active=true]:text-foreground"
+                @click="emit('openSubagent', { child, parent: session })"
+                @contextmenu="openSubagentContextMenu($event, child, session)"
+              >
+                <GitBranchIcon
+                  class="size-3.5 shrink-0"
+                  :class="
+                    child.sessionId === openSubagentId
+                      ? 'text-primary'
+                      : 'text-muted-foreground'
+                  "
+                  aria-hidden="true"
+                />
+                <span class="flex min-w-0 flex-1 flex-col gap-0.5">
+                  <span
+                    class="truncate text-[12px] leading-tight font-semibold"
+                    :class="
+                      child.sessionId === openSubagentId
+                        ? 'text-foreground'
+                        : 'text-foreground/85'
+                    "
+                  >
+                    {{ childLabel(child) }}
+                  </span>
+                  <span class="truncate text-[10.5px] leading-tight text-muted-foreground">
+                    {{ subagentStatusLabel(child.status) }} · {{ t("chat.subagent.readOnly") }}
+                  </span>
+                </span>
+                <span
+                  class="size-2 shrink-0 rounded-full"
+                  :class="subagentStatusDot(child.status)"
+                  :title="subagentStatusLabel(child.status)"
+                  aria-hidden="true"
+                />
+              </SidebarMenuSubButton>
+            </li>
+          </ul>
         </li>
       </ul>
     </SidebarMenuSubItem>
@@ -473,7 +618,7 @@ onUnmounted(() => {
       <div
         v-if="rowMenu"
         role="menu"
-        class="fixed z-50 w-48 overflow-hidden rounded-xl border border-border bg-popover p-1 text-popover-foreground shadow-xl"
+        class="fixed z-50 w-56 overflow-hidden rounded-xl border border-border bg-popover p-1 text-popover-foreground shadow-xl"
         :style="{ left: `${rowMenu.x}px`, top: `${rowMenu.y}px` }"
         @pointerdown.stop
         @contextmenu.prevent
@@ -510,7 +655,7 @@ onUnmounted(() => {
           </button>
         </template>
 
-        <template v-else>
+        <template v-else-if="rowMenu.kind === 'subagent'">
           <button
             type="button"
             role="menuitem"
@@ -539,6 +684,35 @@ onUnmounted(() => {
           >
             <Trash2Icon class="size-3.5" />
             {{ t("common.delete") }}
+          </button>
+        </template>
+
+        <template v-else>
+          <button
+            type="button"
+            role="menuitem"
+            class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground"
+            @click="toggleFinishedGroup(rowMenu.parent.id); closeRowMenu()"
+          >
+            <ChevronRightIcon
+              class="size-3.5 text-muted-foreground transition-transform"
+              :class="isFinishedGroupOpen(rowMenu.parent.id) ? 'rotate-90' : ''"
+            />
+            {{
+              isFinishedGroupOpen(rowMenu.parent.id)
+                ? t("chat.subagent.collapseFinished")
+                : t("chat.subagent.expandFinished")
+            }}
+          </button>
+          <div class="my-1 h-px bg-border" role="separator" />
+          <button
+            type="button"
+            role="menuitem"
+            class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs text-destructive hover:bg-destructive/10"
+            @click="void handleDeleteAllFinished(rowMenu.parent); closeRowMenu()"
+          >
+            <Trash2Icon class="size-3.5" />
+            {{ t("chat.subagent.deleteAllFinishedCount", { count: rowMenu.count }) }}
           </button>
         </template>
       </div>
