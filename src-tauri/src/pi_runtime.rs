@@ -63,6 +63,21 @@ fn sidecar_node_name() -> &'static str {
     }
 }
 
+/// Strips Windows verbatim path prefixes (`\\?\` and `\\?\UNC\`) that Tauri's
+/// `resource_dir()` / `canonicalize()` produce. Node.js 22's `realpathSync`
+/// crashes with `EISDIR: illegal operation on a directory, lstat 'C:'` when
+/// its main script path starts with `\\?\C:\...`.
+fn strip_windows_verbatim_prefix(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
+}
+
 fn join_parts(base: &Path, parts: &[&str]) -> PathBuf {
     let mut out = base.to_path_buf();
     for part in parts {
@@ -117,10 +132,15 @@ pub fn resolve_pi_with_paths(
         };
         if let Some(program) = node_bin {
             let node_modules = join_parts(&root, PI_NODE_MODULES_REL);
+            let clean_program = strip_windows_verbatim_prefix(&program);
+            let clean_cli_js = strip_windows_verbatim_prefix(&cli_js);
+            let clean_node_modules = node_modules
+                .is_dir()
+                .then(|| strip_windows_verbatim_prefix(&node_modules));
             return ResolvedPi {
-                program,
-                prefix_args: vec![cli_js.to_string_lossy().to_string()],
-                node_path: node_modules.is_dir().then_some(node_modules),
+                program: clean_program,
+                prefix_args: vec![clean_cli_js.to_string_lossy().to_string()],
+                node_path: clean_node_modules,
             };
         }
     }
@@ -223,6 +243,22 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strips_windows_verbatim_prefixes_for_node() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new(r"\\?\C:\Users\me\AppData\Local\Nabla\cli.js")),
+            PathBuf::from(r"C:\Users\me\AppData\Local\Nabla\cli.js")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new(r"\\?\UNC\server\share\Nabla\cli.js")),
+            PathBuf::from(r"\\server\share\Nabla\cli.js")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new("/Applications/Nabla.app/Contents/Resources")),
+            PathBuf::from("/Applications/Nabla.app/Contents/Resources")
+        );
     }
 
     #[test]
