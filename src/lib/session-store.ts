@@ -372,6 +372,8 @@ export const sessions = reactive(new Map<string, SessionBuffer>());
 
 /** The session the chat panel follows, or `null` before the first selection. */
 export const activeSession = ref<SessionDto | null>(null);
+/** Title of the selected session from the index, when known. */
+export const activeSessionTitle = ref<string | null>(null);
 
 /** Id of the active session (S1: the row id, never the workspace). */
 export const activeSessionId = computed<string | null>(
@@ -1553,6 +1555,7 @@ export async function selectSession(session: SessionSummary): Promise<void> {
   // session can be resent even if the panel has moved on by then.
   const buffer = ensureBuffer(sessionId, session.workspaceId);
   activeSession.value = dtoFromSummary(session, buffer.status);
+  activeSessionTitle.value = session.title ?? null;
   void ensureSessionEvents();
 
   // The conversation is painted before anything slow runs: the preview is a
@@ -1644,6 +1647,7 @@ export async function newSession(workspaceId: number): Promise<SessionDto> {
   // A session created here has no earlier conversation to read back.
   transcriptSeeded.add(started.sessionId);
   activeSession.value = started;
+  activeSessionTitle.value = null;
   // The index gained a row in this workspace, so the list that shows it must
   // re-read — one open list, not every one of them (S2 of
   // `drawer-responsiveness-oauth.md`). `sessionGeneration` still marks the shape
@@ -1657,6 +1661,7 @@ export async function newSession(workspaceId: number): Promise<SessionDto> {
 export function clearSession(): void {
   if (activeSession.value === null) return;
   activeSession.value = null;
+  activeSessionTitle.value = null;
   sessionGeneration.value += 1;
 }
 

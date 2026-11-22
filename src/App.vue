@@ -4,8 +4,8 @@
 //
 // The drawer owns the workspace and settings data; this component owns only the
 // active selection, so ChatPanel receives one workspace instead of the list.
-import { nextTick, onBeforeUnmount, onMounted, ref } from "vue";
-import { PanelRightCloseIcon } from "@lucide/vue";
+import { defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
+import { PanelRightCloseIcon, RotateCcwIcon } from "@lucide/vue";
 import AppSidebar from "./components/AppSidebar.vue";
 import ChatPanel from "./components/ChatPanel.vue";
 import ResizableAside from "./components/ResizableAside.vue";
@@ -14,16 +14,45 @@ import { openDrawer, openTool } from "./components/tools/dock";
 import { Button } from "./components/ui/button";
 import { SidebarInset, SidebarProvider } from "./components/ui/sidebar";
 import { subscribeEmbedNeedView } from "./contracts/commands";
-import type { WorkspaceInfo } from "./contracts/types";
+import type { SessionSummary, WorkspaceInfo } from "./contracts/types";
 import { setWebviewZoom } from "./contracts/window";
 import { t } from "./lib/i18n";
 import { enabledTools, isToolEnabled } from "./lib/preferences";
+import { selectSession } from "./lib/session-store";
 import {
   applyDocumentZoom,
   createZoomController,
   detectPlatform,
   zoomAction,
 } from "./lib/zoom";
+
+const CommandPalette = defineAsyncComponent(
+  () => import("./components/CommandPalette.vue"),
+);
+
+const sidebarRef = ref<{
+  openSettings: () => void;
+  handleNewSession: () => Promise<void>;
+} | null>(null);
+const paletteOpen = ref(false);
+const paletteLoaded = ref(false);
+
+function openPalette(): void {
+  paletteLoaded.value = true;
+  paletteOpen.value = true;
+}
+
+function handlePaletteSelectWorkspace(workspace: WorkspaceInfo): void {
+  activeWorkspace.value = workspace;
+}
+
+async function handlePaletteSelectSession(payload: {
+  workspace: WorkspaceInfo;
+  session: SessionSummary;
+}): Promise<void> {
+  activeWorkspace.value = payload.workspace;
+  await selectSession(payload.session);
+}
 
 const activeWorkspace = ref<WorkspaceInfo | null>(null);
 // Right tools drawer (S6): collapsed by default; the chat header and the empty
@@ -102,6 +131,34 @@ const zoom = createZoomController({
 });
 
 function onZoomKeydown(event: KeyboardEvent): void {
+  const mod = zoomPlatform === "mac" ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+  if (mod && !event.altKey) {
+    const key = event.key.toLowerCase();
+    if (key === "k") {
+      event.preventDefault();
+      if (paletteOpen.value) {
+        paletteOpen.value = false;
+      } else {
+        openPalette();
+      }
+      return;
+    }
+    if (key === "n" && !event.shiftKey) {
+      event.preventDefault();
+      void sidebarRef.value?.handleNewSession();
+      return;
+    }
+    if (event.key === ".") {
+      event.preventDefault();
+      toggleDrawer();
+      return;
+    }
+    if (event.key === ",") {
+      event.preventDefault();
+      sidebarRef.value?.openSettings();
+      return;
+    }
+  }
   const action = zoomAction(event, zoomPlatform);
   if (action === null) return;
   event.preventDefault();
@@ -129,6 +186,7 @@ onBeforeUnmount(() => {
 <template>
   <SidebarProvider class="h-svh overflow-hidden">
     <AppSidebar
+      ref="sidebarRef"
       :active-workspace-id="activeWorkspace?.id ?? null"
       @select="activeWorkspace = $event"
     />
@@ -144,6 +202,7 @@ onBeforeUnmount(() => {
             :workspace="activeWorkspace"
             :tools-open="toolsOpen"
             @toggle-tools="toggleDrawer"
+            @open-search="openPalette"
           />
         </div>
 
@@ -178,15 +237,30 @@ onBeforeUnmount(() => {
         -->
         <ResizableAside
           v-show="toolsOpen"
+          v-slot="{ width, resetWidth }"
           :aria-label="t('tools.title')"
           class="hidden md:flex"
         >
-          <div class="flex items-center gap-2 border-b px-3 py-2">
-            <h2 class="text-sm font-semibold">{{ t("tools.title") }}</h2>
+          <div class="flex h-13 shrink-0 items-center gap-2 border-b border-sidebar-border px-3.5">
+            <h2 class="text-[10px] font-bold tracking-widest text-muted-foreground uppercase">
+              {{ t("tools.title") }}
+            </h2>
+            <span class="ms-auto font-mono text-[10px] tabular-nums text-muted-foreground">
+              {{ width }} px
+            </span>
             <Button
               variant="ghost"
-              size="icon-sm"
-              class="ms-auto"
+              size="icon-xs"
+              class="text-muted-foreground hover:bg-accent hover:text-foreground"
+              aria-label="Reset panel width"
+              @click="resetWidth"
+            >
+              <RotateCcwIcon />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              class="text-muted-foreground hover:bg-accent hover:text-foreground"
               :aria-label="t('tools.collapse')"
               @click="toolsOpen = false"
             >
@@ -198,5 +272,15 @@ onBeforeUnmount(() => {
         </ResizableAside>
       </div>
     </SidebarInset>
+
+    <CommandPalette
+      v-if="paletteLoaded"
+      v-model:open="paletteOpen"
+      @select-workspace="handlePaletteSelectWorkspace"
+      @select-session="handlePaletteSelectSession"
+      @new-session="void sidebarRef?.handleNewSession()"
+      @toggle-tools="toggleDrawer"
+      @open-settings="sidebarRef?.openSettings()"
+    />
   </SidebarProvider>
 </template>

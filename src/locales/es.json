@@ -543,5 +543,15 @@
   "tools.browser.controlError": "No se pudo ejecutar esa acción en la página: {message}",
   "tools.browser.layoutError": "No se pudo colocar la vista de navegador: {message}",
   "tools.browser.syncError": "La barra de direcciones no puede seguir la página: {message}",
-  "tools.browser.agentNote": "El agente conduce esta vista con las tools MCP de nabla-browser: navega, lee y pulsa en la página que estás viendo."
+  "tools.browser.agentNote": "El agente conduce esta vista con las tools MCP de nabla-browser: navega, lee y pulsa en la página que estás viendo.",
+  "palette.trigger": "Buscar",
+  "palette.title": "Buscar espacios y sesiones",
+  "palette.placeholder": "Ir a un espacio, sesión o acción…",
+  "palette.workspaces": "Espacios",
+  "palette.sessions": "Sesiones",
+  "palette.actions": "Acciones",
+  "palette.empty": "No hay espacios ni sesiones que coincidan.",
+  "palette.action.newSession": "Nueva sesión",
+  "palette.action.toggleTools": "Mostrar u ocultar herramientas",
+  "palette.action.settings": "Abrir ajustes"
 }
