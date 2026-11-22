@@ -31,11 +31,12 @@ one contracts module. Do not add layers that the current screens do not need.
   CSS framework.
 - Generated shadcn-vue components live in `src/components/ui/*` and are owned like vendored code:
   edit them only with a reason, prefer composing them. `src/lib/utils.ts` exposes `cn()`.
-- Build screens from the shell parts: `AppSidebar` (left drawer: logo, workspaces, settings
-  dialog, collapse trigger) + `SidebarInset` (central area; currently the chat). A right drawer is
-  a documented seam, not yet built.
-- Icons come from lucide (one icon family only); accessibility belongs to the component: every
-  icon-only button carries an `aria-label`.
+- Build screens from the shell parts: `AppSidebar` (left drawer: logo, workspaces, sessions &
+  nested subagents, settings trigger) + `SidebarInset` (central chat column + resizable right
+  tools/inspector drawer `ResizableAside`). Global overlays (`SettingsDialog`, `CommandPalette`)
+  are lazy-loaded on first open.
+- Icons come from `@lucide/vue` (one icon family only); accessibility belongs to the component:
+  every icon-only button carries an `aria-label`.
 - Colors are semantic tokens, never literals: use the Tailwind utilities that map to them
   (`bg-background`, `text-muted-foreground`, `bg-primary`, `text-success`, `bg-tertiary`, `border-border`…).
   The values live in `.env` (`VITE_COLOR_*`) and reach the CSS variables through `src/lib/theme.ts`;
@@ -53,7 +54,7 @@ one contracts module. Do not add layers that the current screens do not need.
 - Keep one loading flag per operation (`workspacesLoading`, `adding`, `savingSettings`) so independent
   actions never block each other.
 - Model absent, loading, failed and successful states explicitly. Errors are `string | null` rendered
-  in a closable `v-alert`; success is transient feedback, never a silent state change.
+  in an `Alert`; success is transient feedback, never a silent state change.
 - Never mutate a prop or a caller-owned object; emit the intent to the owner instead.
 - After a successful write, reload or patch the affected data deliberately — do not assume the
   database changed the UI state.
@@ -72,11 +73,19 @@ settings read (S1/S2 of `odd/tasks/drawer-responsiveness-oauth.md`):
   tab, its panes and the active tab exactly as they were. The agent's `openTool()` fills the empty
   active tab instead of leaving it beside a new one, and still reveals an existing app-wide pane
   (Browser) rather than duplicating it.
-- **Terminal is the one lazily mounted tool.** `src/components/tools/registry.ts` wraps it in
-  `defineAsyncComponent(() => import("./TerminalTool.vue"))`, so xterm and its fit addon are
-  downloaded and evaluated when the first terminal pane mounts, not when the drawer's bundle loads.
-  Files, Changes and Browser stay eager: the first two are the panes a session opens first, and
-  Browser coordinates its child webview with the drawer's first paint.
+- **Heavy non-startup surfaces are lazily mounted.** `TerminalTool` (`src/components/tools/registry.ts`),
+  `SettingsDialog` (`AppSidebar.vue`) plus its sub-sections (`McpSection`, `SubagentsSection`,
+  `ProviderModelsEditor`, `AccountsSection`, `ProviderForm`), `CommandPalette` (`App.vue`), and
+  `SubagentView` (`ChatPanel.vue`) are wrapped in `defineAsyncComponent(() => import(...))` so
+  their code is only parsed and evaluated on first open. Files, Changes and Browser stay eager
+  because Files/Changes are opened immediately and Browser coordinates its child webview with
+  the drawer's first paint.
+- **CSS containment keeps long transcripts and drawer resizes isolated.** Settled turns in
+  `TurnGroup.vue` apply `content-visibility: auto` with `contain-intrinsic-block-size: auto 12rem`,
+  and `ResizableAside.vue` applies `contain: layout style`. Entry and disclosure transitions
+  (`src/assets/index.css`: `.nabla-enter`, `.nabla-disclosure`, `.nabla-status-pulse`) animate
+  only compositor properties (`opacity`, `translate`, `transform`) and honour
+  `prefers-reduced-motion`.
 - **The boot settings read is handed over once.** `main.ts` already reads `settings.json` before the
   first mount for the language; it hands that payload to `src/lib/boot-settings.ts`
   (`rememberBootSettings`), and the chat's startup `loadSettings()` takes it (`takeBootSettings`)

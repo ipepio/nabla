@@ -79,11 +79,14 @@ index, never a second copy. To start from zero: quit Nabla and remove that folde
 
 ## Keyboard shortcuts
 
-Zoom is the one shortcut shipped so far. The modifier is the platform's own: `⌘` on
-macOS, `Ctrl` on Windows and Linux.
+The modifier is the platform's own: `⌘` on macOS, `Ctrl` on Windows and Linux.
 
 | Shortcut | macOS | Windows / Linux |
 | --- | --- | --- |
+| Search workspaces, sessions & actions (Command palette) | `⌘ K` | `Ctrl K` |
+| New session (active workspace) | `⌘ N` | `Ctrl N` |
+| Toggle right tools / inspector drawer | `⌘ .` | `Ctrl .` |
+| Open Settings | `⌘ ,` | `Ctrl ,` |
 | Zoom in | `⌘ +` | `Ctrl +` |
 | Zoom out | `⌘ −` | `Ctrl −` |
 | Zoom back to 100% | `⌘ 0` | `Ctrl 0` |
@@ -92,8 +95,25 @@ The zoom walks a fixed list of levels (50% → 200%) one step per press and clam
 both ends; it is not persisted, so a fresh launch starts at 100%. What scales is the
 app's own interface — the main webview. The embedded browser's panes are separate
 webviews and keep the page at its own size, so an agent-driven page never jumps
-because you zoomed the shell around it. The same three chords are listed in
-Settings → General.
+because you zoomed the shell around it.
+
+## Theming & `.env` configuration
+
+Colors are semantic tokens defined in `src/assets/index.css` and overridable at build
+time via `.env` (see [ADR 0009](docs/adr/0009-configurable-theme-tokens.md)):
+
+- **Dark palette** (default): `VITE_COLOR_BACKGROUND`, `VITE_COLOR_FOREGROUND`,
+  `VITE_COLOR_CARD`, `VITE_COLOR_PRIMARY`, `VITE_COLOR_SECONDARY`, `VITE_COLOR_TERTIARY`,
+  `VITE_COLOR_ACCENT`, `VITE_COLOR_MUTED`, `VITE_COLOR_DESTRUCTIVE`, `VITE_COLOR_SUCCESS`,
+  `VITE_COLOR_WARNING`, `VITE_COLOR_BORDER`, `VITE_COLOR_RING`, `VITE_COLOR_SIDEBAR`,
+  `VITE_COLOR_SIDEBAR_ACCENT`, `VITE_COLOR_SIDEBAR_BORDER` (and their `*_FOREGROUND`
+  counterparts).
+- **Light palette**: repeat the same keys with the `VITE_COLOR_LIGHT_` prefix.
+- **Radius**: `VITE_RADIUS` (shared across both modes).
+- **Runtime mode switching**: Dark / Light / System can be switched at runtime in the
+  topbar or Settings (System follows live OS `prefers-color-scheme` changes). Editing hex
+  values in `.env` requires restarting `pnpm tauri dev` or re-running `pnpm tauri build`.
+- **Brand assets**: replace images in `public/brand/` (resolved through `src/lib/brand.ts`).
 
 ## Turning capabilities on
 
@@ -110,14 +130,11 @@ The two features ship off because both leave your machine:
 
 - **Web search** — Settings → Web search. A SearXNG instance you name, or any public
   one if you leave the field empty. The agent gets titles, urls and snippets; the page
-  itself is never opened by the search. The switch gives the agent the tool; the
-  composer's per-turn *web search* request stays disabled until the SearXNG round trip
-  is verified end to end (see below).
-
   itself is never opened by the search. A configured instance is used and nothing else:
   if it fails, the answer says so instead of quietly searching somewhere you did not
   name. See [your own instance](#your-own-instance) for the credentials field and the
-  loopback pattern.
+  loopback pattern. The composer's per-turn *web search* request stays disabled until the
+  SearXNG round trip is verified end to end (see below).
 
 - **Subagents** — Settings → Subagents. One master switch, then one switch per
   profile. With it off the agent has no delegation tools at all. Turn it on and
@@ -194,6 +211,26 @@ cd src-tauri && cargo clippy          # Rust lint
 
 The `tests/` files are the frontend's unit tests, run by Node's own runner; a screen still has to be
 looked at by hand in `pnpm run tauri dev`.
+
+### Frontend performance & optimization
+
+The webview is structured to keep cold startup and long transcripts responsive:
+
+- **Code-splitting (`defineAsyncComponent`)**: non-startup surfaces — `SettingsDialog`
+  and its heavy sub-sections (`McpSection`, `SubagentsSection`, `ProviderModelsEditor`,
+  `AccountsSection`, `ProviderForm`), `CommandPalette` (`⌘K`), `SubagentView`, and
+  `TerminalTool` (xterm.js) — are split into lazy chunks loaded only on first open.
+  Keep new heavy dialogs or tools behind `defineAsyncComponent` so `dist/assets/index-*.js`
+  stays well under Vite's 500 kB threshold (~298 kB / ~81 kB gzip).
+- **CSS containment & off-screen skipping**: settled turns in `TurnGroup.vue` use
+  `content-visibility: auto` with `contain-intrinsic-block-size: auto 12rem`, and the
+  right tools drawer (`ResizableAside.vue`) uses `contain: layout style` so pane reflows
+  do not force full-document layout passes.
+- **Compositor-friendly, reduced-motion-safe animations**: entry and disclosure
+  transitions animate only `opacity` and `translate` via `@starting-style` and
+  `transition-behavior: allow-discrete`, respecting `prefers-reduced-motion`.
+- **Lean dependencies**: stick to `@lucide/vue` (single icon package) and avoid adding
+  redundant UI libraries. Verify bundle impact with `pnpm run build`.
 
 ### Rust build cache and dev diagnostics
 

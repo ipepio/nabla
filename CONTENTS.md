@@ -9,7 +9,7 @@ an agent can load only what its task needs.
 | --- | --- | --- |
 | [docs/ai/preferences.md](docs/ai/preferences.md) | Confirmed maintainer preferences and adjustable defaults | Every session |
 | [docs/ai/architecture.md](docs/ai/architecture.md) | Process tree, module map, capability placement, accepted rules | Exploring or changing behavior |
-| [docs/ai/component-architecture.md](docs/ai/component-architecture.md) | Vue layer: component categories, state ownership, Vuetify use | UI, component or state changes |
+| [docs/ai/component-architecture.md](docs/ai/component-architecture.md) | Vue layer: component categories, state ownership, shadcn-vue & performance | UI, component or state changes |
 | [docs/ai/conventions.md](docs/ai/conventions.md) | TypeScript, serde boundary and Rust error conventions | Before writing code |
 | [docs/ai/verification.md](docs/ai/verification.md) | Exact commands, test-first expectations, known gaps | Before checking a change |
 | [docs/ai/workflow.md](docs/ai/workflow.md) | ODD sessions, spec-verbatim work, work-unit commits | Every task |
@@ -23,10 +23,10 @@ an agent can load only what its task needs.
 | Command seam | `src-tauri/src/commands.rs` | Working: 6 commands, string errors |
 | App store (SQLite) | `src-tauri/src/store.rs` | Working: workspaces + session index, 12 tests total with settings |
 | Human config | `src-tauri/src/settings.rs` | Working: `settings.json`, atomic write |
-| Runtime (pi child) | not created yet | Planned: [odd/tasks/pi-runtime.md](odd/tasks/pi-runtime.md), R1–R5 pending |
-| Webview | `src/` (Vue 3 + Vuetify 4) | Working: shell with workspaces and settings panels |
+| Runtime (pi child) | `src-tauri/src/` | Working: headless pi spawn, NDJSON RPC, event bridge, subagents & MCP |
+| Webview | `src/` (Vue 3 + shadcn-vue + Tailwind v4) | Working: sidebar, chat transcript, command palette (`⌘K`), settings dialog, resizable tools drawer |
 | IPC contracts | `src/contracts/` | Working: typed wrappers and DTO mirrors |
-| Frontend tests | none | Gap: no runner installed (see verification) |
+| Frontend tests | `tests/` (`node --test tests/`) | Working: pure modules and composables via Node's built-in test runner |
 | Product definition | `.docs/` | Local, Spanish, gitignored; not part of the repository |
 
 ## Where future capabilities land
