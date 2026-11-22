@@ -91,8 +91,11 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'Nabla ${{ github.ref_name }}'
           releaseBody: >-
-            Standalone Windows installer (.exe, NSIS) and Linux package (.deb)
-            with embedded Node 22 and pi runtime — no external pi installation required.
+            Standalone installers with embedded Node 22 and the pi runtime —
+            no external pi installation required. Assets: macOS Apple silicon
+            (.dmg, unsigned: right-click → Open the first time) built locally
+            on the tag, plus Windows (.exe, NSIS) and Linux (.deb, amd64) built
+            by this tag's workflow.
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
