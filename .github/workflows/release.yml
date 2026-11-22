@@ -1,0 +1,90 @@
+name: Release
+
+# Desktop bundles for the two non-macOS targets: an NSIS installer (.exe) for
+# Windows and a .deb for Linux. Triggered by pushing a tag `v*`, so publishing
+# stays an explicit human decision — a normal push to main never releases.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bundle:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: '--bundles nsis'
+          - platform: ubuntu-22.04
+            args: '--bundles deb'
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # package.json pins `packageManager: pnpm@12.18.0`; corepack is the only
+      # source of that version, exactly as in ci.yml.
+      - name: Enable corepack
+        run: corepack enable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Tauri on Linux builds against the webkit/gtk stack; the rest are helpers
+      # the .deb bundler and tauri icon tooling invoke.
+      - name: Linux system packages
+        if: matrix.platform == 'ubuntu-22.04'
+        run: >
+          sudo apt-get update &&
+          sudo apt-get install -y
+          libwebkit2gtk-4.1-dev
+          libgtk-3-dev
+          libayatana-appindicator3-dev
+          librsvg2-dev
+          librsvg2-bin
+          libfuse2
+          file
+          patchelf
+          python3-pip
+          dpkg
+
+      - name: Install Tauri CLI
+        run: pnpm dlx @tauri-apps/cli --version || true
+
+      - uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Build the app and attach the bundles to the tag's GitHub release. A
+      # third-party action is justified here: it is the documented bundling path
+      # for the platform matrix and only wraps `tauri build --bundles`.
+      - name: Tauri bundle
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Nabla ${{ github.ref_name }}'
+          releaseBody: >-
+            Windows installer (.exe, NSIS) and Linux package (.deb).
+            Requires pi on PATH.
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
