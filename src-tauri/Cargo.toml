@@ -41,31 +41,22 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 # interactive sessions need a real pseudo-terminal. wezterm's `portable-pty`
 # exposes one API over Unix ptys and Windows ConPTY; `run` stays on plain pipes.
 portable-pty = "0.9"
+# `webview-control.md` T1: the MCP server the agent connects to in order to drive
+# the embedded webview. `axum` is the HTTP binding (MCP streamable HTTP is POST +
+# JSON over HTTP/1.1) and `tokio` the listener it serves on.
+axum = "0.8"
+tokio = { version = "1", features = ["rt", "net"] }
+# 32 bytes of real entropy for the per-run bearer token that guards that endpoint.
+getrandom = "0.3"
+# S6 of `web-search.md`: the `Authorization: Basic` header of a configured SearXNG
+# instance is base64 of `user:password`.
+base64 = "0.23"
 
 # S5 (cross-platform kill): std exposes `Command::process_group` but no way to
 # signal a process group, so reaping pi's descendants on Unix needs killpg/kill.
 # `libc` is already in the dependency tree (tauri + rusqlite) and stays Unix-only.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-# `webview-control.md` T1: the MCP server the agent connects to in order to drive
-# the embedded webview. `axum` is the HTTP binding (MCP streamable HTTP is POST +
-# JSON over HTTP/1.1) and `tokio` the listener it serves on. Justified rather than
-# hand-rolled: this endpoint executes JavaScript in a webview that carries the
-# human's cookies, so the HTTP parser in front of it must not be home-made.
-# Both are already in the tree through tauri, so this adds a version pin, not a
-# new dependency graph.
-axum = "0.8"
-tokio = { version = "1", features = ["rt", "net"] }
-# 32 bytes of real entropy for the per-run bearer token that guards that endpoint.
-# Also already in the tree (through rusqlite and tauri).
-getrandom = "0.3"
-# S6 of `web-search.md`: the `Authorization: Basic` header of a configured SearXNG
-# instance is base64 of `user:password`, and hand-rolling an encoder to avoid this
-# line would be the kind of code that gets the padding wrong in a corner nobody
-# tests. Already in the tree through hyper/reqwest (below), so this pins an existing
-# dependency graph rather than adding one.
-base64 = "0.23"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
