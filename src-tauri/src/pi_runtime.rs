@@ -5,9 +5,12 @@
 //! 1. If `settings.pi_binary` is a custom path (anything other than `"pi"` or empty),
 //!    honor that override verbatim.
 //! 2. Otherwise, check the embedded runtime bundled into standalone installers:
-//!    `<exe_dir>/nabla-node(.exe)` together with
+//!    `<resource_dir>/pi-runtime/bin/node(.exe)` (preferred — keeping Node under
+//!    `Resources/` instead of macOS `Contents/MacOS/` prevents LaunchServices
+//!    from spawning a duplicate `exec` Dock icon for every pi session) or the
+//!    legacy sidecar `<exe_dir>/nabla-node(.exe)`, together with
 //!    `<resource_dir>/pi-runtime/node_modules/@earendil-works/pi-coding-agent/dist/cli.js`.
-//!    When both exist, Nabla invokes `<nabla-node> <cli.js> ...` with `NODE_PATH`
+//!    When both exist, Nabla invokes `<node> <cli.js> ...` with `NODE_PATH`
 //!    pointing at `<resource_dir>/pi-runtime/node_modules` so extensions like
 //!    `nabla-subagents.ts` resolve `@earendil-works/pi-coding-agent` and `typebox`
 //!    with zero external Node or `pi` installation on the user's machine.
@@ -44,6 +47,14 @@ const PI_CLI_REL: &[&str] = &[
 
 const PI_NODE_MODULES_REL: &[&str] = &["pi-runtime", "node_modules"];
 
+fn bundled_node_name() -> &'static str {
+    if cfg!(windows) {
+        "node.exe"
+    } else {
+        "node"
+    }
+}
+
 fn sidecar_node_name() -> &'static str {
     if cfg!(windows) {
         "nabla-node.exe"
@@ -75,32 +86,42 @@ pub fn resolve_pi_with_paths(
         };
     }
 
+    let mut candidate_roots: Vec<PathBuf> = Vec::new();
+    if let Some(res) = resource_dir {
+        candidate_roots.push(res.join("resources"));
+        candidate_roots.push(res.to_path_buf());
+    }
     if let Some(exe) = exe_dir {
-        let node_bin = exe.join(sidecar_node_name());
-        if node_bin.is_file() {
-            let mut candidate_roots: Vec<PathBuf> = Vec::new();
-            if let Some(res) = resource_dir {
-                candidate_roots.push(res.join("resources"));
-                candidate_roots.push(res.to_path_buf());
-            }
-            candidate_roots.push(exe.join("resources"));
-            candidate_roots.push(exe.to_path_buf());
-            if let Some(parent) = exe.parent() {
-                candidate_roots.push(parent.join("Resources").join("resources"));
-                candidate_roots.push(parent.join("Resources"));
-            }
+        candidate_roots.push(exe.join("resources"));
+        candidate_roots.push(exe.to_path_buf());
+        if let Some(parent) = exe.parent() {
+            candidate_roots.push(parent.join("Resources").join("resources"));
+            candidate_roots.push(parent.join("Resources"));
+        }
+    }
 
-            for root in candidate_roots {
-                let cli_js = join_parts(&root, PI_CLI_REL);
-                if cli_js.is_file() {
-                    let node_modules = join_parts(&root, PI_NODE_MODULES_REL);
-                    return ResolvedPi {
-                        program: node_bin,
-                        prefix_args: vec![cli_js.to_string_lossy().to_string()],
-                        node_path: node_modules.is_dir().then_some(node_modules),
-                    };
-                }
-            }
+    let legacy_sidecar = exe_dir
+        .map(|exe| exe.join(sidecar_node_name()))
+        .filter(|p| p.is_file());
+
+    for root in candidate_roots {
+        let cli_js = join_parts(&root, PI_CLI_REL);
+        if !cli_js.is_file() {
+            continue;
+        }
+        let resource_node = root.join("pi-runtime").join("bin").join(bundled_node_name());
+        let node_bin = if resource_node.is_file() {
+            Some(resource_node)
+        } else {
+            legacy_sidecar.clone()
+        };
+        if let Some(program) = node_bin {
+            let node_modules = join_parts(&root, PI_NODE_MODULES_REL);
+            return ResolvedPi {
+                program,
+                prefix_args: vec![cli_js.to_string_lossy().to_string()],
+                node_path: node_modules.is_dir().then_some(node_modules),
+            };
         }
     }
 
@@ -142,6 +163,41 @@ mod tests {
         assert_eq!(resolved.program, PathBuf::from("/custom/bin/pi"));
         assert!(resolved.prefix_args.is_empty());
         assert!(resolved.node_path.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bundled_resource_node_preferred_over_legacy_sidecar() {
+        let dir = temp_dir("resource_node");
+        let exe_dir = dir.join("exe");
+        let res_dir = dir.join("res");
+        fs::create_dir_all(&exe_dir).unwrap();
+        let legacy_node = exe_dir.join(sidecar_node_name());
+        fs::write(&legacy_node, b"legacy").unwrap();
+
+        let resource_node = res_dir
+            .join("resources")
+            .join("pi-runtime")
+            .join("bin")
+            .join(bundled_node_name());
+        fs::create_dir_all(resource_node.parent().unwrap()).unwrap();
+        fs::write(&resource_node, b"resource-node").unwrap();
+
+        let cli_js = join_parts(&res_dir.join("resources"), PI_CLI_REL);
+        fs::create_dir_all(cli_js.parent().unwrap()).unwrap();
+        fs::write(&cli_js, b"// stub cli").unwrap();
+
+        let resolved = resolve_pi_with_paths("pi", Some(&exe_dir), Some(&res_dir));
+        assert_eq!(resolved.program, resource_node);
+        assert_eq!(
+            resolved.prefix_args,
+            vec![cli_js.to_string_lossy().to_string()]
+        );
+        assert_eq!(
+            resolved.node_path,
+            Some(join_parts(&res_dir.join("resources"), PI_NODE_MODULES_REL))
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 

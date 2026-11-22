@@ -5,7 +5,9 @@
  * without requiring the user to install Node.js or `pi` manually.
  *
  * Outputs (all gitignored):
- *   - `src-tauri/binaries/nabla-node-<target-triple>{.exe}` (Tauri externalBin)
+ *   - `src-tauri/resources/pi-runtime/bin/node{.exe}` (portable Node 22 binary;
+ *     kept under `resources/` rather than macOS `Contents/MacOS/` so
+ *     LaunchServices does not show a duplicate `exec` Dock icon per session)
  *   - `src-tauri/resources/pi-runtime/node_modules/@earendil-works/pi-coding-agent/`
  */
 import { execFileSync, spawnSync } from "node:child_process";
@@ -26,8 +28,8 @@ const NODE_VERSION = process.env.NABLA_NODE_VERSION || "22.23.1";
 const PI_PKG_VERSION = process.env.NABLA_PI_VERSION || "latest";
 
 const ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
-const BINARIES_DIR = join(ROOT, "src-tauri", "binaries");
 const RUNTIME_DIR = join(ROOT, "src-tauri", "resources", "pi-runtime");
+const RUNTIME_BIN_DIR = join(RUNTIME_DIR, "bin");
 
 function hostTargetTriple() {
   const { platform, arch } = process;
@@ -110,8 +112,8 @@ async function downloadFile(url, dest) {
 
 async function prepareNodeBinary(triple) {
   const dist = nodeDistForTriple(triple);
-  mkdirSync(BINARIES_DIR, { recursive: true });
-  const targetPath = join(BINARIES_DIR, `nabla-node-${triple}${dist.ext}`);
+  mkdirSync(RUNTIME_BIN_DIR, { recursive: true });
+  const targetPath = join(RUNTIME_BIN_DIR, `node${dist.ext}`);
 
   if (existsSync(targetPath) && triple === hostTargetTriple()) {
     const ver = spawnSync(targetPath, ["--version"], { encoding: "utf8" });
