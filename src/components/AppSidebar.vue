@@ -53,6 +53,7 @@ import { t } from "@/lib/i18n";
 import { sessionRefresh } from "@/lib/session-refresh";
 import {
   activeSession,
+  activeSessionTitle,
   busyIds,
   liveIds,
   newSession,
@@ -74,6 +75,8 @@ import {
   listSessions,
   listWorkspaces,
   removeWorkspace,
+  renameSession,
+  renameWorkspace,
   setWorkspacePinned,
   stopSession,
   touchWorkspace,
@@ -179,6 +182,8 @@ defineExpose({ openSettings, handleNewSession });
 // S6 (next unit): the ⋯ menu's edit item opens this read-only placeholder.
 const editOpen = ref(false);
 const editingWorkspace = ref<WorkspaceInfo | null>(null);
+const editWorkspaceName = ref("");
+const savingWorkspaceRename = ref(false);
 
 /**
  * `add_workspace` rejects with a plain Display string. The one rejection worth
@@ -548,6 +553,24 @@ async function handleDeleteSession(
   }
 }
 
+async function handleRenameSession(
+  workspace: WorkspaceInfo,
+  payload: { session: SessionSummary; title: string },
+) {
+  setSessionActionError(workspace.id, null);
+  const trimmed = payload.title.trim();
+  if (trimmed === "") return;
+  try {
+    await renameSession(payload.session.id, trimmed);
+    if (activeSession.value?.sessionId === String(payload.session.id)) {
+      activeSessionTitle.value = trimmed;
+    }
+    await loadSessions(workspace.id);
+  } catch (cause) {
+    setSessionActionError(workspace.id, commandErrorMessage(cause));
+  }
+}
+
 /**
  * H4 of `odd/tasks/subagent-helpers.md`: a child row opens the read-only view of
  * that child — never a conversation, and never through `selectSession` for the
@@ -643,7 +666,25 @@ async function handleRemoveWorkspace(workspace: WorkspaceInfo) {
  */
 function openEditDialog(workspace: WorkspaceInfo) {
   editingWorkspace.value = workspace;
+  editWorkspaceName.value = workspace.name;
   editOpen.value = true;
+}
+
+async function handleSaveWorkspaceRename() {
+  const ws = editingWorkspace.value;
+  const next = editWorkspaceName.value.trim();
+  if (!ws || next === "" || savingWorkspaceRename.value) return;
+  savingWorkspaceRename.value = true;
+  workspaceError.value = null;
+  try {
+    await renameWorkspace(ws.id, next);
+    await refreshWorkspaces();
+    editOpen.value = false;
+  } catch (cause) {
+    workspaceError.value = commandErrorMessage(cause);
+  } finally {
+    savingWorkspaceRename.value = false;
+  }
 }
 
 onMounted(() => {
@@ -882,6 +923,7 @@ onUnmounted(() => {
               :action-error="sessionActionErrorFor(workspace.id)"
               @select="handleOpenSession(workspace, $event)"
               @pause="handlePauseSession(workspace, $event)"
+              @rename="handleRenameSession(workspace, $event)"
               @delete="handleDeleteSession(workspace, $event)"
               @open-subagent="handleOpenSubagent(workspace, $event)"
             />
@@ -916,31 +958,39 @@ onUnmounted(() => {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>{{ t("workspace.edit") }}</DialogTitle>
-            <DialogDescription>
-              {{ t("workspace.editDescription") }}
+            <DialogDescription class="break-all font-mono text-xs">
+              {{ editingWorkspace?.path }}
             </DialogDescription>
           </DialogHeader>
 
-          <div class="grid gap-3">
-            <div class="grid gap-1">
-              <span class="text-sm font-medium">{{ t("common.name") }}</span>
-              <p class="text-sm break-words text-muted-foreground">
-                {{ editingWorkspace?.name }}
-              </p>
+          <form class="grid gap-3" @submit.prevent="handleSaveWorkspaceRename">
+            <div class="grid gap-1.5">
+              <label class="text-xs font-medium" for="workspace-rename-input">
+                {{ t("common.name") }}
+              </label>
+              <Input
+                id="workspace-rename-input"
+                v-model="editWorkspaceName"
+                type="text"
+                autocomplete="off"
+                class="h-9 text-sm"
+              />
             </div>
-            <div class="grid gap-1">
-              <span class="text-sm font-medium">{{ t("common.path") }}</span>
-              <p class="text-sm break-all text-muted-foreground">
-                {{ editingWorkspace?.path }}
-              </p>
-            </div>
-          </div>
 
-          <DialogFooter>
-            <DialogClose as-child>
-              <Button variant="outline">{{ t("common.close") }}</Button>
-            </DialogClose>
-          </DialogFooter>
+            <DialogFooter>
+              <DialogClose as-child>
+                <Button type="button" variant="outline">
+                  {{ t("common.cancel") }}
+                </Button>
+              </DialogClose>
+              <Button
+                type="submit"
+                :disabled="!editWorkspaceName.trim() || savingWorkspaceRename"
+              >
+                {{ t("workspace.rename.save") }}
+              </Button>
+            </DialogFooter>
+          </form>
         </DialogContent>
       </Dialog>
     </SidebarFooter>

@@ -12,19 +12,22 @@
 // no composer, no queue, no picker and no prompt path here, and the store behind it
 // imports neither `openSession` nor `sendPrompt`: a child cannot be spawned or
 // messaged from this view.
-import { computed, nextTick, onUnmounted, ref, watch } from "vue";
-import { ArrowLeftIcon } from "@lucide/vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { ArrowLeftIcon, ClockIcon, SquareIcon, WrenchIcon } from "@lucide/vue";
 import OlderTurnsControl from "@/components/chat/OlderTurnsControl.vue";
 import TurnGroup from "@/components/chat/TurnGroup.vue";
 import { createTranscriptFollow } from "@/components/chat/transcript-follow";
 import { deriveTurnGroups } from "@/components/chat/turn-groups";
 import { useTurnWindow } from "@/components/chat/turn-window";
+import { formatElapsed } from "@/components/chat/session-metrics";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { cancelSubagent, commandErrorMessage } from "@/contracts/commands";
 import { t } from "@/lib/i18n";
 import { CONVERSATION_TRANSCRIPT_MAX_WIDTH } from "@/lib/layout";
 import { showReasoning } from "@/lib/preferences";
 import {
+  isSubagentActive,
   openSubagent,
   openSubagentId,
   openSubagentStatus,
@@ -56,6 +59,61 @@ const runName = computed(() => {
 
 const statusLabel = computed(() => subagentStatusLabel(openSubagentStatus.value));
 const dotClass = computed(() => subagentStatusDot(openSubagentStatus.value));
+const active = computed(() => isSubagentActive(openSubagentStatus.value));
+
+const cancelling = ref(false);
+const cancelError = ref<string | null>(null);
+
+async function handleCancelSubagent(): Promise<void> {
+  const target = child.value;
+  if (!target || !active.value || cancelling.value) return;
+  cancelling.value = true;
+  cancelError.value = null;
+  try {
+    await cancelSubagent(target.sessionPath);
+  } catch (cause) {
+    cancelError.value = commandErrorMessage(cause);
+  } finally {
+    cancelling.value = false;
+  }
+}
+
+// Live activity ticker for running subagents
+const nowMs = ref(Date.now());
+let activityTicker: number | null = null;
+onMounted(() => {
+  activityTicker = window.setInterval(() => {
+    if (active.value) nowMs.value = Date.now();
+  }, 1000);
+});
+
+const elapsedLabel = computed<string | null>(() => {
+  const c = child.value;
+  if (!c?.startedAt) return null;
+  const start = new Date(c.startedAt).getTime();
+  if (Number.isNaN(start)) return null;
+  const end = c.endedAt ? new Date(c.endedAt).getTime() : nowMs.value;
+  const secs = Math.max(0, Math.floor((end - start) / 1000));
+  return formatElapsed(secs);
+});
+
+const toolStepCount = computed(
+  () => subagentTranscript.value.filter((m) => m.role === "tool").length,
+);
+
+const messageCount = computed(
+  () => subagentTranscript.value.filter((m) => m.role !== "tool").length,
+);
+
+const lastToolName = computed<string | null>(() => {
+  for (let i = subagentTranscript.value.length - 1; i >= 0; i -= 1) {
+    const msg = subagentTranscript.value[i];
+    if (msg.role === "tool" && msg.text.trim() !== "") {
+      return msg.text.trim().split(/\s+/)[0].slice(0, 32);
+    }
+  }
+  return null;
+});
 
 /**
  * The child's transcript, grouped exactly as a conversation is (S3). No chips and
@@ -133,7 +191,13 @@ function handleShowOlderTurns(): void {
 }
 
 // Nothing of the view outlives it: a pending frame would write into a gone element.
-onUnmounted(() => follow.detach());
+onUnmounted(() => {
+  follow.detach();
+  if (activityTicker !== null) {
+    window.clearInterval(activityTicker);
+    activityTicker = null;
+  }
+});
 
 /** The transcript of the child on screen; only a first read can be "loading". */
 const showsLoading = computed(
@@ -184,6 +248,21 @@ const isUntouched = computed(
         </span>
       </div>
 
+      <!-- Individual cancel button for a running/queued child (never stops parent). -->
+      <Button
+        v-if="active"
+        variant="outline"
+        size="xs"
+        class="h-7 shrink-0 gap-1 border-destructive/40 px-2 text-[11px] text-destructive hover:bg-destructive/10"
+        :disabled="cancelling"
+        @click="handleCancelSubagent"
+      >
+        <SquareIcon class="size-3 fill-current" />
+        <span>
+          {{ cancelling ? t("chat.subagent.cancelling") : t("chat.subagent.cancel") }}
+        </span>
+      </Button>
+
       <!-- The one thing this view must never be mistaken for: a chat. -->
       <span
         class="shrink-0 rounded-full border border-border px-2 py-0.5 text-[10px] text-muted-foreground"
@@ -191,6 +270,33 @@ const isUntouched = computed(
         {{ t("chat.subagent.readOnly") }}
       </span>
     </header>
+
+    <!-- Live activity summary strip -->
+    <div
+      class="flex shrink-0 flex-wrap items-center gap-3 border-b border-border bg-secondary/30 px-4 py-1.5 text-[11px] text-muted-foreground"
+    >
+      <span v-if="elapsedLabel" class="inline-flex items-center gap-1 font-mono tabular-nums">
+        <ClockIcon class="size-3 text-primary" aria-hidden="true" />
+        {{ elapsedLabel }}
+      </span>
+      <span class="inline-flex items-center gap-1 tabular-nums">
+        <WrenchIcon class="size-3" aria-hidden="true" />
+        {{ t("chat.subagent.activity.steps", { count: toolStepCount }) }}
+      </span>
+      <span class="tabular-nums">
+        {{ t("chat.subagent.activity.messages", { count: messageCount }) }}
+      </span>
+      <span v-if="lastToolName" class="ms-auto truncate font-mono text-[10px]">
+        {{ t("chat.subagent.activity.lastTool", { tool: lastToolName }) }}
+      </span>
+    </div>
+
+    <div
+      v-if="cancelError"
+      class="shrink-0 border-b border-destructive/30 bg-destructive/10 px-4 py-1.5 text-xs text-destructive"
+    >
+      {{ cancelError }}
+    </div>
 
     <div
       ref="scroller"

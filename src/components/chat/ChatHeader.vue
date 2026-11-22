@@ -7,7 +7,7 @@
 // The header carries no theme state of its own: `isDark` is the resolved mode
 // the panel owns, and `toggleTheme` asks the panel for the next one (S4: the
 // theme is applied by `src/lib/theme.ts` only).
-import { PanelRightOpenIcon, SearchIcon } from "@lucide/vue";
+import { CheckIcon, FileDownIcon, PanelRightOpenIcon, SearchIcon } from "@lucide/vue";
 import ThemeToggle from "@/components/chat/ThemeToggle.vue";
 import { Button } from "@/components/ui/button";
 import { t } from "@/lib/i18n";
@@ -24,6 +24,14 @@ defineProps<{
   sessionTitle?: string | null;
   /** Whether the agent is currently running a turn. */
   working?: boolean;
+  /** Live elapsed duration (`MM:SS`) while the agent is working. */
+  elapsed?: string | null;
+  /** Compact context usage label (`~4.2k / 128k`) when known. */
+  contextLabel?: string | null;
+  /** Highlights the context pill when usage exceeds 75%. */
+  contextHigh?: boolean;
+  /** Brief feedback state after copying the conversation as Markdown. */
+  exported?: boolean;
   /** Right tools drawer visibility, so the control reflects the real state. */
   toolsOpen: boolean;
   /** Is the app currently on the dark palette? Decides the icon and the label. */
@@ -34,6 +42,7 @@ const emit = defineEmits<{
   (e: "toggleTools"): void;
   (e: "toggleTheme"): void;
   (e: "openSearch"): void;
+  (e: "exportMarkdown"): void;
 }>();
 </script>
 
@@ -73,6 +82,18 @@ const emit = defineEmits<{
       </kbd>
     </button>
 
+    <span
+      v-if="contextLabel"
+      class="inline-flex shrink-0 rounded-md border px-2 py-0.5 font-mono text-[10px] tabular-nums"
+      :class="
+        contextHigh
+          ? 'border-warning/40 bg-warning/10 text-warning'
+          : 'border-border bg-card text-muted-foreground'
+      "
+    >
+      {{ contextLabel }}
+    </span>
+
     <div
       v-if="working"
       class="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-primary/25 bg-primary/10 px-2.5 py-1 text-[10px] font-semibold text-primary"
@@ -83,7 +104,22 @@ const emit = defineEmits<{
         aria-hidden="true"
       />
       <span>{{ t("session.working") }}</span>
+      <span v-if="elapsed" class="font-mono tabular-nums opacity-80">
+        {{ elapsed }}
+      </span>
     </div>
+
+    <Button
+      variant="ghost"
+      size="icon-sm"
+      class="text-muted-foreground hover:bg-accent hover:text-foreground"
+      :aria-label="exported ? t('chat.exportMarkdownCopied') : t('chat.exportMarkdown')"
+      :title="exported ? t('chat.exportMarkdownCopied') : t('chat.exportMarkdown')"
+      @click="emit('exportMarkdown')"
+    >
+      <CheckIcon v-if="exported" class="text-primary" />
+      <FileDownIcon v-else />
+    </Button>
 
     <!-- Tools drawer toggle: collapsed by default and reachable from here and
          from the empty state. Hidden while the drawer is open, because the

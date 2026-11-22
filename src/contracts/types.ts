@@ -184,6 +184,13 @@ export interface SessionSummary {
 }
 
 /** User-editable preferences persisted in settings.json. */
+export interface NotificationPreferences {
+  enabled: boolean;
+  onTurnFinish: boolean;
+  onQuestion: boolean;
+  onSubagentFinish: boolean;
+}
+
 export interface AppSettings {
   theme: string;
   piBinary: string;
@@ -260,6 +267,8 @@ export interface AppSettings {
    * as every other preference — unencrypted, no extra trust assumption.
    */
   webSearchCredentials: string;
+  /** Configurable OS notifications (opt-in, per-event triggers). */
+  notifications?: NotificationPreferences;
 }
 
 /**
@@ -857,4 +866,34 @@ export interface McpEndpoint {
   url: string;
   /** The bearer token every request to that endpoint must carry. */
   token: string;
+}
+
+/** One FTS5 full-text hit across indexed session transcripts (`store.rs`). */
+export interface SessionSearchHit {
+  sessionId: number;
+  workspaceId: number;
+  workspaceName: string;
+  sessionTitle: string | null;
+  snippet: string;
+}
+
+/** One local `.md` prompt skill discovered from global or workspace `skills/`. */
+export interface SkillEntry {
+  id: string;
+  name: string;
+  description: string;
+  prompt: string;
+  source: "global" | "workspace";
+}
+
+/** One persistent agent memory record stored in `<data_dir>/memory.db`. */
+export interface MemoryEntry {
+  id: number;
+  scope: string;
+  kind: "preference" | "fact" | "decision" | "project" | "note" | string;
+  title: string;
+  content: string;
+  tags: string;
+  createdAt: number;
+  updatedAt: number;
 }

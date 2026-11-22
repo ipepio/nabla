@@ -52,11 +52,12 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Textarea } from "@/components/ui/textarea";
 import { t } from "@/lib/i18n";
-import { COMPOSER_MAX_WIDTH, COMPOSER_MIN_WIDTH } from "@/lib/layout";
-import type { FsEntry, ProviderModels, SessionCommand } from "@/contracts/types";
+import { COMPOSER_MAX_WIDTH } from "@/lib/layout";
+import type { FsEntry, ProviderModels, SessionCommand, SkillEntry } from "@/contracts/types";
 import {
   debugLog,
   fsListDir,
+  listSkills,
   listWorkspaces,
   sessionCommands,
   workspaceCommands,
@@ -492,7 +493,7 @@ async function refreshCompletion(text: string, caret: number): Promise<void> {
   const request = ++completionRequest;
   const rows =
     found.kind === "command"
-      ? filterCommands(await commandsFor(workspace), found.query)
+      ? await commandSuggestions(workspace, found.query)
       : await pathSuggestions(workspace, found.query);
   // A newer keystroke already asked for its own list.
   if (request !== completionRequest) return;
@@ -578,14 +579,40 @@ function sourceBadge(source: string): string {
  * very long skill list stays one glance, and never truncated silently: the human
  * narrows with two more characters, which is faster than scrolling.
  */
+async function commandSuggestions(
+  workspaceId: number,
+  query: string,
+): Promise<SuggestionItem[]> {
+  const [commands, skills] = await Promise.all([
+    commandsFor(workspaceId),
+    listSkills(workspaceId).catch(() => [] as SkillEntry[]),
+  ]);
+  return filterCommands(commands, skills, query);
+}
+
 function filterCommands(
   commands: SessionCommand[],
+  skills: SkillEntry[],
   query: string,
 ): SuggestionItem[] {
   const needle = query.trim().toLowerCase();
   const limit = 30;
   const rows: SuggestionItem[] = [];
+  const seen = new Set<string>();
+  for (const skill of skills) {
+    if (!skill.name.toLowerCase().startsWith(needle)) continue;
+    seen.add(skill.name.toLowerCase());
+    rows.push({
+      key: `skill:${skill.id}`,
+      label: `/${skill.name}`,
+      hint: skill.description,
+      badge: sourceBadge("skill"),
+      insert: `${skill.prompt}\n`,
+    });
+    if (rows.length === limit) return rows;
+  }
   for (const command of commands) {
+    if (seen.has(command.name.toLowerCase())) continue;
     if (!command.name.toLowerCase().startsWith(needle)) continue;
     rows.push({
       key: command.name,
@@ -908,7 +935,7 @@ watch(() => props.workspaceId, prewarmCommands);
   <div
     ref="card"
     class="relative mx-auto w-full min-w-0 rounded-xl border border-border bg-card shadow-sm transition-colors focus-within:border-primary/45"
-    :style="{ maxWidth: `${maxWidth}px`, minWidth: `${COMPOSER_MIN_WIDTH}px` }"
+    :style="{ maxWidth: `${maxWidth}px` }"
   >
     <!-- S3/S4: the commands of this session, or the entries of the workspace
          directory the `@` mention is typing in. -->
@@ -1056,7 +1083,7 @@ watch(() => props.workspaceId, prewarmCommands);
       @paste="handlePaste"
     />
 
-    <div class="flex min-w-0 items-center gap-1 px-2 pb-2">
+    <div class="flex min-w-0 flex-wrap items-center gap-x-1 gap-y-1.5 px-2 pb-2">
       <!-- S1/S2/S3: attaching (an image or a PDF) and the per-turn tool
            requests. The attachment rows come first and the tool requests under
            their own label; a request that cannot be offered keeps its row,
@@ -1127,7 +1154,7 @@ watch(() => props.workspaceId, prewarmCommands);
         {{ t("chat.composer.queued", { count: queuedCount }) }}
       </span>
 
-      <div class="ms-auto flex min-w-0 shrink items-center gap-1.5">
+      <div class="ms-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-1">
         <!-- Permission mode: what the agent is allowed to do right now, next to
              the controls that shape the turn it will run in. It belongs with the
              composer — the row where the human decides what happens next — not
@@ -1148,7 +1175,7 @@ watch(() => props.workspaceId, prewarmCommands);
             <Button
               variant="ghost"
               size="sm"
-              class="h-8 max-w-[220px] min-w-0 gap-1 border-0 bg-transparent px-2 text-xs font-normal shadow-none hover:bg-muted aria-expanded:bg-muted sm:max-w-[280px] dark:bg-transparent dark:hover:bg-muted"
+              class="h-8 max-w-[165px] min-w-0 gap-1 border-0 bg-transparent px-2 text-xs font-normal shadow-none hover:bg-muted aria-expanded:bg-muted sm:max-w-[240px] dark:bg-transparent dark:hover:bg-muted"
               :disabled="modelDisabled || providerOptions.length === 0"
               :aria-label="t('chat.composer.model')"
               :title="triggerLabel"

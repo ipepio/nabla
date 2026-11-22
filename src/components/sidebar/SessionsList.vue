@@ -24,9 +24,12 @@ import {
   MessageSquareIcon,
   MoreHorizontalIcon,
   PauseIcon,
+  PencilIcon,
+  SquareIcon,
   Trash2Icon,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Dialog,
   DialogClose,
@@ -49,10 +52,12 @@ import {
 } from "@/components/ui/sidebar";
 import { t } from "@/lib/i18n";
 import {
+  isSubagentActive,
   subagentChildrenOf,
   subagentStatusDot,
   subagentStatusLabel,
 } from "@/lib/subagent-store";
+import { cancelSubagent } from "@/contracts/commands";
 import type { SessionSummary, SubagentSession } from "@/contracts/types";
 
 /** One child row of the list, with the chat that delegated to it (H4). */
@@ -83,6 +88,8 @@ const emit = defineEmits<{
   (e: "select", session: SessionSummary): void;
   /** Stop the agent but keep the row, its transcript and its index entry. */
   (e: "pause", session: SessionSummary): void;
+  /** Rename the session's title in the index. */
+  (e: "rename", payload: { session: SessionSummary; title: string }): void;
   /** Remove the session from the app; the parent archives and deletes it. */
   (e: "delete", session: SessionSummary): void;
   /** Show the read-only view of a child this chat delegated to (H4). */
@@ -92,6 +99,24 @@ const emit = defineEmits<{
 /** The session the confirmation dialog is about, `null` when it is closed. */
 const pendingDelete = ref<SessionSummary | null>(null);
 const deleteOpen = ref(false);
+const pendingRename = ref<SessionSummary | null>(null);
+const renameDraft = ref("");
+const renameOpen = ref(false);
+
+function requestRename(session: SessionSummary) {
+  pendingRename.value = session;
+  renameDraft.value = session.title ?? "";
+  renameOpen.value = true;
+}
+
+function confirmRename() {
+  const session = pendingRename.value;
+  const title = renameDraft.value.trim();
+  renameOpen.value = false;
+  pendingRename.value = null;
+  if (session === null || title === "") return;
+  emit("rename", { session, title });
+}
 
 /**
  * How often the relative ages are recomputed. The list itself is refetched by
@@ -120,6 +145,10 @@ function childrenOf(session: SessionSummary): SubagentSession[] {
 /** What a child row is called: the agent definition it runs. */
 function childLabel(child: SubagentSession): string {
   return child.agent.trim() !== "" ? child.agent : child.name;
+}
+
+function handleCancelChild(child: SubagentSession): void {
+  void cancelSubagent(child.sessionPath).catch(() => {});
 }
 
 /** The contract has no title yet, so the fallback is the neutral "Session". */
@@ -263,6 +292,10 @@ onUnmounted(() => {
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" class="w-44">
+            <DropdownMenuItem @select="requestRename(session)">
+              <PencilIcon />
+              {{ t("session.rename") }}
+            </DropdownMenuItem>
             <!-- Pause keeps the row, its transcript and its index entry: it only
                  stops the process, so it is offered only when one is live. -->
             <DropdownMenuItem
@@ -289,7 +322,11 @@ onUnmounted(() => {
         class="mt-1 mb-1.5 ml-4 flex flex-col gap-0.5 border-l border-border pl-2.5"
         :aria-label="t('chat.subagent.list')"
       >
-        <li v-for="child in childrenOf(session)" :key="child.sessionId">
+        <li
+          v-for="child in childrenOf(session)"
+          :key="child.sessionId"
+          class="group/subagent-row relative"
+        >
           <SidebarMenuSubButton
             as="button"
             type="button"
@@ -323,12 +360,27 @@ onUnmounted(() => {
               </span>
             </span>
             <span
-              class="size-2 shrink-0 rounded-full"
-              :class="subagentStatusDot(child.status)"
+              class="size-2 shrink-0 rounded-full transition-opacity"
+              :class="[
+                subagentStatusDot(child.status),
+                isSubagentActive(child.status)
+                  ? 'group-hover/subagent-row:opacity-0'
+                  : '',
+              ]"
               :title="subagentStatusLabel(child.status)"
               aria-hidden="true"
             />
           </SidebarMenuSubButton>
+          <button
+            v-if="isSubagentActive(child.status)"
+            type="button"
+            class="absolute top-1/2 right-1.5 flex size-6 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:bg-destructive/15 hover:text-destructive group-hover/subagent-row:opacity-100 focus-visible:opacity-100"
+            :aria-label="t('chat.subagent.cancel')"
+            :title="t('chat.subagent.cancel')"
+            @click.stop="handleCancelChild(child)"
+          >
+            <SquareIcon class="size-3 fill-current" />
+          </button>
         </li>
       </ul>
     </SidebarMenuSubItem>
@@ -346,6 +398,33 @@ onUnmounted(() => {
 
     <!-- One dialog for the whole list: the trigger only says which row it is
          about, so the list never renders one dialog per session. -->
+    <Dialog v-model:open="renameOpen">
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{{ t("session.rename.title") }}</DialogTitle>
+        </DialogHeader>
+        <form class="grid gap-3" @submit.prevent="confirmRename">
+          <Input
+            v-model="renameDraft"
+            type="text"
+            autocomplete="off"
+            :placeholder="t('session.rename.placeholder')"
+            class="h-9 text-sm"
+          />
+          <DialogFooter>
+            <DialogClose as-child>
+              <Button type="button" variant="outline">
+                {{ t("common.cancel") }}
+              </Button>
+            </DialogClose>
+            <Button type="submit" :disabled="!renameDraft.trim()">
+              {{ t("settings.subagents.save") }}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+
     <Dialog v-model:open="deleteOpen">
       <DialogContent>
         <DialogHeader>

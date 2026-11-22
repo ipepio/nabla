@@ -120,6 +120,60 @@ function headingClass(level: number): string {
           <InlineParts :parts="item" />
         </li>
       </ol>
+      <div
+        v-else-if="segment.type === 'table'"
+        class="my-1 overflow-x-auto rounded-lg border border-border bg-card/50"
+      >
+        <table class="w-full border-collapse text-xs">
+          <thead>
+            <tr class="border-b border-border bg-secondary/50">
+              <th
+                v-for="(header, hIdx) in segment.headers"
+                :key="hIdx"
+                class="border-r border-border px-3 py-2 font-semibold text-foreground last:border-r-0"
+                :class="
+                  segment.alignments[hIdx] === 'center'
+                    ? 'text-center'
+                    : segment.alignments[hIdx] === 'right'
+                      ? 'text-right'
+                      : 'text-left'
+                "
+              >
+                <InlineParts :parts="header" />
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="(row, rIdx) in segment.rows"
+              :key="rIdx"
+              class="border-b border-border/70 last:border-b-0 odd:bg-transparent even:bg-secondary/20"
+            >
+              <td
+                v-for="(cell, cIdx) in row"
+                :key="cIdx"
+                class="border-r border-border/70 px-3 py-2 align-top text-foreground/90 last:border-r-0"
+                :class="
+                  segment.alignments[cIdx] === 'center'
+                    ? 'text-center'
+                    : segment.alignments[cIdx] === 'right'
+                      ? 'text-right'
+                      : 'text-left'
+                "
+              >
+                <InlineParts :parts="cell" />
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <blockquote
+        v-else-if="segment.type === 'blockquote'"
+        class="border-l-2 border-primary/50 pl-3 text-muted-foreground italic whitespace-pre-wrap break-words"
+      >
+        <InlineParts :parts="segment.parts" />
+      </blockquote>
+      <hr v-else-if="segment.type === 'hr'" class="my-1 border-border" />
       <p
         v-else-if="segment.type === 'text'"
         class="whitespace-pre-wrap break-words"

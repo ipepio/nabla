@@ -14,6 +14,23 @@
 
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationPreferences {
+    /// Master switch — off by default until the human explicitly enables it.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Notify when a background turn finishes.
+    #[serde(default)]
+    pub on_turn_finish: bool,
+    /// Notify when the agent blocks waiting for an answer (`ask_*`).
+    #[serde(default)]
+    pub on_question: bool,
+    /// Notify when a delegated subagent finishes or fails.
+    #[serde(default)]
+    pub on_subagent_finish: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -103,6 +120,9 @@ pub struct Settings {
     /// public fallback instance (`websearch::credentials_for`).
     #[serde(default)]
     pub web_search_credentials: String,
+    /// Configurable OS notifications (opt-in, per-event triggers).
+    #[serde(default)]
+    pub notifications: NotificationPreferences,
 }
 
 /// S2/S3 of `chat-preferences-and-queue.md`: both chat toggles ship enabled, so
@@ -134,7 +154,11 @@ fn default_language() -> String {
 /// Browser stay out on purpose — they run arbitrary commands and drive a real
 /// browser, so the human turns them on explicitly in Settings.
 pub fn default_tools() -> Vec<String> {
-    vec!["files".to_string(), "changes".to_string()]
+    vec![
+        "files".to_string(),
+        "changes".to_string(),
+        "document".to_string(),
+    ]
 }
 
 /// S6 of `permission-modes.md`: write is the default, so a fresh install (and a
@@ -189,6 +213,7 @@ impl Default for Settings {
             // No credential until the human types one; an instance that needs
             // none must never receive an empty header.
             web_search_credentials: String::new(),
+            notifications: NotificationPreferences::default(),
         }
     }
 }
@@ -667,15 +692,19 @@ mod tests {
         let s = Settings::default();
         assert_eq!(
             s.enabled_tools,
-            vec!["files".to_string(), "changes".to_string()],
-            "S5: Files and Changes ship on; Terminal and Browser are opt-in"
+            vec![
+                "files".to_string(),
+                "changes".to_string(),
+                "document".to_string(),
+            ],
+            "S5: Files, Changes and Document ship on; Terminal and Browser are opt-in"
         );
 
         // camelCase on the wire, so `preferences.ts` mirrors this key.
         let json = serde_json::to_value(&s).expect("serialize");
         assert_eq!(
             json["enabledTools"],
-            serde_json::json!(["files", "changes"])
+            serde_json::json!(["files", "changes", "document"])
         );
     }
 
@@ -735,7 +764,11 @@ mod tests {
         assert_eq!(s.theme, "light");
         assert_eq!(
             s.enabled_tools,
-            vec!["files".to_string(), "changes".to_string()],
+            vec![
+                "files".to_string(),
+                "changes".to_string(),
+                "document".to_string(),
+            ],
             "an absent key means the shipped set, never an empty drawer"
         );
     }

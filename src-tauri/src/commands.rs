@@ -70,6 +70,8 @@ pub struct AppState {
     /// workspace from ever owning two probe children at once. Per app instance,
     /// never a process-wide static, so two stores can never share a slot.
     pub probes: Arc<CommandProbes>,
+    /// Dedicated persistent agent memory store (`<data_dir>/memory.db`).
+    pub memory: Arc<crate::memory::MemoryStore>,
 }
 
 // Errors cross the bridge as plain strings for now: StoreError and SettingsError
@@ -3390,6 +3392,372 @@ pub fn set_webview_zoom(app: tauri::AppHandle, scale: f64) -> Result<(), String>
     window.set_zoom(scale).map_err(|err| format!("zoom: {err}"))
 }
 
+/// Renames a workspace's human-readable alias in SQLite (path stays untouched).
+#[tauri::command]
+pub fn rename_workspace(
+    state: State<'_, AppState>,
+    id: i64,
+    name: String,
+) -> Result<Workspace, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("workspace name cannot be empty".to_string());
+    }
+    state
+        .store
+        .rename_workspace(id, trimmed)
+        .map_err(display_err)?
+        .ok_or_else(|| format!("workspace {id} not found"))
+}
+
+/// Renames a session's title in the SQLite index (pi's JSONL stays untouched).
+#[tauri::command]
+pub fn rename_session(
+    state: State<'_, AppState>,
+    session_id: i64,
+    title: String,
+) -> Result<(), String> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err("session title cannot be empty".to_string());
+    }
+    let updated = state
+        .store
+        .set_session_title(session_id, trimmed)
+        .map_err(display_err)?;
+    if !updated {
+        return Err(format!("session {session_id} not found"));
+    }
+    Ok(())
+}
+
+/// Lazily refreshes the rebuildable FTS5 index from pi's JSONL files for any
+/// session whose file mtime advanced, then returns full-text search hits.
+#[tauri::command]
+pub async fn search_sessions(
+    state: State<'_, AppState>,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<crate::store::SessionSearchHit>, String> {
+    let query = query.trim().to_string();
+    if query.chars().count() < 2 {
+        return Ok(Vec::new());
+    }
+    let cap = limit.unwrap_or(12).clamp(1, 30);
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let sessions = store.list_all_top_sessions().map_err(display_err)?;
+        for session in sessions {
+            let path = std::path::Path::new(&session.pi_session_path);
+            let Ok(meta) = std::fs::metadata(path) else {
+                continue;
+            };
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let indexed_mtime = store
+                .session_search_mtime(session.id)
+                .map_err(display_err)?;
+            if indexed_mtime == Some(mtime) {
+                continue;
+            }
+            let content = extract_searchable_jsonl_text(path, session.title.as_deref());
+            let _ = store.upsert_session_search(session.id, session.workspace_id, mtime, &content);
+        }
+        store.search_sessions(&query, cap).map_err(display_err)
+    })
+    .await
+    .map_err(|err| format!("search task failed: {err}"))?
+}
+
+fn extract_searchable_jsonl_text(path: &std::path::Path, title: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(t) = title {
+        out.push_str(t);
+        out.push('\n');
+    }
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return out;
+    };
+    const MAX_INDEXED_CHARS: usize = 64_000;
+    for line in raw.lines() {
+        if out.len() >= MAX_INDEXED_CHARS {
+            break;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let msg = value.get("message").unwrap_or(&value);
+        if let Some(text) = msg.get("text").and_then(|v| v.as_str()) {
+            out.push_str(text);
+            out.push('\n');
+        }
+        if let Some(content) = msg.get("content") {
+            if let Some(s) = content.as_str() {
+                out.push_str(s);
+                out.push('\n');
+            } else if let Some(arr) = content.as_array() {
+                for block in arr {
+                    if let Some(s) = block.get("text").and_then(|v| v.as_str()) {
+                        out.push_str(s);
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Lists local `.md` prompt skills from `<config_dir>/skills/` and (when a
+/// workspace is active) `<workspace>/.nabla/skills/`.
+#[tauri::command]
+pub fn list_skills(
+    state: State<'_, AppState>,
+    workspace_id: Option<i64>,
+) -> Result<Vec<crate::skills::SkillEntry>, String> {
+    let ws_path = match workspace_id {
+        Some(id) => state
+            .store
+            .list_workspaces()
+            .map_err(display_err)?
+            .into_iter()
+            .find(|w| w.id == id)
+            .map(|w| std::path::PathBuf::from(w.path)),
+        None => None,
+    };
+    Ok(crate::skills::list_skills(
+        &state.config_dir,
+        ws_path.as_deref(),
+    ))
+}
+
+/// Saves or updates a global `.md` prompt skill in `<config_dir>/skills/`.
+#[tauri::command]
+pub fn save_skill(
+    state: State<'_, AppState>,
+    name: String,
+    description: String,
+    prompt: String,
+) -> Result<crate::skills::SkillEntry, String> {
+    crate::skills::save_skill(&state.config_dir, &name, &description, &prompt)
+}
+
+/// Deletes a global `.md` prompt skill from `<config_dir>/skills/`.
+#[tauri::command]
+pub fn delete_skill(state: State<'_, AppState>, name: String) -> Result<bool, String> {
+    crate::skills::delete_skill(&state.config_dir, &name)
+}
+
+/// Sends a best-effort native OS notification (macOS `osascript`, argv-only).
+#[tauri::command]
+pub fn notify_desktop(title: String, body: String) -> Result<(), String> {
+    let title = title.trim();
+    let body = body.trim();
+    if title.is_empty() && body.is_empty() {
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("osascript")
+            .args([
+                "-e",
+                "on run argv",
+                "-e",
+                "display notification (item 2 of argv) with title (item 1 of argv)",
+                "-e",
+                "end run",
+                "--",
+                title,
+                body,
+            ])
+            .status();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (title, body);
+    }
+    Ok(())
+}
+
+/// Reads a Markdown document from disk for the Document drawer tool.
+#[tauri::command]
+pub fn doc_read(path: String) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("path must not be empty".to_string());
+    }
+    std::fs::read_to_string(trimmed).map_err(|e| format!("failed to read {trimmed}: {e}"))
+}
+
+/// Saves a Markdown document to disk from the Document drawer tool.
+#[tauri::command]
+pub fn doc_write(path: String, content: String) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("path must not be empty".to_string());
+    }
+    let target = std::path::Path::new(trimmed);
+    if let Some(parent) = target.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create directory {}: {e}", parent.display()))?;
+    }
+    std::fs::write(target, content.as_bytes())
+        .map_err(|e| format!("failed to write {trimmed}: {e}"))
+}
+
+/// Inactivity TTL for temporary scratch Markdown documents in `<data_dir>/tmp/docs/` (24 hours).
+pub const TEMP_DOC_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// Directory where Nabla stores transparent scratch Markdown drafts.
+pub fn temp_docs_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("tmp").join("docs")
+}
+
+/// Removes temporary scratch documents whose last modification time is older than `max_age`.
+pub fn cleanup_temp_docs(data_dir: &std::path::Path, max_age: std::time::Duration) -> usize {
+    let dir = temp_docs_dir(data_dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let Ok(elapsed) = modified.elapsed() else {
+            continue;
+        };
+        if elapsed >= max_age && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Creates a transparent scratch Markdown file inside Nabla's `<data_dir>/tmp/docs/`
+/// folder so the user can write/preview/export without being forced to pick a save path.
+#[tauri::command]
+pub fn doc_create_temp(state: State<'_, AppState>) -> Result<String, String> {
+    let _ = cleanup_temp_docs(
+        &state.data_dir,
+        std::time::Duration::from_secs(TEMP_DOC_TTL_SECS),
+    );
+    let dir = temp_docs_dir(&state.data_dir);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("failed to create temp docs directory {}: {e}", dir.display()))?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("draft-{ts}.md"));
+    std::fs::write(&path, b"# Untitled\n\n")
+        .map_err(|e| format!("failed to create temp document {}: {e}", path.display()))?;
+    Ok(path.display().to_string())
+}
+
+/// Exports a Markdown file to `.docx` (embedding local PNG/JPEG images).
+#[tauri::command]
+pub fn export_docx_file(input: String, output: Option<String>) -> Result<String, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("input path must not be empty".to_string());
+    }
+    let out = crate::docx_export::export_markdown_to_docx(
+        trimmed,
+        output.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+    )?;
+    Ok(out.display().to_string())
+}
+
+/// Lists or FTS5-searches persistent agent memories from `<data_dir>/memory.db`.
+#[tauri::command]
+pub fn memory_list(
+    state: State<'_, AppState>,
+    query: Option<String>,
+    scope: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::memory::MemoryEntry>, String> {
+    state
+        .memory
+        .search(query.as_deref(), scope.as_deref(), limit.unwrap_or(50))
+}
+
+/// Saves or updates a persistent agent memory in `<data_dir>/memory.db`.
+#[tauri::command]
+pub fn memory_save(
+    state: State<'_, AppState>,
+    title: String,
+    content: String,
+    kind: Option<String>,
+    tags: Option<String>,
+    scope: Option<String>,
+) -> Result<crate::memory::MemoryEntry, String> {
+    state.memory.save(
+        &title,
+        &content,
+        kind.as_deref(),
+        tags.as_deref(),
+        scope.as_deref(),
+    )
+}
+
+/// Deletes a single persistent agent memory by id.
+#[tauri::command]
+pub fn memory_delete(state: State<'_, AppState>, id: i64) -> Result<bool, String> {
+    state.memory.delete(id)
+}
+
+/// Clears persistent agent memories (all, or filtered by scope).
+#[tauri::command]
+pub fn memory_clear(state: State<'_, AppState>, scope: Option<String>) -> Result<usize, String> {
+    state.memory.clear(scope.as_deref())
+}
+
+/// Resolves `<data_dir>/subagents/cancel/<sanitized-stem>.cancel` for a child session.
+pub fn subagent_cancel_path(data_dir: &Path, session_path: &str) -> Result<PathBuf, String> {
+    let stem = Path::new(session_path.trim())
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let safe: String = stem
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if safe.is_empty() {
+        return Err("invalid subagent session path".to_string());
+    }
+    Ok(data_dir
+        .join("subagents")
+        .join("cancel")
+        .join(format!("{safe}.cancel")))
+}
+
+/// Signals `nabla-subagents.ts` to abort one specific running/queued subagent
+/// without stopping the parent session or sibling subagents.
+#[tauri::command]
+pub fn cancel_subagent(state: State<'_, AppState>, session_path: String) -> Result<(), String> {
+    let path = subagent_cancel_path(&state.data_dir, &session_path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create subagent cancel dir: {e}"))?;
+    }
+    std::fs::write(&path, b"cancel")
+        .map_err(|e| format!("failed to write cancel signal: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3422,6 +3790,37 @@ mod tests {
         fn store(&self) -> Store {
             Store::open(&self.0.join("nabla.db")).expect("open store")
         }
+    }
+
+    #[test]
+    fn cleanup_temp_docs_removes_expired_files_and_keeps_fresh_ones() {
+        let dir = TempSeedDir::new("tmp_docs_cleanup");
+        let docs = temp_docs_dir(&dir.0);
+        std::fs::create_dir_all(&docs).expect("create tmp docs dir");
+        let stale = docs.join("draft-old.md");
+        std::fs::write(&stale, "# Old").expect("write stale");
+        // Zero TTL removes everything immediately; large TTL keeps fresh files.
+        assert_eq!(
+            cleanup_temp_docs(&dir.0, std::time::Duration::from_secs(3600)),
+            0
+        );
+        assert!(stale.exists());
+        assert_eq!(
+            cleanup_temp_docs(&dir.0, std::time::Duration::ZERO),
+            1
+        );
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn subagent_cancel_path_sanitizes_session_stem() {
+        let base = PathBuf::from("/tmp/nabla-data");
+        let path = subagent_cancel_path(&base, "/foo/bar/abc-123_def.jsonl").expect("valid stem");
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/nabla-data/subagents/cancel/abc-123_def.cancel")
+        );
+        assert!(subagent_cancel_path(&base, "   ").is_err());
     }
 
     impl Drop for TempSeedDir {

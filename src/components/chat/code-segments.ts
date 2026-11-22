@@ -48,6 +48,21 @@ export type TextSegment =
       items: InlinePart[][];
     }
   | {
+      type: "table";
+      /** Header cells, each parsed for inline code, emphasis and links. */
+      headers: InlinePart[][];
+      /** Column alignments inferred from the separator row. */
+      alignments: ("left" | "center" | "right")[];
+      /** Body rows, padded/clamped to match `headers.length`. */
+      rows: InlinePart[][][];
+    }
+  | {
+      type: "blockquote";
+      /** Blockquote text, parsed for inline markup. */
+      parts: InlinePart[];
+    }
+  | { type: "hr" }
+  | {
       type: "code";
       /** The fence's language tag, `""` when the fence carries none. */
       language: string;
@@ -79,6 +94,56 @@ const BULLET_ITEM = /^[ \t]*[-*+][ \t]+(\S.*?)[ \t]*$/;
  * row's text.
  */
 const NUMBERED_ITEM = /^[ \t]*\d{1,9}\.[ \t]+(\S.*?)[ \t]*$/;
+/** Horizontal rule: three or more `-`, `*` or `_` on a line of their own. */
+const HORIZONTAL_RULE = /^[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*$/;
+/** Blockquote line: `>` with optional space. */
+const BLOCKQUOTE_LINE = /^[ \t]*>[ \t]?(.*)$/;
+/** GFM table separator row: `|---|---|` or `| :---: | ---: |`. */
+const TABLE_SEPARATOR =
+  /^[ \t]*\|?[ \t]*:?-{3,}:?[ \t]*(?:\|[ \t]*:?-{3,}:?[ \t]*)*\|?[ \t]*$/;
+
+function isTableRowLine(line: string): boolean {
+  const trimmed = line.trim();
+  return trimmed.includes("|") && (trimmed.startsWith("|") || trimmed.endsWith("|"));
+}
+
+function isTableSeparatorLine(line: string): boolean {
+  const trimmed = line.trim();
+  return trimmed.includes("|") && trimmed.includes("-") && TABLE_SEPARATOR.test(trimmed);
+}
+
+function splitTableCells(line: string): string[] {
+  const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+  const cells: string[] = [];
+  let current = "";
+  for (let i = 0; i < trimmed.length; i += 1) {
+    if (trimmed[i] === "\\" && trimmed[i + 1] === "|") {
+      current += "|";
+      i += 1;
+      continue;
+    }
+    if (trimmed[i] === "|") {
+      cells.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += trimmed[i];
+  }
+  cells.push(current.trim());
+  return cells;
+}
+
+function parseTableAlignments(line: string, count: number): ("left" | "center" | "right")[] {
+  const raw = splitTableCells(line);
+  return Array.from({ length: count }, (_, i) => {
+    const cell = (raw[i] ?? "").trim();
+    const left = cell.startsWith(":");
+    const right = cell.endsWith(":");
+    if (left && right) return "center";
+    if (right) return "right";
+    return "left";
+  });
+}
 /**
  * Inline markdown, one combined pass. The alternation order matters: bold
  * (`**`/`__`) before italic (`*`/`_`), otherwise `**x**` would match the
@@ -212,7 +277,59 @@ function proseSegments(raw: string): TextSegment[] {
     list = null;
   }
 
-  for (const line of raw.split("\n")) {
+  const lines = raw.split("\n");
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+
+    // GFM table: header row followed by a valid separator row (`|---|---|`).
+    if (
+      isTableRowLine(line) &&
+      i + 1 < lines.length &&
+      isTableSeparatorLine(lines[i + 1])
+    ) {
+      flushParagraph();
+      flushList();
+      const rawHeaders = splitTableCells(line);
+      const alignments = parseTableAlignments(lines[i + 1], rawHeaders.length);
+      const headers = rawHeaders.map(inlinePartsOf);
+      i += 2;
+      const rows: InlinePart[][][] = [];
+      while (i < lines.length && isTableRowLine(lines[i])) {
+        const cells = splitTableCells(lines[i]);
+        while (cells.length < headers.length) cells.push("");
+        rows.push(cells.slice(0, headers.length).map(inlinePartsOf));
+        i += 1;
+      }
+      i -= 1;
+      segments.push({ type: "table", headers, alignments, rows });
+      continue;
+    }
+
+    if (HORIZONTAL_RULE.test(line)) {
+      flushParagraph();
+      flushList();
+      segments.push({ type: "hr" });
+      continue;
+    }
+
+    const quote = BLOCKQUOTE_LINE.exec(line);
+    if (quote !== null) {
+      flushParagraph();
+      flushList();
+      const quoteLines = [quote[1] ?? ""];
+      while (i + 1 < lines.length) {
+        const nextQuote = BLOCKQUOTE_LINE.exec(lines[i + 1]);
+        if (nextQuote === null) break;
+        quoteLines.push(nextQuote[1] ?? "");
+        i += 1;
+      }
+      segments.push({
+        type: "blockquote",
+        parts: inlinePartsOf(quoteLines.join("\n")),
+      });
+      continue;
+    }
+
     const heading = HEADING.exec(line);
     if (heading !== null) {
       flushParagraph();
@@ -342,7 +459,15 @@ export function segmentsOf(text: string): TextSegment[] {
  * delta instead of one full scan for nothing — which is what made the cache
  * slower than no cache for prose without fences.
  */
-type ProseLine = "none" | "prose" | "heading" | "ordered" | "unordered";
+type ProseLine =
+  | "none"
+  | "prose"
+  | "heading"
+  | "ordered"
+  | "unordered"
+  | "table"
+  | "blockquote"
+  | "hr";
 
 interface Boundaries {
   /** Offset just past the last complete line already read. */
@@ -391,6 +516,21 @@ function scanBoundaries(boundaries: Boundaries, text: string): void {
     if (HEADING.test(line)) {
       boundaries.last = "heading";
       settle(boundaries, start);
+      continue;
+    }
+    if (HORIZONTAL_RULE.test(line)) {
+      boundaries.last = "hr";
+      settle(boundaries, start);
+      continue;
+    }
+    if (BLOCKQUOTE_LINE.test(line)) {
+      if (boundaries.last !== "blockquote") settle(boundaries, start);
+      boundaries.last = "blockquote";
+      continue;
+    }
+    if (isTableRowLine(line)) {
+      if (boundaries.last !== "table") settle(boundaries, start);
+      boundaries.last = "table";
       continue;
     }
     const row = listRowOf(line);

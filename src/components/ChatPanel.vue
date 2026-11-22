@@ -47,6 +47,13 @@ import { draftKeyFor, usePromptDraft } from "@/components/chat/use-prompt-draft"
 import { useThrottledText } from "@/components/chat/use-throttled-text";
 import { createTranscriptFollow } from "@/components/chat/transcript-follow";
 import { useTurnWindow } from "@/components/chat/turn-window";
+import { formatTranscriptMarkdown } from "@/components/chat/export-markdown";
+import {
+  contextUsageRatio,
+  estimateTokens,
+  formatCompactTokens,
+  formatElapsed,
+} from "@/components/chat/session-metrics";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -74,6 +81,7 @@ import type {
 } from "@/contracts/types";
 import { useAppearance } from "@/lib/appearance";
 import { takeBootSettings } from "@/lib/boot-settings";
+import { sendAppNotification } from "@/lib/notifications";
 import {
   addAttachments,
   addPdfAttachment,
@@ -759,9 +767,102 @@ const isEmptyState = computed(() => {
  * decision and `canSend` are all derived from it — the same field the drawer's
  * spinner reads through `busyIds`, so the two surfaces cannot disagree.
  */
+const selectedModelContextWindow = computed<number | null>(() => {
+  const provider = providerModels.value.find(
+    (entry) => entry.provider === providerId.value,
+  );
+  const model = provider?.models.find((entry) => entry.id === modelId.value);
+  return model?.contextWindow ?? null;
+});
+
+const estimatedContextTokens = computed(() =>
+  estimateTokens([
+    ...transcript.value.map((m) => m.text),
+    streamingText.value,
+  ]),
+);
+
+const contextRatio = computed(() =>
+  contextUsageRatio(
+    estimatedContextTokens.value,
+    selectedModelContextWindow.value,
+  ),
+);
+
+const contextLabel = computed<string | null>(() => {
+  if (transcript.value.length === 0 && streamingText.value === "") return null;
+  const used = formatCompactTokens(estimatedContextTokens.value);
+  const limit = selectedModelContextWindow.value;
+  return limit ? `~${used} / ${formatCompactTokens(limit)}` : `~${used} tok`;
+});
+
+const contextHigh = computed(
+  () => contextRatio.value !== null && contextRatio.value >= 0.75,
+);
+
+const exportedMarkdown = ref(false);
+let exportTimer: number | null = null;
+async function handleExportMarkdown(): Promise<void> {
+  const md = formatTranscriptMarkdown(
+    workspaceName.value,
+    activeSessionTitle.value,
+    transcript.value,
+  );
+  try {
+    await navigator.clipboard.writeText(md);
+    exportedMarkdown.value = true;
+    if (exportTimer !== null) window.clearTimeout(exportTimer);
+    exportTimer = window.setTimeout(() => {
+      exportedMarkdown.value = false;
+      exportTimer = null;
+    }, 1800);
+  } catch {
+    exportedMarkdown.value = false;
+  }
+}
+
+const turnStartedAt = ref<number | null>(null);
+const turnElapsedSecs = ref(0);
+let elapsedTimer: number | null = null;
+const turnElapsedLabel = computed<string | null>(() =>
+  turnStartedAt.value !== null ? formatElapsed(turnElapsedSecs.value) : null,
+);
+
 const agentWorking = computed(
   () => sending.value || starting.value || (buffer.value?.busy ?? false),
 );
+
+watch(agentWorking, (working, wasWorking) => {
+  if (working) {
+    if (turnStartedAt.value === null) {
+      turnStartedAt.value = Date.now();
+      turnElapsedSecs.value = 0;
+    }
+    if (elapsedTimer === null) {
+      elapsedTimer = window.setInterval(() => {
+        if (turnStartedAt.value !== null) {
+          turnElapsedSecs.value = Math.floor(
+            (Date.now() - turnStartedAt.value) / 1000,
+          );
+        }
+      }, 1000);
+    }
+  } else {
+    turnStartedAt.value = null;
+    if (elapsedTimer !== null) {
+      window.clearInterval(elapsedTimer);
+      elapsedTimer = null;
+    }
+    // Configurable OS notification when a background turn completes.
+    if (wasWorking) {
+      void sendAppNotification(
+        "turnFinish",
+        t("notify.turnFinished.title"),
+        t("notify.turnFinished.body", { workspace: workspaceName.value }),
+      );
+    }
+  }
+});
 
 /**
  * The prompt can be sent right now: there is a workspace, something to say, and
@@ -914,10 +1015,18 @@ const composerSlot = ref<HTMLElement | null>(null);
  * A settled question takes its half-typed text with it: the request is closed, so
  * keeping the text would only resurrect it on a request id that never returns.
  */
-watch(questions, (list) => {
+watch(questions, (list, previous) => {
   const live = new Set(list.map((question) => question.id));
   for (const id of [...answerDrafts.keys()]) {
     if (!live.has(id)) answerDrafts.delete(id);
+  }
+  const prevIds = new Set((previous ?? []).map((question) => question.id));
+  if (list.some((question) => !prevIds.has(question.id))) {
+    void sendAppNotification(
+      "question",
+      t("notify.question.title"),
+      t("notify.question.body", { workspace: workspaceName.value }),
+    );
   }
 });
 
@@ -1634,6 +1743,10 @@ onUnmounted(() => {
   // Only the focus listener and the transcript listeners are ours: the
   // agent-event subscription belongs to the store and must survive a panel swap.
   window.removeEventListener("focus", handleWindowFocus);
+  if (elapsedTimer !== null) {
+    window.clearInterval(elapsedTimer);
+    elapsedTimer = null;
+  }
   detachTranscriptViewport();
 });
 </script>
@@ -1785,11 +1898,16 @@ onUnmounted(() => {
         :title="workspaceName"
         :session-title="sessionHeading"
         :working="agentWorking"
+        :elapsed="turnElapsedLabel"
+        :context-label="contextLabel"
+        :context-high="contextHigh"
+        :exported="exportedMarkdown"
         :tools-open="toolsOpen"
         :is-dark="isDark"
         @toggle-tools="emit('toggleTools')"
         @toggle-theme="handleToggleTheme"
         @open-search="emit('openSearch')"
+        @export-markdown="handleExportMarkdown"
       />
 
       <!-- No tab strip any more: the panel is one pane, so the `v-else` children

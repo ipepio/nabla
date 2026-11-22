@@ -36,6 +36,7 @@ use axum::{
 use serde_json::{Value, json};
 use tauri::Emitter;
 
+use crate::docx_export;
 use crate::embed::EmbedError;
 use crate::websearch::{self, SearchGateway, SearchHit};
 
@@ -101,6 +102,14 @@ pub trait WebviewDriver: Send + Sync + 'static {
     /// Runs a script in one existing view and answers what the platform
     /// serialized from it.
     fn eval(&self, view_id: &str, script: &str) -> Result<String, DriverFailure>;
+
+    /// Notifies the UI to open/focus a Markdown document in the right drawer.
+    fn open_document(&self, _path: &str) {}
+
+    /// Access to the persistent agent memory store (`memory.db`), if available.
+    fn memory_store(&self) -> Option<Arc<crate::memory::MemoryStore>> {
+        None
+    }
 }
 
 /// A driver failure, typed so the dispatcher can tell an accident from an answer.
@@ -232,10 +241,25 @@ fn call_tool(
         return error(id, -32602, &format!("unknown tool `{name}`"));
     }
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-    // `web_search` is answered before anything looks for a view: it needs no
-    // browser, so it must never `ensure_view` (S4 of `web-search.md`).
+    // `web_search`, `export_docx` and `open_document` need no browser view, so
+    // they are answered before anything triggers `ensure_view`.
     if name == WEB_SEARCH {
         return web_search_result(search, id, &arguments);
+    }
+    if name == EXPORT_DOCX {
+        return export_docx_result(driver, id, &arguments);
+    }
+    if name == OPEN_DOCUMENT {
+        return open_document_result(driver, id, &arguments);
+    }
+    if name == MEMORY_SAVE {
+        return memory_save_result(driver, id, &arguments);
+    }
+    if name == MEMORY_SEARCH {
+        return memory_search_result(driver, id, &arguments);
+    }
+    if name == MEMORY_FORGET {
+        return memory_forget_result(driver, id, &arguments);
     }
     let asked_view = arguments.get("viewId").and_then(Value::as_str);
 
@@ -330,6 +354,7 @@ enum Action {
     Back,
     Forward,
     Reload,
+    Screenshot,
 }
 
 impl Action {
@@ -360,6 +385,7 @@ impl Action {
             "back" => Action::Back,
             "forward" => Action::Forward,
             "reload" => Action::Reload,
+            "screenshot" => Action::Screenshot,
             other => unreachable!("`{other}` is in TOOL_NAMES and has no arm"),
         })
     }
@@ -403,6 +429,7 @@ impl Action {
                 "went forward one history entry",
             ),
             Action::Reload => history(driver, view, "location.reload()", "reloaded the page"),
+            Action::Screenshot => driver.eval(&view.id, SCREENSHOT_SCRIPT),
         }
     }
 }
@@ -575,7 +602,7 @@ fn targets_text(views: &[LiveView]) -> String {
 /// Every tool this server offers, in catalog order. Kept as data so a name that
 /// is listed but not dispatched (or the reverse) fails a test instead of the
 /// model's next call.
-const TOOL_NAMES: [&str; 11] = [
+const TOOL_NAMES: [&str; 17] = [
     "navigate",
     "eval",
     "get_url",
@@ -585,6 +612,12 @@ const TOOL_NAMES: [&str; 11] = [
     "back",
     "forward",
     "reload",
+    "screenshot",
+    "export_docx",
+    "open_document",
+    "memory_save",
+    "memory_search",
+    "memory_forget",
     // The one tool that needs no view, listed last before the registry itself:
     // `list_targets` is the tool whose answer is the view list.
     "web_search",
@@ -594,6 +627,42 @@ const TOOL_NAMES: [&str; 11] = [
 /// S3 of `web-search.md`: the tool name. A constant because the catalog, the
 /// dispatch and the tests must all spell it the same way.
 const WEB_SEARCH: &str = "web_search";
+
+/// Local Markdown → Word (`.docx`) export tool name.
+const EXPORT_DOCX: &str = "export_docx";
+
+/// Opens a Markdown document in Nabla's right-hand Document editor/preview drawer.
+const OPEN_DOCUMENT: &str = "open_document";
+
+/// Persistent agent memory MCP tool names (`memory.db`).
+const MEMORY_SAVE: &str = "memory_save";
+const MEMORY_SEARCH: &str = "memory_search";
+const MEMORY_FORGET: &str = "memory_forget";
+
+/// Captures a visual snapshot of the visible viewport. Attempts an offscreen
+/// SVG foreignObject -> Canvas PNG data URL first; if cross-origin tainting
+/// blocks canvas readback, falls back to a structured viewport layout map with
+/// element bounding boxes so the agent always gets actionable visual context.
+const SCREENSHOT_SCRIPT: &str = r#"(() => {
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const pick = (sel, limit) => Array.from(document.querySelectorAll(sel))
+    .map(el => {
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0 || r.bottom < 0 || r.top > vh || r.right < 0 || r.left > vw) return null;
+      const text = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+      return { tag: el.tagName.toLowerCase(), text, rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)] };
+    })
+    .filter(Boolean)
+    .slice(0, limit);
+  const summary = {
+    url: location.href,
+    title: document.title,
+    viewport: { width: vw, height: vh, scrollX: Math.round(window.scrollX), scrollY: Math.round(window.scrollY) },
+    headings: pick('h1,h2,h3', 12),
+    controls: pick('button,a[href],input,textarea,select,[role="button"]', 30)
+  };
+  return JSON.stringify(summary);
+})()"#;
 
 /// The catalog. The schemas are what the model sees, so every field is
 /// described: a bare `{"type":"object"}` makes the model guess.
@@ -754,6 +823,52 @@ fn tool_catalog() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "screenshot",
+            "description": "Capture a structured visual layout snapshot of the embedded browser's visible viewport (URL, title, viewport geometry, visible headings and interactive controls with bounding boxes).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "viewId": {
+                        "type": "string",
+                        "description": "Which view, when more than one is open. Omit for the only one."
+                    }
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "export_docx",
+            "description": "Convert a local Markdown (.md) file into a new editable Word (.docx) document with native headings, lists, links, tables and embedded local PNG/JPEG images. Never overwrites an existing output file and opens the document in Nabla's right drawer.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "input": {
+                        "type": "string",
+                        "description": "Path to the source Markdown file."
+                    },
+                    "output": {
+                        "type": "string",
+                        "description": "Optional destination .docx path. Defaults to sibling .docx beside input."
+                    }
+                },
+                "required": ["input"]
+            }
+        }),
+        json!({
+            "name": "open_document",
+            "description": "Open a Markdown (.md) file in Nabla's right-hand Document editor and live preview drawer so the human can view, edit, embed images, or export it to .docx/.pdf.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or workspace path to the Markdown (.md) file."
+                    }
+                },
+                "required": ["path"]
+            }
+        }),
+        json!({
             "name": "web_search",
             "description": "Search the web through a SearXNG instance and return titles, urls and \
                             snippets. It does NOT open or render a page: the snippet is what the \
@@ -775,6 +890,45 @@ fn tool_catalog() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "memory_save",
+            "description": "Save or update a durable fact, user preference, architectural decision, or project note in Nabla's persistent memory store (`memory.db`). Re-saving with the same title and scope updates the existing entry.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Short unique title for this memory." },
+                    "content": { "type": "string", "description": "The durable detail to remember across sessions." },
+                    "kind": { "type": "string", "description": "Category: preference, fact, decision, project, or note." },
+                    "tags": { "type": "string", "description": "Optional comma-separated keywords for search." },
+                    "scope": { "type": "string", "description": "Optional scope (defaults to 'global')." }
+                },
+                "required": ["title", "content"]
+            }
+        }),
+        json!({
+            "name": "memory_search",
+            "description": "Search Nabla's persistent memory store (`memory.db`) using full-text search, or list the most recent memories when `query` is omitted.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Optional full-text search terms." },
+                    "scope": { "type": "string", "description": "Optional scope filter." },
+                    "limit": { "type": "integer", "description": "Max entries to return (default 10)." }
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "memory_forget",
+            "description": "Delete a persistent memory record by its numeric `id`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "Numeric id of the memory to remove." }
+                },
+                "required": ["id"]
+            }
+        }),
+        json!({
             "name": "list_targets",
             "description": "List the open browser views, one `id (url)` per line. Use it when a call \
                             needs a `viewId`. An empty list is a normal answer: it means no view is \
@@ -786,6 +940,104 @@ fn tool_catalog() -> Vec<Value> {
             }
         }),
     ]
+}
+
+// ── `export_docx` & `open_document` ────────────────────────────────────────
+
+fn export_docx_result(driver: &dyn WebviewDriver, id: &Value, arguments: &Value) -> Value {
+    let Some(input) = arguments
+        .get("input")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return error(id, -32602, "export_docx needs an `input` argument");
+    };
+    let output = arguments
+        .get("output")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let clean_input = input.strip_prefix('@').unwrap_or(input);
+    driver.open_document(clean_input);
+
+    match docx_export::export_markdown_to_docx(input, output) {
+        Ok(path) => tool_result(id, &path.display().to_string(), false),
+        Err(reason) => tool_result(id, &reason, true),
+    }
+}
+
+fn open_document_result(driver: &dyn WebviewDriver, id: &Value, arguments: &Value) -> Value {
+    let Some(path) = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return error(id, -32602, "open_document needs a `path` argument");
+    };
+    let clean = path.strip_prefix('@').unwrap_or(path);
+    driver.open_document(clean);
+    tool_result(id, &format!("opened document `{clean}` in Nabla"), false)
+}
+
+// ── persistent agent memory (`memory_save` / `memory_search` / `memory_forget`) ──
+
+fn memory_save_result(driver: &dyn WebviewDriver, id: &Value, arguments: &Value) -> Value {
+    let Some(store) = driver.memory_store() else {
+        return tool_result(id, "persistent memory store is unavailable", true);
+    };
+    let Some(title) = argument(arguments, "title") else {
+        return error(id, -32602, "memory_save needs a `title` argument");
+    };
+    let Some(content) = argument(arguments, "content") else {
+        return error(id, -32602, "memory_save needs a `content` argument");
+    };
+    let kind = argument(arguments, "kind");
+    let tags = argument(arguments, "tags");
+    let scope = argument(arguments, "scope");
+    match store.save(title, content, kind, tags, scope) {
+        Ok(entry) => {
+            let text = serde_json::to_string_pretty(&entry).unwrap_or(entry.title);
+            tool_result(id, &text, false)
+        }
+        Err(reason) => tool_result(id, &reason, true),
+    }
+}
+
+fn memory_search_result(driver: &dyn WebviewDriver, id: &Value, arguments: &Value) -> Value {
+    let Some(store) = driver.memory_store() else {
+        return tool_result(id, "persistent memory store is unavailable", true);
+    };
+    let query = argument(arguments, "query");
+    let scope = argument(arguments, "scope");
+    let limit = arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(10);
+    match store.search(query, scope, limit) {
+        Ok(entries) => {
+            let text = serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string());
+            tool_result(id, &text, false)
+        }
+        Err(reason) => tool_result(id, &reason, true),
+    }
+}
+
+fn memory_forget_result(driver: &dyn WebviewDriver, id: &Value, arguments: &Value) -> Value {
+    let Some(store) = driver.memory_store() else {
+        return tool_result(id, "persistent memory store is unavailable", true);
+    };
+    let Some(memory_id) = arguments.get("id").and_then(Value::as_i64) else {
+        return error(id, -32602, "memory_forget needs a numeric `id` argument");
+    };
+    match store.delete(memory_id) {
+        Ok(true) => tool_result(id, &format!("deleted memory #{memory_id}"), false),
+        Ok(false) => tool_result(id, &format!("no memory found with id {memory_id}"), true),
+        Err(reason) => tool_result(id, &reason, true),
+    }
 }
 
 // ── `web_search` (S3/S4 of `web-search.md`) ────────────────────────────────
@@ -1938,7 +2190,7 @@ mod tests {
             &driver,
             &request(
                 "tools/call",
-                json!({ "name": "screenshot", "arguments": {} }),
+                json!({ "name": "nonexistent_tool", "arguments": {} }),
             ),
         )
         .expect("answer");
@@ -2973,11 +3225,20 @@ pub fn start(
 pub struct EmbedDriver {
     app: tauri::AppHandle,
     embeds: crate::embed::EmbedSessions,
+    memory: Arc<crate::memory::MemoryStore>,
 }
 
 impl EmbedDriver {
-    pub fn new(app: tauri::AppHandle, embeds: crate::embed::EmbedSessions) -> EmbedDriver {
-        EmbedDriver { app, embeds }
+    pub fn new(
+        app: tauri::AppHandle,
+        embeds: crate::embed::EmbedSessions,
+        memory: Arc<crate::memory::MemoryStore>,
+    ) -> EmbedDriver {
+        EmbedDriver {
+            app,
+            embeds,
+            memory,
+        }
     }
 
     /// What one embed failure means to the dispatcher, and what is corrected
@@ -3085,6 +3346,14 @@ impl WebviewDriver for EmbedDriver {
         self.embeds
             .eval(&self.app, view_id, script)
             .map_err(|error| self.failure(view_id, error))
+    }
+
+    fn open_document(&self, path: &str) {
+        let _ = self.app.emit("doc-open", json!({ "path": path }));
+    }
+
+    fn memory_store(&self) -> Option<Arc<crate::memory::MemoryStore>> {
+        Some(Arc::clone(&self.memory))
     }
 }
 

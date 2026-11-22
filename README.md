@@ -272,9 +272,26 @@ attachments; delegate to a subagent and watch its session appear nested under th
 chat that started it; open that child and watch it work, read-only; stop the parent and
 see the children die with it; ask the agent to drive the embedded browser pane.
 
-Known for now: no screenshot tool for the embedded webview; a session's changes to the
-subagent master switch need a fresh session; the app is macOS-only and has no
-auto-update.
+Known for now: a session's changes to the subagent master switch need a fresh session;
+the app is macOS-only and has no auto-update.
+
+### Built-in capabilities
+
+- **Word export (`export_docx`)**: pure-Rust Markdown → `.docx` MCP tool (native headings,
+  lists, links, tables; offline, never overwrites an existing file).
+- **Browser viewport snapshot (`screenshot`)**: MCP tool returning a structured visual map
+  of the embedded browser's visible viewport (geometry, headings, interactive controls).
+- **Workspace & session management**: rename workspaces and sessions inline, and copy any
+  conversation as clean Markdown from the chat header.
+- **Live session metrics**: estimated context window usage (`~tokens / limit`) and live
+  turn elapsed timer in the header.
+- **Native OS notifications**: desktop alerts when Nabla is in the background and a turn
+  finishes or the agent asks a question.
+- **Full-text search (`⌘K` / `Ctrl+K`)**: rebuildable SQLite FTS5 index over Pi's JSONL
+  transcripts alongside workspace, session and action search.
+- **Local prompt skills (`/`)**: drop `.md` templates (with optional `name:`/`description:`
+  YAML frontmatter) into `<config_dir>/skills/` or `<workspace>/.nabla/skills/` to invoke
+  them from `/` in the composer.
 
 ## Documentation
 

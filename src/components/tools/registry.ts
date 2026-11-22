@@ -26,6 +26,7 @@
 // own state and its own requests.
 import { defineAsyncComponent, type Component } from "vue";
 import {
+  FileTextIcon,
   FilesIcon,
   GitBranchIcon,
   GlobeIcon,
@@ -53,16 +54,18 @@ import FilesTool from "./FilesTool.vue";
  * paint — neither may wait for a second round-trip.
  */
 const TerminalTool = defineAsyncComponent(() => import("./TerminalTool.vue"));
+const DocumentTool = defineAsyncComponent(() => import("./DocumentTool.vue"));
 
 /**
  * The context of one tool instance, per tool. Files browses a folder, Terminal
- * runs a shell in one, and the two read-only views need no context of their own
- * (they read the active workspace).
+ * runs a shell in one, Document edits/previews a Markdown file, and the two
+ * read-only views need no context of their own (they read the active workspace).
  */
 export interface ToolContexts {
   files: { rootPath: string };
   terminal: { cwd: string };
   changes: Record<string, never>;
+  document: { path: string };
   browser: Record<string, never>;
 }
 
@@ -141,6 +144,14 @@ export const TOOLS: readonly ToolDefinition[] = [
     component: ChangesTool,
     singleton: true,
     defaultContext: (): ToolContext => ({}),
+  },
+  {
+    id: "document",
+    labelKey: "tools.document.label",
+    descriptionKey: "settings.general.tools.document.description",
+    icon: FileTextIcon,
+    component: DocumentTool,
+    defaultContext: (): ToolContext => ({ path: "" }),
   },
   {
     id: "terminal",

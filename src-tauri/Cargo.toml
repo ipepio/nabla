@@ -27,6 +27,8 @@ tauri = { version = "2", features = ["unstable"] }
 tauri-plugin-opener = "2"
 # Native folder picker for the workspace add flow (S9).
 tauri-plugin-dialog = "2"
+# Native OS notifications with Nabla's own app icon and OS permission prompt.
+tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Bundled: compiles SQLite into the binary, no system dependency, cross-platform.

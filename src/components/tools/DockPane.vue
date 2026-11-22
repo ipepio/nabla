@@ -111,6 +111,8 @@ const binding = computed(() => {
       return { cwd: instance.context.cwd };
     case "changes":
       return { workspace: props.workspace };
+    case "document":
+      return { path: instance.context.path, workspace: props.workspace };
     case "browser":
       // `active`: the pane's tab is drawn, so the child webview may exist.
       // `visible`: the drawer it lives in is drawn, so the view may be shown;

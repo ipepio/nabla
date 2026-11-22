@@ -36,6 +36,7 @@ import type {
   TranscriptMessage,
 } from "../contracts/types";
 import { t } from "./i18n";
+import { sendAppNotification } from "./notifications";
 import type { ChatMessage } from "./session-store";
 
 /** Everything known about one chat's children, keyed by the parent's session id. */
@@ -303,7 +304,30 @@ async function loadOne(
       // A workspace change or a workspace removal in the meantime: this answer
       // describes children nobody is looking at any more.
       if (current === undefined || current.workspaceId !== workspaceId) return;
-      if (!sameChildren(current.children, children)) current.children = children;
+      const previousById = new Map(
+        current.children.map((child) => [child.sessionId, child.status] as const),
+      );
+      if (!sameChildren(current.children, children)) {
+        if (current.loaded) {
+          for (const child of children) {
+            const prev = previousById.get(child.sessionId);
+            if (
+              prev !== undefined &&
+              isSubagentActive(prev) &&
+              (child.status === "done" || child.status === "failed")
+            ) {
+              void sendAppNotification(
+                "subagentFinish",
+                t("notify.subagentFinished.title", { agent: child.agent }),
+                child.status === "failed"
+                  ? t("notify.subagentFinished.failed", { agent: child.agent })
+                  : t("notify.subagentFinished.done", { agent: child.agent }),
+              );
+            }
+          }
+        }
+        current.children = children;
+      }
       current.loaded = true;
       current.error = null;
     } catch (cause) {

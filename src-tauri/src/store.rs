@@ -103,6 +103,16 @@ pub struct SessionPreviewRow {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSearchHit {
+    pub session_id: i64,
+    pub workspace_id: i64,
+    pub workspace_name: String,
+    pub session_title: Option<String>,
+    pub snippet: String,
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     Sqlite(String),
@@ -261,6 +271,25 @@ impl Store {
                  COMMIT;",
             )?;
         }
+        if current < 6 {
+            // v6: rebuildable FTS5 index over pi's JSONL transcripts for full-text
+            // search in ⌘K. Pi's files stay the sole source of truth; dropping
+            // nabla.db simply rebuilds this index on the next search.
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE VIRTUAL TABLE IF NOT EXISTS session_search_fts USING fts5(
+                   session_id UNINDEXED,
+                   workspace_id UNINDEXED,
+                   content
+                 );
+                 CREATE TABLE IF NOT EXISTS session_search_meta (
+                   session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                   mtime_secs INTEGER NOT NULL
+                 );
+                 PRAGMA user_version = 6;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
     }
 
@@ -365,10 +394,130 @@ impl Store {
         Ok(affected > 0)
     }
 
+    pub fn rename_workspace(&self, id: i64, name: &str) -> StoreResult<Option<Workspace>> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.conn()?;
+        let affected = conn.execute(
+            "UPDATE workspaces SET name = ?1 WHERE id = ?2",
+            rusqlite::params![trimmed, id],
+        )?;
+        if affected == 0 {
+            return Ok(None);
+        }
+        let row = conn.query_row(
+            "SELECT id, path, name, created_at, pinned, last_used_at FROM workspaces WHERE id = ?1",
+            [id],
+            workspace_from_row,
+        )?;
+        Ok(Some(row))
+    }
+
     pub fn remove_workspace(&self, id: i64) -> StoreResult<bool> {
         let conn = self.conn()?;
         let affected = conn.execute("DELETE FROM workspaces WHERE id = ?1", [id])?;
         Ok(affected > 0)
+    }
+
+    /// Returns every top-level session across all workspaces (used to lazily
+    /// refresh the rebuildable FTS5 search index against pi's JSONL files).
+    pub fn list_all_top_sessions(&self) -> StoreResult<Vec<SessionRow>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, workspace_id, pi_session_path, title, model, started_at, updated_at,
+                    parent_session_id
+             FROM sessions
+             WHERE parent_session_id IS NULL
+             ORDER BY updated_at DESC, id DESC",
+        )?;
+        let rows = stmt
+            .query_map([], session_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn session_search_mtime(&self, session_id: i64) -> StoreResult<Option<i64>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT mtime_secs FROM session_search_meta WHERE session_id = ?1",
+        )?;
+        let mut rows = stmt.query([session_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn upsert_session_search(
+        &self,
+        session_id: i64,
+        workspace_id: i64,
+        mtime_secs: i64,
+        content: &str,
+    ) -> StoreResult<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "DELETE FROM session_search_fts WHERE session_id = ?1",
+            [session_id],
+        )?;
+        conn.execute(
+            "INSERT INTO session_search_fts (session_id, workspace_id, content) VALUES (?1, ?2, ?3)",
+            rusqlite::params![session_id, workspace_id, content],
+        )?;
+        conn.execute(
+            "INSERT INTO session_search_meta (session_id, mtime_secs)
+             VALUES (?1, ?2)
+             ON CONFLICT(session_id) DO UPDATE SET mtime_secs = excluded.mtime_secs",
+            rusqlite::params![session_id, mtime_secs],
+        )?;
+        Ok(())
+    }
+
+    pub fn search_sessions(&self, query: &str, limit: usize) -> StoreResult<Vec<SessionSearchHit>> {
+        let tokens: Vec<String> = query
+            .split_whitespace()
+            .filter_map(|word| {
+                let cleaned: String = word
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                    .collect();
+                if cleaned.is_empty() {
+                    None
+                } else {
+                    Some(format!("\"{cleaned}\"*"))
+                }
+            })
+            .collect();
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let match_expr = tokens.join(" AND ");
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.workspace_id, w.name, s.title,
+                    snippet(session_search_fts, 2, '', '', '…', 14)
+             FROM session_search_fts f
+             JOIN sessions s ON s.id = f.session_id
+             JOIN workspaces w ON w.id = s.workspace_id
+             WHERE session_search_fts MATCH ?1
+             ORDER BY bm25(session_search_fts)
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![match_expr, limit as i64], |row| {
+                Ok(SessionSearchHit {
+                    session_id: row.get(0)?,
+                    workspace_id: row.get(1)?,
+                    workspace_name: row.get(2)?,
+                    session_title: row.get(3)?,
+                    snippet: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     // Used by the upcoming pi-runtime feature (see SessionNew note above).
@@ -775,7 +924,7 @@ mod tests {
         // The migration chain runs to its head, so a v1 file leaves at v5 (the
         // parent link joined in v5) and every earlier table is present along the
         // way.
-        assert_eq!(user_version(&store), 5);
+        assert_eq!(user_version(&store), 6);
         assert!(
             store
                 .list_provider_status()
@@ -857,7 +1006,7 @@ mod tests {
             .expect("the cache accepts a row after the upgrade");
         assert_eq!(store.list_provider_status().expect("list").len(), 1);
 
-        assert_eq!(user_version(&store), 5, "v5 is the migration contract");
+        assert_eq!(user_version(&store), 6, "v6 is the migration contract");
     }
 
     // H4 of `subagent-helpers.md`: a child is not a top-level session. Listing the
@@ -941,7 +1090,7 @@ mod tests {
 
         let store = Store::open(&db.0).expect("upgrade v3 -> v4");
 
-        assert_eq!(user_version(&store), 5);
+        assert_eq!(user_version(&store), 6);
         let workspaces = store.list_workspaces().expect("list workspaces");
         assert_eq!(workspaces.len(), 1, "the v3 workspace must survive");
         assert!(workspaces[0].pinned);
@@ -978,7 +1127,7 @@ mod tests {
         // Reopening an already-migrated database re-runs nothing.
         drop(store);
         let reopened = Store::open(&db.0).expect("reopen");
-        assert_eq!(user_version(&reopened), 5);
+        assert_eq!(user_version(&reopened), 6);
         assert!(
             reopened
                 .session_preview(sessions[0].id)
@@ -1109,10 +1258,10 @@ mod tests {
             .expect("insert");
         drop(store);
 
-        let reopened = Store::open(&db.0).expect("reopen a v5 database");
+        let reopened = Store::open(&db.0).expect("reopen a v6 database");
         assert_eq!(
             user_version(&reopened),
-            5,
+            6,
             "reopening must not change the schema version"
         );
         let rows = reopened.list_provider_status().expect("list");
@@ -1652,7 +1801,7 @@ mod tests {
 
         let store = Store::open(&db.0).expect("upgrade v4 -> v5");
 
-        assert_eq!(user_version(&store), 5, "the chain reaches v5");
+        assert_eq!(user_version(&store), 6, "the chain reaches v6");
         let sessions = store.list_sessions(1).expect("list");
         assert_eq!(sessions.len(), 1, "the v4 session must survive");
         assert_eq!(sessions[0].pi_session_path, "/sessions/v4.jsonl");
@@ -1681,7 +1830,7 @@ mod tests {
         // Reopening an already-migrated database re-runs nothing.
         drop(store);
         let reopened = Store::open(&db.0).expect("reopen");
-        assert_eq!(user_version(&reopened), 5);
+        assert_eq!(user_version(&reopened), 6);
     }
 
     // v5: a child dies with the chat that started it. An orphan row would be a

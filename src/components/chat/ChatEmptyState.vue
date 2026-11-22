@@ -25,9 +25,9 @@ defineProps<{
 
 <template>
   <div
-    class="flex h-full min-h-0 flex-col items-center justify-center overflow-y-auto px-6 py-10"
+    class="flex h-full min-h-0 flex-col items-center justify-center overflow-x-hidden overflow-y-auto px-4 py-8 sm:px-6"
   >
-    <div class="flex w-full max-w-[640px] flex-col items-center gap-6">
+    <div class="flex w-full min-w-0 max-w-[640px] flex-col items-center gap-6">
       <div class="flex flex-col items-center gap-3">
         <img
           :src="logo"

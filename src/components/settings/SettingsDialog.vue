@@ -96,6 +96,7 @@ import { computed, defineAsyncComponent, ref, watch, type Ref } from "vue";
 import {
   BlocksIcon,
   BotIcon,
+  BrainIcon,
   CheckIcon,
   ExternalLinkIcon,
   MonitorIcon,
@@ -103,6 +104,7 @@ import {
   PlugIcon,
   PlusIcon,
   SettingsIcon,
+  SparklesIcon,
   SunIcon,
   XIcon,
 } from "@lucide/vue";
@@ -131,8 +133,10 @@ import {
   applyPreferences,
   enabledTools,
   isToolEnabled,
+  notificationPreferences,
   preferenceDraftCommit,
   queueMessages,
+  setNotificationPreferences,
   setQueueMessages,
   setShowReasoning,
   setToolEnabled,
@@ -145,6 +149,11 @@ import {
   webSearchInstance,
   type ToolPreferenceId,
 } from "@/lib/preferences";
+import {
+  checkNotificationPermission,
+  ensureNotificationPermission,
+  type NotificationPermissionState,
+} from "@/lib/notifications";
 import {
   agentsConfigDirty,
   agentsConfigSaving,
@@ -169,6 +178,12 @@ const ProviderModelsEditor = defineAsyncComponent(
 const SubagentsSection = defineAsyncComponent(
   () => import("./SubagentsSection.vue"),
 );
+const MemorySection = defineAsyncComponent(
+  () => import("./MemorySection.vue"),
+);
+const SkillsSection = defineAsyncComponent(
+  () => import("./SkillsSection.vue"),
+);
 import {
   commandErrorMessage,
   configFilePath,
@@ -185,7 +200,7 @@ import type { AppSettings, ProviderSummary } from "@/contracts/types";
 const open = defineModel<boolean>("open", { default: false });
 
 /** S1 of `settings-dialog.md`: the sections the app can drive right now. */
-type Section = "general" | "providers" | "mcp" | "subagents";
+type Section = "general" | "providers" | "mcp" | "subagents" | "memory" | "skills";
 const section = ref<Section>("general");
 
 /** S2: every row renders through the catalogue, so a locale switch re-renders. */
@@ -572,6 +587,11 @@ const TOOL_SWITCHES: {
     descriptionKey: "settings.general.tools.changes.description",
   },
   {
+    id: "document",
+    labelKey: "settings.general.tools.document",
+    descriptionKey: "settings.general.tools.document.description",
+  },
+  {
     id: "terminal",
     labelKey: "settings.general.tools.terminal",
     descriptionKey: "settings.general.tools.terminal.description",
@@ -592,6 +612,43 @@ const TOOL_SWITCHES: {
  */
 function handleToolToggle(id: ToolPreferenceId, next: boolean) {
   void setToolEnabled(id, next);
+}
+
+const notificationPermission = ref<NotificationPermissionState>("prompt");
+
+async function refreshNotificationPermission(): Promise<void> {
+  notificationPermission.value = await checkNotificationPermission();
+}
+
+async function handleNotificationsMasterToggle(next: boolean): Promise<void> {
+  if (next) {
+    const granted = await ensureNotificationPermission();
+    notificationPermission.value = granted ? "granted" : "denied";
+    if (!granted) {
+      await setNotificationPreferences({ enabled: false });
+      return;
+    }
+    const prefs = notificationPreferences.value;
+    const anyTrigger =
+      prefs.onTurnFinish || prefs.onQuestion || prefs.onSubagentFinish;
+    await setNotificationPreferences({
+      enabled: true,
+      // When turning notifications on for the first time, pre-select useful defaults
+      // so the human immediately sees what will notify them and can toggle each one.
+      ...(anyTrigger
+        ? {}
+        : { onTurnFinish: true, onQuestion: true, onSubagentFinish: false }),
+    });
+    return;
+  }
+  await setNotificationPreferences({ enabled: false });
+}
+
+function handleNotificationTriggerToggle(
+  field: "onTurnFinish" | "onQuestion" | "onSubagentFinish",
+  next: boolean,
+): void {
+  void setNotificationPreferences({ [field]: next });
 }
 
 /**
@@ -869,6 +926,7 @@ async function handleSaveAll(): Promise<void> {
       webSearchEnabled: webSearchEnabled.value,
       webSearchInstance: nextInstance,
       webSearchCredentials: nextCredentials,
+      notifications: { ...notificationPreferences.value },
     });
     settings.value = saved;
     applyPreferences(saved);
@@ -915,6 +973,7 @@ watch(open, (isOpen) => {
   error.value = null;
   void loadPreferences();
   void loadProviders();
+  void refreshNotificationPermission();
   // The catalogue is re-read on every open — the file may have been edited
   // outside the app — through the shared store, so this pane and the chat's
   // picker always agree. `invalidate` marks it stale and lets the read below (or
@@ -1031,6 +1090,42 @@ watch(open, (isOpen) => {
               aria-hidden="true"
             />
             {{ t("settings.section.subagents") }}
+          </button>
+          <button
+            type="button"
+            :aria-current="section === 'memory' ? 'page' : undefined"
+            :class="[
+              'flex w-full items-center gap-2.5 rounded-lg border px-3 py-2 text-left text-xs outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+              section === 'memory'
+                ? 'border-border bg-sidebar-accent font-semibold text-sidebar-accent-foreground'
+                : 'border-transparent text-muted-foreground hover:bg-secondary hover:text-foreground',
+            ]"
+            @click="section = 'memory'"
+          >
+            <BrainIcon
+              class="size-4 shrink-0"
+              :class="section === 'memory' ? 'text-primary' : ''"
+              aria-hidden="true"
+            />
+            {{ t("settings.section.memory") }}
+          </button>
+          <button
+            type="button"
+            :aria-current="section === 'skills' ? 'page' : undefined"
+            :class="[
+              'flex w-full items-center gap-2.5 rounded-lg border px-3 py-2 text-left text-xs outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+              section === 'skills'
+                ? 'border-border bg-sidebar-accent font-semibold text-sidebar-accent-foreground'
+                : 'border-transparent text-muted-foreground hover:bg-secondary hover:text-foreground',
+            ]"
+            @click="section = 'skills'"
+          >
+            <SparklesIcon
+              class="size-4 shrink-0"
+              :class="section === 'skills' ? 'text-primary' : ''"
+              aria-hidden="true"
+            />
+            {{ t("settings.section.skills") }}
           </button>
         </nav>
 
@@ -1211,6 +1306,164 @@ watch(open, (isOpen) => {
                       :class="[
                         'size-3.5 rounded-full transition-transform',
                         isToolEnabled(tool.id)
+                          ? 'translate-x-4.5 bg-primary'
+                          : 'translate-x-0.5 bg-muted-foreground',
+                      ]"
+                      aria-hidden="true"
+                    />
+                  </button>
+                </div>
+              </div>
+            </section>
+
+            <!-- Configurable OS notifications (opt-in, per-event triggers). -->
+            <section class="space-y-3 rounded-xl border border-border bg-secondary/40 p-4">
+              <div class="flex items-start justify-between gap-4">
+                <div class="min-w-0">
+                  <div class="flex items-center gap-2">
+                    <h3 class="text-xs font-semibold text-foreground">
+                      {{ t("settings.general.notifications") }}
+                    </h3>
+                    <span
+                      v-if="notificationPermission === 'granted'"
+                      class="rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-[10px] font-medium text-primary"
+                    >
+                      {{ t("settings.general.notifications.permissionGranted") }}
+                    </span>
+                    <span
+                      v-else-if="notificationPermission === 'denied'"
+                      class="rounded-full border border-destructive/30 bg-destructive/10 px-2 py-0.5 text-[10px] font-medium text-destructive"
+                    >
+                      {{ t("settings.general.notifications.permissionDenied") }}
+                    </span>
+                  </div>
+                  <p class="mt-0.5 text-[11px] text-muted-foreground">
+                    {{ t("settings.general.notifications.description") }}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  :aria-checked="notificationPreferences.enabled"
+                  :aria-label="t('settings.general.notifications')"
+                  :class="[
+                    'relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full border outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                    notificationPreferences.enabled
+                      ? 'border-primary/40 bg-primary/15'
+                      : 'border-border bg-accent',
+                  ]"
+                  @click="handleNotificationsMasterToggle(!notificationPreferences.enabled)"
+                >
+                  <span
+                    :class="[
+                      'size-3.5 rounded-full transition-transform',
+                      notificationPreferences.enabled
+                        ? 'translate-x-4.5 bg-primary'
+                        : 'translate-x-0.5 bg-muted-foreground',
+                    ]"
+                    aria-hidden="true"
+                  />
+                </button>
+              </div>
+
+              <div
+                v-if="notificationPreferences.enabled"
+                class="divide-y divide-sidebar-border border-t border-sidebar-border pt-2"
+              >
+                <div class="flex items-start justify-between gap-4 py-2 first:pt-0 last:pb-0">
+                  <div class="min-w-0">
+                    <p class="text-xs font-medium text-foreground">
+                      {{ t("settings.general.notifications.onTurnFinish") }}
+                    </p>
+                    <p class="mt-0.5 text-[11px] text-muted-foreground">
+                      {{ t("settings.general.notifications.onTurnFinish.description") }}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    :aria-checked="notificationPreferences.onTurnFinish"
+                    :aria-label="t('settings.general.notifications.onTurnFinish')"
+                    :class="[
+                      'relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full border outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                      notificationPreferences.onTurnFinish
+                        ? 'border-primary/40 bg-primary/15'
+                        : 'border-border bg-accent',
+                    ]"
+                    @click="handleNotificationTriggerToggle('onTurnFinish', !notificationPreferences.onTurnFinish)"
+                  >
+                    <span
+                      :class="[
+                        'size-3.5 rounded-full transition-transform',
+                        notificationPreferences.onTurnFinish
+                          ? 'translate-x-4.5 bg-primary'
+                          : 'translate-x-0.5 bg-muted-foreground',
+                      ]"
+                      aria-hidden="true"
+                    />
+                  </button>
+                </div>
+
+                <div class="flex items-start justify-between gap-4 py-2 first:pt-0 last:pb-0">
+                  <div class="min-w-0">
+                    <p class="text-xs font-medium text-foreground">
+                      {{ t("settings.general.notifications.onQuestion") }}
+                    </p>
+                    <p class="mt-0.5 text-[11px] text-muted-foreground">
+                      {{ t("settings.general.notifications.onQuestion.description") }}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    :aria-checked="notificationPreferences.onQuestion"
+                    :aria-label="t('settings.general.notifications.onQuestion')"
+                    :class="[
+                      'relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full border outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                      notificationPreferences.onQuestion
+                        ? 'border-primary/40 bg-primary/15'
+                        : 'border-border bg-accent',
+                    ]"
+                    @click="handleNotificationTriggerToggle('onQuestion', !notificationPreferences.onQuestion)"
+                  >
+                    <span
+                      :class="[
+                        'size-3.5 rounded-full transition-transform',
+                        notificationPreferences.onQuestion
+                          ? 'translate-x-4.5 bg-primary'
+                          : 'translate-x-0.5 bg-muted-foreground',
+                      ]"
+                      aria-hidden="true"
+                    />
+                  </button>
+                </div>
+
+                <div class="flex items-start justify-between gap-4 py-2 first:pt-0 last:pb-0">
+                  <div class="min-w-0">
+                    <p class="text-xs font-medium text-foreground">
+                      {{ t("settings.general.notifications.onSubagentFinish") }}
+                    </p>
+                    <p class="mt-0.5 text-[11px] text-muted-foreground">
+                      {{ t("settings.general.notifications.onSubagentFinish.description") }}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    :aria-checked="notificationPreferences.onSubagentFinish"
+                    :aria-label="t('settings.general.notifications.onSubagentFinish')"
+                    :class="[
+                      'relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full border outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                      notificationPreferences.onSubagentFinish
+                        ? 'border-primary/40 bg-primary/15'
+                        : 'border-border bg-accent',
+                    ]"
+                    @click="handleNotificationTriggerToggle('onSubagentFinish', !notificationPreferences.onSubagentFinish)"
+                  >
+                    <span
+                      :class="[
+                        'size-3.5 rounded-full transition-transform',
+                        notificationPreferences.onSubagentFinish
                           ? 'translate-x-4.5 bg-primary'
                           : 'translate-x-0.5 bg-muted-foreground',
                       ]"
@@ -1789,7 +2042,11 @@ watch(open, (isOpen) => {
                MCP — it owns its read, its draft and its one write — and it is a
                section rather than a block inside General because a profile is a
                stored definition, not a preference of the chat. -->
-          <SubagentsSection v-else />
+          <SubagentsSection v-else-if="section === 'subagents'" />
+
+          <MemorySection v-else-if="section === 'memory'" />
+
+          <SkillsSection v-else />
 
           <Alert v-if="error" variant="destructive" class="mt-4">
             <AlertDescription>{{ error }}</AlertDescription>

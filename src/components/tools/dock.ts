@@ -458,6 +458,79 @@ export function openTool(
 }
 
 /**
+ * Opens or focuses a Document pane pointed at `path`:
+ * - If a Document pane already holds that exact `path`, focuses its tab.
+ * - If a Document pane is empty (`path === ""`), loads `path` into it.
+ * - Otherwise opens a new Document tab so existing open documents stay untouched.
+ */
+export function openDocumentInDrawer(
+  path: string,
+  workspace: WorkspaceInfo | null,
+  enabled: readonly string[],
+): string | null {
+  const trimmed = path.trim();
+  applyDock(workspace, enabled);
+  if (!enabled.includes("document")) return null;
+
+  let emptyTarget: { tabId: string; paneId: string } | null = null;
+  for (const tab of tabs.value) {
+    if (tab.layout === null) continue;
+    for (const slot of leafSlots(tab.layout)) {
+      if (slot.instance.toolId !== "document") continue;
+      if (slot.instance.context.path === trimmed) {
+        activeTabId.value = tab.id;
+        focusedId.value = slot.instance.id;
+        return tab.id;
+      }
+      if (emptyTarget === null && slot.instance.context.path === "") {
+        emptyTarget = { tabId: tab.id, paneId: slot.instance.id };
+      }
+    }
+  }
+
+  if (emptyTarget !== null) {
+    const tab = tabById(emptyTarget.tabId);
+    if (tab && tab.layout !== null) {
+      const targetPaneId = emptyTarget.paneId;
+      const layout = mapLeaves(tab.layout, (leaf) =>
+        leaf.instance.id === targetPaneId && leaf.instance.toolId === "document"
+          ? {
+              kind: "leaf",
+              instance: {
+                ...leaf.instance,
+                context: { path: trimmed },
+              },
+            }
+          : leaf,
+      );
+      replaceTab(tab.id, { ...tab, layout });
+      activeTabId.value = tab.id;
+      focusedId.value = targetPaneId;
+      return tab.id;
+    }
+  }
+
+  const tabId = openTool("document", workspace, enabled);
+  if (tabId === null) return null;
+  const tab = tabById(tabId);
+  if (tab && tab.layout !== null) {
+    const layout = mapLeaves(tab.layout, (leaf) =>
+      leaf.instance.toolId === "document"
+        ? {
+            kind: "leaf",
+            instance: {
+              ...leaf.instance,
+              context: { path: trimmed },
+            },
+          }
+        : leaf,
+    );
+    replaceTab(tab.id, { ...tab, layout });
+  }
+  return tabId;
+}
+
+/**
  * Splits one pane in two inside its tab. The new pane shows the same tool with the
  * same context, which is the useful starting point: a second Files pane on the same
  * folder, one "Browse" away from a different one; a second shell in the same

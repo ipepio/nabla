@@ -3,7 +3,10 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import {
+  open as openDialog,
+  save as saveDialog,
+} from "@tauri-apps/plugin-dialog";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { AgentEventEnvelope } from "./agent-events";
 import type {
@@ -19,6 +22,7 @@ import type {
   McpEndpoint,
   McpScope,
   McpServerSummary,
+  MemoryEntry,
   ModelInfo,
   ModelOption,
   PermissionMode,
@@ -37,10 +41,12 @@ import type {
   SessionDto,
   SessionCommand,
   SessionModelInfo,
+  SessionSearchHit,
   SessionStatusDto,
   SessionSummary,
   ShellOutputEvent,
   ShellSession,
+  SkillEntry,
   SubagentSession,
   ThinkingLevel,
   TranscriptMessage,
@@ -1206,4 +1212,160 @@ export async function subscribeEmbedNeedView(
  */
 export function mcpEndpoint(): Promise<McpEndpoint | null> {
   return invoke<McpEndpoint | null>("mcp_endpoint");
+}
+
+/** Renames a workspace alias in SQLite (path stays unchanged). */
+export function renameWorkspace(id: number, name: string): Promise<WorkspaceInfo> {
+  return invoke<WorkspaceInfo>("rename_workspace", { id, name });
+}
+
+/** Renames a session title in SQLite (pi's JSONL stays unchanged). */
+export function renameSession(sessionId: number, title: string): Promise<void> {
+  return invoke<void>("rename_session", { sessionId, title });
+}
+
+/** Full-text FTS5 search across past session transcripts (rebuildable from JSONL). */
+export function searchSessions(
+  query: string,
+  limit = 12,
+): Promise<SessionSearchHit[]> {
+  return invoke<SessionSearchHit[]>("search_sessions", { query, limit });
+}
+
+/** Lists local `.md` prompt skills from global config and optional workspace. */
+export function listSkills(workspaceId: number | null): Promise<SkillEntry[]> {
+  return invoke<SkillEntry[]>("list_skills", { workspaceId });
+}
+
+/** Saves or updates a global `.md` prompt skill. */
+export function saveSkill(payload: {
+  name: string;
+  description: string;
+  prompt: string;
+}): Promise<SkillEntry> {
+  return invoke<SkillEntry>("save_skill", payload);
+}
+
+/** Deletes a global `.md` prompt skill by slug name. */
+export function deleteSkill(name: string): Promise<boolean> {
+  return invoke<boolean>("delete_skill", { name });
+}
+
+/** Sends a best-effort native OS notification when Nabla is in the background. */
+export function notifyDesktop(title: string, body: string): Promise<void> {
+  return invoke<void>("notify_desktop", { title, body });
+}
+
+/** Reads a Markdown document from disk for the Document drawer tool. */
+export function docRead(path: string): Promise<string> {
+  return invoke<string>("doc_read", { path });
+}
+
+/** Saves a Markdown document to disk from the Document drawer tool. */
+export function docWrite(path: string, content: string): Promise<void> {
+  return invoke<void>("doc_write", { path, content });
+}
+
+/** Creates a transparent scratch Markdown file in Nabla's tmp folder. */
+export function docCreateTemp(): Promise<string> {
+  return invoke<string>("doc_create_temp");
+}
+
+/** Exports a Markdown file to `.docx` (embedding local PNG/JPEG images). */
+export function exportDocxFile(
+  input: string,
+  output: string | null = null,
+): Promise<string> {
+  return invoke<string>("export_docx_file", { input, output });
+}
+
+/** Opens a native picker for a single Markdown file. */
+export async function pickMarkdownFile(
+  title: string,
+  defaultPath?: string,
+): Promise<string | null> {
+  const picked = await openDialog({
+    title,
+    defaultPath,
+    directory: false,
+    multiple: false,
+    filters: [{ name: "Markdown", extensions: ["md", "markdown", "txt"] }],
+  });
+  return typeof picked === "string" ? picked : null;
+}
+
+/** Opens a native Save dialog for creating a new Markdown file. */
+export async function pickSaveMarkdownFile(
+  title: string,
+  defaultPath?: string,
+): Promise<string | null> {
+  const picked = await saveDialog({
+    title,
+    defaultPath,
+    filters: [{ name: "Markdown", extensions: ["md"] }],
+  });
+  return typeof picked === "string" ? picked : null;
+}
+
+/** Opens a native Save dialog for exporting a `.docx` file. */
+export async function pickSaveDocxFile(
+  title: string,
+  defaultPath?: string,
+): Promise<string | null> {
+  const picked = await saveDialog({
+    title,
+    defaultPath,
+    filters: [{ name: "Word Document", extensions: ["docx"] }],
+  });
+  return typeof picked === "string" ? picked : null;
+}
+
+/** Subscribes to `doc-open` events emitted when an agent opens/exports a doc. */
+export async function subscribeDocOpen(
+  handler: (payload: { path: string }) => void,
+): Promise<() => void> {
+  return listen<{ path: string }>("doc-open", ({ payload }) => {
+    handler(payload);
+  });
+}
+
+/** Lists or FTS5-searches persistent agent memories from `memory.db`. */
+export function memoryList(
+  query: string | null = null,
+  scope: string | null = null,
+  limit = 50,
+): Promise<MemoryEntry[]> {
+  return invoke<MemoryEntry[]>("memory_list", { query, scope, limit });
+}
+
+/** Saves or updates a persistent agent memory in `memory.db`. */
+export function memorySave(payload: {
+  title: string;
+  content: string;
+  kind?: string | null;
+  tags?: string | null;
+  scope?: string | null;
+}): Promise<MemoryEntry> {
+  return invoke<MemoryEntry>("memory_save", {
+    title: payload.title,
+    content: payload.content,
+    kind: payload.kind ?? null,
+    tags: payload.tags ?? null,
+    scope: payload.scope ?? null,
+  });
+}
+
+/** Deletes a single persistent memory by id. */
+export function memoryDelete(id: number): Promise<boolean> {
+  return invoke<boolean>("memory_delete", { id });
+}
+
+/** Clears persistent memories (all, or filtered by scope). */
+export function memoryClear(scope: string | null = null): Promise<number> {
+  return invoke<number>("memory_clear", { scope });
+}
+
+/** Signals Nabla's subagent extension to abort one specific child session. */
+export function cancelSubagent(sessionPath: string): Promise<void> {
+  return invoke<void>("cancel_subagent", { sessionPath });
 }

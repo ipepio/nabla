@@ -102,8 +102,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 
 /** The five tools this extension registers. Also the recursion strip list (S5). */
 const OWN_TOOLS: readonly string[] = [
@@ -882,13 +882,55 @@ export default function nablaSubagents(pi: ExtensionAPI) {
         void session?.abort().catch(() => undefined);
       };
       signal?.addEventListener("abort", onAbort, { once: true });
+
+      // Individual host-initiated cancellation (`cancel_subagent` command):
+      // Nabla writes `<data_dir>/subagents/cancel/<stem>.cancel` so the user
+      // can stop one specific child without aborting the parent or siblings.
+      const cancelStem = basename(sessionPath, ".jsonl").replace(/[^a-zA-Z0-9_-]/g, "");
+      const cancelDir = dataDir();
+      const cancelPath =
+        cancelDir && cancelStem !== ""
+          ? join(cancelDir, "subagents", "cancel", `${cancelStem}.cancel`)
+          : null;
+      let cancelledByHost = false;
+      const checkHostCancel = (): boolean => {
+        if (!cancelPath || cancelledByHost) return cancelledByHost;
+        if (!existsSync(cancelPath)) return false;
+        cancelledByHost = true;
+        try {
+          unlinkSync(cancelPath);
+        } catch {
+          // best-effort cleanup
+        }
+        void session?.abort().catch(() => undefined);
+        return true;
+      };
+      const cancelPoll =
+        cancelPath !== null ? setInterval(() => void checkHostCancel(), 400) : null;
+
       try {
-        // `expandPromptTemplates: false`: the task is data, never a command or
-        // a template — a child must not be steerable by what the parent writes.
-        await session.prompt(task, { expandPromptTemplates: false });
+        if (!checkHostCancel()) {
+          // `expandPromptTemplates: false`: the task is data, never a command or
+          // a template — a child must not be steerable by what the parent writes.
+          await session.prompt(task, { expandPromptTemplates: false });
+        }
       } finally {
+        if (cancelPoll !== null) clearInterval(cancelPoll);
         signal?.removeEventListener("abort", onAbort);
         unsubscribe();
+      }
+
+      if (cancelledByHost) {
+        child.status = "failed";
+        child.endedAt = nowIso();
+        publish(parent);
+        return {
+          child,
+          status: "failed",
+          failure: "run",
+          text: "",
+          reason: "Cancelled by user",
+        };
       }
 
       const outcome = finalText(session);

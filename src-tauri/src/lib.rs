@@ -1,12 +1,15 @@
 mod agents;
 mod cli;
 mod commands;
+mod docx_export;
 // The embedded browser: one child webview per view, added to the main window.
 mod embed;
 // The composer's image input: format sniffing, base64 and the per-turn bounds
 // (`odd/tasks/composer-image-input.md`).
 mod image_input;
 mod mcp;
+// Persistent agent memory (`<data_dir>/memory.db`, Engram pattern).
+mod memory;
 // The composer's PDF input: local `pdftotext` extraction, page by page, bounded
 // (`odd/tasks/composer-tools-pdf.md`).
 mod pdf_input;
@@ -18,6 +21,7 @@ mod providers;
 mod rpc;
 mod settings;
 mod shell;
+mod skills;
 mod store;
 // `web_search`: the agent's web search, backed by a SearXNG instance the human
 // configures or, failing that, by any public one (`web-search.md`).
@@ -42,6 +46,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         // Native folder picker for the workspace add flow (S9).
         .plugin(tauri_plugin_dialog::init())
+        // Native OS notifications with Nabla's own app icon.
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             // Directories are resolved once at startup: Tauri maps them to the
             // platform-specific locations, so no path is hardcoded here.
@@ -151,6 +157,10 @@ pub fn run() {
             // The embedded browser's registry, shared by the commands and by the
             // MCP server: the agent drives exactly the views the human sees.
             let embeds = embed::EmbedSessions::new();
+            let memory = Arc::new(
+                memory::MemoryStore::open(&data_dir.join("memory.db"))
+                    .expect("failed to open persistent agent memory store"),
+            );
             // `webview-control.md` T1: the MCP server pi connects to in order to
             // drive those views. A failure to bind is not fatal — the app runs
             // without agent control of the browser, which is the honest
@@ -159,6 +169,7 @@ pub fn run() {
                 Arc::new(mcp_server::EmbedDriver::new(
                     app.handle().clone(),
                     embeds.clone(),
+                    Arc::clone(&memory),
                 )),
                 // S1 of `web-search.md`: the `web_search` tool reads its switch and
                 // its instance from `settings.json` on every call, so a change in
@@ -173,6 +184,22 @@ pub fn run() {
             // inside the registration's `remove`→`add` window would inherit a
             // config with no `nabla-browser` tools for its whole life.
             let mcp_registration = Arc::new(mcp_server::RegistrationGate::new());
+            // Prune stale scratch Markdown documents at boot and periodically
+            // in the background (every 30 minutes of inactivity).
+            let cleanup_data_dir = data_dir.clone();
+            let _ = commands::cleanup_temp_docs(
+                &cleanup_data_dir,
+                std::time::Duration::from_secs(commands::TEMP_DOC_TTL_SECS),
+            );
+            let _ = std::thread::Builder::new()
+                .name("nabla-tmp-cleanup".to_string())
+                .spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(30 * 60));
+                    let _ = commands::cleanup_temp_docs(
+                        &cleanup_data_dir,
+                        std::time::Duration::from_secs(commands::TEMP_DOC_TTL_SECS),
+                    );
+                });
             app.manage(AppState {
                 store,
                 config_dir,
@@ -205,6 +232,7 @@ pub fn run() {
                 // One in-flight command probe per workspace, for the `/` list
                 // before any session exists.
                 probes: Arc::new(commands::CommandProbes::new()),
+                memory,
             });
             // S4 of `webview-control.md` (T3): the endpoint is written into pi's
             // global `mcp.json` so every session pi spawns already carries the
@@ -388,7 +416,23 @@ pub fn run() {
             commands::mcp_endpoint,
             // The UI's own zoom (`⌘`/`Ctrl` `+`, `-`, `0`): the main webview only,
             // never the embedded browser's child webviews.
-            commands::set_webview_zoom
+            commands::set_webview_zoom,
+            commands::rename_workspace,
+            commands::rename_session,
+            commands::search_sessions,
+            commands::list_skills,
+            commands::save_skill,
+            commands::delete_skill,
+            commands::notify_desktop,
+            commands::doc_read,
+            commands::doc_write,
+            commands::doc_create_temp,
+            commands::export_docx_file,
+            commands::memory_list,
+            commands::memory_save,
+            commands::memory_delete,
+            commands::memory_clear,
+            commands::cancel_subagent
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

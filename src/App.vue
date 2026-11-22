@@ -10,10 +10,10 @@ import AppSidebar from "./components/AppSidebar.vue";
 import ChatPanel from "./components/ChatPanel.vue";
 import ResizableAside from "./components/ResizableAside.vue";
 import ToolTabs from "./components/tools/ToolTabs.vue";
-import { openDrawer, openTool } from "./components/tools/dock";
+import { openDocumentInDrawer, openDrawer, openTool } from "./components/tools/dock";
 import { Button } from "./components/ui/button";
 import { SidebarInset, SidebarProvider } from "./components/ui/sidebar";
-import { subscribeEmbedNeedView } from "./contracts/commands";
+import { subscribeDocOpen, subscribeEmbedNeedView } from "./contracts/commands";
 import type { SessionSummary, WorkspaceInfo } from "./contracts/types";
 import { setWebviewZoom } from "./contracts/window";
 import { t } from "./lib/i18n";
@@ -106,8 +106,17 @@ async function openBrowserPane(): Promise<void> {
   openTool("browser", activeWorkspace.value, enabledTools.value);
 }
 
-/** The `embed-need-view` unsubscribe, once the listener is up. */
+/** Auto-opens the right drawer on the Document tool when an agent opens/exports a doc. */
+async function openDocumentPane(path: string): Promise<void> {
+  if (!isToolEnabled("document")) return;
+  toolsOpen.value = true;
+  await nextTick();
+  openDocumentInDrawer(path, activeWorkspace.value, enabledTools.value);
+}
+
+/** The `embed-need-view` and `doc-open` unsubscribes, once the listeners are up. */
 let unsubscribeNeedView: (() => void) | null = null;
+let unsubscribeDocOpen: (() => void) | null = null;
 /** Set on unmount: a subscribe that answers afterwards releases itself. */
 let disposed = false;
 
@@ -167,12 +176,17 @@ function onZoomKeydown(event: KeyboardEvent): void {
 
 onMounted(async () => {
   document.addEventListener("keydown", onZoomKeydown);
-  const off = await subscribeEmbedNeedView(() => void openBrowserPane());
+  const [offNeedView, offDocOpen] = await Promise.all([
+    subscribeEmbedNeedView(() => void openBrowserPane()),
+    subscribeDocOpen(({ path }) => void openDocumentPane(path)),
+  ]);
   if (disposed) {
-    off();
+    offNeedView();
+    offDocOpen();
     return;
   }
-  unsubscribeNeedView = off;
+  unsubscribeNeedView = offNeedView;
+  unsubscribeDocOpen = offDocOpen;
 });
 
 onBeforeUnmount(() => {
@@ -180,6 +194,8 @@ onBeforeUnmount(() => {
   disposed = true;
   unsubscribeNeedView?.();
   unsubscribeNeedView = null;
+  unsubscribeDocOpen?.();
+  unsubscribeDocOpen = null;
 });
 </script>
 

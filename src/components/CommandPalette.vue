@@ -5,6 +5,7 @@
 import { computed, nextTick, ref, watch } from "vue";
 import {
   CirclePlusIcon,
+  FileSearchIcon,
   FolderIcon,
   MessageSquareIcon,
   PanelRightIcon,
@@ -17,8 +18,8 @@ import {
   DialogDescription,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { listSessions, listWorkspaces } from "@/contracts/commands";
-import type { SessionSummary, WorkspaceInfo } from "@/contracts/types";
+import { listSessions, listWorkspaces, searchSessions } from "@/contracts/commands";
+import type { SessionSearchHit, SessionSummary, WorkspaceInfo } from "@/contracts/types";
 import { t } from "@/lib/i18n";
 
 const open = defineModel<boolean>("open", { default: false });
@@ -33,7 +34,7 @@ const emit = defineEmits<{
 
 interface PaletteItem {
   id: string;
-  group: "workspaces" | "sessions" | "actions";
+  group: "workspaces" | "sessions" | "messages" | "actions";
   label: string;
   subtitle?: string;
   shortcut?: string;
@@ -44,6 +45,8 @@ const query = ref("");
 const loading = ref(false);
 const workspaces = ref<WorkspaceInfo[]>([]);
 const sessionsByWorkspace = ref<Record<number, SessionSummary[]>>({});
+const searchHits = ref<SessionSearchHit[]>([]);
+let searchTimer: number | null = null;
 const activeIndex = ref(0);
 const inputRef = ref<HTMLInputElement | null>(null);
 
@@ -99,6 +102,7 @@ const items = computed<PaletteItem[]>(() => {
     }
   }
 
+  const shownSessionIds = new Set<number>();
   for (const ws of workspaces.value) {
     const sessions = sessionsByWorkspace.value[ws.id] ?? [];
     for (const session of sessions) {
@@ -108,6 +112,7 @@ const items = computed<PaletteItem[]>(() => {
         title.toLowerCase().includes(q) ||
         ws.name.toLowerCase().includes(q)
       ) {
+        shownSessionIds.add(session.id);
         result.push({
           id: `session-${session.id}`,
           group: "sessions",
@@ -120,6 +125,26 @@ const items = computed<PaletteItem[]>(() => {
         });
       }
     }
+  }
+
+  // Full-text FTS5 hits inside past conversation transcripts.
+  for (const hit of searchHits.value) {
+    if (shownSessionIds.has(hit.sessionId)) continue;
+    const ws = workspaces.value.find((w) => w.id === hit.workspaceId);
+    const session = (sessionsByWorkspace.value[hit.workspaceId] ?? []).find(
+      (s) => s.id === hit.sessionId,
+    );
+    if (!ws || !session) continue;
+    result.push({
+      id: `fts-${hit.sessionId}`,
+      group: "messages",
+      label: hit.sessionTitle?.trim() || t("session.untitled"),
+      subtitle: `${hit.workspaceName} · ${hit.snippet}`,
+      run: () => {
+        emit("selectSession", { workspace: ws, session });
+        open.value = false;
+      },
+    });
   }
 
   const actions: PaletteItem[] = [
@@ -164,6 +189,23 @@ const items = computed<PaletteItem[]>(() => {
   return result;
 });
 
+watch(query, (next) => {
+  if (searchTimer !== null) window.clearTimeout(searchTimer);
+  const trimmed = next.trim();
+  if (trimmed.length < 2) {
+    searchHits.value = [];
+    return;
+  }
+  searchTimer = window.setTimeout(async () => {
+    try {
+      const hits = await searchSessions(trimmed, 10);
+      if (query.value.trim() === trimmed) searchHits.value = hits;
+    } catch {
+      searchHits.value = [];
+    }
+  }, 160);
+});
+
 watch(items, (next) => {
   if (activeIndex.value >= next.length) activeIndex.value = 0;
 });
@@ -173,6 +215,7 @@ watch(
   async (isOpen) => {
     if (!isOpen) return;
     query.value = "";
+    searchHits.value = [];
     activeIndex.value = 0;
     void loadEntries();
     await nextTick();
@@ -199,6 +242,7 @@ function onKeydown(event: KeyboardEvent): void {
 function itemIcon(item: PaletteItem) {
   if (item.group === "workspaces") return FolderIcon;
   if (item.group === "sessions") return MessageSquareIcon;
+  if (item.group === "messages") return FileSearchIcon;
   if (item.id === "action-new-session") return CirclePlusIcon;
   if (item.id === "action-toggle-tools") return PanelRightIcon;
   return SettingsIcon;

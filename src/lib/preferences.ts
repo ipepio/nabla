@@ -25,7 +25,11 @@
  */
 import { ref } from "vue";
 import { getSettings, saveSettings } from "@/contracts/commands";
-import type { AppSettings, ThinkingLevel } from "@/contracts/types";
+import type {
+  AppSettings,
+  NotificationPreferences,
+  ThinkingLevel,
+} from "@/contracts/types";
 
 /**
  * S2: the reasoning block is rendered. Default `true` — the Rust default for both
@@ -83,15 +87,25 @@ export const thinkingLevel = ref<ThinkingLevel>(DEFAULT_THINKING_LEVEL);
  * today. Keeping the two lists apart is what stops a switch from implying a tab
  * that does not exist.
  */
-export const TOOL_IDS = ["files", "changes", "terminal", "browser"] as const;
+export const TOOL_IDS = [
+  "files",
+  "changes",
+  "document",
+  "terminal",
+  "browser",
+] as const;
 export type ToolPreferenceId = (typeof TOOL_IDS)[number];
 
 /**
  * S5: the tools a fresh install, or a settings file written before this
- * preference existed, offers. Files and Changes are read-only views, so they ship
- * on; Terminal and Browser execute code, so they are opt-in (F2/F3).
+ * preference existed, offers. Files, Changes and Document ship on; Terminal and
+ * Browser execute code, so they are opt-in (F2/F3).
  */
-export const DEFAULT_ENABLED_TOOLS: readonly string[] = ["files", "changes"];
+export const DEFAULT_ENABLED_TOOLS: readonly string[] = [
+  "files",
+  "changes",
+  "document",
+];
 
 /**
  * S5: the drawer tools the human enabled. A ref at module scope because the
@@ -127,6 +141,30 @@ export const webSearchInstance = ref("");
  * same trust level as the rest of that file, which is the human's own.
  */
 export const webSearchCredentials = ref("");
+
+/** Configurable OS notifications: opt-in master switch + per-event triggers. */
+export const DEFAULT_NOTIFICATION_PREFERENCES: NotificationPreferences = {
+  enabled: false,
+  onTurnFinish: false,
+  onQuestion: false,
+  onSubagentFinish: false,
+};
+
+export const notificationPreferences = ref<NotificationPreferences>({
+  ...DEFAULT_NOTIFICATION_PREFERENCES,
+});
+
+function normalizeNotifications(
+  value: NotificationPreferences | undefined,
+): NotificationPreferences {
+  if (!value) return { ...DEFAULT_NOTIFICATION_PREFERENCES };
+  return {
+    enabled: Boolean(value.enabled),
+    onTurnFinish: Boolean(value.onTurnFinish),
+    onQuestion: Boolean(value.onQuestion),
+    onSubagentFinish: Boolean(value.onSubagentFinish),
+  };
+}
 
 /** S5: whether one tool id is enabled right now. Unknown ids read as off. */
 export function isToolEnabled(id: string): boolean {
@@ -171,6 +209,7 @@ export function applyPreferences(settings: AppSettings | null): void {
   webSearchEnabled.value = settings?.webSearchEnabled ?? false;
   webSearchInstance.value = settings?.webSearchInstance ?? "";
   webSearchCredentials.value = settings?.webSearchCredentials ?? "";
+  notificationPreferences.value = normalizeNotifications(settings?.notifications);
 }
 
 /**
@@ -299,6 +338,18 @@ export async function setToolEnabled(
   await persist({ enabledTools: enabledTools.value });
 }
 
+/** Updates OS notification preferences and persists them to `settings.json`. */
+export async function setNotificationPreferences(
+  patch: Partial<NotificationPreferences>,
+): Promise<void> {
+  const next: NotificationPreferences = {
+    ...notificationPreferences.value,
+    ...patch,
+  };
+  notificationPreferences.value = next;
+  await persist({ notifications: next });
+}
+
 /** The refs plus the seed, for components that want the whole set at once. */
 export function usePreferences() {
   return {
@@ -309,6 +360,7 @@ export function usePreferences() {
     webSearchEnabled,
     webSearchInstance,
     webSearchCredentials,
+    notificationPreferences,
     isToolEnabled,
     applyPreferences,
   };
