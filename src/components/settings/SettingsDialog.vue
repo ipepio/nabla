@@ -242,8 +242,29 @@ const LANGUAGE_OPTIONS: { value: Locale; labelKey: MessageKey }[] = [
  * app ignores. The platform is read once, exactly as `App.vue` reads it.
  */
 const SHORTCUT_PLATFORM = detectPlatform(navigator.userAgent, navigator.platform);
+const SHORTCUT_MOD = SHORTCUT_PLATFORM === "mac" ? "⌘" : "Ctrl+";
 const ZOOM_SHORTCUT_LABELS = zoomShortcutLabels(SHORTCUT_PLATFORM);
 const SHORTCUT_ROWS: { labelKey: MessageKey; keys: string }[] = [
+  {
+    labelKey: "settings.general.shortcuts.search",
+    keys: `${SHORTCUT_MOD}K`,
+  },
+  {
+    labelKey: "settings.general.shortcuts.newSession",
+    keys: `${SHORTCUT_MOD}N`,
+  },
+  {
+    labelKey: "settings.general.shortcuts.toggleTools",
+    keys: `${SHORTCUT_MOD}.`,
+  },
+  {
+    labelKey: "settings.general.shortcuts.openSettings",
+    keys: `${SHORTCUT_MOD},`,
+  },
+  {
+    labelKey: "settings.general.shortcuts.saveDocument",
+    keys: `${SHORTCUT_MOD}S`,
+  },
   {
     labelKey: "settings.general.shortcuts.zoomIn",
     keys: ZOOM_SHORTCUT_LABELS.in,

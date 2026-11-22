@@ -106,7 +106,11 @@ const binding = computed(() => {
   const instance = props.instance;
   switch (instance.toolId) {
     case "files":
-      return { rootPath: instance.context.rootPath, onBrowse: browse };
+      return {
+        rootPath: instance.context.rootPath,
+        workspace: props.workspace,
+        onBrowse: browse,
+      };
     case "terminal":
       return { cwd: instance.context.cwd };
     case "changes":

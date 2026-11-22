@@ -36,8 +36,10 @@ import {
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { commandErrorMessage, fsListDir } from "@/contracts/commands";
-import type { FsEntry } from "@/contracts/types";
+import type { FsEntry, WorkspaceInfo } from "@/contracts/types";
 import { t } from "@/lib/i18n";
+import { enabledTools, isToolEnabled } from "@/lib/preferences";
+import { openDocumentInDrawer } from "./dock";
 import FilePreview from "./FilePreview.vue";
 import { formatBytes } from "./format";
 
@@ -47,6 +49,7 @@ const props = defineProps<{
    * same face this pane had before the dock existed.
    */
   rootPath: string;
+  workspace?: WorkspaceInfo | null;
 }>();
 
 const emit = defineEmits<{
@@ -75,6 +78,16 @@ const errorsByPath = ref<Record<string, string>>({});
 const selectedPath = ref<string | null>(null);
 
 let disposed = false;
+
+function openInDocumentTool(entry: FsEntry): void {
+  if (entry.kind === "dir") return;
+  if (!/\.(md|markdown)$/i.test(entry.name)) return;
+  if (!isToolEnabled("document")) return;
+  const base = props.rootPath.replace(/[\\/]+$/, "");
+  const sep = base.includes("\\") ? "\\" : "/";
+  const fullPath = `${base}${sep}${entry.path}`;
+  openDocumentInDrawer(fullPath, props.workspace ?? null, enabledTools.value);
+}
 
 async function loadDir(relPath: string): Promise<void> {
   const root = props.rootPath;
@@ -254,6 +267,7 @@ onBeforeUnmount(() => {
             "
             :title="row.entry.path"
             @click="activate(row.entry)"
+            @dblclick="openInDocumentTool(row.entry)"
           >
             <template v-if="row.entry.kind === 'dir'">
               <ChevronRightIcon

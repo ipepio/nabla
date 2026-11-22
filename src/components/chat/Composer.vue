@@ -1095,6 +1095,7 @@ watch(() => props.workspaceId, prewarmCommands);
             variant="ghost"
             size="icon-sm"
             :aria-label="t('chat.composer.attach')"
+            :title="t('chat.composer.attach')"
             :disabled="disabled"
           >
             <PlusIcon />
@@ -1256,6 +1257,7 @@ watch(() => props.workspaceId, prewarmCommands);
           size="icon-sm"
           class="rounded-lg border-border bg-secondary hover:border-destructive hover:text-destructive"
           :aria-label="t('chat.composer.stop')"
+          :title="t('chat.composer.stop')"
           @click="emit('stop')"
         >
           <SquareIcon />
@@ -1264,6 +1266,9 @@ watch(() => props.workspaceId, prewarmCommands);
           size="icon-sm"
           class="rounded-lg bg-primary text-primary-foreground hover:bg-primary/90"
           :aria-label="
+            queueing ? t('chat.composer.queue') : t('chat.composer.send')
+          "
+          :title="
             queueing ? t('chat.composer.queue') : t('chat.composer.send')
           "
           :disabled="!canSubmit"

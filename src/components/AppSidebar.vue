@@ -719,7 +719,7 @@ onUnmounted(() => {
 
 <template>
   <Sidebar collapsible="icon">
-    <SidebarHeader class="gap-3 border-b border-sidebar-border px-3 py-3">
+    <SidebarHeader class="gap-3 px-3 py-3">
       <div class="flex items-center gap-2">
         <!-- Expanded header, one row: [mark] [wordmark] [collapse control].
              The drawer is still the only place with a collapse control (S8). -->
@@ -936,7 +936,7 @@ onUnmounted(() => {
       </Alert>
     </SidebarContent>
 
-    <SidebarFooter class="border-t border-sidebar-border px-2.5 py-2.5">
+    <SidebarFooter class="px-2.5 py-2.5">
       <!-- S1 of `settings-dialog.md`: the gear opens the two-pane settings
            dialog; the dialog owns every preference read and write. -->
       <Button

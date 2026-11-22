@@ -10,6 +10,11 @@
 import { CheckIcon, FileDownIcon, PanelRightOpenIcon, SearchIcon } from "@lucide/vue";
 import ThemeToggle from "@/components/chat/ThemeToggle.vue";
 import { Button } from "@/components/ui/button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { t } from "@/lib/i18n";
 
 const isMac =
@@ -109,33 +114,45 @@ const emit = defineEmits<{
       </span>
     </div>
 
-    <Button
-      variant="ghost"
-      size="icon-sm"
-      class="text-muted-foreground hover:bg-accent hover:text-foreground"
-      :aria-label="exported ? t('chat.exportMarkdownCopied') : t('chat.exportMarkdown')"
-      :title="exported ? t('chat.exportMarkdownCopied') : t('chat.exportMarkdown')"
-      @click="emit('exportMarkdown')"
-    >
-      <CheckIcon v-if="exported" class="text-primary" />
-      <FileDownIcon v-else />
-    </Button>
+    <Tooltip>
+      <TooltipTrigger as-child>
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          class="text-muted-foreground hover:bg-accent hover:text-foreground"
+          :aria-label="exported ? t('chat.exportMarkdownCopied') : t('chat.exportMarkdown')"
+          @click="emit('exportMarkdown')"
+        >
+          <CheckIcon v-if="exported" class="text-primary" />
+          <FileDownIcon v-else />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">
+        {{ exported ? t("chat.exportMarkdownCopied") : t("chat.exportMarkdown") }}
+      </TooltipContent>
+    </Tooltip>
 
     <!-- Tools drawer toggle: collapsed by default and reachable from here and
          from the empty state. Hidden while the drawer is open, because the
          drawer carries its own collapse control (no duplicate affordance in
          the central area). -->
-    <Button
-      v-if="!toolsOpen"
-      variant="ghost"
-      size="icon-sm"
-      class="text-muted-foreground hover:bg-accent hover:text-foreground"
-      :aria-label="t('chat.expandTools')"
-      :aria-pressed="toolsOpen"
-      @click="emit('toggleTools')"
-    >
-      <PanelRightOpenIcon />
-    </Button>
+    <Tooltip v-if="!toolsOpen">
+      <TooltipTrigger as-child>
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          class="text-muted-foreground hover:bg-accent hover:text-foreground"
+          :aria-label="t('chat.expandTools')"
+          :aria-pressed="toolsOpen"
+          @click="emit('toggleTools')"
+        >
+          <PanelRightOpenIcon />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">
+        {{ t("chat.expandTools") }}
+      </TooltipContent>
+    </Tooltip>
 
     <!-- Theme switch: the icon names the *target* palette (sun = light), and
          the panel persists the new mode in settings.json. Shared with the

@@ -52,12 +52,15 @@ import {
 } from "@/components/ui/sidebar";
 import { t } from "@/lib/i18n";
 import {
+  closeSubagentView,
   isSubagentActive,
+  loadSubagentChildren,
+  openSubagentId as currentOpenSubagentId,
   subagentChildrenOf,
   subagentStatusDot,
   subagentStatusLabel,
 } from "@/lib/subagent-store";
-import { cancelSubagent } from "@/contracts/commands";
+import { cancelSubagent, deleteSession } from "@/contracts/commands";
 import type { SessionSummary, SubagentSession } from "@/contracts/types";
 
 /** One child row of the list, with the chat that delegated to it (H4). */
@@ -151,6 +154,66 @@ function handleCancelChild(child: SubagentSession): void {
   void cancelSubagent(child.sessionPath).catch(() => {});
 }
 
+async function handleDeleteChild(
+  child: SubagentSession,
+  parent: SessionSummary,
+): Promise<void> {
+  try {
+    if (currentOpenSubagentId.value === child.sessionId) {
+      closeSubagentView();
+    }
+    await deleteSession(child.sessionId);
+    await loadSubagentChildren(parent.workspaceId, [parent.id], { force: true });
+  } catch {
+    // Best-effort: row stays if deletion was rejected.
+  }
+}
+
+type RowContextMenu =
+  | { kind: "session"; x: number; y: number; session: SessionSummary }
+  | { kind: "subagent"; x: number; y: number; child: SubagentSession; parent: SessionSummary };
+
+const rowMenu = ref<RowContextMenu | null>(null);
+
+function closeRowMenu(): void {
+  rowMenu.value = null;
+}
+
+function clampMenuPos(clientX: number, clientY: number): { x: number; y: number } {
+  const menuW = 200;
+  const menuH = 160;
+  return {
+    x: Math.min(clientX, Math.max(8, window.innerWidth - menuW - 8)),
+    y: Math.min(clientY, Math.max(8, window.innerHeight - menuH - 8)),
+  };
+}
+
+function openSessionContextMenu(event: MouseEvent, session: SessionSummary): void {
+  if (import.meta.env.DEV && event.shiftKey) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const { x, y } = clampMenuPos(event.clientX, event.clientY);
+  rowMenu.value = { kind: "session", x, y, session };
+}
+
+function openSubagentContextMenu(
+  event: MouseEvent,
+  child: SubagentSession,
+  parent: SessionSummary,
+): void {
+  if (import.meta.env.DEV && event.shiftKey) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const { x, y } = clampMenuPos(event.clientX, event.clientY);
+  rowMenu.value = { kind: "subagent", x, y, child, parent };
+}
+
+function onWindowKeydown(event: KeyboardEvent): void {
+  if (event.key === "Escape" && rowMenu.value !== null) {
+    closeRowMenu();
+  }
+}
+
 /** The contract has no title yet, so the fallback is the neutral "Session". */
 function label(session: SessionSummary): string {
   return session.title ?? t("session.untitled");
@@ -202,9 +265,15 @@ onMounted(() => {
   ageTickHandle = window.setInterval(() => {
     ageClock.value += 1;
   }, AGE_TICK_MS);
+  window.addEventListener("pointerdown", closeRowMenu);
+  window.addEventListener("keydown", onWindowKeydown);
+  window.addEventListener("blur", closeRowMenu);
 });
 
 onUnmounted(() => {
+  window.removeEventListener("pointerdown", closeRowMenu);
+  window.removeEventListener("keydown", onWindowKeydown);
+  window.removeEventListener("blur", closeRowMenu);
   if (ageTickHandle === null) return;
   window.clearInterval(ageTickHandle);
   ageTickHandle = null;
@@ -225,6 +294,7 @@ onUnmounted(() => {
         :is-active="String(session.id) === activeSessionId"
         class="relative h-auto w-full items-center gap-2.5 rounded-lg border border-transparent px-2.5 py-2 pr-7 text-left text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground data-[active=true]:border-border data-[active=true]:bg-sidebar-accent data-[active=true]:text-foreground data-[active=true]:before:absolute data-[active=true]:before:inset-y-2 data-[active=true]:before:-left-1 data-[active=true]:before:w-0.5 data-[active=true]:before:rounded-full data-[active=true]:before:bg-primary"
         @click="emit('select', session)"
+        @contextmenu="openSessionContextMenu($event, session)"
       >
         <MessageSquareIcon
           class="size-4 shrink-0 opacity-75"
@@ -334,6 +404,7 @@ onUnmounted(() => {
             :is-active="child.sessionId === openSubagentId"
             class="h-auto w-full items-center gap-2.5 rounded-lg border border-transparent px-2.5 py-2 text-left text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground data-[active=true]:border-border data-[active=true]:bg-sidebar-accent data-[active=true]:text-foreground"
             @click="emit('openSubagent', { child, parent: session })"
+            @contextmenu="openSubagentContextMenu($event, child, session)"
           >
             <GitBranchIcon
               class="size-3.5 shrink-0"
@@ -398,6 +469,81 @@ onUnmounted(() => {
 
     <!-- One dialog for the whole list: the trigger only says which row it is
          about, so the list never renders one dialog per session. -->
+    <Teleport to="body">
+      <div
+        v-if="rowMenu"
+        role="menu"
+        class="fixed z-50 w-48 overflow-hidden rounded-xl border border-border bg-popover p-1 text-popover-foreground shadow-xl"
+        :style="{ left: `${rowMenu.x}px`, top: `${rowMenu.y}px` }"
+        @pointerdown.stop
+        @contextmenu.prevent
+      >
+        <template v-if="rowMenu.kind === 'session'">
+          <button
+            type="button"
+            role="menuitem"
+            class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground"
+            @click="requestRename(rowMenu.session); closeRowMenu()"
+          >
+            <PencilIcon class="size-3.5 text-muted-foreground" />
+            {{ t("session.rename") }}
+          </button>
+          <button
+            v-if="isRunning(rowMenu.session, liveSessionIds)"
+            type="button"
+            role="menuitem"
+            class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground"
+            @click="emit('pause', rowMenu.session); closeRowMenu()"
+          >
+            <PauseIcon class="size-3.5 text-muted-foreground" />
+            {{ t("session.pause") }}
+          </button>
+          <div class="my-1 h-px bg-border" role="separator" />
+          <button
+            type="button"
+            role="menuitem"
+            class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs text-destructive hover:bg-destructive/10"
+            @click="requestDelete(rowMenu.session); closeRowMenu()"
+          >
+            <Trash2Icon class="size-3.5" />
+            {{ t("common.delete") }}
+          </button>
+        </template>
+
+        <template v-else>
+          <button
+            type="button"
+            role="menuitem"
+            class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground"
+            @click="emit('openSubagent', { child: rowMenu.child, parent: rowMenu.parent }); closeRowMenu()"
+          >
+            <GitBranchIcon class="size-3.5 text-muted-foreground" />
+            {{ t("chat.subagent.open") }}
+          </button>
+          <button
+            v-if="isSubagentActive(rowMenu.child.status)"
+            type="button"
+            role="menuitem"
+            class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs text-destructive hover:bg-destructive/10"
+            @click="handleCancelChild(rowMenu.child); closeRowMenu()"
+          >
+            <SquareIcon class="size-3 fill-current" />
+            {{ t("chat.subagent.cancel") }}
+          </button>
+          <div class="my-1 h-px bg-border" role="separator" />
+          <button
+            type="button"
+            role="menuitem"
+            class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs text-destructive hover:bg-destructive/10"
+            @click="void handleDeleteChild(rowMenu.child, rowMenu.parent); closeRowMenu()"
+          >
+            <Trash2Icon class="size-3.5" />
+            {{ t("common.delete") }}
+          </button>
+        </template>
+      </div>
+    </Teleport>
+
     <Dialog v-model:open="renameOpen">
       <DialogContent>
         <DialogHeader>

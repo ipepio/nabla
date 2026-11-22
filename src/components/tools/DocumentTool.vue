@@ -70,6 +70,8 @@ const currentPath = ref<string>(props.path || "");
 const isTempDoc = ref(false);
 const blocks = ref<DocBlock[]>([]);
 const savedSnapshot = ref<string>("");
+const lastDiskContent = ref<string>("");
+const externalUpdatePending = ref(false);
 const focusedBlockId = ref<string | null>(null);
 const loading = ref(false);
 const saving = ref(false);
@@ -85,6 +87,7 @@ const slashActiveIndex = ref(0);
 const blockInputEls = new Map<string, HTMLTextAreaElement>();
 let statusTimer: number | null = null;
 let autoSaveTimer: number | null = null;
+let diskPollTimer: number | null = null;
 
 function setBlockInputRef(id: string, el: unknown): void {
   if (el instanceof HTMLTextAreaElement) {
@@ -95,9 +98,13 @@ function setBlockInputRef(id: string, el: unknown): void {
   }
 }
 
+const SUPPORTS_FIELD_SIZING =
+  typeof CSS !== "undefined" && CSS.supports("field-sizing", "content");
+
 function autoResizeTextarea(el: HTMLTextAreaElement): void {
+  if (SUPPORTS_FIELD_SIZING) return;
   el.style.height = "auto";
-  el.style.height = `${Math.max(el.scrollHeight, 24)}px`;
+  el.style.height = `${Math.max(el.scrollHeight + 2, 26)}px`;
 }
 
 function showNotice(msg: string): void {
@@ -220,6 +227,8 @@ async function loadDocument(path: string): Promise<void> {
     const text = await docRead(trimmed);
     currentPath.value = trimmed;
     isTempDoc.value = looksLikeTempPath(trimmed);
+    lastDiskContent.value = text;
+    externalUpdatePending.value = false;
     const parsed = parseMarkdownToBlocks(text);
     blocks.value = parsed;
     savedSnapshot.value = serializeBlocksToMarkdown(parsed);
@@ -290,6 +299,8 @@ async function handleSaveAs(): Promise<boolean> {
     currentPath.value = picked;
     isTempDoc.value = false;
     savedSnapshot.value = md;
+    lastDiskContent.value = md;
+    externalUpdatePending.value = false;
     showNotice(t("tools.document.saved"));
     return true;
   } catch (cause) {
@@ -310,6 +321,8 @@ async function handleSave(): Promise<boolean> {
     const md = serializedMarkdown.value;
     await docWrite(currentPath.value, md);
     savedSnapshot.value = md;
+    lastDiskContent.value = md;
+    externalUpdatePending.value = false;
     if (!isTempDoc.value) showNotice(t("tools.document.saved"));
     return true;
   } catch (cause) {
@@ -331,6 +344,7 @@ watch(serializedMarkdown, (md) => {
       void docWrite(currentPath.value, latest)
         .then(() => {
           savedSnapshot.value = latest;
+          lastDiskContent.value = latest;
         })
         .catch(() => {});
     }
@@ -810,13 +824,13 @@ function handleExportPdf(): void {
 function blockTextareaClass(kind: TextBlockKind): string {
   switch (kind) {
     case "h1":
-      return "text-2xl font-bold tracking-tight text-foreground leading-tight";
+      return "text-2xl font-bold tracking-tight text-foreground leading-normal py-0.5";
     case "h2":
-      return "text-lg font-semibold tracking-tight text-foreground leading-snug pt-2";
+      return "text-lg font-semibold tracking-tight text-foreground leading-normal pt-2 pb-0.5";
     case "h3":
-      return "text-base font-semibold text-foreground leading-snug pt-1";
+      return "text-base font-semibold text-foreground leading-normal pt-1 pb-0.5";
     case "h4":
-      return "text-sm font-semibold text-foreground/95 leading-snug pt-1";
+      return "text-sm font-semibold text-foreground/95 leading-normal pt-1 pb-0.5";
     case "quote":
       return "text-sm italic text-muted-foreground leading-relaxed";
     case "code":
@@ -845,14 +859,44 @@ function onKeydown(event: KeyboardEvent): void {
   }
 }
 
+async function syncFromDiskIfChanged(): Promise<void> {
+  const path = currentPath.value;
+  if (!path || loading.value || saving.value) return;
+  try {
+    const diskText = await docRead(path);
+    if (diskText === lastDiskContent.value) return;
+    if (isDirty.value) {
+      externalUpdatePending.value = true;
+      return;
+    }
+    lastDiskContent.value = diskText;
+    externalUpdatePending.value = false;
+    const parsed = parseMarkdownToBlocks(diskText);
+    blocks.value = parsed;
+    savedSnapshot.value = serializeBlocksToMarkdown(parsed);
+  } catch {
+    // Ignore transient read errors while an external tool is mid-write.
+  }
+}
+
+function handleWindowFocus(): void {
+  void syncFromDiskIfChanged();
+}
+
 onMounted(() => {
   window.addEventListener("keydown", onKeydown);
+  window.addEventListener("focus", handleWindowFocus);
+  diskPollTimer = window.setInterval(() => {
+    void syncFromDiskIfChanged();
+  }, 1500);
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKeydown);
+  window.removeEventListener("focus", handleWindowFocus);
   if (statusTimer !== null) window.clearTimeout(statusTimer);
   if (autoSaveTimer !== null) window.clearTimeout(autoSaveTimer);
+  if (diskPollTimer !== null) window.clearInterval(diskPollTimer);
 });
 </script>
 
@@ -1034,6 +1078,20 @@ onBeforeUnmount(() => {
       class="shrink-0 border-b border-destructive/30 bg-destructive/10 px-3 py-1.5 text-[11px] text-destructive"
     >
       {{ error }}
+    </div>
+    <div
+      v-else-if="externalUpdatePending"
+      class="flex shrink-0 items-center justify-between gap-2 border-b border-warning/30 bg-warning/10 px-3 py-1 text-[11px] text-warning"
+    >
+      <span>{{ t("tools.document.externalUpdate") }}</span>
+      <Button
+        variant="outline"
+        size="xs"
+        class="h-5 px-2 text-[10px]"
+        @click="loadDocument(currentPath)"
+      >
+        {{ t("tools.document.reload") }}
+      </Button>
     </div>
     <div
       v-else-if="statusNotice"
@@ -1222,7 +1280,7 @@ onBeforeUnmount(() => {
               :value="block.text"
               rows="1"
               :placeholder="blockPlaceholder(block.kind, idx)"
-              class="min-w-0 flex-1 resize-none overflow-hidden border-0 bg-transparent p-0 outline-hidden placeholder:text-muted-foreground/40"
+              class="h-auto min-h-[1lh] w-full min-w-0 flex-1 resize-none overflow-hidden border-0 bg-transparent p-0 [field-sizing:content] outline-hidden placeholder:text-muted-foreground/40"
               :class="[
                 blockTextareaClass(block.kind),
                 block.kind === 'todo' && block.checked ? 'line-through opacity-55' : '',

@@ -6,6 +6,11 @@
 // so this button never touches the contracts seam.
 import { MoonIcon, SunIcon } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { t } from "@/lib/i18n";
 
 const props = defineProps<{
@@ -17,16 +22,23 @@ const emit = defineEmits<{ (e: "toggle"): void }>();
 </script>
 
 <template>
-  <Button
-    variant="ghost"
-    size="icon-sm"
-    :aria-label="
-      props.isDark ? t('theme.switchToLight') : t('theme.switchToDark')
-    "
-    :aria-pressed="props.isDark"
-    @click="emit('toggle')"
-  >
-    <SunIcon v-if="props.isDark" />
-    <MoonIcon v-else />
-  </Button>
+  <Tooltip>
+    <TooltipTrigger as-child>
+      <Button
+        variant="ghost"
+        size="icon-sm"
+        :aria-label="
+          props.isDark ? t('theme.switchToLight') : t('theme.switchToDark')
+        "
+        :aria-pressed="props.isDark"
+        @click="emit('toggle')"
+      >
+        <SunIcon v-if="props.isDark" />
+        <MoonIcon v-else />
+      </Button>
+    </TooltipTrigger>
+    <TooltipContent side="bottom">
+      {{ props.isDark ? t("theme.switchToLight") : t("theme.switchToDark") }}
+    </TooltipContent>
+  </Tooltip>
 </template>

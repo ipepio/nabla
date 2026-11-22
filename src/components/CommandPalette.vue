@@ -5,6 +5,7 @@
 import { computed, nextTick, ref, watch } from "vue";
 import {
   CirclePlusIcon,
+  FilePlus2Icon,
   FileSearchIcon,
   FolderIcon,
   MessageSquareIcon,
@@ -28,6 +29,7 @@ const emit = defineEmits<{
   (e: "selectWorkspace", workspace: WorkspaceInfo): void;
   (e: "selectSession", payload: { workspace: WorkspaceInfo; session: SessionSummary }): void;
   (e: "newSession"): void;
+  (e: "newDocument"): void;
   (e: "toggleTools"): void;
   (e: "openSettings"): void;
 }>();
@@ -159,6 +161,15 @@ const items = computed<PaletteItem[]>(() => {
       },
     },
     {
+      id: "action-new-document",
+      group: "actions",
+      label: t("palette.action.newDocument"),
+      run: () => {
+        emit("newDocument");
+        open.value = false;
+      },
+    },
+    {
       id: "action-toggle-tools",
       group: "actions",
       label: t("palette.action.toggleTools"),
@@ -244,6 +255,7 @@ function itemIcon(item: PaletteItem) {
   if (item.group === "sessions") return MessageSquareIcon;
   if (item.group === "messages") return FileSearchIcon;
   if (item.id === "action-new-session") return CirclePlusIcon;
+  if (item.id === "action-new-document") return FilePlus2Icon;
   if (item.id === "action-toggle-tools") return PanelRightIcon;
   return SettingsIcon;
 }

@@ -6,6 +6,7 @@
 // active selection, so ChatPanel receives one workspace instead of the list.
 import { defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { PanelRightCloseIcon, RotateCcwIcon } from "@lucide/vue";
+import AppContextMenu from "./components/AppContextMenu.vue";
 import AppSidebar from "./components/AppSidebar.vue";
 import ChatPanel from "./components/ChatPanel.vue";
 import ResizableAside from "./components/ResizableAside.vue";
@@ -13,7 +14,12 @@ import ToolTabs from "./components/tools/ToolTabs.vue";
 import { openDocumentInDrawer, openDrawer, openTool } from "./components/tools/dock";
 import { Button } from "./components/ui/button";
 import { SidebarInset, SidebarProvider } from "./components/ui/sidebar";
-import { subscribeDocOpen, subscribeEmbedNeedView } from "./contracts/commands";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "./components/ui/tooltip";
+import { docCreateTemp, subscribeDocOpen, subscribeEmbedNeedView } from "./contracts/commands";
 import type { SessionSummary, WorkspaceInfo } from "./contracts/types";
 import { setWebviewZoom } from "./contracts/window";
 import { t } from "./lib/i18n";
@@ -112,6 +118,17 @@ async function openDocumentPane(path: string): Promise<void> {
   toolsOpen.value = true;
   await nextTick();
   openDocumentInDrawer(path, activeWorkspace.value, enabledTools.value);
+}
+
+/** Creates a transparent scratch `.md` doc and opens it in the right drawer. */
+async function handleNewDocument(): Promise<void> {
+  if (!isToolEnabled("document")) return;
+  try {
+    const tempPath = await docCreateTemp();
+    await openDocumentPane(tempPath);
+  } catch {
+    await openDocumentPane("");
+  }
 }
 
 /** The `embed-need-view` and `doc-open` unsubscribes, once the listeners are up. */
@@ -264,24 +281,38 @@ onBeforeUnmount(() => {
             <span class="ms-auto font-mono text-[10px] tabular-nums text-muted-foreground">
               {{ width }} px
             </span>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              class="text-muted-foreground hover:bg-accent hover:text-foreground"
-              aria-label="Reset panel width"
-              @click="resetWidth"
-            >
-              <RotateCcwIcon />
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              class="text-muted-foreground hover:bg-accent hover:text-foreground"
-              :aria-label="t('tools.collapse')"
-              @click="toolsOpen = false"
-            >
-              <PanelRightCloseIcon />
-            </Button>
+            <Tooltip>
+              <TooltipTrigger as-child>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  class="text-muted-foreground hover:bg-accent hover:text-foreground"
+                  :aria-label="t('tools.resetWidth')"
+                  @click="resetWidth"
+                >
+                  <RotateCcwIcon />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                {{ t("tools.resetWidth") }}
+              </TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger as-child>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  class="text-muted-foreground hover:bg-accent hover:text-foreground"
+                  :aria-label="t('tools.collapse')"
+                  @click="toolsOpen = false"
+                >
+                  <PanelRightCloseIcon />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                {{ t("tools.collapse") }}
+              </TooltipContent>
+            </Tooltip>
           </div>
 
           <ToolTabs :workspace="activeWorkspace" :visible="toolsOpen" />
@@ -295,6 +326,15 @@ onBeforeUnmount(() => {
       @select-workspace="handlePaletteSelectWorkspace"
       @select-session="handlePaletteSelectSession"
       @new-session="void sidebarRef?.handleNewSession()"
+      @new-document="void handleNewDocument()"
+      @toggle-tools="toggleDrawer"
+      @open-settings="sidebarRef?.openSettings()"
+    />
+
+    <AppContextMenu
+      @new-session="void sidebarRef?.handleNewSession()"
+      @open-search="openPalette"
+      @new-document="void handleNewDocument()"
       @toggle-tools="toggleDrawer"
       @open-settings="sidebarRef?.openSettings()"
     />

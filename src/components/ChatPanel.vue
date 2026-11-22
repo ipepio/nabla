@@ -12,6 +12,7 @@
 // running and keeps accumulating events off screen.
 import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import {
+  LoaderCircleIcon,
   PanelRightOpenIcon,
   XIcon,
 } from "@lucide/vue";
@@ -136,7 +137,9 @@ import {
 } from "@/lib/preferences";
 import {
   closeSubagentView,
+  isSubagentActive,
   openSubagent,
+  subagentChildrenOf,
 } from "@/lib/subagent-store";
 import { isDarkMode, type ThemeMode } from "@/lib/theme";
 
@@ -831,6 +834,37 @@ const turnElapsedLabel = computed<string | null>(() =>
 const agentWorking = computed(
   () => sending.value || starting.value || (buffer.value?.busy ?? false),
 );
+
+/**
+ * Human-readable description of what the agent is doing right now, rendered
+ * directly at the bottom of the transcript so the user never stares at static
+ * text wondering whether the session is alive.
+ */
+const liveActivityLabel = computed<string>(() => {
+  const activeChildren = subagentChildrenOf(
+    currentSession.value?.sessionId ?? null,
+  ).filter((c) => isSubagentActive(c.status));
+  if (activeChildren.length > 0) {
+    const names = activeChildren
+      .map((c) => c.agent.trim() || c.name)
+      .join(", ");
+    return t("chat.activity.subagent", { names });
+  }
+  for (let i = tools.value.length - 1; i >= 0; i -= 1) {
+    const entry = tools.value[i];
+    if (entry.state === "running") {
+      const cleanName = entry.toolName.replace(/^mcp__[^_]+__/, "");
+      return t("chat.activity.tool", { tool: cleanName });
+    }
+  }
+  if (streamingReasoning.value !== "" && streamingText.value === "") {
+    return t("chat.activity.thinking");
+  }
+  if (streamingText.value !== "") {
+    return t("chat.activity.writing");
+  }
+  return t("chat.activity.waitingModel");
+});
 
 watch(agentWorking, (working, wasWorking) => {
   if (working) {
@@ -2022,16 +2056,36 @@ onUnmounted(() => {
             :question="question"
           />
 
-          <!-- The turn in progress renders inside its own group (S3): its
-               finished steps are folded, the step being written is not — see
-               `TurnGroup`. Nothing about it is appended here. -->
+          <!-- Live activity bar pinned at the bottom of the transcript while
+               the agent is working (especially helpful during long tool calls,
+               subagent runs, or model thinking pauses). -->
+          <div
+            v-if="agentWorking && questions.length === 0"
+            role="status"
+            aria-live="polite"
+            class="flex items-center gap-2.5 rounded-xl border border-primary/25 bg-primary/5 px-3.5 py-2.5 text-xs text-foreground"
+          >
+            <LoaderCircleIcon
+              class="size-3.5 shrink-0 animate-spin text-primary"
+              aria-hidden="true"
+            />
+            <span class="min-w-0 flex-1 truncate font-medium">
+              {{ liveActivityLabel }}
+            </span>
+            <span
+              v-if="turnElapsedLabel"
+              class="shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground"
+            >
+              {{ turnElapsedLabel }}
+            </span>
+          </div>
         </div>
       </ScrollArea>
 
       <!-- Composer, pinned under the transcript, plus the turns/steps meta. -->
       <div
         ref="composerSlot"
-        class="border-t border-sidebar-border bg-background px-5 pt-3 pb-3.5"
+        class="bg-background px-5 pt-2 pb-3.5"
       >
         <!-- S3: this session's waiting prompts, directly above the composer and
              capped to three visible rows so the input never leaves the screen.
