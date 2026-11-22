@@ -22,18 +22,14 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const NODE_VERSION = process.env.NABLA_NODE_VERSION || "22.14.0";
+const NODE_VERSION = process.env.NABLA_NODE_VERSION || "22.23.1";
 const PI_PKG_VERSION = process.env.NABLA_PI_VERSION || "latest";
 
 const ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const BINARIES_DIR = join(ROOT, "src-tauri", "binaries");
 const RUNTIME_DIR = join(ROOT, "src-tauri", "resources", "pi-runtime");
 
-function detectTargetTriple() {
-  const argIdx = process.argv.indexOf("--target");
-  if (argIdx !== -1 && process.argv[argIdx + 1]) {
-    return process.argv[argIdx + 1];
-  }
+function hostTargetTriple() {
   const { platform, arch } = process;
   if (platform === "win32" && arch === "x64") return "x86_64-pc-windows-msvc";
   if (platform === "win32" && arch === "arm64") return "aarch64-pc-windows-msvc";
@@ -44,24 +40,31 @@ function detectTargetTriple() {
   throw new Error(`Unsupported platform/arch: ${platform}/${arch}`);
 }
 
+function detectTargetTriple() {
+  const argIdx = process.argv.indexOf("--target");
+  if (argIdx !== -1 && process.argv[argIdx + 1]) {
+    return process.argv[argIdx + 1];
+  }
+  return hostTargetTriple();
+}
+
 function nodeDistForTriple(triple) {
   switch (triple) {
     case "x86_64-pc-windows-msvc":
       return {
-        archive: `node-v${NODE_VERSION}-win-x64.zip`,
-        innerBin: `node-v${NODE_VERSION}-win-x64/node.exe`,
+        url: `https://nodejs.org/dist/v${NODE_VERSION}/win-x64/node.exe`,
         ext: ".exe",
-        format: "zip",
+        format: "raw",
       };
     case "aarch64-pc-windows-msvc":
       return {
-        archive: `node-v${NODE_VERSION}-win-arm64.zip`,
-        innerBin: `node-v${NODE_VERSION}-win-arm64/node.exe`,
+        url: `https://nodejs.org/dist/v${NODE_VERSION}/win-arm64/node.exe`,
         ext: ".exe",
-        format: "zip",
+        format: "raw",
       };
     case "x86_64-unknown-linux-gnu":
       return {
+        url: `https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz`,
         archive: `node-v${NODE_VERSION}-linux-x64.tar.xz`,
         innerBin: `node-v${NODE_VERSION}-linux-x64/bin/node`,
         ext: "",
@@ -69,6 +72,7 @@ function nodeDistForTriple(triple) {
       };
     case "aarch64-unknown-linux-gnu":
       return {
+        url: `https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-arm64.tar.xz`,
         archive: `node-v${NODE_VERSION}-linux-arm64.tar.xz`,
         innerBin: `node-v${NODE_VERSION}-linux-arm64/bin/node`,
         ext: "",
@@ -76,6 +80,7 @@ function nodeDistForTriple(triple) {
       };
     case "aarch64-apple-darwin":
       return {
+        url: `https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-darwin-arm64.tar.gz`,
         archive: `node-v${NODE_VERSION}-darwin-arm64.tar.gz`,
         innerBin: `node-v${NODE_VERSION}-darwin-arm64/bin/node`,
         ext: "",
@@ -83,6 +88,7 @@ function nodeDistForTriple(triple) {
       };
     case "x86_64-apple-darwin":
       return {
+        url: `https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-darwin-x64.tar.gz`,
         archive: `node-v${NODE_VERSION}-darwin-x64.tar.gz`,
         innerBin: `node-v${NODE_VERSION}-darwin-x64/bin/node`,
         ext: "",
@@ -106,33 +112,32 @@ async function prepareNodeBinary(triple) {
   const dist = nodeDistForTriple(triple);
   mkdirSync(BINARIES_DIR, { recursive: true });
   const targetPath = join(BINARIES_DIR, `nabla-node-${triple}${dist.ext}`);
-  if (existsSync(targetPath)) {
+
+  if (existsSync(targetPath) && triple === hostTargetTriple()) {
+    const ver = spawnSync(targetPath, ["--version"], { encoding: "utf8" });
+    if (ver.status === 0 && ver.stdout.trim() === `v${NODE_VERSION}`) {
+      console.log(`[pi-runtime] reusing existing ${targetPath} (${ver.stdout.trim()})`);
+      return targetPath;
+    }
+  } else if (existsSync(targetPath)) {
     console.log(`[pi-runtime] reusing existing ${targetPath}`);
     return targetPath;
   }
 
-  const url = `https://nodejs.org/dist/v${NODE_VERSION}/${dist.archive}`;
+  if (dist.format === "raw") {
+    console.log(`[pi-runtime] downloading ${dist.url}`);
+    await downloadFile(dist.url, targetPath);
+    console.log(`[pi-runtime] prepared sidecar ${targetPath}`);
+    return targetPath;
+  }
+
   const workDir = mkdtempSync(join(tmpdir(), "nabla-node-"));
   const archivePath = join(workDir, dist.archive);
   try {
-    console.log(`[pi-runtime] downloading ${url}`);
-    await downloadFile(url, archivePath);
+    console.log(`[pi-runtime] downloading ${dist.url}`);
+    await downloadFile(dist.url, archivePath);
 
-    if (dist.format === "zip") {
-      if (process.platform === "win32") {
-        execFileSync(
-          "powershell",
-          [
-            "-NoProfile",
-            "-Command",
-            `Expand-Archive -Path '${archivePath}' -DestinationPath '${workDir}' -Force`,
-          ],
-          { stdio: "inherit" },
-        );
-      } else {
-        execFileSync("unzip", ["-q", archivePath, "-d", workDir], { stdio: "inherit" });
-      }
-    } else if (dist.format === "tar.xz") {
+    if (dist.format === "tar.xz") {
       execFileSync("tar", ["-xJf", archivePath, "-C", workDir], { stdio: "inherit" });
     } else {
       execFileSync("tar", ["-xzf", archivePath, "-C", workDir], { stdio: "inherit" });
@@ -202,15 +207,18 @@ async function main() {
   const nodeBin = await prepareNodeBinary(triple);
   const cliPath = preparePiPackages();
 
-  // Smoke-check on native host builds
-  const check = spawnSync(nodeBin, [cliPath, "--version"], {
-    encoding: "utf8",
-    env: { ...process.env, NODE_PATH: join(RUNTIME_DIR, "node_modules") },
-  });
-  if (check.status === 0) {
+  // Smoke-check on native host builds: fail loudly if bundled pi cannot boot.
+  if (triple === hostTargetTriple()) {
+    const check = spawnSync(nodeBin, [cliPath, "--version"], {
+      encoding: "utf8",
+      env: { ...process.env, NODE_PATH: join(RUNTIME_DIR, "node_modules") },
+    });
+    if (check.status !== 0) {
+      throw new Error(
+        `Bundled pi smoke-check failed (exit ${check.status}): ${check.stderr || check.error}`,
+      );
+    }
     console.log(`[pi-runtime] verified bundled pi: ${check.stdout.trim()}`);
-  } else {
-    console.warn(`[pi-runtime] smoke-check skipped/warned: ${check.stderr || check.error}`);
   }
 }
 
