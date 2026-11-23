@@ -35,8 +35,10 @@ pub struct AppState {
     pub store: Store,
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
-    /// S3 of `providers-pane.md`: pi's own provider configuration lives under the
-    /// user's home directory, resolved once at startup by Tauri's path resolver.
+    /// Nabla's isolated pi agent directory (`<data_dir>/pi-agent`), forwarded
+    /// via `PI_CODING_AGENT_DIR` so Nabla never shares `~/.pi/agent/`.
+    pub pi_agent_dir: PathBuf,
+    /// User home directory resolved once at startup by Tauri's path resolver.
     pub home_dir: PathBuf,
     pub runtime: ProcessManager,
     /// S1/S3 of `pi-cli-bridge.md`: the allowlisted bridge to the `pi` command
@@ -288,32 +290,35 @@ pub fn list_models() -> Result<Vec<ModelInfo>, String> {
 /// Path of pi's provider configuration inside the user's home directory. One
 /// resolver for reading and writing, so both target the `models.json` pi itself
 /// reads (S3).
+#[cfg_attr(not(test), allow(dead_code))]
 fn models_file(home_dir: &Path) -> PathBuf {
     crate::providers::models_path(home_dir)
 }
 
 fn models_path(state: &AppState) -> PathBuf {
-    models_file(&state.home_dir)
+    state.pi_agent_dir.join("models.json")
 }
 
 /// Path of pi's cached provider catalog. Read-only: the union of
 /// `list_provider_models` needs it, and nothing here writes it.
+#[cfg_attr(not(test), allow(dead_code))]
 fn catalog_file(home_dir: &Path) -> PathBuf {
     crate::providers::models_store_path(home_dir)
 }
 
 fn catalog_path(state: &AppState) -> PathBuf {
-    catalog_file(&state.home_dir)
+    state.pi_agent_dir.join("models-store.json")
 }
 
 /// Path of pi's credentials file. Read-only too: it decides which catalog-only
 /// providers are usable, and no token ever leaves `providers`.
+#[cfg_attr(not(test), allow(dead_code))]
 fn credentials_file(home_dir: &Path) -> PathBuf {
     crate::providers::auth_path(home_dir)
 }
 
 fn credentials_path(state: &AppState) -> PathBuf {
-    credentials_file(&state.home_dir)
+    state.pi_agent_dir.join("auth.json")
 }
 
 /// S1: the providers pi knows. The api key is reduced to `has_api_key` (S4).
@@ -1967,6 +1972,10 @@ fn delete_session_core(
     archive_session_file(data_dir, Path::new(&row.pi_session_path))
         .map_err(|err| format!("cannot archive session file {}: {err}", row.pi_session_path))?;
 
+    if row.parent_session_id.is_some() {
+        dismiss_subagent_path(data_dir, &row.pi_session_path);
+    }
+
     store.delete_session(session_id).map_err(display_err)
 }
 
@@ -2367,8 +2376,80 @@ pub struct SubagentSession {
 }
 
 /// Directory the extension publishes its manifests in, under the app data dir.
+const DISMISSED_SUBAGENTS_FILE: &str = "dismissed.json";
+
 fn manifests_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("subagents")
+}
+
+fn dismissed_subagents_path(data_dir: &Path) -> PathBuf {
+    manifests_dir(data_dir).join(DISMISSED_SUBAGENTS_FILE)
+}
+
+fn read_dismissed_subagents(data_dir: &Path) -> std::collections::HashSet<String> {
+    let Ok(body) = std::fs::read_to_string(dismissed_subagents_path(data_dir)) else {
+        return std::collections::HashSet::new();
+    };
+    serde_json::from_str::<Vec<String>>(&body)
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+/// Records a deleted subagent's `sessionPath` as permanently dismissed and prunes
+/// it from existing manifest files so a later poll (or a live parent rewriting
+/// its manifest from memory) never resurrects a deleted subagent as an empty row.
+fn dismiss_subagent_path(data_dir: &Path, session_path: &str) {
+    let trimmed = session_path.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let dir = manifests_dir(data_dir);
+    let _ = std::fs::create_dir_all(&dir);
+
+    let mut dismissed = read_dismissed_subagents(data_dir);
+    if dismissed.insert(trimmed.to_string()) {
+        let mut sorted: Vec<String> = dismissed.into_iter().collect();
+        sorted.sort();
+        if let Ok(json) = serde_json::to_string_pretty(&sorted) {
+            let _ = std::fs::write(dismissed_subagents_path(data_dir), json);
+        }
+    }
+
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.file_name().and_then(|n| n.to_str()) == Some(DISMISSED_SUBAGENTS_FILE) {
+            continue;
+        }
+        if !path.extension().is_some_and(|ext| ext == "json") {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(&body)
+        else {
+            continue;
+        };
+        let before = items.len();
+        let kept: Vec<serde_json::Value> = items
+            .into_iter()
+            .filter(|item| {
+                item.get("sessionPath")
+                    .and_then(|v| v.as_str())
+                    .map(|p| p != trimmed)
+                    .unwrap_or(true)
+            })
+            .collect();
+        if kept.len() != before
+            && let Ok(updated) = serde_json::to_string_pretty(&kept)
+        {
+            let _ = std::fs::write(&path, updated);
+        }
+    }
 }
 
 /// Parses one manifest body: a JSON array of children. Anything else — a file a
@@ -2415,16 +2496,24 @@ fn read_manifests(data_dir: &Path) -> Vec<SubagentManifestEntry> {
         // No directory yet: no session has delegated, which is an empty answer.
         return Vec::new();
     };
+    let dismissed = read_dismissed_subagents(data_dir);
     let mut files: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "json")
+                && path.file_name().and_then(|n| n.to_str()) != Some(DISMISSED_SUBAGENTS_FILE)
+        })
         .collect();
     files.sort();
     let mut children = Vec::new();
     for file in files {
         if let Ok(body) = std::fs::read_to_string(&file) {
-            children.extend(manifest_entries(&body));
+            children.extend(
+                manifest_entries(&body)
+                    .into_iter()
+                    .filter(|entry| !dismissed.contains(&entry.session_path)),
+            );
         }
     }
     children
@@ -2952,7 +3041,16 @@ pub fn mcp_logout(
 #[tauri::command]
 pub fn mcp_file_path(state: State<'_, AppState>, scope: McpScope) -> Result<String, String> {
     let project = project_root()?;
-    mcp_file_path_for(&state.home_dir, &project, scope)
+    match scope {
+        McpScope::Global => {
+            let path = state.pi_agent_dir.join("mcp.json");
+            if !path.is_absolute() {
+                return Err(format!("mcp file path is not absolute: {}", path.display()));
+            }
+            Ok(path.to_string_lossy().to_string())
+        }
+        McpScope::Project => mcp_file_path_for(&state.home_dir, &project, scope),
+    }
 }
 
 /// The project root `pi` itself resolves for `-l`: the working directory of the
@@ -6315,6 +6413,58 @@ exit 1
         assert!(manifest_entries("").is_empty());
         assert!(manifest_entries("{}").is_empty(), "an object is not a list");
         assert!(manifest_entries("not json").is_empty());
+    }
+
+    #[test]
+    fn deleted_subagent_is_dismissed_and_never_resurrected_from_manifest() {
+        let fixture = SubagentFixture::new("subagent_dismiss");
+        let manifest_body = r#"[
+          {
+            "name": "worker-1",
+            "agent": "worker",
+            "sessionPath": "/data/sessions/subagents/child-gone.jsonl",
+            "status": "done",
+            "startedAt": "2026-07-01T10:00:00.000Z",
+            "endedAt": "2026-07-01T10:01:00.000Z",
+            "parentSessionPath": "/sessions/parent-chat.jsonl"
+          }
+        ]"#;
+        fixture.write_manifest("parent-chat.json", manifest_body);
+
+        let before = subagent_sessions_for(
+            &fixture.store,
+            &fixture.data_dir(),
+            fixture.workspace_id,
+            fixture.parent.id,
+        )
+        .expect("list before delete");
+        assert_eq!(before.len(), 1);
+
+        let runtime = ProcessManager::new(Arc::new(|_, _| {}));
+        let deleted = delete_session_core(
+            &fixture.store,
+            &runtime,
+            &fixture.data_dir(),
+            before[0].session_id,
+        )
+        .expect("delete child session");
+        assert!(deleted);
+
+        // Even if a live parent process rewrites its manifest from memory with
+        // the old entry, the dismissed tombstone prevents resurrection.
+        fixture.write_manifest("parent-chat.json", manifest_body);
+
+        let after = subagent_sessions_for(
+            &fixture.store,
+            &fixture.data_dir(),
+            fixture.workspace_id,
+            fixture.parent.id,
+        )
+        .expect("list after delete");
+        assert!(
+            after.is_empty(),
+            "deleted subagent must stay gone after manifest rewrite: {after:?}"
+        );
     }
 
     // H3.2/H3.6: a child the manifest attributes to a chat is indexed under that

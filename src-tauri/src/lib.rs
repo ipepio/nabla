@@ -109,6 +109,11 @@ pub fn run() {
             if let Ok(resource_dir) = app.path().resource_dir() {
                 pi_runtime::init_resource_dir(resource_dir);
             }
+            // Isolate pi's models, auth, settings and MCP config inside Nabla's
+            // own data directory (`PI_CODING_AGENT_DIR`), never sharing `~/.pi/agent/`.
+            let pi_agent_dir = pi_runtime::default_agent_dir(&data_dir);
+            let _ = std::fs::create_dir_all(&pi_agent_dir);
+            pi_runtime::init_agent_dir(pi_agent_dir.clone());
             commands::seed_default_workspace(&store, &home)?;
             // One supervisor for every pi child (S3). Its sink is the only
             // bridge from a pi process to the webview (S6): each event leaves
@@ -210,9 +215,7 @@ pub fn run() {
                 store,
                 config_dir,
                 data_dir,
-                // S3 of `providers-pane.md`: providers live in pi's own
-                // `~/.pi/agent/models.json`, so the module needs the home dir
-                // Tauri just resolved — not a second, invented location.
+                pi_agent_dir,
                 home_dir: home,
                 runtime,
                 cli: cli::CliSessions::new(),

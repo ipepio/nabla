@@ -865,6 +865,9 @@ fn pty_command(binary: &str, args: &[String]) -> CommandBuilder {
     if let Some(node_path) = resolved.node_path {
         command.env("NODE_PATH", node_path);
     }
+    if let Some(agent_dir) = crate::pi_runtime::agent_dir() {
+        command.env("PI_CODING_AGENT_DIR", agent_dir);
+    }
     command
 }
 
@@ -885,6 +888,9 @@ fn build_command(binary: &str, args: &[String]) -> Command {
     }
     if let Some(node_path) = resolved.node_path {
         command.env("NODE_PATH", node_path);
+    }
+    if let Some(agent_dir) = crate::pi_runtime::agent_dir() {
+        command.env("PI_CODING_AGENT_DIR", agent_dir);
     }
     #[cfg(unix)]
     {

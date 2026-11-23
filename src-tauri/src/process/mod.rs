@@ -1515,6 +1515,9 @@ fn build_command(
     if let Some(node_path) = resolved.node_path {
         command.env("NODE_PATH", node_path);
     }
+    if let Some(agent_dir) = crate::pi_runtime::agent_dir() {
+        command.env("PI_CODING_AGENT_DIR", agent_dir);
+    }
     if let Some(dir) = layout.data_dir {
         // L4 of `permission-modes.md`: the gate reads `<data_dir>/permissions.json`
         // on every tool call, so a mode change affects the very next call of a

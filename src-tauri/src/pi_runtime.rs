@@ -21,10 +21,27 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 static RESOURCE_DIR: OnceLock<PathBuf> = OnceLock::new();
+static AGENT_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Records Tauri's resolved `resource_dir()` once at app startup.
 pub fn init_resource_dir(dir: PathBuf) {
     let _ = RESOURCE_DIR.set(dir);
+}
+
+/// Nabla's isolated pi agent directory (`<data_dir>/pi-agent`), passed via
+/// `PI_CODING_AGENT_DIR` so Nabla never inherits or mutates `~/.pi/agent/`.
+pub fn default_agent_dir(data_dir: &Path) -> PathBuf {
+    strip_windows_verbatim_prefix(&data_dir.join("pi-agent"))
+}
+
+/// Records Nabla's isolated `PI_CODING_AGENT_DIR` once at app startup.
+pub fn init_agent_dir(dir: PathBuf) {
+    let _ = AGENT_DIR.set(strip_windows_verbatim_prefix(&dir));
+}
+
+/// Returns Nabla's isolated `PI_CODING_AGENT_DIR` when initialized.
+pub fn agent_dir() -> Option<&'static Path> {
+    AGENT_DIR.get().map(PathBuf::as_path)
 }
 
 /// How to spawn `pi`: the executable, any leading arguments (e.g. `cli.js`), and
