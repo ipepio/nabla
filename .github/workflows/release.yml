@@ -61,6 +61,8 @@ jobs:
           libayatana-appindicator3-dev
           librsvg2-dev
           librsvg2-bin
+          libasound2-dev
+          pkg-config
           libfuse2
           file
           patchelf

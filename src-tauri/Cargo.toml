@@ -1,6 +1,6 @@
 [package]
 name = "nabla"
-version = "0.2.0"
+version = "0.3.0"
 license = "Apache-2.0"
 description = "A Tauri App"
 authors = ["you"]
@@ -36,7 +36,8 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 # S2: model discovery is a native HTTP call. It runs in Rust so the webview never
 # sees the api key and CORS/CSP stay out of the way. rustls keeps the build free
 # of an OpenSSL system dependency.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
+futures-util = "0.3"
 # S3 (interactive login): `pi auth login` refuses to run without a TTY, so the
 # interactive sessions need a real pseudo-terminal. wezterm's `portable-pty`
 # exposes one API over Unix ptys and Windows ConPTY; `run` stays on plain pipes.
@@ -51,6 +52,17 @@ getrandom = "0.3"
 # S6 of `web-search.md`: the `Authorization: Basic` header of a configured SearXNG
 # instance is base64 of `user:password`.
 base64 = "0.23"
+# Embedded local CPU ONNX inference for Moonshine STT and Kokoro 82M TTS.
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "download-binaries", "copy-dylibs", "tls-rustls"] }
+ndarray = "0.17"
+# Native cross-platform microphone capture (CoreAudio / WASAPI / ALSA) so STT
+# never depends on WKWebView getUserMedia restrictions.
+cpal = "0.15"
+# Official Gradium Phonon 40M GGUF Rust runtime (in-process, zero Python).
+ptts = { version = "0.7.1", default-features = false, features = ["hf"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ptts = { version = "0.7.1", default-features = false, features = ["hf", "accelerate"] }
 
 # S5 (cross-platform kill): std exposes `Command::process_group` but no way to
 # signal a process group, so reaping pi's descendants on Unix needs killpg/kill.
