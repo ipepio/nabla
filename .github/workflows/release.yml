@@ -28,7 +28,7 @@ jobs:
         include:
           - platform: windows-latest
             args: '--config src-tauri/tauri.bundle.conf.json --bundles nsis'
-          - platform: ubuntu-22.04
+          - platform: ubuntu-24.04
             args: '--config src-tauri/tauri.bundle.conf.json --bundles deb'
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 60
@@ -52,7 +52,7 @@ jobs:
       # Tauri on Linux builds against the webkit/gtk stack; the rest are helpers
       # the .deb bundler and tauri icon tooling invoke.
       - name: Linux system packages
-        if: matrix.platform == 'ubuntu-22.04'
+        if: matrix.platform == 'ubuntu-24.04'
         run: >
           sudo apt-get update &&
           sudo apt-get install -y
@@ -63,7 +63,6 @@ jobs:
           librsvg2-bin
           libasound2-dev
           pkg-config
-          libfuse2
           file
           patchelf
           python3-pip
