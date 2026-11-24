@@ -275,7 +275,7 @@ function sessionsFor(workspaceId: number): SessionSummary[] {
   // too means any refresh — poll, send or turn end — lands in the right order
   // even if a response arrives out of band. `updatedAt` is ISO-8601, so the
   // string comparison is the chronological one.
-  return [...cached].sort((a, b) => {
+  return cached.toSorted((a, b) => {
     if (a.updatedAt === b.updatedAt) return b.id - a.id;
     return a.updatedAt < b.updatedAt ? 1 : -1;
   });

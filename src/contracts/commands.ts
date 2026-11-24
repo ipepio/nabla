@@ -12,11 +12,13 @@ import type { AgentEventEnvelope } from "./agent-events";
 import type {
   AgentsConfig,
   AppSettings,
+  CustomVoiceModelDraft,
   EmbedNavEvent,
   EmbedPopupTab,
   FsEntry,
   FsPreview,
   GitEntry,
+  HostHardwareInfo,
   ImageAttachment,
   McpAddDraft,
   McpEndpoint,
@@ -43,6 +45,10 @@ import type {
   SessionModelInfo,
   SessionSearchHit,
   SessionStatusDto,
+  VoiceDownloadProgress,
+  VoiceModelEntry,
+  VoiceSynthesizeResult,
+  VoiceTranscribeResult,
   SessionSummary,
   ShellOutputEvent,
   ShellSession,
@@ -1329,6 +1335,15 @@ export async function subscribeDocOpen(
   });
 }
 
+/** Subscribes to `drawer-open-tool` events emitted when an agent opens a drawer tool. */
+export async function subscribeDrawerOpenTool(
+  handler: (payload: { tool: string; path?: string | null }) => void,
+): Promise<() => void> {
+  return listen<{ tool: string; path?: string | null }>("drawer-open-tool", ({ payload }) => {
+    handler(payload);
+  });
+}
+
 /** Lists or FTS5-searches persistent agent memories from `memory.db`. */
 export function memoryList(
   query: string | null = null,
@@ -1368,4 +1383,92 @@ export function memoryClear(scope: string | null = null): Promise<number> {
 /** Signals Nabla's subagent extension to abort one specific child session. */
 export function cancelSubagent(sessionPath: string): Promise<void> {
   return invoke<void>("cancel_subagent", { sessionPath });
+}
+
+// ── local voice models (embedded CPU TTS & STT) ─────────────────────────────
+
+export function voiceListModels(): Promise<VoiceModelEntry[]> {
+  return invoke<VoiceModelEntry[]>("voice_list_models");
+}
+
+export function voiceHostInfo(): Promise<HostHardwareInfo> {
+  return invoke<HostHardwareInfo>("voice_host_info");
+}
+
+export function voiceDownloadModel(
+  modelId: string,
+  voiceIds?: string[],
+): Promise<void> {
+  return invoke<void>("voice_download_model", {
+    modelId,
+    voiceIds: voiceIds ?? null,
+  });
+}
+
+export function voiceCancelDownload(modelId: string): Promise<boolean> {
+  return invoke<boolean>("voice_cancel_download", { modelId });
+}
+
+export function voiceDeleteModel(
+  modelId: string,
+  voiceId?: string,
+): Promise<boolean> {
+  return invoke<boolean>("voice_delete_model", {
+    modelId,
+    voiceId: voiceId ?? null,
+  });
+}
+
+export function voiceImportCustomModel(
+  draft: CustomVoiceModelDraft,
+): Promise<VoiceModelEntry> {
+  return invoke<VoiceModelEntry>("voice_import_custom_model", { draft });
+}
+
+export async function subscribeVoiceDownloadProgress(
+  handler: (progress: VoiceDownloadProgress) => void,
+): Promise<() => void> {
+  return listen<VoiceDownloadProgress>("voice-download-progress", ({ payload }) => {
+    handler(payload);
+  });
+}
+
+export function voiceTranscribePcm(payload: {
+  pcmBase64: string;
+  sampleRate: number;
+  modelId?: string | null;
+}): Promise<VoiceTranscribeResult> {
+  return invoke<VoiceTranscribeResult>("voice_transcribe_pcm", {
+    pcmBase64: payload.pcmBase64,
+    sampleRate: payload.sampleRate,
+    modelId: payload.modelId ?? null,
+  });
+}
+
+export function voiceSynthesizeSegment(payload: {
+  text: string;
+  modelId?: string | null;
+  voiceId?: string | null;
+  speed?: number | null;
+  language?: string | null;
+}): Promise<VoiceSynthesizeResult> {
+  return invoke<VoiceSynthesizeResult>("voice_synthesize_segment", {
+    text: payload.text,
+    modelId: payload.modelId ?? null,
+    voiceId: payload.voiceId ?? null,
+    speed: payload.speed ?? null,
+    language: payload.language ?? null,
+  });
+}
+
+export function voiceRecordStart(): Promise<void> {
+  return invoke<void>("voice_record_start");
+}
+
+export function voiceRecordStopAndTranscribe(): Promise<VoiceTranscribeResult> {
+  return invoke<VoiceTranscribeResult>("voice_record_stop_and_transcribe");
+}
+
+export function voiceRecordCancel(): Promise<void> {
+  return invoke<void>("voice_record_cancel");
 }

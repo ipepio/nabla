@@ -19,7 +19,12 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "./components/ui/tooltip";
-import { docCreateTemp, subscribeDocOpen, subscribeEmbedNeedView } from "./contracts/commands";
+import {
+  docCreateTemp,
+  subscribeDocOpen,
+  subscribeDrawerOpenTool,
+  subscribeEmbedNeedView,
+} from "./contracts/commands";
 import type { SessionSummary, WorkspaceInfo } from "./contracts/types";
 import { setWebviewZoom } from "./contracts/window";
 import { t } from "./lib/i18n";
@@ -120,6 +125,24 @@ async function openDocumentPane(path: string): Promise<void> {
   openDocumentInDrawer(path, activeWorkspace.value, enabledTools.value);
 }
 
+/** Auto-opens/focuses any enabled tool tab in the right drawer on agent request. */
+async function openDrawerTool(tool: string, path?: string | null): Promise<void> {
+  if (tool === "document") {
+    await openDocumentPane(path ?? "");
+    return;
+  }
+  if (tool === "browser") {
+    await openBrowserPane();
+    return;
+  }
+  if (tool === "terminal" || tool === "files") {
+    if (!isToolEnabled(tool)) return;
+    toolsOpen.value = true;
+    await nextTick();
+    openTool(tool, activeWorkspace.value, enabledTools.value);
+  }
+}
+
 /** Creates a transparent scratch `.md` doc and opens it in the right drawer. */
 async function handleNewDocument(): Promise<void> {
   if (!isToolEnabled("document")) return;
@@ -134,6 +157,7 @@ async function handleNewDocument(): Promise<void> {
 /** The `embed-need-view` and `doc-open` unsubscribes, once the listeners are up. */
 let unsubscribeNeedView: (() => void) | null = null;
 let unsubscribeDocOpen: (() => void) | null = null;
+let unsubscribeDrawerOpenTool: (() => void) | null = null;
 /** Set on unmount: a subscribe that answers afterwards releases itself. */
 let disposed = false;
 
@@ -193,17 +217,20 @@ function onZoomKeydown(event: KeyboardEvent): void {
 
 onMounted(async () => {
   document.addEventListener("keydown", onZoomKeydown);
-  const [offNeedView, offDocOpen] = await Promise.all([
+  const [offNeedView, offDocOpen, offDrawerOpenTool] = await Promise.all([
     subscribeEmbedNeedView(() => void openBrowserPane()),
     subscribeDocOpen(({ path }) => void openDocumentPane(path)),
+    subscribeDrawerOpenTool(({ tool, path }) => void openDrawerTool(tool, path)),
   ]);
   if (disposed) {
     offNeedView();
     offDocOpen();
+    offDrawerOpenTool();
     return;
   }
   unsubscribeNeedView = offNeedView;
   unsubscribeDocOpen = offDocOpen;
+  unsubscribeDrawerOpenTool = offDrawerOpenTool;
 });
 
 onBeforeUnmount(() => {
@@ -213,6 +240,8 @@ onBeforeUnmount(() => {
   unsubscribeNeedView = null;
   unsubscribeDocOpen?.();
   unsubscribeDocOpen = null;
+  unsubscribeDrawerOpenTool?.();
+  unsubscribeDrawerOpenTool = null;
 });
 </script>
 

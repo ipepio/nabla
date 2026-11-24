@@ -81,6 +81,7 @@ import type {
   WorkspaceInfo,
 } from "@/contracts/types";
 import { useAppearance } from "@/lib/appearance";
+import { pendingDocumentAgentRequest } from "@/lib/agent-selection";
 import { takeBootSettings } from "@/lib/boot-settings";
 import { sendAppNotification } from "@/lib/notifications";
 import {
@@ -239,6 +240,27 @@ const draftKey = computed<string | null>(() =>
  */
 const draft = usePromptDraft(() => draftKey.value);
 const prompt = draft.text;
+
+watch(pendingDocumentAgentRequest, async (req) => {
+  if (!req) return;
+  pendingDocumentAgentRequest.value = null;
+  if (req.mode === "insert") {
+    const existing = prompt.value.trim();
+    prompt.value = existing ? `${existing}\n\n${req.prompt}` : req.prompt;
+    await nextTick();
+    const textarea = document.querySelector<HTMLTextAreaElement>(
+      "textarea[data-composer-input], form textarea",
+    );
+    if (textarea) {
+      textarea.focus();
+      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+    }
+    return;
+  }
+  prompt.value = req.prompt;
+  await nextTick();
+  void handleSend();
+});
 
 /**
  * S1-S2 of `odd/tasks/composer-image-input.md`: the images attached to the draft on

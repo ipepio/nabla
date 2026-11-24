@@ -94,6 +94,7 @@
  */
 import { computed, defineAsyncComponent, ref, watch, type Ref } from "vue";
 import {
+  AudioLinesIcon,
   BlocksIcon,
   BotIcon,
   BrainIcon,
@@ -184,6 +185,9 @@ const MemorySection = defineAsyncComponent(
 const SkillsSection = defineAsyncComponent(
   () => import("./SkillsSection.vue"),
 );
+const VoiceSection = defineAsyncComponent(
+  () => import("./VoiceSection.vue"),
+);
 import {
   commandErrorMessage,
   configFilePath,
@@ -200,7 +204,14 @@ import type { AppSettings, ProviderSummary } from "@/contracts/types";
 const open = defineModel<boolean>("open", { default: false });
 
 /** S1 of `settings-dialog.md`: the sections the app can drive right now. */
-type Section = "general" | "providers" | "mcp" | "subagents" | "memory" | "skills";
+type Section =
+  | "general"
+  | "providers"
+  | "mcp"
+  | "subagents"
+  | "memory"
+  | "skills"
+  | "voice";
 const section = ref<Section>("general");
 
 /** S2: every row renders through the catalogue, so a locale switch re-renders. */
@@ -1148,6 +1159,24 @@ watch(open, (isOpen) => {
             />
             {{ t("settings.section.skills") }}
           </button>
+          <button
+            type="button"
+            :aria-current="section === 'voice' ? 'page' : undefined"
+            :class="[
+              'flex w-full items-center gap-2.5 rounded-lg border px-3 py-2 text-left text-xs outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+              section === 'voice'
+                ? 'border-border bg-sidebar-accent font-semibold text-sidebar-accent-foreground'
+                : 'border-transparent text-muted-foreground hover:bg-secondary hover:text-foreground',
+            ]"
+            @click="section = 'voice'"
+          >
+            <AudioLinesIcon
+              class="size-4 shrink-0"
+              :class="section === 'voice' ? 'text-primary' : ''"
+              aria-hidden="true"
+            />
+            {{ t("settings.section.voice") }}
+          </button>
         </nav>
 
         <!-- S1: the scrolling pane. -->
@@ -2067,7 +2096,9 @@ watch(open, (isOpen) => {
 
           <MemorySection v-else-if="section === 'memory'" />
 
-          <SkillsSection v-else />
+          <SkillsSection v-else-if="section === 'skills'" />
+
+          <VoiceSection v-else />
 
           <Alert v-if="error" variant="destructive" class="mt-4">
             <AlertDescription>{{ error }}</AlertDescription>

@@ -62,7 +62,7 @@ const ROOT = "";
 
 /** Directories first, then names: the order a file manager uses. */
 function sortEntries(entries: FsEntry[]): FsEntry[] {
-  return [...entries].sort((left, right) => {
+  return entries.toSorted((left, right) => {
     const leftDir = left.kind === "dir" ? 0 : 1;
     const rightDir = right.kind === "dir" ? 0 : 1;
     if (leftDir !== rightDir) return leftDir - rightDir;

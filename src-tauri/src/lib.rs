@@ -24,6 +24,8 @@ mod settings;
 mod shell;
 mod skills;
 mod store;
+// Embedded local CPU voice models & downloader (TTS/STT).
+mod voice;
 // `web_search`: the agent's web search, backed by a SearXNG instance the human
 // configures or, failing that, by any public one (`web-search.md`).
 mod websearch;
@@ -166,6 +168,7 @@ pub fn run() {
             // The embedded browser's registry, shared by the commands and by the
             // MCP server: the agent drives exactly the views the human sees.
             let embeds = embed::EmbedSessions::new();
+            let shells = shell::ShellSessions::new();
             let memory = Arc::new(
                 memory::MemoryStore::open(&data_dir.join("memory.db"))
                     .expect("failed to open persistent agent memory store"),
@@ -179,6 +182,7 @@ pub fn run() {
                     app.handle().clone(),
                     embeds.clone(),
                     Arc::clone(&memory),
+                    shells.clone(),
                 )),
                 // S1 of `web-search.md`: the `web_search` tool reads its switch and
                 // its instance from `settings.json` on every call, so a change in
@@ -224,7 +228,7 @@ pub fn run() {
                 // emit their `{ sessionId, stream, data?, exitCode? }` payload
                 // on `shell-output`, a channel of their own so a terminal's
                 // bytes never interleave with the agent's events.
-                shells: shell::ShellSessions::new(),
+                shells,
                 shell_sink: {
                     let shell_handle = app.handle().clone();
                     Arc::new(move |event: &shell::ShellOutputEvent| {
@@ -242,6 +246,16 @@ pub fn run() {
                 // before any session exists.
                 probes: Arc::new(commands::CommandProbes::new()),
                 memory,
+                voice_downloads: Arc::new(voice::VoiceDownloadManager::new()),
+                voice_download_sink: {
+                    let voice_handle = app.handle().clone();
+                    Arc::new(move |progress: &voice::VoiceDownloadProgress| {
+                        let _ = voice_handle.emit("voice-download-progress", progress.clone());
+                    })
+                },
+                voice_stt: Arc::new(voice::VoiceSttEngine::new()),
+                voice_tts: Arc::new(voice::VoiceTtsEngine::new()),
+                voice_recorder: Arc::new(voice::VoiceRecorderState::new()),
             });
             // S4 of `webview-control.md` (T3): the endpoint is written into pi's
             // global `mcp.json` so every session pi spawns already carries the
@@ -441,7 +455,18 @@ pub fn run() {
             commands::memory_save,
             commands::memory_delete,
             commands::memory_clear,
-            commands::cancel_subagent
+            commands::cancel_subagent,
+            commands::voice_list_models,
+            commands::voice_host_info,
+            commands::voice_download_model,
+            commands::voice_cancel_download,
+            commands::voice_delete_model,
+            commands::voice_import_custom_model,
+            commands::voice_transcribe_pcm,
+            commands::voice_synthesize_segment,
+            commands::voice_record_start,
+            commands::voice_record_stop_and_transcribe,
+            commands::voice_record_cancel
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

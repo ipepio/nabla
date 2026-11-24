@@ -33,6 +33,42 @@ pub struct NotificationPreferences {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct VoicePreferences {
+    /// Active local STT model id (e.g. `"moonshine-tiny-es"`), empty when none selected.
+    #[serde(default)]
+    pub stt_model: String,
+    /// Active local TTS model id (e.g. `"kokoro-82m"`), empty when none selected.
+    #[serde(default)]
+    pub tts_model: String,
+    /// Active TTS voice pack id (e.g. `"ef_dora"`).
+    #[serde(default)]
+    pub tts_voice: String,
+    /// Speech rate multiplier (`0.5`..=`2.0`, default `1.0`).
+    #[serde(default = "default_tts_speed")]
+    pub tts_speed: f32,
+    /// Auto-read assistant responses when ready (off by default).
+    #[serde(default)]
+    pub auto_read: bool,
+}
+
+fn default_tts_speed() -> f32 {
+    1.0
+}
+
+impl Default for VoicePreferences {
+    fn default() -> Self {
+        Self {
+            stt_model: String::new(),
+            tts_model: String::new(),
+            tts_voice: String::new(),
+            tts_speed: default_tts_speed(),
+            auto_read: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Settings {
     /// UI theme: "dark" | "light" | "system".
     pub theme: String,
@@ -123,6 +159,9 @@ pub struct Settings {
     /// Configurable OS notifications (opt-in, per-event triggers).
     #[serde(default)]
     pub notifications: NotificationPreferences,
+    /// Local embedded CPU voice preferences (STT/TTS model & voice selection).
+    #[serde(default)]
+    pub voice: VoicePreferences,
 }
 
 /// S2/S3 of `chat-preferences-and-queue.md`: both chat toggles ship enabled, so
@@ -214,6 +253,7 @@ impl Default for Settings {
             // none must never receive an empty header.
             web_search_credentials: String::new(),
             notifications: NotificationPreferences::default(),
+            voice: VoicePreferences::default(),
         }
     }
 }

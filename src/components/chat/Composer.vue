@@ -32,11 +32,19 @@ import {
   ChevronDownIcon,
   FileTextIcon,
   ImageIcon,
+  Loader2Icon,
+  MicIcon,
   PlusIcon,
   SquareIcon,
   WrenchIcon,
   XIcon,
 } from "@lucide/vue";
+import {
+  commandErrorMessage,
+  voiceRecordCancel,
+  voiceRecordStart,
+  voiceRecordStopAndTranscribe,
+} from "@/contracts/commands";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -383,7 +391,46 @@ onMounted(async () => {
   stopDropListener = stop;
 });
 
+const isRecording = ref(false);
+const isTranscribing = ref(false);
+const voiceError = ref<string | null>(null);
+
+async function toggleDictation(): Promise<void> {
+  if (isTranscribing.value) return;
+  voiceError.value = null;
+
+  if (isRecording.value) {
+    isRecording.value = false;
+    isTranscribing.value = true;
+    try {
+      const result = await voiceRecordStopAndTranscribe();
+      const spoken = result.text.trim();
+      if (spoken) {
+        const prefix = props.modelValue.trimEnd();
+        const next = prefix ? `${prefix} ${spoken}` : spoken;
+        emit("update:modelValue", next);
+      }
+    } catch (cause) {
+      voiceError.value = commandErrorMessage(cause);
+    } finally {
+      isTranscribing.value = false;
+    }
+    return;
+  }
+
+  try {
+    await voiceRecordStart();
+    isRecording.value = true;
+  } catch (cause) {
+    voiceError.value = commandErrorMessage(cause);
+    isRecording.value = false;
+  }
+}
+
 onUnmounted(() => {
+  if (isRecording.value) {
+    void voiceRecordCancel().catch(() => {});
+  }
   dropListenerDisposed = true;
   stopDropListener?.();
   stopDropListener = null;
@@ -948,6 +995,22 @@ watch(() => props.workspaceId, prewarmCommands);
       @highlight="activeIndex = $event"
     />
 
+    <div
+      v-if="voiceError"
+      class="flex items-center justify-between gap-2 border-b border-destructive/25 bg-destructive/10 px-3 py-1.5 text-[11px] text-destructive"
+      role="alert"
+    >
+      <span class="min-w-0 flex-1 truncate">{{ voiceError }}</span>
+      <button
+        type="button"
+        class="shrink-0 rounded p-0.5 hover:bg-destructive/15"
+        :aria-label="t('common.dismiss')"
+        @click="voiceError = null"
+      >
+        <XIcon class="size-3" />
+      </button>
+    </div>
+
     <!-- S1-S3: everything attached to this draft, before the text it travels
          with. An image preview is the same base64 the model will receive; a PDF
          chip names its pages without carrying their text; a tool chip names the
@@ -1251,6 +1314,40 @@ watch(() => props.workspaceId, prewarmCommands);
              land on different nodes never fires, and the row under the pointer
              is the one that gains a Stop button and a queue strip at the edge of
              a turn. Preventing the default here does not cancel the click. -->
+        <Button
+          v-if="!streaming || canQueue"
+          variant="ghost"
+          size="icon-sm"
+          class="rounded-lg transition-colors"
+          :class="
+            isRecording
+              ? 'bg-destructive/15 text-destructive hover:bg-destructive/20'
+              : 'text-muted-foreground hover:bg-secondary hover:text-foreground'
+          "
+          :disabled="disabled || isTranscribing"
+          :aria-label="
+            isTranscribing
+              ? t('chat.composer.transcribing')
+              : isRecording
+                ? t('chat.composer.dictateStop')
+                : t('chat.composer.dictate')
+          "
+          :title="
+            voiceError
+              ? voiceError
+              : isTranscribing
+                ? t('chat.composer.transcribing')
+                : isRecording
+                  ? t('chat.composer.dictateStop')
+                  : t('chat.composer.dictate')
+          "
+          @mousedown.prevent
+          @click="void toggleDictation()"
+        >
+          <Loader2Icon v-if="isTranscribing" class="size-4 animate-spin" />
+          <SquareIcon v-else-if="isRecording" class="size-3.5 fill-current" />
+          <MicIcon v-else class="size-4" />
+        </Button>
         <Button
           v-if="streaming && canStop"
           variant="outline"

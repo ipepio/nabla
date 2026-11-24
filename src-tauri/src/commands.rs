@@ -74,6 +74,16 @@ pub struct AppState {
     pub probes: Arc<CommandProbes>,
     /// Dedicated persistent agent memory store (`<data_dir>/memory.db`).
     pub memory: Arc<crate::memory::MemoryStore>,
+    /// In-flight local voice model/voice downloads.
+    pub voice_downloads: Arc<crate::voice::VoiceDownloadManager>,
+    /// Emitter for `voice-download-progress` events.
+    pub voice_download_sink: crate::voice::DownloadSink,
+    /// Lazy-loaded local CPU Moonshine STT engine.
+    pub voice_stt: Arc<crate::voice::VoiceSttEngine>,
+    /// Lazy-loaded local CPU Kokoro TTS engine.
+    pub voice_tts: Arc<crate::voice::VoiceTtsEngine>,
+    /// Native cross-platform microphone recorder (`cpal`).
+    pub voice_recorder: Arc<crate::voice::VoiceRecorderState>,
 }
 
 // Errors cross the bridge as plain strings for now: StoreError and SettingsError
@@ -3858,6 +3868,185 @@ pub fn cancel_subagent(state: State<'_, AppState>, session_path: String) -> Resu
             .map_err(|e| format!("failed to create subagent cancel dir: {e}"))?;
     }
     std::fs::write(&path, b"cancel").map_err(|e| format!("failed to write cancel signal: {e}"))
+}
+
+// ── local voice models (embedded CPU TTS & STT) ─────────────────────────────
+
+/// Lists all curated and user-imported local voice models with their disk state.
+#[tauri::command]
+pub fn voice_list_models(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::voice::VoiceModelEntry>, String> {
+    let active = state.voice_downloads.active_ids();
+    Ok(crate::voice::list_catalog(&state.data_dir, &active))
+}
+
+/// Reports host CPU cores, RAM, and recommended local voice models for this machine.
+#[tauri::command]
+pub fn voice_host_info() -> crate::voice::HostHardwareInfo {
+    crate::voice::detect_host_hardware()
+}
+
+/// Starts downloading one model (if not already present) plus any requested voice packs.
+#[tauri::command]
+pub fn voice_download_model(
+    state: State<'_, AppState>,
+    model_id: String,
+    voice_ids: Option<Vec<String>>,
+) -> Result<(), String> {
+    let spec = crate::voice::find_model_spec(&state.data_dir, &model_id)
+        .ok_or_else(|| format!("unknown voice model: {model_id}"))?;
+    state.voice_downloads.start_download(
+        state.data_dir.clone(),
+        spec,
+        voice_ids.unwrap_or_default(),
+        Arc::clone(&state.voice_download_sink),
+    )
+}
+
+/// Cancels an active model download.
+#[tauri::command]
+pub fn voice_cancel_download(
+    state: State<'_, AppState>,
+    model_id: String,
+) -> Result<bool, String> {
+    Ok(state.voice_downloads.cancel(&model_id))
+}
+
+/// Deletes either one voice pack or an entire local voice model from disk.
+#[tauri::command]
+pub fn voice_delete_model(
+    state: State<'_, AppState>,
+    model_id: String,
+    voice_id: Option<String>,
+) -> Result<bool, String> {
+    let _ = state.voice_downloads.cancel(&model_id);
+    if voice_id.is_none() {
+        state.voice_stt.evict(&model_id);
+        state.voice_tts.evict(&model_id);
+    }
+    crate::voice::delete_model(&state.data_dir, &model_id, voice_id.as_deref())
+}
+
+/// Registers a user-supplied ONNX model (Hugging Face repo or direct HTTPS `.onnx`).
+#[tauri::command]
+pub fn voice_import_custom_model(
+    state: State<'_, AppState>,
+    draft: crate::voice::CustomVoiceModelDraft,
+) -> Result<crate::voice::VoiceModelEntry, String> {
+    crate::voice::import_custom_model(&state.data_dir, draft)
+}
+
+/// Transcribes a base64 16-bit mono PCM clip locally on CPU using the active STT model.
+#[tauri::command]
+pub async fn voice_transcribe_pcm(
+    state: State<'_, AppState>,
+    pcm_base64: String,
+    sample_rate: u32,
+    model_id: Option<String>,
+) -> Result<crate::voice::VoiceTranscribeResult, String> {
+    let resolved_model = match model_id.filter(|s| !s.trim().is_empty()) {
+        Some(id) => id,
+        None => {
+            let cfg = settings::load(&settings_path(&state)).map_err(display_err)?;
+            let id = cfg.voice.stt_model.trim().to_string();
+            if id.is_empty() {
+                return Err(
+                    "No STT model selected. Download and activate one in Settings → Voice."
+                        .to_string(),
+                );
+            }
+            id
+        }
+    };
+    let stt = Arc::clone(&state.voice_stt);
+    let data_dir = state.data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        stt.transcribe_pcm(&data_dir, &resolved_model, &pcm_base64, sample_rate)
+    })
+    .await
+    .map_err(|e| format!("STT worker failed: {e}"))?
+}
+
+/// Synthesizes one text segment locally on CPU using the active Kokoro TTS model & voice.
+#[tauri::command]
+pub async fn voice_synthesize_segment(
+    state: State<'_, AppState>,
+    text: String,
+    model_id: Option<String>,
+    voice_id: Option<String>,
+    speed: Option<f32>,
+    language: Option<String>,
+) -> Result<crate::voice::VoiceSynthesizeResult, String> {
+    let cfg = settings::load(&settings_path(&state)).map_err(display_err)?;
+    let resolved_model = model_id
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| cfg.voice.tts_model.clone());
+    if resolved_model.trim().is_empty() {
+        return Err(
+            "No TTS model selected. Download and activate one in Settings → Voice.".to_string(),
+        );
+    }
+    let resolved_voice = voice_id
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| cfg.voice.tts_voice.clone());
+    let resolved_speed = speed.unwrap_or(cfg.voice.tts_speed);
+    let tts = Arc::clone(&state.voice_tts);
+    let data_dir = state.data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        tts.synthesize(
+            &data_dir,
+            &resolved_model,
+            &resolved_voice,
+            &text,
+            resolved_speed,
+            language.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| format!("TTS worker failed: {e}"))?
+}
+
+/// Starts native microphone capture via `cpal`.
+#[tauri::command]
+pub fn voice_record_start(state: State<'_, AppState>) -> Result<(), String> {
+    let cfg = settings::load(&settings_path(&state)).map_err(display_err)?;
+    if cfg.voice.stt_model.trim().is_empty() {
+        return Err(
+            "No STT model selected. Download and activate one in Settings → Voice.".to_string(),
+        );
+    }
+    state.voice_recorder.start()
+}
+
+/// Stops native microphone capture and transcribes the recorded audio locally on CPU.
+#[tauri::command]
+pub async fn voice_record_stop_and_transcribe(
+    state: State<'_, AppState>,
+) -> Result<crate::voice::VoiceTranscribeResult, String> {
+    let cfg = settings::load(&settings_path(&state)).map_err(display_err)?;
+    let model_id = cfg.voice.stt_model.trim().to_string();
+    if model_id.is_empty() {
+        state.voice_recorder.cancel();
+        return Err(
+            "No STT model selected. Download and activate one in Settings → Voice.".to_string(),
+        );
+    }
+    let (samples, sample_rate) = state.voice_recorder.stop()?;
+    let stt = Arc::clone(&state.voice_stt);
+    let data_dir = state.data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        stt.transcribe_samples(&data_dir, &model_id, &samples, sample_rate)
+    })
+    .await
+    .map_err(|e| format!("STT worker failed: {e}"))?
+}
+
+/// Cancels an active native microphone recording without transcribing.
+#[tauri::command]
+pub fn voice_record_cancel(state: State<'_, AppState>) -> Result<(), String> {
+    state.voice_recorder.cancel();
+    Ok(())
 }
 
 #[cfg(test)]

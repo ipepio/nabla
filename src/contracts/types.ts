@@ -269,6 +269,17 @@ export interface AppSettings {
   webSearchCredentials: string;
   /** Configurable OS notifications (opt-in, per-event triggers). */
   notifications?: NotificationPreferences;
+  /** Local embedded CPU voice preferences (STT/TTS model & voice selection). */
+  voice?: VoicePreferences;
+}
+
+/** Mirrors `VoicePreferences` in `src-tauri/src/settings.rs`. */
+export interface VoicePreferences {
+  sttModel: string;
+  ttsModel: string;
+  ttsVoice: string;
+  ttsSpeed: number;
+  autoRead: boolean;
 }
 
 /**
@@ -896,4 +907,78 @@ export interface MemoryEntry {
   tags: string;
   createdAt: number;
   updatedAt: number;
+}
+
+// ── local voice models (embedded CPU TTS & STT) ─────────────────────────────
+
+export type VoiceModelKind = "tts" | "stt";
+
+export interface VoicePackStatus {
+  id: string;
+  name: string;
+  language: string;
+  gender: string;
+  approxBytes: number;
+  installed: boolean;
+  installedBytes: number;
+}
+
+export interface HostHardwareInfo {
+  cpuCores: number;
+  totalRamGb: number;
+  arch: string;
+  recommendedSttId: string;
+  recommendedTtsId: string;
+}
+
+export interface VoiceModelEntry {
+  id: string;
+  kind: VoiceModelKind;
+  engine: string;
+  family: string;
+  variantLabel: string;
+  name: string;
+  description: string;
+  params: string;
+  languages: string[];
+  streaming: string;
+  license: string;
+  repoId: string;
+  approxBytes: number;
+  minRamGb: number;
+  recommended: boolean;
+  runtimeReady: boolean;
+  status: "not_installed" | "downloading" | "installed";
+  installedBytes: number;
+  voices: VoicePackStatus[];
+  custom: boolean;
+}
+
+export interface CustomVoiceModelDraft {
+  kind: VoiceModelKind;
+  engine: string;
+  name: string;
+  repoOrUrl: string;
+  language?: string;
+}
+
+export interface VoiceDownloadProgress {
+  modelId: string;
+  voiceId: string | null;
+  fileName: string;
+  downloadedBytes: number;
+  totalBytes: number;
+  status: "downloading" | "completed" | "cancelled" | "error";
+  error: string | null;
+}
+
+export interface VoiceTranscribeResult {
+  text: string;
+  durationMs: number;
+}
+
+export interface VoiceSynthesizeResult {
+  wavBase64: string;
+  sampleRate: number;
+  durationMs: number;
 }

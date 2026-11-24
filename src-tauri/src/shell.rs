@@ -10,7 +10,7 @@
 // field by field. The terminal is **not** exposed to the agent: pi already has
 // its own shell tool, and a second one here would only widen the surface.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -40,6 +40,21 @@ const KILL_GRACE: Duration = Duration::from_millis(500);
 /// Bytes read from the pty at once: one event per read, no line splitting (a
 /// terminal renders partial lines and escape sequences as they arrive).
 const CHUNK: usize = 8192;
+
+/// Ring-buffer cap per terminal so MCP `terminal_read` can inspect recent output
+/// without unbounded memory growth.
+const OUTPUT_RING_CAP: usize = 65_536;
+
+/// Snapshot of one live or recently-exited terminal for MCP discovery.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveShell {
+    pub session_id: String,
+    pub pid: Option<u32>,
+    pub shell: String,
+    pub cwd: String,
+    pub alive: bool,
+}
 
 /// The environment a shell is allowed to see. Everything else — provider keys,
 /// tokens, git identities — stays out: the terminal belongs to the human, and
@@ -151,11 +166,11 @@ fn resolve_shell_with(configured: Option<String>, exists: impl Fn(&Path) -> bool
         })
 }
 
-/// Registry of live terminals. Owned by `AppState`.
-#[derive(Default)]
+/// Registry of live terminals. Owned by `AppState` and shared with the MCP driver.
+#[derive(Default, Clone)]
 pub struct ShellSessions {
-    sessions: Mutex<HashMap<String, Arc<ShellHandle>>>,
-    next_id: AtomicUsize,
+    sessions: Arc<Mutex<HashMap<String, Arc<ShellHandle>>>>,
+    next_id: Arc<AtomicUsize>,
 }
 
 impl ShellSessions {
@@ -204,16 +219,20 @@ impl ShellSessions {
 
         let session_id = self.next_session_id();
         let exited = Arc::new(AtomicBool::new(false));
+        let output_buf = Arc::new(Mutex::new(VecDeque::with_capacity(CHUNK)));
         sessions.insert(
             session_id.clone(),
             Arc::new(ShellHandle {
                 pid,
+                shell: command.to_string(),
+                cwd: cwd.display().to_string(),
                 // Kept alive and kept addressable: dropping the master closes the
                 // terminal, and `resize` needs it.
                 master: Mutex::new(master),
                 writer: Mutex::new(Some(writer)),
                 killer: Mutex::new(Some(killer)),
                 exited: Arc::clone(&exited),
+                output_buf: Arc::clone(&output_buf),
             }),
         );
         drop(sessions);
@@ -223,6 +242,7 @@ impl ShellSessions {
             reader,
             session_id.clone(),
             Arc::clone(&sink),
+            Arc::clone(&output_buf),
             Arc::clone(&reader_done),
         );
 
@@ -307,6 +327,42 @@ impl ShellSessions {
         true
     }
 
+    /// Lists all open terminal sessions in stable `session_id` order.
+    pub fn list(&self) -> Vec<LiveShell> {
+        let mut out: Vec<LiveShell> = lock(&self.sessions)
+            .iter()
+            .map(|(id, handle)| LiveShell {
+                session_id: id.clone(),
+                pid: handle.pid,
+                shell: handle.shell.clone(),
+                cwd: handle.cwd.clone(),
+                alive: !handle.exited.load(Ordering::SeqCst),
+            })
+            .collect();
+        out.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        out
+    }
+
+    /// Reads the most recent lines from a terminal's ring buffer, optionally
+    /// stripping ANSI escape sequences for clean LLM consumption.
+    pub fn read_output(&self, session_id: &str, max_lines: usize, strip_ansi: bool) -> Option<String> {
+        let handle = self.handle(session_id)?;
+        let raw_bytes: Vec<u8> = {
+            let guard = lock(&handle.output_buf);
+            guard.iter().copied().collect()
+        };
+        let decoded = String::from_utf8_lossy(&raw_bytes);
+        let text = if strip_ansi {
+            strip_ansi_codes(&decoded)
+        } else {
+            decoded.into_owned()
+        };
+        let limit = max_lines.clamp(1, 500);
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines.len().saturating_sub(limit);
+        Some(lines[start..].join("\n"))
+    }
+
     /// Closes every live session (S2: no terminal outlives the host).
     pub fn close_all(&self) {
         let ids: Vec<String> = lock(&self.sessions).keys().cloned().collect();
@@ -327,7 +383,9 @@ impl ShellSessions {
 
 impl Drop for ShellSessions {
     fn drop(&mut self) {
-        self.close_all();
+        if Arc::strong_count(&self.sessions) == 1 {
+            self.close_all();
+        }
     }
 }
 
@@ -335,6 +393,10 @@ impl Drop for ShellSessions {
 struct ShellHandle {
     /// Session leader of the pty, when the platform reports one.
     pid: Option<u32>,
+    /// Spawned shell executable path/name.
+    shell: String,
+    /// Working directory the terminal started in.
+    cwd: String,
     /// The pty itself. Dropping it closes the terminal.
     master: Mutex<Box<dyn MasterPty + Send>>,
     /// Taken by `close` to hang up; a live session always has it.
@@ -343,6 +405,61 @@ struct ShellHandle {
     killer: Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>,
     /// Set by the exit watcher once the child is reaped.
     exited: Arc<AtomicBool>,
+    /// Recent PTY output ring buffer (bounded to `OUTPUT_RING_CAP` bytes).
+    output_buf: Arc<Mutex<VecDeque<u8>>>,
+}
+
+/// Strips ANSI CSI/OSC escape sequences and carriage returns so an agent reading
+/// a terminal buffer gets clean human-readable lines.
+pub fn strip_ansi_codes(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            i += 1;
+            if i >= bytes.len() {
+                break;
+            }
+            match bytes[i] {
+                // CSI: ESC [ ... final byte 0x40..=0x7E
+                b'[' => {
+                    i += 1;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                }
+                // OSC: ESC ] ... BEL (0x07) or ST (ESC \)
+                b']' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                // Two-byte escape sequence
+                _ => {
+                    i += 1;
+                }
+            }
+        } else if bytes[i] == b'\r' {
+            i += 1;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Forwards pty output as `data` events until the terminal closes (S2).
@@ -354,6 +471,7 @@ fn stream_pty(
     reader: Box<dyn Read + Send>,
     session_id: String,
     sink: ShellSink,
+    output_buf: Arc<Mutex<VecDeque<u8>>>,
     done: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
@@ -362,12 +480,28 @@ fn stream_pty(
         loop {
             match reader.read(&mut chunk) {
                 Ok(0) => break,
-                Ok(filled) => sink(&ShellOutputEvent {
-                    session_id: session_id.clone(),
-                    stream: ShellOutputStream::Data,
-                    data: Some(String::from_utf8_lossy(&chunk[..filled]).into_owned()),
-                    exit_code: None,
-                }),
+                Ok(filled) => {
+                    {
+                        let mut buf = lock(&output_buf);
+                        let slice = &chunk[..filled];
+                        if slice.len() >= OUTPUT_RING_CAP {
+                            buf.clear();
+                            buf.extend(&slice[slice.len() - OUTPUT_RING_CAP..]);
+                        } else {
+                            let overflow = (buf.len() + slice.len()).saturating_sub(OUTPUT_RING_CAP);
+                            if overflow > 0 {
+                                buf.drain(..overflow);
+                            }
+                            buf.extend(slice);
+                        }
+                    }
+                    sink(&ShellOutputEvent {
+                        session_id: session_id.clone(),
+                        stream: ShellOutputStream::Data,
+                        data: Some(String::from_utf8_lossy(&chunk[..filled]).into_owned()),
+                        exit_code: None,
+                    });
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                 // A pty whose child is gone reports EIO on some platforms and a
                 // clean end of file on others: both mean the terminal is over.

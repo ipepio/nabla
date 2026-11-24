@@ -106,6 +106,15 @@ pub trait WebviewDriver: Send + Sync + 'static {
     /// Notifies the UI to open/focus a Markdown document in the right drawer.
     fn open_document(&self, _path: &str) {}
 
+    /// Notifies the UI to open/focus any tool tab (`terminal`, `browser`,
+    /// `document`, `files`) in Nabla's right tool drawer.
+    fn open_tool(&self, _tool: &str, _path: Option<&str>) {}
+
+    /// Access to the live Terminal PTY registry (`ShellSessions`), if available.
+    fn shells(&self) -> Option<crate::shell::ShellSessions> {
+        None
+    }
+
     /// Access to the persistent agent memory store (`memory.db`), if available.
     fn memory_store(&self) -> Option<Arc<crate::memory::MemoryStore>> {
         None
@@ -260,6 +269,18 @@ fn call_tool(
     }
     if name == MEMORY_FORGET {
         return memory_forget_result(driver, id, &arguments);
+    }
+    if name == TERMINAL_LIST {
+        return terminal_list_result(driver, id);
+    }
+    if name == TERMINAL_READ {
+        return terminal_read_result(driver, id, &arguments);
+    }
+    if name == TERMINAL_WRITE {
+        return terminal_write_result(driver, id, &arguments);
+    }
+    if name == OPEN_TOOL {
+        return open_tool_result(driver, id, &arguments);
     }
     let asked_view = arguments.get("viewId").and_then(Value::as_str);
 
@@ -602,7 +623,7 @@ fn targets_text(views: &[LiveView]) -> String {
 /// Every tool this server offers, in catalog order. Kept as data so a name that
 /// is listed but not dispatched (or the reverse) fails a test instead of the
 /// model's next call.
-const TOOL_NAMES: [&str; 17] = [
+const TOOL_NAMES: [&str; 21] = [
     "navigate",
     "eval",
     "get_url",
@@ -615,12 +636,14 @@ const TOOL_NAMES: [&str; 17] = [
     "screenshot",
     "export_docx",
     "open_document",
+    "web_search",
     "memory_save",
     "memory_search",
     "memory_forget",
-    // The one tool that needs no view, listed last before the registry itself:
-    // `list_targets` is the tool whose answer is the view list.
-    "web_search",
+    "terminal_list",
+    "terminal_read",
+    "terminal_write",
+    "open_tool",
     "list_targets",
 ];
 
@@ -638,6 +661,12 @@ const OPEN_DOCUMENT: &str = "open_document";
 const MEMORY_SAVE: &str = "memory_save";
 const MEMORY_SEARCH: &str = "memory_search";
 const MEMORY_FORGET: &str = "memory_forget";
+
+/// Right tool drawer & live Terminal PTY control MCP tool names.
+const TERMINAL_LIST: &str = "terminal_list";
+const TERMINAL_READ: &str = "terminal_read";
+const TERMINAL_WRITE: &str = "terminal_write";
+const OPEN_TOOL: &str = "open_tool";
 
 /// Captures a visual snapshot of the visible viewport. Attempts an offscreen
 /// SVG foreignObject -> Canvas PNG data URL first; if cross-origin tainting
@@ -929,6 +958,54 @@ fn tool_catalog() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "terminal_list",
+            "description": "List all open Terminal tabs in Nabla's right tool drawer (sessionId, shell, cwd, pid, alive). Use this to discover live interactive terminals the human is looking at.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }),
+        json!({
+            "name": "terminal_read",
+            "description": "Read the recent visible screen output from an open Terminal tab in Nabla's right tool drawer (ANSI escape sequences stripped by default).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sessionId": { "type": "string", "description": "Optional terminal sessionId from `terminal_list`. Omit when only one terminal is open." },
+                    "lines": { "type": "integer", "description": "How many recent lines to return (default 80, max 500)." },
+                    "raw": { "type": "boolean", "description": "Set true to preserve raw ANSI escape codes (default false)." }
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "terminal_write",
+            "description": "Send text or control keys directly into an open Terminal tab in Nabla's right tool drawer (e.g. drive an interactive CLI, REPL, or dev server the human opened).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sessionId": { "type": "string", "description": "Optional terminal sessionId from `terminal_list`. Omit when only one terminal is open." },
+                    "text": { "type": "string", "description": "Literal text to type into the terminal." },
+                    "pressEnter": { "type": "boolean", "description": "Append a carriage return (`\\r`) after `text` (default false)." },
+                    "key": { "type": "string", "description": "Optional special key to send: enter, ctrl+c, ctrl+d, esc, tab, up, down, left, right, backspace." }
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "open_tool",
+            "description": "Open or focus a tool tab in Nabla's right tool drawer (`terminal`, `browser`, `document`, or `files`).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tool": { "type": "string", "description": "Tool to open: terminal, browser, document, or files." },
+                    "path": { "type": "string", "description": "Optional file path when opening `document`." }
+                },
+                "required": ["tool"]
+            }
+        }),
+        json!({
             "name": "list_targets",
             "description": "List the open browser views, one `id (url)` per line. Use it when a call \
                             needs a `viewId`. An empty list is a normal answer: it means no view is \
@@ -980,6 +1057,156 @@ fn open_document_result(driver: &dyn WebviewDriver, id: &Value, arguments: &Valu
     let clean = path.strip_prefix('@').unwrap_or(path);
     driver.open_document(clean);
     tool_result(id, &format!("opened document `{clean}` in Nabla"), false)
+}
+
+// ── right tool drawer & live Terminal control ────────────────────────────────
+
+fn resolve_terminal_id(
+    shells: &crate::shell::ShellSessions,
+    asked: Option<&str>,
+) -> Result<String, String> {
+    let live = shells.list();
+    if let Some(id) = asked.map(str::trim).filter(|s| !s.is_empty()) {
+        if live.iter().any(|s| s.session_id == id) {
+            return Ok(id.to_string());
+        }
+        return Err(format!("no open terminal with sessionId `{id}`"));
+    }
+    if let Some(first_alive) = live.iter().find(|s| s.alive) {
+        return Ok(first_alive.session_id.clone());
+    }
+    if let Some(first) = live.first() {
+        return Ok(first.session_id.clone());
+    }
+    Err("no Terminal tab is currently open in Nabla's tool drawer (call `open_tool` with `tool: \"terminal\"` first)".to_string())
+}
+
+fn terminal_list_result(driver: &dyn WebviewDriver, id: &Value) -> Value {
+    let Some(shells) = driver.shells() else {
+        return tool_result(id, "terminal registry is unavailable", true);
+    };
+    let list = shells.list();
+    if list.is_empty() {
+        return tool_result(id, "no open terminals in Nabla's tool drawer", false);
+    }
+    let body = serde_json::to_string_pretty(&list).unwrap_or_else(|_| "[]".to_string());
+    tool_result(id, &body, false)
+}
+
+fn terminal_read_result(driver: &dyn WebviewDriver, id: &Value, arguments: &Value) -> Value {
+    let Some(shells) = driver.shells() else {
+        return tool_result(id, "terminal registry is unavailable", true);
+    };
+    let asked = arguments.get("sessionId").and_then(Value::as_str);
+    let session_id = match resolve_terminal_id(&shells, asked) {
+        Ok(sid) => sid,
+        Err(msg) => return tool_result(id, &msg, true),
+    };
+    let lines = arguments
+        .get("lines")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(80);
+    let raw = arguments
+        .get("raw")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match shells.read_output(&session_id, lines, !raw) {
+        Some(text) => tool_result(id, &text, false),
+        None => tool_result(id, &format!("terminal `{session_id}` is no longer open"), true),
+    }
+}
+
+fn terminal_write_result(driver: &dyn WebviewDriver, id: &Value, arguments: &Value) -> Value {
+    let Some(shells) = driver.shells() else {
+        return tool_result(id, "terminal registry is unavailable", true);
+    };
+    let asked = arguments.get("sessionId").and_then(Value::as_str);
+    let session_id = match resolve_terminal_id(&shells, asked) {
+        Ok(sid) => sid,
+        Err(msg) => return tool_result(id, &msg, true),
+    };
+
+    let mut payload = String::new();
+    if let Some(text) = arguments.get("text").and_then(Value::as_str) {
+        payload.push_str(text);
+    }
+    if arguments
+        .get("pressEnter")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        payload.push('\r');
+    }
+    if let Some(key) = arguments.get("key").and_then(Value::as_str) {
+        let seq = match key.trim().to_ascii_lowercase().as_str() {
+            "enter" | "return" => "\r",
+            "ctrl+c" | "sigint" => "\x03",
+            "ctrl+d" | "eof" => "\x04",
+            "esc" | "escape" => "\x1b",
+            "tab" => "\t",
+            "backspace" => "\x7f",
+            "up" => "\x1b[A",
+            "down" => "\x1b[B",
+            "right" => "\x1b[C",
+            "left" => "\x1b[D",
+            other => {
+                return error(
+                    id,
+                    -32602,
+                    &format!("unsupported terminal key `{other}`"),
+                );
+            }
+        };
+        payload.push_str(seq);
+    }
+    if payload.is_empty() {
+        return error(
+            id,
+            -32602,
+            "terminal_write needs `text`, `pressEnter: true`, or `key`",
+        );
+    }
+
+    match shells.write(&session_id, &payload) {
+        Ok(true) => tool_result(
+            id,
+            &format!("wrote {} bytes to terminal `{session_id}`", payload.len()),
+            false,
+        ),
+        Ok(false) => tool_result(id, &format!("terminal `{session_id}` has exited"), true),
+        Err(err) => tool_result(id, &err.to_string(), true),
+    }
+}
+
+fn open_tool_result(driver: &dyn WebviewDriver, id: &Value, arguments: &Value) -> Value {
+    let Some(tool) = arguments
+        .get("tool")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return error(id, -32602, "open_tool needs a `tool` argument");
+    };
+    let normalized = tool.to_ascii_lowercase();
+    if !matches!(normalized.as_str(), "terminal" | "browser" | "document" | "files") {
+        return error(
+            id,
+            -32602,
+            "open_tool `tool` must be one of: terminal, browser, document, files",
+        );
+    }
+    let path = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    driver.open_tool(&normalized, path);
+    tool_result(
+        id,
+        &format!("requested Nabla to open tool `{normalized}` in the right drawer"),
+        false,
+    )
 }
 
 // ── persistent agent memory (`memory_save` / `memory_search` / `memory_forget`) ──
@@ -3226,6 +3453,7 @@ pub struct EmbedDriver {
     app: tauri::AppHandle,
     embeds: crate::embed::EmbedSessions,
     memory: Arc<crate::memory::MemoryStore>,
+    shells: crate::shell::ShellSessions,
 }
 
 impl EmbedDriver {
@@ -3233,11 +3461,13 @@ impl EmbedDriver {
         app: tauri::AppHandle,
         embeds: crate::embed::EmbedSessions,
         memory: Arc<crate::memory::MemoryStore>,
+        shells: crate::shell::ShellSessions,
     ) -> EmbedDriver {
         EmbedDriver {
             app,
             embeds,
             memory,
+            shells,
         }
     }
 
@@ -3350,6 +3580,16 @@ impl WebviewDriver for EmbedDriver {
 
     fn open_document(&self, path: &str) {
         let _ = self.app.emit("doc-open", json!({ "path": path }));
+    }
+
+    fn open_tool(&self, tool: &str, path: Option<&str>) {
+        let _ = self
+            .app
+            .emit("drawer-open-tool", json!({ "tool": tool, "path": path }));
+    }
+
+    fn shells(&self) -> Option<crate::shell::ShellSessions> {
+        Some(self.shells.clone())
     }
 
     fn memory_store(&self) -> Option<Arc<crate::memory::MemoryStore>> {

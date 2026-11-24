@@ -86,6 +86,9 @@ export function usePromptDraft(
    * so a switch settles the text under the key it was typed for. */
   let armedKey: string | null = null;
   let armedText = "";
+  /** Key whose stored draft populated `text` on restore, so clearing the composer
+   * after a session/workspace switch also forgets the original key. */
+  let loadedFromKey: string | null = null;
   let timer: number | null = null;
 
   function cancel(): void {
@@ -116,20 +119,24 @@ export function usePromptDraft(
 
   watch(text, (next) => {
     const target = key();
+    if (next.trim() === "") {
+      // An emptied composer is an empty draft: keeping the stored text would
+      // resurrect words the human deleted, including any key it was restored from.
+      armedKey = null;
+      armedText = "";
+      cancel();
+      forgetDraft(target);
+      if (loadedFromKey !== null && loadedFromKey !== target) {
+        forgetDraft(loadedFromKey);
+      }
+      loadedFromKey = null;
+      return;
+    }
     if (target === null) {
       // Nothing addresses this text, so there is nowhere to persist it.
       armedKey = null;
       armedText = "";
       cancel();
-      return;
-    }
-    if (next === "") {
-      // An emptied composer is an empty draft: keeping the stored text would
-      // resurrect words the human deleted.
-      armedKey = null;
-      armedText = "";
-      cancel();
-      forgetDraft(target);
       return;
     }
     arm(target, next);
@@ -147,6 +154,7 @@ export function usePromptDraft(
       if (text.value !== "") return;
       const stored = readDraft(target);
       if (stored === "") return;
+      loadedFromKey = target;
       text.value = stored;
     },
     { immediate: true },
@@ -159,6 +167,10 @@ export function usePromptDraft(
     const current = key();
     text.value = "";
     forgetDraft(current);
+    if (loadedFromKey !== null && loadedFromKey !== current) {
+      forgetDraft(loadedFromKey);
+    }
+    loadedFromKey = null;
     for (const other of alsoForget) {
       if (other !== current) forgetDraft(other);
     }

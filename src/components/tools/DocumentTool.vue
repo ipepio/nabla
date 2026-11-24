@@ -2,9 +2,11 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import {
   BoldIcon,
+  BookOpenIcon,
   CheckSquareIcon,
   ChevronDownIcon,
   CodeIcon,
+  CopyIcon,
   FileDownIcon,
   FilePlus2Icon,
   FileTextIcon,
@@ -18,14 +20,18 @@ import {
   LinkIcon,
   ListIcon,
   ListOrderedIcon,
+  MessageSquarePlusIcon,
   MinusIcon,
   PlusIcon,
   PrinterIcon,
   QuoteIcon,
   SaveIcon,
+  SparklesIcon,
   TableIcon,
+  TextSelectIcon,
   Trash2Icon,
   TypeIcon,
+  WandSparklesIcon,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import {
@@ -50,6 +56,10 @@ import {
 } from "@/contracts/commands";
 import type { WorkspaceInfo } from "@/contracts/types";
 import { t, type MessageKey } from "@/lib/i18n";
+import {
+  requestAgentWithDocumentSelection,
+  type DocumentAgentAction,
+} from "@/lib/agent-selection";
 import {
   createTextBlock,
   detectMarkdownShortcut,
@@ -83,6 +93,160 @@ const statusNotice = ref<string | null>(null);
 const slashMenuBlockId = ref<string | null>(null);
 const slashQuery = ref("");
 const slashActiveIndex = ref(0);
+
+// Multi-block selection state (drag across blocks, Shift+Click, Cmd/Ctrl+A)
+const selectedBlockIds = ref<Set<string>>(new Set());
+const dragAnchorIdx = ref<number | null>(null);
+const isPointerDownInDoc = ref(false);
+const isMultiBlockDragging = ref(false);
+
+// Right-click context menu for interacting with the agent on selected text/blocks
+const ctxMenuVisible = ref(false);
+const ctxMenuX = ref(0);
+const ctxMenuY = ref(0);
+const ctxSelectedText = ref("");
+
+const hasMultiBlockSelection = computed(() => selectedBlockIds.value.size > 0);
+
+function clearBlockSelection(): void {
+  if (selectedBlockIds.value.size > 0) {
+    selectedBlockIds.value = new Set();
+  }
+}
+
+function selectBlockRange(startIdx: number, endIdx: number): void {
+  const from = Math.max(0, Math.min(startIdx, endIdx));
+  const to = Math.min(blocks.value.length - 1, Math.max(startIdx, endIdx));
+  const next = new Set<string>();
+  for (let i = from; i <= to; i += 1) {
+    next.add(blocks.value[i].id);
+  }
+  selectedBlockIds.value = next;
+}
+
+function selectAllBlocks(): void {
+  if (blocks.value.length === 0) return;
+  selectBlockRange(0, blocks.value.length - 1);
+  if (document.activeElement instanceof HTMLElement) {
+    document.activeElement.blur();
+  }
+}
+
+function getSelectedBlocksMarkdown(): string {
+  const selected = blocks.value.filter((b) => selectedBlockIds.value.has(b.id));
+  if (selected.length === 0) return "";
+  return serializeBlocksToMarkdown(selected).trim();
+}
+
+function getCurrentDocumentSelectionText(): string {
+  if (selectedBlockIds.value.size > 0) {
+    return getSelectedBlocksMarkdown();
+  }
+  if (focusedBlockId.value) {
+    const el = blockInputEls.get(focusedBlockId.value);
+    if (el) {
+      const start = el.selectionStart ?? 0;
+      const end = el.selectionEnd ?? 0;
+      if (end > start) {
+        return el.value.slice(start, end);
+      }
+    }
+  }
+  const active = document.activeElement;
+  if (active instanceof HTMLTextAreaElement || active instanceof HTMLInputElement) {
+    const start = active.selectionStart ?? 0;
+    const end = active.selectionEnd ?? 0;
+    if (end > start) {
+      return active.value.slice(start, end);
+    }
+  }
+  return window.getSelection()?.toString() ?? "";
+}
+
+function handleBlockMouseDown(idx: number, event: MouseEvent): void {
+  if (event.button !== 0) return;
+  closeContextMenu();
+  if (event.shiftKey && dragAnchorIdx.value !== null) {
+    event.preventDefault();
+    selectBlockRange(dragAnchorIdx.value, idx);
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
+    return;
+  }
+  clearBlockSelection();
+  dragAnchorIdx.value = idx;
+  isPointerDownInDoc.value = true;
+  isMultiBlockDragging.value = false;
+}
+
+function handleBlockMouseEnter(idx: number): void {
+  if (!isPointerDownInDoc.value || dragAnchorIdx.value === null) return;
+  if (idx !== dragAnchorIdx.value || isMultiBlockDragging.value) {
+    if (!isMultiBlockDragging.value) {
+      isMultiBlockDragging.value = true;
+      window.getSelection()?.removeAllRanges();
+      if (document.activeElement instanceof HTMLElement) {
+        document.activeElement.blur();
+      }
+    }
+    selectBlockRange(dragAnchorIdx.value, idx);
+  }
+}
+
+function handleGlobalMouseUp(): void {
+  isPointerDownInDoc.value = false;
+  isMultiBlockDragging.value = false;
+}
+
+function closeContextMenu(): void {
+  ctxMenuVisible.value = false;
+}
+
+function handleDocumentContextMenu(event: MouseEvent): void {
+  if (import.meta.env.DEV && event.shiftKey) return;
+  const text = getCurrentDocumentSelectionText().trim();
+  if (!text) return; // Fall through to AppContextMenu when nothing is selected
+
+  event.preventDefault();
+  event.stopPropagation();
+  ctxSelectedText.value = text;
+  const menuW = 248;
+  const menuH = 270;
+  ctxMenuX.value = Math.min(event.clientX, Math.max(8, window.innerWidth - menuW - 8));
+  ctxMenuY.value = Math.min(event.clientY, Math.max(8, window.innerHeight - menuH - 8));
+  ctxMenuVisible.value = true;
+}
+
+function runAgentAction(action: DocumentAgentAction): void {
+  const text = ctxSelectedText.value;
+  closeContextMenu();
+  if (!text) return;
+  requestAgentWithDocumentSelection(action, text, currentPath.value || fileName.value);
+}
+
+async function copySelectedDocumentText(): Promise<void> {
+  const text = ctxSelectedText.value || getCurrentDocumentSelectionText();
+  closeContextMenu();
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    showNotice(t("context.copy"));
+  } catch {
+    document.execCommand("copy");
+  }
+}
+
+function deleteSelectedBlocks(): void {
+  if (selectedBlockIds.value.size === 0) return;
+  blocks.value = blocks.value.filter((b) => !selectedBlockIds.value.has(b.id));
+  clearBlockSelection();
+  if (blocks.value.length === 0) {
+    const fresh = createTextBlock("paragraph", "");
+    blocks.value.push(fresh);
+    focusBlock(fresh.id, false);
+  }
+}
 
 const blockInputEls = new Map<string, HTMLTextAreaElement>();
 let statusTimer: number | null = null;
@@ -856,6 +1020,47 @@ function onKeydown(event: KeyboardEvent): void {
   if (mod && event.key.toLowerCase() === "s") {
     event.preventDefault();
     void handleSave();
+    return;
+  }
+  if (event.key === "Escape") {
+    if (ctxMenuVisible.value) {
+      closeContextMenu();
+      return;
+    }
+    if (selectedBlockIds.value.size > 0) {
+      clearBlockSelection();
+      return;
+    }
+  }
+  if (selectedBlockIds.value.size > 0) {
+    if (mod && event.key.toLowerCase() === "c") {
+      event.preventDefault();
+      void copySelectedDocumentText();
+      return;
+    }
+    if (mod && event.key.toLowerCase() === "a") {
+      event.preventDefault();
+      selectAllBlocks();
+      return;
+    }
+    if (event.key === "Backspace" || event.key === "Delete") {
+      event.preventDefault();
+      deleteSelectedBlocks();
+      return;
+    }
+  } else if (mod && event.key.toLowerCase() === "a" && focusedBlockId.value) {
+    // Pressing Cmd/Ctrl+A when the whole current block is already selected expands
+    // the selection to the entire document (Notion-style two-stage Select All).
+    const el = blockInputEls.get(focusedBlockId.value);
+    if (
+      el &&
+      document.activeElement === el &&
+      el.selectionStart === 0 &&
+      el.selectionEnd === el.value.length
+    ) {
+      event.preventDefault();
+      selectAllBlocks();
+    }
   }
 }
 
@@ -886,6 +1091,8 @@ function handleWindowFocus(): void {
 onMounted(() => {
   window.addEventListener("keydown", onKeydown);
   window.addEventListener("focus", handleWindowFocus);
+  window.addEventListener("mouseup", handleGlobalMouseUp);
+  window.addEventListener("pointerdown", closeContextMenu);
   diskPollTimer = window.setInterval(() => {
     void syncFromDiskIfChanged();
   }, 1500);
@@ -894,6 +1101,8 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKeydown);
   window.removeEventListener("focus", handleWindowFocus);
+  window.removeEventListener("mouseup", handleGlobalMouseUp);
+  window.removeEventListener("pointerdown", closeContextMenu);
   if (statusTimer !== null) window.clearTimeout(statusTimer);
   if (autoSaveTimer !== null) window.clearTimeout(autoSaveTimer);
   if (diskPollTimer !== null) window.clearInterval(diskPollTimer);
@@ -1132,13 +1341,22 @@ onBeforeUnmount(() => {
     <div
       v-else
       class="min-h-0 flex-1 overflow-y-auto px-6 py-6 sm:px-10"
-      @click.self="blocks.length > 0 && focusBlock(blocks[blocks.length - 1].id, true)"
+      :class="isMultiBlockDragging ? 'select-none' : ''"
+      @click.self="clearBlockSelection(); blocks.length > 0 && focusBlock(blocks[blocks.length - 1].id, true)"
+      @contextmenu="handleDocumentContextMenu"
     >
       <div class="mx-auto max-w-2xl space-y-1.5 pb-24">
         <div
           v-for="(block, idx) in blocks"
           :key="block.id"
-          class="group relative"
+          class="group relative rounded-md transition-colors"
+          :class="
+            selectedBlockIds.has(block.id)
+              ? 'bg-primary/15 ring-1 ring-primary/35'
+              : ''
+          "
+          @mousedown="handleBlockMouseDown(idx, $event)"
+          @mouseenter="handleBlockMouseEnter(idx)"
         >
           <!-- Divider block -->
           <div
@@ -1325,5 +1543,116 @@ onBeforeUnmount(() => {
         </div>
       </div>
     </div>
+
+    <!-- Selection status bar when multiple blocks are selected -->
+    <div
+      v-if="hasMultiBlockSelection"
+      class="flex shrink-0 items-center justify-between gap-2 border-t border-border bg-card/80 px-3 py-1.5 text-[11px] text-muted-foreground"
+    >
+      <span class="font-medium text-foreground">
+        {{ t("tools.document.selectionCount", { count: selectedBlockIds.size }) }}
+      </span>
+      <div class="flex items-center gap-1.5">
+        <Button
+          variant="default"
+          size="xs"
+          class="h-6 gap-1 px-2 text-[11px]"
+          @click="
+            ctxSelectedText = getSelectedBlocksMarkdown();
+            runAgentAction('ask');
+          "
+        >
+          <SparklesIcon class="size-3" />
+          {{ t("tools.document.context.ask") }}
+        </Button>
+        <Button
+          variant="outline"
+          size="xs"
+          class="h-6 gap-1 px-2 text-[11px]"
+          @click="copySelectedDocumentText"
+        >
+          <CopyIcon class="size-3" />
+          {{ t("context.copy") }}
+        </Button>
+      </div>
+    </div>
+
+    <!-- Right-click context menu on document selection -->
+    <Teleport to="body">
+      <div
+        v-if="ctxMenuVisible"
+        role="menu"
+        class="fixed z-50 w-60 overflow-hidden rounded-xl border border-border bg-popover p-1 text-popover-foreground shadow-xl"
+        :style="{ left: `${ctxMenuX}px`, top: `${ctxMenuY}px` }"
+        @pointerdown.stop
+        @contextmenu.prevent
+      >
+        <p class="px-2.5 py-1 text-[10px] font-semibold tracking-wider text-muted-foreground uppercase">
+          {{ t("tools.document.context.agentHeading") }}
+        </p>
+
+        <button
+          type="button"
+          role="menuitem"
+          class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs font-medium text-primary hover:bg-accent hover:text-accent-foreground"
+          @click="runAgentAction('ask')"
+        >
+          <MessageSquarePlusIcon class="size-3.5 shrink-0" />
+          <span>{{ t("tools.document.context.ask") }}</span>
+        </button>
+
+        <button
+          type="button"
+          role="menuitem"
+          class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground"
+          @click="runAgentAction('explain')"
+        >
+          <BookOpenIcon class="size-3.5 shrink-0 text-muted-foreground" />
+          <span>{{ t("tools.document.context.explain") }}</span>
+        </button>
+
+        <button
+          type="button"
+          role="menuitem"
+          class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground"
+          @click="runAgentAction('improve')"
+        >
+          <WandSparklesIcon class="size-3.5 shrink-0 text-muted-foreground" />
+          <span>{{ t("tools.document.context.improve") }}</span>
+        </button>
+
+        <button
+          type="button"
+          role="menuitem"
+          class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground"
+          @click="runAgentAction('summarize')"
+        >
+          <SparklesIcon class="size-3.5 shrink-0 text-muted-foreground" />
+          <span>{{ t("tools.document.context.summarize") }}</span>
+        </button>
+
+        <div class="my-1 h-px bg-border" role="separator" />
+
+        <button
+          type="button"
+          role="menuitem"
+          class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground"
+          @click="copySelectedDocumentText"
+        >
+          <CopyIcon class="size-3.5 shrink-0 text-muted-foreground" />
+          <span>{{ t("context.copy") }}</span>
+        </button>
+
+        <button
+          type="button"
+          role="menuitem"
+          class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground"
+          @click="closeContextMenu(); selectAllBlocks()"
+        >
+          <TextSelectIcon class="size-3.5 shrink-0 text-muted-foreground" />
+          <span>{{ t("tools.document.context.selectDocument") }}</span>
+        </button>
+      </div>
+    </Teleport>
   </div>
 </template>
