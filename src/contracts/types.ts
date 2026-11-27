@@ -1093,3 +1093,22 @@ export interface UsageSnapshot {
   totalWeekCost: number;
   fetchedAt: number;
 }
+
+export interface UpdateInfo {
+  currentVersion: string;
+  latestVersion: string;
+  available: boolean;
+  releaseUrl: string;
+  notes: string;
+  assetName: string | null;
+  assetUrl: string | null;
+  assetSize: number | null;
+  assetSha256: string | null;
+}
+
+export interface UpdateProgressEvent {
+  stage: "downloading" | "verifying" | "installing" | "relaunching" | "error";
+  downloaded: number;
+  total: number | null;
+  message: string | null;
+}

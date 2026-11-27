@@ -3176,6 +3176,21 @@ pub async fn test_provider_usage_config(
     crate::usage::test_provider_usage_config(&state.data_dir, &state.pi_agent_dir, draft).await
 }
 
+// ── In-app GitHub Releases updater ─────────────────────────────────────────
+
+#[tauri::command]
+pub async fn check_for_update() -> Result<crate::updater::UpdateInfo, String> {
+    crate::updater::check_for_update().await
+}
+
+#[tauri::command]
+pub async fn install_update(
+    app: tauri::AppHandle,
+    info: crate::updater::UpdateInfo,
+) -> Result<(), String> {
+    crate::updater::install_update(&app, &info).await
+}
+
 // ── pi CLI bridge (S1-S4 of `pi-cli-bridge.md`) ─────────────────────────────
 
 /// S1/S2: runs one allowlisted `pi` invocation with a mandatory deadline and

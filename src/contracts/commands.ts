@@ -62,6 +62,8 @@ import type {
   ThinkingLevel,
   TranscriptMessage,
   UiAnswer,
+  UpdateInfo,
+  UpdateProgressEvent,
   UsageSnapshot,
   WorkspaceInfo,
 } from "./types";
@@ -737,6 +739,22 @@ export function testProviderUsageConfig(
   draft: ProviderUsageConfigDraft,
 ): Promise<ProviderQuotaSnapshot> {
   return invoke<ProviderQuotaSnapshot>("test_provider_usage_config", { draft });
+}
+
+export function checkForUpdate(): Promise<UpdateInfo> {
+  return invoke<UpdateInfo>("check_for_update");
+}
+
+export function installUpdate(info: UpdateInfo): Promise<void> {
+  return invoke<void>("install_update", { info });
+}
+
+export function subscribeUpdaterProgress(
+  handler: (event: UpdateProgressEvent) => void,
+): Promise<() => void> {
+  return listen<UpdateProgressEvent>("updater-progress", (event) => {
+    handler(event.payload);
+  });
 }
 
 export function sendPrompt(

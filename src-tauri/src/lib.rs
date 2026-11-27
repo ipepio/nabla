@@ -25,6 +25,7 @@ mod settings;
 mod shell;
 mod skills;
 mod store;
+mod updater;
 mod usage;
 // Embedded local CPU voice models & downloader (TTS/STT).
 mod voice;
@@ -505,7 +506,9 @@ pub fn run() {
             commands::list_provider_usage_configs,
             commands::save_provider_usage_config,
             commands::delete_provider_usage_config,
-            commands::test_provider_usage_config
+            commands::test_provider_usage_config,
+            commands::check_for_update,
+            commands::install_update
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

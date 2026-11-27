@@ -12,9 +12,12 @@
 // gear button opens; the drawer only keeps the open flag.
 import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch } from "vue";
 import {
+  ArrowDownToLineIcon,
+  CheckIcon,
   CirclePlusIcon,
   FolderPlusIcon,
   PanelLeftIcon,
+  RefreshCwIcon,
   SearchIcon,
   SettingsIcon,
   SlidersHorizontalIcon,
@@ -42,8 +45,16 @@ import {
   SidebarTrigger,
   useSidebar,
 } from "@/components/ui/sidebar";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 const SettingsDialog = defineAsyncComponent(
   () => import("@/components/settings/SettingsDialog.vue"),
+);
+const UpdateDialog = defineAsyncComponent(
+  () => import("@/components/UpdateDialog.vue"),
 );
 import SessionsList from "@/components/sidebar/SessionsList.vue";
 import WorkspaceRow from "@/components/sidebar/WorkspaceRow.vue";
@@ -70,6 +81,7 @@ import {
 } from "@/lib/subagent-store";
 import {
   addWorkspace,
+  checkForUpdate,
   commandErrorMessage,
   deleteSession,
   listSessions,
@@ -81,7 +93,12 @@ import {
   stopSession,
   touchWorkspace,
 } from "../contracts/commands";
-import type { SessionSummary, SubagentSession, WorkspaceInfo } from "../contracts/types";
+import type {
+  SessionSummary,
+  SubagentSession,
+  UpdateInfo,
+  WorkspaceInfo,
+} from "../contracts/types";
 
 const props = defineProps<{ activeWorkspaceId: number | null }>();
 const emit = defineEmits<{ select: [workspace: WorkspaceInfo | null] }>();
@@ -687,6 +704,57 @@ async function handleSaveWorkspaceRename() {
   }
 }
 
+// ── In-app GitHub Releases updater ─────────────────────────────────────────
+const updateInfo = ref<UpdateInfo | null>(null);
+const updateAvailable = computed(() => updateInfo.value?.available === true);
+const checkingUpdate = ref(false);
+const upToDateFlash = ref(false);
+const updateDialogOpen = ref(false);
+let updateBootTimer: number | null = null;
+let updatePollTimer: number | null = null;
+let upToDateTimer: number | null = null;
+
+const updateTooltip = computed(() => {
+  if (checkingUpdate.value) return "Checking for updates…";
+  if (updateAvailable.value && updateInfo.value) {
+    return `Update available: v${updateInfo.value.latestVersion}`;
+  }
+  if (upToDateFlash.value && updateInfo.value) {
+    return `Up to date (v${updateInfo.value.currentVersion})`;
+  }
+  return "Check for updates";
+});
+
+async function runUpdateCheck(interactive: boolean): Promise<void> {
+  if (checkingUpdate.value) return;
+  checkingUpdate.value = true;
+  try {
+    const info = await checkForUpdate();
+    updateInfo.value = info;
+    if (info.available && interactive) {
+      updateDialogOpen.value = true;
+    } else if (!info.available && interactive) {
+      upToDateFlash.value = true;
+      if (upToDateTimer !== null) window.clearTimeout(upToDateTimer);
+      upToDateTimer = window.setTimeout(() => {
+        upToDateFlash.value = false;
+      }, 3500);
+    }
+  } catch {
+    // Silent background check failures stay quiet; manual check simply settles.
+  } finally {
+    checkingUpdate.value = false;
+  }
+}
+
+function handleUpdateClick(): void {
+  if (updateAvailable.value) {
+    updateDialogOpen.value = true;
+    return;
+  }
+  void runUpdateCheck(true);
+}
+
 onMounted(() => {
   void refreshWorkspaces();
   // The persisted theme is applied by the chat panel at startup (its settings
@@ -702,6 +770,13 @@ onMounted(() => {
   // in another workspace reorders them), paused while the window is hidden.
   document.addEventListener("visibilitychange", handleVisibilityChange);
   sessionPollHandle = window.setInterval(pollExpandedSessions, SESSION_POLL_MS);
+  // Silent background update check (6s after startup + every 6h).
+  updateBootTimer = window.setTimeout(() => {
+    void runUpdateCheck(false);
+  }, 6000);
+  updatePollTimer = window.setInterval(() => {
+    void runUpdateCheck(false);
+  }, 6 * 60 * 60 * 1000);
 });
 
 onUnmounted(() => {
@@ -712,6 +787,18 @@ onUnmounted(() => {
   if (sessionPollHandle !== null) {
     window.clearInterval(sessionPollHandle);
     sessionPollHandle = null;
+  }
+  if (updateBootTimer !== null) {
+    window.clearTimeout(updateBootTimer);
+    updateBootTimer = null;
+  }
+  if (updatePollTimer !== null) {
+    window.clearInterval(updatePollTimer);
+    updatePollTimer = null;
+  }
+  if (upToDateTimer !== null) {
+    window.clearTimeout(upToDateTimer);
+    upToDateTimer = null;
   }
   document.removeEventListener("visibilitychange", handleVisibilityChange);
 });
@@ -938,19 +1025,64 @@ onUnmounted(() => {
 
     <SidebarFooter class="px-2.5 py-2.5">
       <!-- S1 of `settings-dialog.md`: the gear opens the two-pane settings
-           dialog; the dialog owns every preference read and write. -->
-      <Button
-        variant="ghost"
-        class="h-8 w-full justify-start gap-2 rounded-lg text-xs text-muted-foreground hover:bg-secondary hover:text-foreground"
-        :aria-label="t('sidebar.settings')"
-        @click="openSettings"
-      >
-        <SettingsIcon />
-        <span class="group-data-[collapsible=icon]:hidden">
-          {{ t("sidebar.settings") }}
-        </span>
-      </Button>
+           dialog; the icon-only update button sits on the right (hidden when
+           collapsed, where a dot on the Settings icon signals an available update). -->
+      <div class="flex items-center gap-1">
+        <Button
+          variant="ghost"
+          class="h-8 min-w-0 flex-1 justify-start gap-2 rounded-lg text-xs text-muted-foreground hover:bg-secondary hover:text-foreground"
+          :aria-label="t('sidebar.settings')"
+          @click="openSettings"
+        >
+          <span class="relative inline-flex shrink-0">
+            <SettingsIcon />
+            <span
+              v-if="updateAvailable"
+              class="hidden group-data-[collapsible=icon]:block absolute -top-0.5 -right-0.5 size-2 rounded-full bg-primary ring-2 ring-sidebar"
+              aria-hidden="true"
+            />
+          </span>
+          <span class="group-data-[collapsible=icon]:hidden">
+            {{ t("sidebar.settings") }}
+          </span>
+        </Button>
+
+        <Tooltip>
+          <TooltipTrigger as-child>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              class="relative shrink-0 rounded-lg group-data-[collapsible=icon]:hidden"
+              :class="
+                updateAvailable
+                  ? 'border border-primary/40 bg-primary/15 text-primary hover:bg-primary/25 hover:text-primary'
+                  : 'text-muted-foreground hover:bg-secondary hover:text-foreground'
+              "
+              :disabled="checkingUpdate"
+              :aria-label="updateTooltip"
+              @click="handleUpdateClick"
+            >
+              <ArrowDownToLineIcon v-if="updateAvailable" class="size-3.5" />
+              <CheckIcon v-else-if="upToDateFlash" class="size-3.5 text-primary" />
+              <RefreshCwIcon
+                v-else
+                class="size-3.5"
+                :class="checkingUpdate ? 'animate-spin' : ''"
+              />
+              <span
+                v-if="updateAvailable"
+                class="nabla-status-pulse absolute -top-0.5 -right-0.5 size-2 rounded-full bg-primary"
+                aria-hidden="true"
+              />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="top">
+            {{ updateTooltip }}
+          </TooltipContent>
+        </Tooltip>
+      </div>
       <SettingsDialog v-if="settingsLoaded" v-model:open="settingsOpen" />
+      <UpdateDialog v-model:open="updateDialogOpen" :info="updateInfo" />
 
       <!-- S6: read-only placeholder behind the row menu's "Edit workspace".
            Alias editing and the delete confirmation are the next unit. -->

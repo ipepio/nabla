@@ -56,7 +56,7 @@ run("hdiutil", [
   appPath,
   "-ov",
   "-format",
-  "UDZO",
+  "ULMO",
   dmgPath,
 ]);
 console.log(`[macos-dmg] ready: ${dmgPath}`);
