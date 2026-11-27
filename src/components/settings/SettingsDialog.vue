@@ -176,6 +176,9 @@ const ProviderForm = defineAsyncComponent(() => import("./ProviderForm.vue"));
 const ProviderModelsEditor = defineAsyncComponent(
   () => import("./ProviderModelsEditor.vue"),
 );
+const ProviderUsageEditor = defineAsyncComponent(
+  () => import("./ProviderUsageEditor.vue"),
+);
 const SubagentsSection = defineAsyncComponent(
   () => import("./SubagentsSection.vue"),
 );
@@ -2039,6 +2042,14 @@ watch(open, (isOpen) => {
                   :catalog-only="editTarget.catalogOnly"
                   :refresh="editorRefresh"
                   @changed="handleModelsChanged"
+                />
+
+                <Separator />
+
+                <ProviderUsageEditor
+                  :provider-id="editTarget.id"
+                  :provider-name="editTarget.name"
+                  :base-url="editTarget.baseUrl"
                 />
 
                 <DialogFooter>

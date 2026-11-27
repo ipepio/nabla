@@ -18,6 +18,7 @@ import {
 } from "@lucide/vue";
 import ChatEmptyState from "@/components/chat/ChatEmptyState.vue";
 import ThemeToggle from "@/components/chat/ThemeToggle.vue";
+import UsagePopover from "@/components/chat/UsagePopover.vue";
 import ChatHeader from "@/components/chat/ChatHeader.vue";
 import Composer from "@/components/chat/Composer.vue";
 import QuestionCard from "@/components/chat/QuestionCard.vue";
@@ -1817,6 +1818,7 @@ onUnmounted(() => {
       v-if="isEmptyState && !showsSubagentView"
       class="absolute top-2 right-2 z-10 flex items-center gap-1"
     >
+      <UsagePopover :active-provider="providerId" />
       <ThemeToggle :is-dark="isDark" @toggle="handleToggleTheme" />
       <Button
         v-if="!toolsOpen"
@@ -1957,6 +1959,7 @@ onUnmounted(() => {
         :elapsed="turnElapsedLabel"
         :context-label="contextLabel"
         :context-high="contextHigh"
+        :active-provider="providerId"
         :exported="exportedMarkdown"
         :tools-open="toolsOpen"
         :is-dark="isDark"

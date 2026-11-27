@@ -3111,6 +3111,51 @@ pub fn acp_start_login(
     Ok(opened)
 }
 
+// ── CodexBar-style provider quota & local usage snapshot ──────────────────
+
+#[tauri::command]
+pub async fn get_usage_snapshot(
+    state: State<'_, AppState>,
+) -> Result<crate::usage::UsageSnapshot, String> {
+    Ok(crate::usage::collect_usage_snapshot(
+        &state.data_dir,
+        &state.pi_agent_dir,
+        &state.home_dir,
+    )
+    .await)
+}
+
+#[tauri::command]
+pub fn list_provider_usage_configs(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::usage::ProviderUsageConfigSummary>, String> {
+    Ok(crate::usage::list_provider_usage_configs(&state.data_dir))
+}
+
+#[tauri::command]
+pub fn save_provider_usage_config(
+    state: State<'_, AppState>,
+    draft: crate::usage::ProviderUsageConfigDraft,
+) -> Result<crate::usage::ProviderUsageConfigSummary, String> {
+    crate::usage::save_provider_usage_config(&state.data_dir, draft)
+}
+
+#[tauri::command]
+pub fn delete_provider_usage_config(
+    state: State<'_, AppState>,
+    provider_id: String,
+) -> Result<bool, String> {
+    crate::usage::delete_provider_usage_config(&state.data_dir, &provider_id)
+}
+
+#[tauri::command]
+pub async fn test_provider_usage_config(
+    state: State<'_, AppState>,
+    draft: crate::usage::ProviderUsageConfigDraft,
+) -> Result<crate::usage::ProviderQuotaSnapshot, String> {
+    crate::usage::test_provider_usage_config(&state.data_dir, &state.pi_agent_dir, draft).await
+}
+
 // ── pi CLI bridge (S1-S4 of `pi-cli-bridge.md`) ─────────────────────────────
 
 /// S1/S2: runs one allowlisted `pi` invocation with a mandatory deadline and

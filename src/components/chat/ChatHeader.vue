@@ -9,6 +9,7 @@
 // theme is applied by `src/lib/theme.ts` only).
 import { CheckIcon, FileDownIcon, PanelRightOpenIcon, SearchIcon } from "@lucide/vue";
 import ThemeToggle from "@/components/chat/ThemeToggle.vue";
+import UsagePopover from "@/components/chat/UsagePopover.vue";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -35,6 +36,8 @@ defineProps<{
   contextLabel?: string | null;
   /** Highlights the context pill when usage exceeds 75%. */
   contextHigh?: boolean;
+  /** Active provider id for the current session (e.g. `anthropic`, `openai`, `acp:claude`). */
+  activeProvider?: string | null;
   /** Brief feedback state after copying the conversation as Markdown. */
   exported?: boolean;
   /** Right tools drawer visibility, so the control reflects the real state. */
@@ -98,6 +101,8 @@ const emit = defineEmits<{
     >
       {{ contextLabel }}
     </span>
+
+    <UsagePopover :active-provider="activeProvider" />
 
     <div
       v-if="working"

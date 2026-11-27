@@ -25,6 +25,7 @@ mod settings;
 mod shell;
 mod skills;
 mod store;
+mod usage;
 // Embedded local CPU voice models & downloader (TTS/STT).
 mod voice;
 // `web_search`: the agent's web search, backed by a SearXNG instance the human
@@ -489,7 +490,12 @@ pub fn run() {
             commands::acp_set_agent_enabled,
             commands::acp_save_custom_agent,
             commands::acp_delete_custom_agent,
-            commands::acp_start_login
+            commands::acp_start_login,
+            commands::get_usage_snapshot,
+            commands::list_provider_usage_configs,
+            commands::save_provider_usage_config,
+            commands::delete_provider_usage_config,
+            commands::test_provider_usage_config
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

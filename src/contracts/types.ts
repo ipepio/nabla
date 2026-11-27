@@ -1011,3 +1011,83 @@ export interface CustomAcpAgentDraft {
   loginCommand?: string | null;
   loginArgs?: string[];
 }
+
+export interface QuotaWindow {
+  label: string;
+  usedPercent: number;
+  resetAt: string | null;
+  resetInSecs: number | null;
+  detail?: string | null;
+}
+
+export interface ProviderQuotaSnapshot {
+  providerId: string;
+  name: string;
+  plan: string | null;
+  windows: QuotaWindow[];
+  status: string;
+  error: string | null;
+}
+
+export interface ProviderUsageConfigSummary {
+  providerId: string;
+  name: string;
+  enabled: boolean;
+  preset: string;
+  url: string;
+  method: string;
+  authMode: string;
+  hasSecret: boolean;
+  origin: string | null;
+  referer: string | null;
+  windowLabel: string | null;
+  usedPath: string | null;
+  remainingPath: string | null;
+  limitPath: string | null;
+  resetAtPath: string | null;
+  planPath: string | null;
+  unit: string;
+}
+
+export interface ProviderUsageConfigDraft {
+  providerId: string;
+  name: string;
+  enabled: boolean;
+  preset: string;
+  url: string;
+  method: string;
+  authMode: string;
+  secret?: string | null;
+  clearSecret?: boolean;
+  origin?: string | null;
+  referer?: string | null;
+  windowLabel?: string | null;
+  usedPath?: string | null;
+  remainingPath?: string | null;
+  limitPath?: string | null;
+  resetAtPath?: string | null;
+  planPath?: string | null;
+  unit: string;
+}
+
+export interface LocalUsageRow {
+  provider: string;
+  model: string;
+  todayTokens: number;
+  weekTokens: number;
+  monthTokens: number;
+  todayCost: number;
+  weekCost: number;
+  monthCost: number;
+  turns: number;
+}
+
+export interface UsageSnapshot {
+  quotas: ProviderQuotaSnapshot[];
+  local: LocalUsageRow[];
+  totalTodayTokens: number;
+  totalWeekTokens: number;
+  totalTodayCost: number;
+  totalWeekCost: number;
+  fetchedAt: number;
+}

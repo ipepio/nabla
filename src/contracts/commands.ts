@@ -40,8 +40,11 @@ import type {
   ProviderModel,
   ProviderModelDraft,
   ProviderModels,
+  ProviderQuotaSnapshot,
   ProviderStatusRow,
   ProviderSummary,
+  ProviderUsageConfigDraft,
+  ProviderUsageConfigSummary,
   SessionDto,
   SessionCommand,
   SessionModelInfo,
@@ -59,6 +62,7 @@ import type {
   ThinkingLevel,
   TranscriptMessage,
   UiAnswer,
+  UsageSnapshot,
   WorkspaceInfo,
 } from "./types";
 
@@ -709,6 +713,30 @@ export function acpStartLogin(
     agentId,
     workspace: workspace ?? null,
   });
+}
+
+export function getUsageSnapshot(): Promise<UsageSnapshot> {
+  return invoke<UsageSnapshot>("get_usage_snapshot");
+}
+
+export function listProviderUsageConfigs(): Promise<ProviderUsageConfigSummary[]> {
+  return invoke<ProviderUsageConfigSummary[]>("list_provider_usage_configs");
+}
+
+export function saveProviderUsageConfig(
+  draft: ProviderUsageConfigDraft,
+): Promise<ProviderUsageConfigSummary> {
+  return invoke<ProviderUsageConfigSummary>("save_provider_usage_config", { draft });
+}
+
+export function deleteProviderUsageConfig(providerId: string): Promise<boolean> {
+  return invoke<boolean>("delete_provider_usage_config", { providerId });
+}
+
+export function testProviderUsageConfig(
+  draft: ProviderUsageConfigDraft,
+): Promise<ProviderQuotaSnapshot> {
+  return invoke<ProviderQuotaSnapshot>("test_provider_usage_config", { draft });
 }
 
 export function sendPrompt(
