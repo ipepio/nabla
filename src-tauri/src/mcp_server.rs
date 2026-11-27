@@ -59,6 +59,12 @@ macro_rules! debug_line {
 /// (`mcp__nabla-browser__navigate`).
 pub const SERVER_NAME: &str = "nabla-browser";
 
+/// CLI flag that launches Nabla in headless MCP stdio-to-HTTP bridge mode so
+/// ACP agents without HTTP MCP support can still reach `nabla-browser`.
+pub const STDIO_BRIDGE_FLAG: &str = "--mcp-stdio-bridge";
+pub const STDIO_BRIDGE_URL_ENV: &str = "NABLA_MCP_URL";
+pub const STDIO_BRIDGE_TOKEN_ENV: &str = "NABLA_MCP_TOKEN";
+
 /// How long a tool that needs a view waits for the app to open the pane
 /// (`auto-open-pane.md`, S4). Bounded like `REGISTRATION_WAIT`: the pane may never
 /// appear, and a tool call must not hang on that.
@@ -740,10 +746,10 @@ fn tool_catalog() -> Vec<Value> {
     vec![
         json!({
             "name": "navigate",
-            "description": "Open a url in the embedded browser view the human is looking at (opens the Browser tab if closed). \
-                            Accepts http, https and about:blank only. Prefer `web_search`, `curl`, `gh`, or `git` for \
-                            repositories, APIs, and public docs; use `navigate` only when the user asks to open a page \
-                            in the browser or when a site requires visual interaction, JS/SPA rendering, or user auth.",
+            "description": "Open a url in the embedded browser view the human is looking at (automatically opens the Browser tab if closed). \
+                            Accepts http, https and about:blank only. Call this whenever the user asks to open, enter, or interact \
+                            with a website or web app (SPAs, forms, authenticated sessions). For read-only lookups of public repos, \
+                            APIs, or docs, prefer `web_search`, `curl`, `gh`, or `git`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1768,9 +1774,10 @@ impl RegistrationOutcome {
 /// How long a session start waits for the registration before starting anyway.
 ///
 /// Bounded on purpose: the browser pane and the app work without the agent
-/// tools, so a registration that never reports costs a short pause, never a
-/// session that cannot be created.
-pub const REGISTRATION_WAIT: Duration = Duration::from_secs(5);
+/// tools, so a registration that never reports costs a bounded pause, never a
+/// session that cannot be created. Wide enough to cover a cold Node/`pi` boot
+/// right after an app update without racing `mcp.json`.
+pub const REGISTRATION_WAIT: Duration = Duration::from_secs(20);
 
 /// The reason `wait` answers when nobody completed the gate in time.
 pub const REGISTRATION_TIMEOUT: &str = "the registration did not finish in time";
@@ -3554,6 +3561,12 @@ mod tests {
         // GET has no stream to offer, and saying so beats hanging.
         let get = raw(&endpoint.url, "GET");
         assert!(get.starts_with("HTTP/1.1 405"), "{get}");
+
+        // DELETE terminates an MCP streamable HTTP session cleanly (requires token).
+        let del_unauth = raw(&endpoint.url, "DELETE");
+        assert!(del_unauth.starts_with("HTTP/1.1 401"), "{del_unauth}");
+        let del_auth = raw(&format!("{}?token={token}", endpoint.url), "DELETE");
+        assert!(del_auth.starts_with("HTTP/1.1 204"), "{del_auth}");
     }
 
     /// Sends one POST over a real socket and returns the raw response.
@@ -3959,7 +3972,7 @@ fn serve(
                 // Only `/mcp`: anything else on this port is not a protocol we
                 // speak, and the router answers 404 without a handler.
                 let router = Router::new()
-                    .route("/mcp", post(handle_post))
+                    .route("/mcp", post(handle_post).delete(handle_delete))
                     .with_state(state);
                 let _ = axum::serve(listener, router).await;
             });
@@ -4077,4 +4090,105 @@ fn accepted(state: &ServerState) -> Response {
             .insert(header::HeaderName::from_static("mcp-session-id"), value);
     }
     response
+}
+
+/// MCP Streamable HTTP session termination (`DELETE /mcp`).
+async fn handle_delete(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Query(query): Query<TokenQuery>,
+) -> Response {
+    if !authorized(&headers, &query, &state.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Headless stdio-to-HTTP MCP bridge (`nabla --mcp-stdio-bridge`).
+///
+/// Reads newline-delimited JSON-RPC 2.0 frames from stdin, forwards each one
+/// to the parent Nabla process's local `127.0.0.1` MCP HTTP endpoint using
+/// `NABLA_MCP_URL` and `NABLA_MCP_TOKEN`, and writes non-empty responses back
+/// to stdout. Allows ACP CLIs that only support stdio MCP servers to drive all
+/// built-in `nabla-browser` tools with zero external dependencies.
+pub fn run_stdio_bridge() -> i32 {
+    use std::io::{BufRead, Write};
+
+    let Ok(url) = std::env::var(STDIO_BRIDGE_URL_ENV) else {
+        eprintln!("nabla mcp-stdio-bridge: missing {STDIO_BRIDGE_URL_ENV}");
+        return 1;
+    };
+    let Ok(token) = std::env::var(STDIO_BRIDGE_TOKEN_ENV) else {
+        eprintln!("nabla mcp-stdio-bridge: missing {STDIO_BRIDGE_TOKEN_ENV}");
+        return 1;
+    };
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        eprintln!("nabla mcp-stdio-bridge: failed to initialize tokio runtime");
+        return 1;
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+    else {
+        eprintln!("nabla mcp-stdio-bridge: failed to build HTTP client");
+        return 1;
+    };
+
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let outcome = runtime.block_on(async {
+            client
+                .post(&url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(
+                    reqwest::header::ACCEPT,
+                    "application/json, text/event-stream",
+                )
+                .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(trimmed.to_string())
+                .send()
+                .await
+        });
+        match outcome {
+            Ok(resp) => {
+                let status = resp.status();
+                let body = runtime.block_on(resp.text()).unwrap_or_default();
+                if status == reqwest::StatusCode::ACCEPTED || body.trim().is_empty() {
+                    continue;
+                }
+                let compact = serde_json::from_str::<Value>(&body)
+                    .and_then(|v| serde_json::to_string(&v))
+                    .unwrap_or_else(|_| body.trim().replace('\n', " "));
+                if writeln!(out, "{compact}").is_err() || out.flush().is_err() {
+                    break;
+                }
+            }
+            Err(err) => {
+                if let Ok(req) = serde_json::from_str::<Value>(trimmed)
+                    && let Some(id) = req.get("id").filter(|id| !id.is_null())
+                {
+                    let err_frame = error(
+                        id,
+                        -32000,
+                        &format!("nabla mcp bridge request failed: {err}"),
+                    );
+                    if writeln!(out, "{err_frame}").is_err() || out.flush().is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    0
 }

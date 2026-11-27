@@ -610,19 +610,66 @@ impl AcpManager {
             }
         };
 
-        // Handshake 2: session/new (with Nabla's HTTP MCP server injected)
-        let try_session_new = |with_mcp: bool| -> Result<Value, String> {
+        // Handshake 2: session/new (inject Nabla's built-in `nabla-browser` MCP
+        // server). Prefer HTTP when the agent explicitly advertises
+        // `agentCapabilities.mcpCapabilities.http`; otherwise prefer Nabla's
+        // built-in `--mcp-stdio-bridge` (stdio is the one mandatory MCP
+        // transport in ACP), falling back across transports before ever
+        // dropping MCP.
+        let bridge_exe = std::env::current_exe().ok();
+        let mut transports = Vec::new();
+        if mcp.is_some() {
+            if protocol::agent_supports_http_mcp(&init_result) {
+                transports.push(protocol::AcpMcpTransport::Http);
+                if bridge_exe.is_some() {
+                    transports.push(protocol::AcpMcpTransport::Stdio);
+                }
+            } else {
+                if bridge_exe.is_some() {
+                    transports.push(protocol::AcpMcpTransport::Stdio);
+                }
+                transports.push(protocol::AcpMcpTransport::Http);
+            }
+        }
+        transports.push(protocol::AcpMcpTransport::None);
+
+        let try_session_new = |transport: protocol::AcpMcpTransport| -> Result<Value, String> {
             let new_id = handle.next_id.fetch_add(1, Ordering::Relaxed);
-            let new_req = protocol::build_session_new_request(
+            let new_req = protocol::build_session_new_request_with_transport(
                 new_id,
                 &cwd.to_string_lossy(),
-                if with_mcp { mcp } else { None },
+                mcp,
+                transport,
+                bridge_exe.as_deref(),
             );
             handle.send_rpc_request(new_id, &new_req, Some(INIT_TIMEOUT))
         };
 
-        let session_result = match try_session_new(mcp.is_some()) {
-            Ok(v) => v,
+        let try_all_transports =
+            |order: &[protocol::AcpMcpTransport]| -> Result<(Value, protocol::AcpMcpTransport), String> {
+                let mut last_err = String::new();
+                for &transport in order {
+                    match try_session_new(transport) {
+                        Ok(v) => return Ok((v, transport)),
+                        Err(err) => {
+                            if err.to_ascii_lowercase().contains("auth") {
+                                return Err(err);
+                            }
+                            if transport != protocol::AcpMcpTransport::None {
+                                eprintln!(
+                                    "nabla: ACP session/new for {} failed with MCP transport {:?}: {err}",
+                                    spec.name, transport
+                                );
+                            }
+                            last_err = err;
+                        }
+                    }
+                }
+                Err(last_err)
+            };
+
+        let (session_result, chosen_transport) = match try_all_transports(&transports) {
+            Ok(pair) => pair,
             Err(err) if err.to_ascii_lowercase().contains("auth") => {
                 if let Some(method_id) = init_result
                     .get("authMethods")
@@ -634,25 +681,24 @@ impl AcpManager {
                     let auth_req = protocol::build_authenticate_request(auth_id, method_id);
                     let _ = handle.send_rpc_request(auth_id, &auth_req, Some(INIT_TIMEOUT));
                 }
-                try_session_new(mcp.is_some())
-                    .or_else(|_| try_session_new(false))
-                    .map_err(|e2| {
-                        handle.set_status(RuntimeStatus::Crashed, Some(e2.clone()));
-                        handle.kill();
-                        format!("{} requires sign-in (Settings -> Providers): {e2}", spec.name)
-                    })?
+                try_all_transports(&transports).map_err(|e2| {
+                    handle.set_status(RuntimeStatus::Crashed, Some(e2.clone()));
+                    handle.kill();
+                    format!("{} requires sign-in (Settings -> Providers): {e2}", spec.name)
+                })?
             }
-            Err(err) if mcp.is_some() => try_session_new(false).map_err(|e2| {
-                handle.set_status(RuntimeStatus::Crashed, Some(e2.clone()));
-                handle.kill();
-                format!("ACP session/new failed for {}: {err} (retry: {e2})", spec.name)
-            })?,
             Err(err) => {
                 handle.set_status(RuntimeStatus::Crashed, Some(err.clone()));
                 handle.kill();
                 return Err(format!("ACP session/new failed for {}: {err}", spec.name));
             }
         };
+        if mcp.is_some() && chosen_transport == protocol::AcpMcpTransport::None {
+            eprintln!(
+                "nabla: ACP agent {} started without nabla-browser MCP tools (all transports rejected)",
+                spec.name
+            );
+        }
 
         let acp_sid = session_result
             .get("sessionId")

@@ -4,6 +4,8 @@
 //! notifications to and from Nabla's `AgentEvent` stream so the Vue webview
 //! renders ACP sessions identically to core Nabla sessions.
 
+use std::path::Path;
+
 use serde_json::{Value, json};
 
 use crate::mcp_server::Endpoint;
@@ -48,23 +50,73 @@ pub fn build_authenticate_request(id: u64, method_id: &str) -> Value {
     })
 }
 
+/// Transport used to inject Nabla's built-in `nabla-browser` MCP server into
+/// an ACP `session/new` handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpMcpTransport {
+    None,
+    Http,
+    Stdio,
+}
+
+/// Whether the ACP agent explicitly advertised HTTP MCP support in `initialize`.
+pub fn agent_supports_http_mcp(init_result: &Value) -> bool {
+    init_result
+        .get("agentCapabilities")
+        .and_then(|caps| caps.get("mcpCapabilities"))
+        .and_then(|mcp| mcp.get("http"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Builds the ACP `session/new` JSON-RPC request, injecting Nabla's embedded
-/// HTTP MCP server (`nabla-browser`) so the ACP agent inherits Browser,
-/// Terminal, Drawer, Document, Web Search, Memory, Session Context, and Subagents.
-pub fn build_session_new_request(id: u64, cwd: &str, mcp: Option<&Endpoint>) -> Value {
+/// MCP server (`nabla-browser`) over HTTP or Nabla's built-in stdio bridge so
+/// every ACP agent inherits Browser, Terminal, Drawer, Document, Web Search,
+/// Memory, Session Context, and Subagents.
+pub fn build_session_new_request_with_transport(
+    id: u64,
+    cwd: &str,
+    mcp: Option<&Endpoint>,
+    transport: AcpMcpTransport,
+    bridge_exe: Option<&Path>,
+) -> Value {
     let mut mcp_servers = Vec::new();
     if let Some(ep) = mcp {
-        mcp_servers.push(json!({
-            "type": "http",
-            "name": crate::mcp_server::SERVER_NAME,
-            "url": ep.url,
-            "headers": [
-                {
-                    "name": "Authorization",
-                    "value": format!("Bearer {}", ep.token)
+        match transport {
+            AcpMcpTransport::Http => {
+                mcp_servers.push(json!({
+                    "type": "http",
+                    "name": crate::mcp_server::SERVER_NAME,
+                    "url": ep.url,
+                    "headers": [
+                        {
+                            "name": "Authorization",
+                            "value": format!("Bearer {}", ep.token)
+                        }
+                    ]
+                }));
+            }
+            AcpMcpTransport::Stdio => {
+                if let Some(exe) = bridge_exe {
+                    mcp_servers.push(json!({
+                        "name": crate::mcp_server::SERVER_NAME,
+                        "command": exe.to_string_lossy(),
+                        "args": [crate::mcp_server::STDIO_BRIDGE_FLAG],
+                        "env": [
+                            {
+                                "name": crate::mcp_server::STDIO_BRIDGE_URL_ENV,
+                                "value": ep.url
+                            },
+                            {
+                                "name": crate::mcp_server::STDIO_BRIDGE_TOKEN_ENV,
+                                "value": ep.token
+                            }
+                        ]
+                    }));
                 }
-            ]
-        }));
+            }
+            AcpMcpTransport::None => {}
+        }
     }
     json!({
         "jsonrpc": "2.0",
@@ -75,6 +127,17 @@ pub fn build_session_new_request(id: u64, cwd: &str, mcp: Option<&Endpoint>) -> 
             "mcpServers": mcp_servers
         }
     })
+}
+
+/// Convenience wrapper for HTTP MCP injection used by tests.
+#[cfg(test)]
+pub fn build_session_new_request(id: u64, cwd: &str, mcp: Option<&Endpoint>) -> Value {
+    let transport = if mcp.is_some() {
+        AcpMcpTransport::Http
+    } else {
+        AcpMcpTransport::None
+    };
+    build_session_new_request_with_transport(id, cwd, mcp, transport, None)
 }
 
 /// Builds the ACP `session/set_model` JSON-RPC request to switch models live
@@ -412,6 +475,45 @@ mod tests {
         let req = build_session_new_request(2, "/tmp/ws", Some(&ep));
         assert_eq!(req["method"], "session/new");
         assert_eq!(req["params"]["mcpServers"][0]["name"], "nabla-browser");
+        assert_eq!(req["params"]["mcpServers"][0]["type"], "http");
+    }
+
+    #[test]
+    fn session_new_injects_stdio_bridge_for_agents_without_http_mcp() {
+        let ep = Endpoint {
+            url: "http://127.0.0.1:41234/mcp".to_string(),
+            token: "secret-token".to_string(),
+        };
+        let req = build_session_new_request_with_transport(
+            2,
+            "/tmp/ws",
+            Some(&ep),
+            AcpMcpTransport::Stdio,
+            Some(Path::new("/usr/bin/nabla")),
+        );
+        let server = &req["params"]["mcpServers"][0];
+        assert_eq!(server["name"], "nabla-browser");
+        assert_eq!(server["command"], "/usr/bin/nabla");
+        assert_eq!(server["args"], json!(["--mcp-stdio-bridge"]));
+        assert!(server.get("type").is_none());
+        assert_eq!(
+            server["env"],
+            json!([
+                { "name": "NABLA_MCP_URL", "value": "http://127.0.0.1:41234/mcp" },
+                { "name": "NABLA_MCP_TOKEN", "value": "secret-token" }
+            ])
+        );
+    }
+
+    #[test]
+    fn detects_http_mcp_capability_from_initialize_result() {
+        assert!(agent_supports_http_mcp(&json!({
+            "agentCapabilities": { "mcpCapabilities": { "http": true } }
+        })));
+        assert!(!agent_supports_http_mcp(&json!({
+            "agentCapabilities": { "mcpCapabilities": { "http": false } }
+        })));
+        assert!(!agent_supports_http_mcp(&json!({})));
     }
 
     #[test]

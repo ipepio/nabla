@@ -46,6 +46,9 @@ use process::ProcessManager;
 use rpc::AgentEvent;
 use store::Store;
 
+pub use mcp_server::STDIO_BRIDGE_FLAG as MCP_STDIO_BRIDGE_FLAG;
+pub use mcp_server::run_stdio_bridge as run_mcp_stdio_bridge;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()

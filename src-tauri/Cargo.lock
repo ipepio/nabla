@@ -2893,7 +2893,7 @@ dependencies = [
 
 [[package]]
 name = "nabla"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "axum",
  "base64 0.23.1",

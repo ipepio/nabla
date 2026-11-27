@@ -3837,7 +3837,18 @@ pub fn register_mcp_server(state: &AppState) -> RegistrationOutcome {
     }
 }
 
-/// The write itself: `remove` then `add` through pi's CLI.
+/// Whether `<pi_agent_dir>/mcp.json` currently appears to contain an entry for
+/// `server_name`. Skipping `pi mcp remove` when absent avoids a redundant cold
+/// Node/pi CLI boot during app startup (cutting registration time roughly in half).
+fn mcp_json_has_server(pi_agent_dir: &Path, server_name: &str) -> bool {
+    let path = pi_agent_dir.join("mcp.json");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    raw.contains(&format!("\"{server_name}\""))
+}
+
+/// The write itself: remove any stale entry, then `add` through pi's CLI.
 fn write_registration(
     state: &AppState,
     endpoint: &crate::mcp_server::Endpoint,
@@ -3846,9 +3857,18 @@ fn write_registration(
     // must not leave the human with no registration at all.
     let args =
         mcp::add_args(&crate::mcp_server::registration_draft(endpoint)).map_err(display_err)?;
-    let _ = unregister_mcp_server(state);
+    if mcp_json_has_server(&state.pi_agent_dir, crate::mcp_server::SERVER_NAME) {
+        let _ = unregister_mcp_server(state);
+    }
     let result = mcp_call(state, &args, cli::DEFAULT_TIMEOUT_MS)?;
-    check_mcp_mutation(&result, "add")
+    if result.exit_code == Some(0) {
+        return Ok(());
+    }
+    // Retry once after an explicit remove in case an entry existed in an
+    // unexpected shape or raced with a concurrent write.
+    let _ = unregister_mcp_server(state);
+    let retry = mcp_call(state, &args, cli::DEFAULT_TIMEOUT_MS)?;
+    check_mcp_mutation(&retry, "add")
 }
 
 /// S4: takes the entry back out when the app exits. The url names this run's
@@ -6191,6 +6211,28 @@ exit 1
             Some(0),
             false
         )));
+    }
+
+    #[test]
+    fn mcp_json_has_server_detects_existing_entry() {
+        let dir = std::env::temp_dir().join(format!(
+            "nabla-mcp-has-server-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(!mcp_json_has_server(&dir, "nabla-browser"));
+        std::fs::write(dir.join("mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+        assert!(!mcp_json_has_server(&dir, "nabla-browser"));
+        std::fs::write(
+            dir.join("mcp.json"),
+            r#"{"mcpServers":{"nabla-browser":{"url":"http://127.0.0.1:1/mcp"}}}"#,
+        )
+        .unwrap();
+        assert!(mcp_json_has_server(&dir, "nabla-browser"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // S1: the file path is absolute and names pi's own file for each scope.
