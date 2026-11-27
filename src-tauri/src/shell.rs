@@ -59,6 +59,20 @@ pub struct LiveShell {
 /// The environment a shell is allowed to see. Everything else — provider keys,
 /// tokens, git identities — stays out: the terminal belongs to the human, and
 /// forwarding the runtime's allowlist would hand the child more than it needs.
+/// On Linux, desktop session variables are also forwarded so CLI sign-in flows
+/// (e.g. `agy`, `claude`, `codex`) can open the system browser via `xdg-open`.
+#[cfg(target_os = "linux")]
+const FORWARDED_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "LANG",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XAUTHORITY",
+];
+#[cfg(not(target_os = "linux"))]
 const FORWARDED_ENV: &[&str] = &["PATH", "HOME", "LANG"];
 
 /// Handle of one terminal, as handed to the webview.

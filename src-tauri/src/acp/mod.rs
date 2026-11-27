@@ -401,22 +401,23 @@ impl AcpManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        if let Ok(path) = std::env::var("PATH") {
-            let mut merged = path;
-            for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
-                if !merged.split(':').any(|p| p == dir) {
-                    merged.push(':');
-                    merged.push_str(dir);
-                }
+        let mut path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).collect())
+            .unwrap_or_default();
+        if let Some(cmd_dir) = Path::new(&spec.command)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            && !path_dirs.iter().any(|d| d == cmd_dir)
+        {
+            path_dirs.push(cmd_dir.to_path_buf());
+        }
+        for dir in catalog::extra_path_dirs() {
+            if !path_dirs.iter().any(|d| d == &dir) {
+                path_dirs.push(dir);
             }
-            if let Ok(home) = std::env::var("HOME") {
-                let local_bin = format!("{home}/.local/bin");
-                if !merged.split(':').any(|p| p == local_bin) {
-                    merged.push(':');
-                    merged.push_str(&local_bin);
-                }
-            }
-            cmd.env("PATH", merged);
+        }
+        if let Ok(joined) = std::env::join_paths(path_dirs) {
+            cmd.env("PATH", joined);
         }
 
         let mut child = cmd.spawn().map_err(|e| {

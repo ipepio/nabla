@@ -33,9 +33,12 @@
 //   its blocking work on a worker thread, so the main thread is free to build
 //   the child. `embed_eval` waits for a callback and therefore never runs on the
 //   main thread either.
-// - **Linux.** wry builds child webviews on webkit2gtk, but positioning and
-//   transparency differ from macOS and were not exercised by this feature; a
-//   GTK window may also need the child to be reparented on resize.
+// - **Linux.** `tauri.conf.json` creates `main` as a `WebviewWindow` whose
+//   primary WebKitGTK view lives inside `window.default_vbox()` (a vertical
+//   `gtk::Box`). `Window::add_child` packs child webviews into that same box,
+//   splitting the window vertically and ignoring bounds; `linux_gtk` wraps the
+//   main webview in a `gtk::Overlay` and floats each `embed-*` child at its
+//   exact measured rect via `connect_get_child_position`.
 // - **iOS/Android.** `Window::add_child` does not exist there (it is
 //   `cfg(desktop)`), so the registry still exists — `AppState` stays uniform —
 //   and every webview operation answers [`EmbedError::Unsupported`].
@@ -82,7 +85,9 @@ use tauri::{Emitter, Manager, Url};
 #[cfg(desktop)]
 use tauri::webview::{NewWindowFeatures, NewWindowResponse, WebviewBuilder, WebviewWindowBuilder};
 #[cfg(desktop)]
-use tauri::{AppHandle, LogicalPosition, LogicalSize, Rect, WebviewUrl};
+use tauri::{AppHandle, LogicalPosition, LogicalSize, WebviewUrl};
+#[cfg(all(desktop, not(target_os = "linux")))]
+use tauri::Rect;
 
 /// One line on the dev terminal: `pnpm tauri dev` forwards this process's stderr,
 /// which is the only place a native action can be watched from (the webview's own
@@ -920,6 +925,14 @@ fn adopt_popup(app: AppHandle, embeds: EmbedSessions, view_id: String) {
     // One pixel, at the origin, hidden: the pane places the tab on the rect it
     // measured before it shows anything. Until then the platform has a placement it
     // asked for, so no layer is left guessing.
+    #[cfg(target_os = "linux")]
+    linux_gtk::attach_to_overlay(
+        &window,
+        &webview,
+        &view_id,
+        place(0.0, 0.0, MIN_EXTENT, MIN_EXTENT),
+    );
+    #[cfg(not(target_os = "linux"))]
     let _ = webview.set_bounds(Rect {
         position: LogicalPosition::new(0.0, 0.0).into(),
         size: LogicalSize::new(MIN_EXTENT, MIN_EXTENT).into(),
@@ -1056,6 +1069,12 @@ impl EmbedSessions {
             LogicalSize::new(placed.width, placed.height),
         ) {
             Ok(webview) => {
+                // On Linux/GTK, `add_child` packs the child webview into the
+                // window's vertical `default_vbox`, splitting the main UI in
+                // half vertically instead of floating over the pane rect. Move
+                // it into a `gtk::Overlay` positioned by exact coordinates.
+                #[cfg(target_os = "linux")]
+                linux_gtk::attach_to_overlay(&window, &webview, &view.id, placed);
                 // Ready HERE, not when it was reserved: a tool that waited for a
                 // pane must never act on a label the platform has not built yet.
                 if !self.mark_ready(&view.id) {
@@ -1115,6 +1134,12 @@ impl EmbedSessions {
     ) -> Result<(), EmbedError> {
         let placed = place(x, y, width, height);
         let webview = self.webview(app, view_id)?;
+        #[cfg(target_os = "linux")]
+        {
+            linux_gtk::update_overlay_bounds(app, &webview, view_id, placed);
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
         webview
             .set_bounds(Rect {
                 position: LogicalPosition::new(placed.x, placed.y).into(),
@@ -1140,7 +1165,12 @@ impl EmbedSessions {
     ) -> Result<(), EmbedError> {
         let webview = self.webview(app, view_id)?;
         let answer = if visible {
-            webview.show()
+            let res = webview.show();
+            #[cfg(target_os = "linux")]
+            if res.is_ok() {
+                linux_gtk::refresh_overlay(&webview);
+            }
+            res
         } else {
             webview.hide()
         };
@@ -1195,11 +1225,15 @@ impl EmbedSessions {
         // Forget first: a navigation handler firing during the close must find
         // nothing to update, and a second close answers `false`.
         let known = self.forget(view_id).is_some();
+        #[cfg(target_os = "linux")]
+        linux_gtk::forget_bounds(view_id);
         let mut closed = close_label(app, view_id);
         // The page and the tabs it opened are one thing to the human: closing the
         // page closes its popups, instead of leaving hidden webviews that hold a
         // provider's live session nobody can reach any more.
         for popup in self.take_popups_of(&[view_id.to_string()]) {
+            #[cfg(target_os = "linux")]
+            linux_gtk::forget_bounds(&popup.id);
             closed |= close_label(app, &popup.id);
             close_popup_window(app, &popup.id);
         }
@@ -1223,6 +1257,8 @@ impl EmbedSessions {
     /// keeping the app covered after a quit path started from a clean registry.
     pub fn close_all(&self, app: &AppHandle) -> usize {
         let views = self.drain();
+        #[cfg(target_os = "linux")]
+        linux_gtk::clear_bounds();
         let mut closed = 0;
         for view in &views {
             if close_label(app, &view.id) {
@@ -1270,6 +1306,199 @@ impl EmbedSessions {
             .ok_or_else(|| EmbedError::UnknownView(view_id.to_string()))?;
         app.get_webview(view_id)
             .ok_or_else(|| EmbedError::UnknownView(view_id.to_string()))
+    }
+}
+
+/// Linux/GTK overlay host for embedded child webviews.
+///
+/// On Linux, `tauri.conf.json` creates `main` as a `WebviewWindow` whose main
+/// `WebKitWebView` is packed directly into `window.default_vbox()` (a vertical
+/// `gtk::Box`). Calling `Window::add_child` adds the child webview into that
+/// same vertical box, splitting the window 50/50 vertically and ignoring
+/// logical bounds. Wrapping the main webview in a `gtk::Overlay` keeps the main
+/// UI at 100% of the window while floating each `embed-*` child at its exact
+/// measured `(x, y, width, height)` via `connect_get_child_position`.
+#[cfg(target_os = "linux")]
+mod linux_gtk {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    use gtk::prelude::*;
+    use tauri::{AppHandle, Manager};
+
+    use super::{MAIN_WINDOW_LABEL, Placed};
+
+    const OVERLAY_WIDGET_NAME: &str = "nabla-embed-overlay";
+
+    static BOUNDS: OnceLock<Mutex<HashMap<String, Placed>>> = OnceLock::new();
+
+    fn bounds_map() -> &'static Mutex<HashMap<String, Placed>> {
+        BOUNDS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn set_bounds_record(view_id: &str, placed: Placed) {
+        bounds_map()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(view_id.to_string(), placed);
+    }
+
+    pub fn forget_bounds(view_id: &str) {
+        bounds_map()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(view_id);
+    }
+
+    pub fn clear_bounds() {
+        bounds_map()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    fn ensure_overlay(vbox: &gtk::Box, child_widget: &gtk::Widget) -> gtk::Overlay {
+        for existing in vbox.children() {
+            if let Ok(overlay) = existing.downcast::<gtk::Overlay>()
+                && overlay.widget_name().as_str() == OVERLAY_WIDGET_NAME
+            {
+                return overlay;
+            }
+        }
+
+        let overlay = gtk::Overlay::new();
+        overlay.set_widget_name(OVERLAY_WIDGET_NAME);
+        overlay.set_hexpand(true);
+        overlay.set_vexpand(true);
+
+        overlay.connect_get_child_position(|_overlay, widget| {
+            let name = widget.widget_name();
+            let placed = bounds_map()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(name.as_str())
+                .copied()?;
+            Some(gtk::Allocation::new(
+                placed.x.round() as i32,
+                placed.y.round() as i32,
+                (placed.width.round() as i32).max(1),
+                (placed.height.round() as i32).max(1),
+            ))
+        });
+
+        for existing in vbox.children() {
+            if existing == *child_widget {
+                continue;
+            }
+            if existing.downcast_ref::<gtk::MenuBar>().is_some() {
+                continue;
+            }
+            vbox.remove(&existing);
+            existing.set_hexpand(true);
+            existing.set_vexpand(true);
+            overlay.add(&existing);
+            break;
+        }
+
+        vbox.pack_start(&overlay, true, true, 0);
+        // `show()` instead of `show_all()` so hidden overlay children (e.g. popups)
+        // stay hidden until the browser pane explicitly shows them.
+        overlay.show();
+        overlay
+    }
+
+    fn attach_widget_to_overlay(
+        window: &tauri::Window,
+        child_widget: &gtk::Widget,
+        view_id: &str,
+    ) {
+        let Ok(vbox) = window.default_vbox() else {
+            return;
+        };
+
+        if let Some(parent) = child_widget.parent() {
+            let already_in_overlay = parent
+                .downcast_ref::<gtk::Overlay>()
+                .is_some_and(|o| o.widget_name().as_str() == OVERLAY_WIDGET_NAME);
+            if already_in_overlay {
+                child_widget.set_widget_name(view_id);
+                parent.queue_resize();
+                child_widget.queue_resize();
+                return;
+            }
+            if let Ok(container) = parent.clone().downcast::<gtk::Container>() {
+                container.remove(child_widget);
+                // If wry created a helper `gtk::Fixed` inside `default_vbox` that is
+                // now empty, remove it so it does not claim half of the vbox height.
+                if container.downcast_ref::<gtk::Fixed>().is_some()
+                    && container.children().is_empty()
+                    && let Some(grandparent) = container
+                        .parent()
+                        .and_then(|w| w.downcast::<gtk::Container>().ok())
+                {
+                    grandparent.remove(&container);
+                }
+            }
+        }
+
+        let overlay = ensure_overlay(&vbox, child_widget);
+        child_widget.set_widget_name(view_id);
+        // Keep minimum size request at 1x1 so an overlay child never inflates the
+        // window's minimum size; `connect_get_child_position` supplies the exact rect.
+        child_widget.set_size_request(1, 1);
+        overlay.add_overlay(child_widget);
+        overlay.queue_resize();
+        child_widget.queue_resize();
+    }
+
+    pub fn attach_to_overlay(
+        window: &tauri::Window,
+        webview: &tauri::Webview,
+        view_id: &str,
+        placed: Placed,
+    ) {
+        set_bounds_record(view_id, placed);
+        let win = window.clone();
+        let id = view_id.to_string();
+        let _ = webview.with_webview(move |platform_wv| {
+            let child_widget: gtk::Widget = platform_wv.inner().upcast_ref::<gtk::Widget>().clone();
+            attach_widget_to_overlay(&win, &child_widget, &id);
+        });
+    }
+
+    pub fn update_overlay_bounds(
+        app: &AppHandle,
+        webview: &tauri::Webview,
+        view_id: &str,
+        placed: Placed,
+    ) {
+        set_bounds_record(view_id, placed);
+        let app = app.clone();
+        let id = view_id.to_string();
+        let _ = webview.with_webview(move |platform_wv| {
+            let child_widget: gtk::Widget = platform_wv.inner().upcast_ref::<gtk::Widget>().clone();
+            if let Some(parent) = child_widget.parent()
+                && parent
+                    .downcast_ref::<gtk::Overlay>()
+                    .is_some_and(|o| o.widget_name().as_str() == OVERLAY_WIDGET_NAME)
+            {
+                child_widget.set_widget_name(&id);
+                parent.queue_resize();
+                child_widget.queue_resize();
+            } else if let Some(win) = app.get_window(MAIN_WINDOW_LABEL) {
+                attach_widget_to_overlay(&win, &child_widget, &id);
+            }
+        });
+    }
+
+    pub fn refresh_overlay(webview: &tauri::Webview) {
+        let _ = webview.with_webview(|platform_wv| {
+            let child_widget: gtk::Widget = platform_wv.inner().upcast_ref::<gtk::Widget>().clone();
+            if let Some(parent) = child_widget.parent() {
+                parent.queue_resize();
+            }
+            child_widget.queue_resize();
+        });
     }
 }
 

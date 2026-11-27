@@ -7,7 +7,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -33,7 +33,7 @@ struct GroupedAgyModel {
     efforts: Vec<(String, String)>,
 }
 
-static AGY_MODELS_CACHE: OnceLock<Vec<GroupedAgyModel>> = OnceLock::new();
+static AGY_MODELS_CACHE: OnceLock<Mutex<Option<Vec<GroupedAgyModel>>>> = OnceLock::new();
 
 /// Extracts the ACP agent id (`"acp:antigravity"` -> `Some("antigravity")`).
 pub fn acp_agent_id(runtime: &str) -> Option<&str> {
@@ -107,6 +107,46 @@ pub struct AcpLaunchSpec {
     pub args: Vec<String>,
 }
 
+/// Common user/system executable directories on macOS and Linux that desktop
+/// launchers often omit from `PATH` (Snap, Homebrew, nvm/fnm/volta/bun/pnpm,
+/// cargo, `~/.local/bin`).
+pub fn extra_path_dirs() -> Vec<PathBuf> {
+    let mut extra = Vec::new();
+    if let Some(home) = home_dir() {
+        extra.extend([
+            home.join(".local/bin"),
+            home.join(".npm-global/bin"),
+            home.join(".local/share/pnpm"),
+            home.join(".volta/bin"),
+            home.join(".bun/bin"),
+            home.join(".cargo/bin"),
+            home.join(".asdf/shims"),
+            home.join(".mise/shims"),
+            home.join(".fnm/aliases/default/bin"),
+        ]);
+        // Latest nvm-managed Node bin directory, if present.
+        let nvm_versions = home.join(".nvm/versions/node");
+        if let Ok(entries) = fs::read_dir(&nvm_versions) {
+            let mut versions: Vec<PathBuf> = entries
+                .filter_map(Result::ok)
+                .map(|e| e.path().join("bin"))
+                .filter(|p| p.is_dir())
+                .collect();
+            versions.sort();
+            versions.reverse();
+            extra.extend(versions);
+        }
+    }
+    extra.extend([
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/snap/bin"),
+        PathBuf::from("/var/lib/snapd/snap/bin"),
+        PathBuf::from("/home/linuxbrew/.linuxbrew/bin"),
+    ]);
+    extra
+}
+
 /// Searches `PATH` (plus common macOS/Linux user bin dirs) for an executable.
 pub fn find_in_path(binary: &str) -> Option<PathBuf> {
     let as_path = Path::new(binary);
@@ -117,18 +157,9 @@ pub fn find_in_path(binary: &str) -> Option<PathBuf> {
         .map(|p| env::split_paths(&p).collect())
         .unwrap_or_default();
 
-    if let Some(home) = home_dir() {
-        for extra in [
-            home.join(".local/bin"),
-            home.join(".npm-global/bin"),
-            home.join(".volta/bin"),
-            home.join(".bun/bin"),
-            PathBuf::from("/opt/homebrew/bin"),
-            PathBuf::from("/usr/local/bin"),
-        ] {
-            if !dirs.iter().any(|d| d == &extra) {
-                dirs.push(extra);
-            }
+    for extra in extra_path_dirs() {
+        if !dirs.iter().any(|d| d == &extra) {
+            dirs.push(extra);
         }
     }
 
@@ -173,19 +204,51 @@ fn env_non_empty(name: &str) -> bool {
     env::var(name).map(|v| !v.trim().is_empty()).unwrap_or(false)
 }
 
+/// Checks whether Antigravity CLI credentials exist under a given home directory,
+/// covering both standard installs (`~/.gemini/antigravity-cli`) and Linux Snap
+/// installs (`~/snap/antigravity-cli/{common,current}/.gemini/antigravity-cli`).
+pub fn has_antigravity_auth_in(home: &Path) -> bool {
+    let agy_dir = home.join(".gemini").join("antigravity-cli");
+    let gemini_dir = home.join(".gemini");
+    if file_non_empty(&agy_dir.join("antigravity-oauth-token"))
+        || dir_has_files(&agy_dir)
+        || file_non_empty(&gemini_dir.join("oauth_creds.json"))
+        || file_non_empty(&gemini_dir.join("google_accounts.json"))
+    {
+        return true;
+    }
+
+    for snap_slot in ["common", "current"] {
+        let snap_gemini = home
+            .join("snap")
+            .join("antigravity-cli")
+            .join(snap_slot)
+            .join(".gemini");
+        let snap_agy = snap_gemini.join("antigravity-cli");
+        if file_non_empty(&snap_agy.join("antigravity-oauth-token"))
+            || file_non_empty(&snap_gemini.join("oauth_creds.json"))
+            || file_non_empty(&snap_gemini.join("google_accounts.json"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn detect_antigravity_auth() -> bool {
     if env_non_empty("GEMINI_API_KEY") {
         return true;
     }
-    if let Some(home) = home_dir() {
-        let agy_dir = home.join(".gemini").join("antigravity-cli");
-        let gemini_dir = home.join(".gemini");
-        if dir_has_files(&agy_dir)
-            || file_non_empty(&gemini_dir.join("oauth_creds.json"))
-            || file_non_empty(&gemini_dir.join("google_accounts.json"))
+    if let Ok(app_dir) = env::var("ANTIGRAVITY_APP_DATA_DIR") {
+        let dir = PathBuf::from(app_dir.trim());
+        if !dir.as_os_str().is_empty()
+            && (file_non_empty(&dir.join("antigravity-oauth-token")) || dir_has_files(&dir))
         {
             return true;
         }
+    }
+    if let Some(home) = home_dir() {
+        return has_antigravity_auth_in(&home);
     }
     false
 }
@@ -425,40 +488,49 @@ fn group_antigravity_models(raw_pairs: Vec<(String, String)>) -> Vec<GroupedAgyM
 }
 
 fn discover_antigravity_models(agy_cmd: &str) -> Vec<GroupedAgyModel> {
-    AGY_MODELS_CACHE
-        .get_or_init(|| {
-            let parsed = Command::new(agy_cmd)
-                .arg("models")
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| {
-                    let stdout = String::from_utf8_lossy(&o.stdout);
-                    stdout
-                        .lines()
-                        .filter_map(|line| {
-                            let (id, label) = line.split_once('\t')?;
-                            let id = id.trim();
-                            let label = label.trim();
-                            if id.is_empty() || label.is_empty() {
-                                return None;
-                            }
-                            Some((id.to_string(), label.to_string()))
-                        })
-                        .collect::<Vec<_>>()
+    let cache = AGY_MODELS_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock()
+        && let Some(ref cached) = *guard
+    {
+        return cached.clone();
+    }
+
+    let parsed = Command::new(agy_cmd)
+        .arg("models")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            stdout
+                .lines()
+                .filter_map(|line| {
+                    let (id, label) = line.split_once('\t')?;
+                    let id = id.trim();
+                    let label = label.trim();
+                    if id.is_empty() || label.is_empty() {
+                        return None;
+                    }
+                    Some((id.to_string(), label.to_string()))
                 })
-                .unwrap_or_default();
-            if parsed.is_empty() {
-                vec![GroupedAgyModel {
-                    base_id: "default".to_string(),
-                    label: "Antigravity (Default)".to_string(),
-                    efforts: Vec::new(),
-                }]
-            } else {
-                group_antigravity_models(parsed)
-            }
+                .collect::<Vec<_>>()
         })
-        .clone()
+        .unwrap_or_default();
+
+    if parsed.is_empty() {
+        // Do not cache fallback failures so signing in later immediately discovers real models.
+        vec![GroupedAgyModel {
+            base_id: "default".to_string(),
+            label: "Antigravity (Default)".to_string(),
+            efforts: Vec::new(),
+        }]
+    } else {
+        let grouped = group_antigravity_models(parsed);
+        if let Ok(mut guard) = cache.lock() {
+            *guard = Some(grouped.clone());
+        }
+        grouped
+    }
 }
 
 /// Returns the effort levels supported by an ACP agent's selected model.
@@ -893,5 +965,27 @@ mod tests {
         assert_eq!(levels, vec!["low", "medium", "high", "xhigh"]);
         assert_eq!(grouped[1].base_id, "gemini-pro-orchestrator-neon");
         assert!(grouped[1].efforts.is_empty());
+    }
+
+    #[test]
+    fn detects_antigravity_auth_in_linux_snap_common_dir() {
+        let home = std::env::temp_dir().join("nabla-acp-snap-auth-test");
+        let _ = fs::remove_dir_all(&home);
+        assert!(!has_antigravity_auth_in(&home));
+
+        let snap_agy_dir = home
+            .join("snap")
+            .join("antigravity-cli")
+            .join("common")
+            .join(".gemini")
+            .join("antigravity-cli");
+        fs::create_dir_all(&snap_agy_dir).unwrap();
+        // Empty dir without oauth token is not considered signed in.
+        assert!(!has_antigravity_auth_in(&home));
+
+        fs::write(snap_agy_dir.join("antigravity-oauth-token"), "ya29.test-token").unwrap();
+        assert!(has_antigravity_auth_in(&home));
+
+        let _ = fs::remove_dir_all(&home);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "nabla"
-version = "0.4.1"
+version = "0.4.2"
 license = "Apache-2.0"
 description = "A Tauri App"
 authors = ["you"]
@@ -69,6 +69,12 @@ ptts = { version = "0.7.1", default-features = false, features = ["hf", "acceler
 # `libc` is already in the dependency tree (tauri + rusqlite) and stays Unix-only.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Linux embedded browser overlay: reuses `gtk 0.18` already in the dependency
+# tree from Tauri/wry so child webviews float in a `gtk::Overlay` instead of
+# splitting `default_vbox` vertically.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

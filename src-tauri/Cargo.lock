@@ -2893,13 +2893,14 @@ dependencies = [
 
 [[package]]
 name = "nabla"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "axum",
  "base64 0.23.1",
  "cpal",
  "futures-util",
  "getrandom 0.3.4",
+ "gtk",
  "libc",
  "ndarray",
  "ort",

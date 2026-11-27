@@ -1145,10 +1145,7 @@ async fn fetch_antigravity_quota(home_dir: &Path) -> Option<ProviderQuotaSnapsho
     }
 
     // Fallback when `agy` is not signed in or `/usage` timed out.
-    let agy_dir = home_dir.join(".gemini").join("antigravity-cli");
-    let has_auth = agy_dir.is_dir()
-        || home_dir.join(".gemini").join("oauth_creds.json").is_file()
-        || home_dir.join(".gemini").join("google_accounts.json").is_file();
+    let has_auth = crate::acp::catalog::has_antigravity_auth_in(home_dir);
     Some(ProviderQuotaSnapshot {
         provider_id: "antigravity".to_string(),
         name: "Antigravity".to_string(),
