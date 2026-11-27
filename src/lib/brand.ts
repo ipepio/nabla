@@ -15,6 +15,8 @@
 export const BRAND = {
   mark: "/logo_white.png", // squared mark, dark theme
   markLight: "/logo.png", // squared mark, light theme
+  markTrimmed: "/logo_white_trimmed.png", // trimmed triangle mark, dark theme
+  markTrimmedLight: "/logo_trimmed.png", // trimmed triangle mark, light theme
   logo: "/logo_texto_white.png", // mark + wordmark, dark theme
   logoLight: "/logo_texto.png", // mark + wordmark, light theme
   wordmark: "/text_white_trimmed.png", // wordmark only, dark theme (cropped)
@@ -25,7 +27,7 @@ export const BRAND = {
 export type BrandAsset = keyof typeof BRAND;
 
 /** The base kinds whose light sibling is picked by theme. */
-export type BrandBase = "mark" | "logo" | "wordmark";
+export type BrandBase = "mark" | "markTrimmed" | "logo" | "wordmark";
 
 /** Absolute URL (Vite base) of one brand asset. */
 export function brandAsset(kind: BrandAsset): string {

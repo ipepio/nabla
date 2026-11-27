@@ -276,6 +276,8 @@ export interface AppSettings {
   notifications?: NotificationPreferences;
   /** Local embedded CPU voice preferences (STT/TTS model & voice selection). */
   voice?: VoicePreferences;
+  /** Default search engine for the embedded browser's address bar. */
+  browserSearchEngine?: string;
 }
 
 /** Mirrors `VoicePreferences` in `src-tauri/src/settings.rs`. */

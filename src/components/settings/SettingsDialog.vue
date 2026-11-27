@@ -132,11 +132,14 @@ import { Separator } from "@/components/ui/separator";
 import { useAppearance } from "@/lib/appearance";
 import {
   applyPreferences,
+  BROWSER_SEARCH_ENGINES,
+  browserSearchEngine,
   enabledTools,
   isToolEnabled,
   notificationPreferences,
   preferenceDraftCommit,
   queueMessages,
+  setBrowserSearchEngine,
   setNotificationPreferences,
   setQueueMessages,
   setShowReasoning,
@@ -1369,6 +1372,37 @@ watch(open, (isOpen) => {
                     />
                   </button>
                 </div>
+              </div>
+
+              <div
+                v-if="isToolEnabled('browser')"
+                class="flex items-center justify-between gap-4 border-t border-sidebar-border pt-3"
+              >
+                <div class="min-w-0">
+                  <div class="text-xs font-medium text-foreground">
+                    Browser search engine
+                  </div>
+                  <p class="mt-0.5 text-[11px] text-muted-foreground">
+                    Used when typing search terms instead of a URL in the embedded browser bar.
+                  </p>
+                </div>
+                <Select
+                  :model-value="browserSearchEngine"
+                  @update:model-value="void setBrowserSearchEngine(String($event))"
+                >
+                  <SelectTrigger class="h-8 w-44 shrink-0 text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem
+                      v-for="engine in BROWSER_SEARCH_ENGINES"
+                      :key="engine.id"
+                      :value="engine.id"
+                    >
+                      {{ engine.label }}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
             </section>
 

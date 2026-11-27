@@ -99,10 +99,24 @@ macro_rules! debug_line {
     };
 }
 
-/// How many embedded browsers may exist at once, popups included. The pane shows
-/// one panel; four is room for a second look, a third, and an OAuth popup next to
-/// the page that opened it, without letting a stuck UI leak a webview per click.
-pub const MAX_VIEWS: usize = 4;
+/// How many embedded browsers may exist at once, popups included. Eight leaves
+/// room for several pages plus chained OAuth/2FA popups without leaking webviews.
+pub const MAX_VIEWS: usize = 8;
+
+/// Standard desktop User-Agent applied to the embedded browser (and its popups)
+/// so OAuth providers (Google, Microsoft, GitHub) do not reject it as an
+/// unsupported embedded webview (`disallowed_useragent`).
+#[cfg(target_os = "macos")]
+const DESKTOP_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15";
+#[cfg(target_os = "windows")]
+const DESKTOP_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0";
+#[cfg(all(desktop, not(target_os = "macos"), not(target_os = "windows")))]
+const DESKTOP_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15";
+
+/// Persistent `WKWebsiteDataStore` identifier on macOS 14+ so cookies,
+/// `localStorage`, and sign-in sessions survive app restarts.
+#[cfg(target_os = "macos")]
+const BROWSER_DATA_STORE_ID: [u8; 16] = *b"nabla-browser-01";
 
 /// What a view shows before it is navigated anywhere.
 pub const DEFAULT_URL: &str = "about:blank";
@@ -385,6 +399,8 @@ struct Inner {
     /// Signalled on every registry change, under `views`: a view was registered
     /// (wake a waiter) or removed (cancel it).
     changed: Condvar,
+    /// Persistent profile directory for cookies/localStorage (`<data_dir>/browser-profile`).
+    profile_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for EmbedSessions {
@@ -395,12 +411,21 @@ impl Default for EmbedSessions {
 
 impl EmbedSessions {
     pub fn new() -> EmbedSessions {
+        Self::build_registry(None)
+    }
+
+    pub fn with_profile_dir(profile_dir: std::path::PathBuf) -> EmbedSessions {
+        Self::build_registry(Some(profile_dir))
+    }
+
+    fn build_registry(profile_dir: Option<std::path::PathBuf>) -> EmbedSessions {
         EmbedSessions {
             inner: Arc::new(Inner {
                 views: Mutex::new(Vec::new()),
                 next_index: AtomicUsize::new(0),
                 closed: AtomicUsize::new(0),
                 changed: Condvar::new(),
+                profile_dir,
             }),
         }
     }
@@ -802,11 +827,15 @@ fn popup_request(
     let registry = embeds.clone();
     let emitter = app.clone();
     let navigated_id = label.clone();
+    let nested_popup_app = app.clone();
+    let nested_popup_registry = embeds.clone();
+    let nested_opener_id = opener_id.to_string();
     let built = WebviewWindowBuilder::new(app, label.clone(), WebviewUrl::External(started))
         // The opener's own webview configuration travels here. On macOS WebKit
         // refuses a webview built with anything else, and a popup without it has no
         // `window.opener` — which is the half of S3 the provider page needs.
         .window_features(features)
+        .user_agent(DESKTOP_USER_AGENT)
         // Invisible: this window exists for the microsecond it takes WebKit to hand
         // the webview back, and the webview is moved into the main window right
         // after. The pane shows it only once it has placed it on a measured rect.
@@ -829,6 +858,17 @@ fn popup_request(
                 },
             );
             true
+        })
+        // Allow chained popups (e.g. OAuth -> SSO / 2FA) to open as managed tabs
+        // under the same page opener instead of being silently blocked.
+        .on_new_window(move |url, nested_features| {
+            popup_request(
+                &nested_popup_app,
+                &nested_popup_registry,
+                &nested_opener_id,
+                url,
+                nested_features,
+            )
         })
         .build();
     match built {
@@ -973,7 +1013,9 @@ impl EmbedSessions {
         let popup_app = app.clone();
         let popup_registry = self.clone();
         let opener_id = view.id.clone();
-        let builder = WebviewBuilder::new(view.id.clone(), WebviewUrl::External(parsed))
+        let mut builder = WebviewBuilder::new(view.id.clone(), WebviewUrl::External(parsed))
+            .incognito(false)
+            .user_agent(DESKTOP_USER_AGENT)
             .on_navigation(move |url| {
                 // Only an accepted navigation is recorded and reported: a refused
                 // one loaded nothing, so answering its url would misdescribe
@@ -998,6 +1040,14 @@ impl EmbedSessions {
             .on_new_window(move |url, features| {
                 popup_request(&popup_app, &popup_registry, &opener_id, url, features)
             });
+        if let Some(dir) = &self.inner.profile_dir {
+            let _ = std::fs::create_dir_all(dir);
+            builder = builder.data_directory(dir.clone());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            builder = builder.data_store_identifier(BROWSER_DATA_STORE_ID);
+        }
         match window.add_child(
             builder,
             // A position may be negative (a panel scrolled partially off), only

@@ -1341,6 +1341,11 @@ export function docCreateTemp(): Promise<string> {
   return invoke<string>("doc_create_temp");
 }
 
+/** Reports the currently open Markdown document to Rust so agents can read it via `get_open_document`. */
+export function docSetActive(path: string | null): Promise<void> {
+  return invoke<void>("doc_set_active", { path });
+}
+
 /** Exports a Markdown file to `.docx` (embedding local PNG/JPEG images). */
 export function exportDocxFile(
   input: string,

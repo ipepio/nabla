@@ -45,6 +45,8 @@ pub struct AppState {
     pub acp: crate::acp::AcpManager,
     /// Path to the currently active Nabla session JSONL (read by `session_context` MCP tool).
     pub active_session_path: Arc<Mutex<Option<PathBuf>>>,
+    /// Path to the currently open Markdown document in the Document drawer (read by `get_open_document` MCP tool).
+    pub active_document_path: Arc<Mutex<Option<String>>>,
     /// S1/S3 of `pi-cli-bridge.md`: the allowlisted bridge to the `pi` command
     /// line and the registry of interactive sessions it started.
     pub cli: CliSessions,
@@ -485,8 +487,23 @@ pub fn remove_provider_model(
         .map_err(display_err)
 }
 
+pub(crate) fn apply_native_window_theme(app: &tauri::AppHandle, theme: &str) {
+    let target = match theme.trim().to_ascii_lowercase().as_str() {
+        "light" => Some(tauri::Theme::Light),
+        "dark" => Some(tauri::Theme::Dark),
+        _ => None,
+    };
+    if let Some(window) = tauri::Manager::get_window(app, crate::embed::MAIN_WINDOW_LABEL) {
+        let _ = window.set_theme(target);
+    }
+}
+
 #[tauri::command]
-pub fn save_settings(state: State<'_, AppState>, settings: Settings) -> Result<Settings, String> {
+pub fn save_settings(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    settings: Settings,
+) -> Result<Settings, String> {
     let path = settings_path(&state);
     // `settings` is the payload here, so the module is reached by crate path.
     crate::settings::save(&path, &settings).map_err(display_err)?;
@@ -498,6 +515,9 @@ pub fn save_settings(state: State<'_, AppState>, settings: Settings) -> Result<S
     // only on the dedicated command below.
     crate::settings::write_permission_projection(&state.data_dir, saved.mode())
         .map_err(display_err)?;
+    // Sync the native window appearance so embedded browser child webviews inherit
+    // Nabla's Light / Dark / System `prefers-color-scheme`.
+    apply_native_window_theme(&app, &saved.theme);
     Ok(saved)
 }
 
@@ -4054,6 +4074,16 @@ pub fn notify_desktop(title: String, body: String) -> Result<(), String> {
     {
         let _ = (title, body);
     }
+    Ok(())
+}
+
+/// Records the Markdown document currently open in Nabla's Document pane so agents
+/// can inspect and edit it via the `get_open_document` MCP tool.
+#[tauri::command]
+pub fn doc_set_active(state: State<'_, AppState>, path: Option<String>) -> Result<(), String> {
+    let clean = path.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let mut guard = lock(&state.active_document_path);
+    *guard = clean;
     Ok(())
 }
 

@@ -129,6 +129,11 @@ pub trait WebviewDriver: Send + Sync + 'static {
     fn active_session_path(&self) -> Option<std::path::PathBuf> {
         None
     }
+
+    /// Path to the Markdown document currently open in Nabla's Document pane.
+    fn active_document_path(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A driver failure, typed so the dispatcher can tell an accident from an answer.
@@ -270,6 +275,9 @@ fn call_tool(
     }
     if name == OPEN_DOCUMENT {
         return open_document_result(driver, id, &arguments);
+    }
+    if name == GET_OPEN_DOCUMENT {
+        return get_open_document_result(driver, id);
     }
     if name == MEMORY_SAVE {
         return memory_save_result(driver, id, &arguments);
@@ -642,7 +650,7 @@ fn targets_text(views: &[LiveView]) -> String {
 /// Every tool this server offers, in catalog order. Kept as data so a name that
 /// is listed but not dispatched (or the reverse) fails a test instead of the
 /// model's next call.
-const TOOL_NAMES: [&str; 24] = [
+const TOOL_NAMES: [&str; 25] = [
     "navigate",
     "eval",
     "get_url",
@@ -655,6 +663,7 @@ const TOOL_NAMES: [&str; 24] = [
     "screenshot",
     "export_docx",
     "open_document",
+    "get_open_document",
     "web_search",
     "memory_save",
     "memory_search",
@@ -668,6 +677,8 @@ const TOOL_NAMES: [&str; 24] = [
     "subagent_run",
     "list_targets",
 ];
+
+const GET_OPEN_DOCUMENT: &str = "get_open_document";
 
 const SESSION_CONTEXT: &str = "session_context";
 const SUBAGENT_LIST: &str = "subagent_list";
@@ -924,6 +935,15 @@ fn tool_catalog() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "get_open_document",
+            "description": "Returns the file path and current Markdown content of the document currently open in Nabla's Document pane, so you can read or edit it directly without asking the user for the path.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }),
+        json!({
             "name": "web_search",
             "description": "Search the web through a SearXNG instance and return titles, urls and \
                             snippets. It does NOT open or render a page: the snippet is what the \
@@ -1118,6 +1138,41 @@ fn open_document_result(driver: &dyn WebviewDriver, id: &Value, arguments: &Valu
     let clean = path.strip_prefix('@').unwrap_or(path);
     driver.open_document(clean);
     tool_result(id, &format!("opened document `{clean}` in Nabla"), false)
+}
+
+fn get_open_document_result(driver: &dyn WebviewDriver, id: &Value) -> Value {
+    let Some(path) = driver.active_document_path() else {
+        return tool_result(
+            id,
+            "No document is currently open in Nabla's Document pane.",
+            false,
+        );
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            const MAX_BYTES: usize = 256 * 1024;
+            let (body, truncated) = if content.len() > MAX_BYTES {
+                let mut end = MAX_BYTES;
+                while !content.is_char_boundary(end) && end > 0 {
+                    end -= 1;
+                }
+                (&content[..end], true)
+            } else {
+                (content.as_str(), false)
+            };
+            let payload = json!({
+                "path": path,
+                "truncated": truncated,
+                "content": body,
+            });
+            tool_result(id, &payload.to_string(), false)
+        }
+        Err(err) => tool_result(
+            id,
+            &format!("Document `{path}` is open, but could not be read from disk: {err}"),
+            true,
+        ),
+    }
 }
 
 // ── right tool drawer & live Terminal control ────────────────────────────────
@@ -3687,6 +3742,7 @@ pub struct EmbedDriver {
     shells: crate::shell::ShellSessions,
     data_dir: std::path::PathBuf,
     active_session_path: Arc<Mutex<Option<std::path::PathBuf>>>,
+    active_document_path: Arc<Mutex<Option<String>>>,
 }
 
 impl EmbedDriver {
@@ -3697,6 +3753,7 @@ impl EmbedDriver {
         shells: crate::shell::ShellSessions,
         data_dir: std::path::PathBuf,
         active_session_path: Arc<Mutex<Option<std::path::PathBuf>>>,
+        active_document_path: Arc<Mutex<Option<String>>>,
     ) -> EmbedDriver {
         EmbedDriver {
             app,
@@ -3705,6 +3762,7 @@ impl EmbedDriver {
             shells,
             data_dir,
             active_session_path,
+            active_document_path,
         }
     }
 
@@ -3816,6 +3874,9 @@ impl WebviewDriver for EmbedDriver {
     }
 
     fn open_document(&self, path: &str) {
+        if let Ok(mut guard) = self.active_document_path.lock() {
+            *guard = Some(path.to_string());
+        }
         let _ = self.app.emit("doc-open", json!({ "path": path }));
     }
 
@@ -3839,6 +3900,10 @@ impl WebviewDriver for EmbedDriver {
 
     fn active_session_path(&self) -> Option<std::path::PathBuf> {
         self.active_session_path.lock().ok().and_then(|g| g.clone())
+    }
+
+    fn active_document_path(&self) -> Option<String> {
+        self.active_document_path.lock().ok().and_then(|g| g.clone())
     }
 }
 

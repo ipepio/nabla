@@ -210,6 +210,8 @@ export function applyPreferences(settings: AppSettings | null): void {
   webSearchInstance.value = settings?.webSearchInstance ?? "";
   webSearchCredentials.value = settings?.webSearchCredentials ?? "";
   notificationPreferences.value = normalizeNotifications(settings?.notifications);
+  const engine = settings?.browserSearchEngine?.trim() ?? "";
+  browserSearchEngine.value = engine === "" ? DEFAULT_BROWSER_SEARCH_ENGINE : engine;
 }
 
 /**
@@ -338,6 +340,43 @@ export async function setToolEnabled(
   await persist({ enabledTools: enabledTools.value });
 }
 
+/**
+ * Default search engine used by the embedded browser's address bar when the user
+ * types plain search terms instead of a URL.
+ */
+export const BROWSER_SEARCH_ENGINES = [
+  { id: "duckduckgo", label: "DuckDuckGo", template: "https://duckduckgo.com/?q={query}" },
+  { id: "google", label: "Google", template: "https://www.google.com/search?q={query}" },
+  { id: "bing", label: "Bing", template: "https://www.bing.com/search?q={query}" },
+  { id: "brave", label: "Brave Search", template: "https://search.brave.com/search?q={query}" },
+  { id: "kagi", label: "Kagi", template: "https://kagi.com/search?q={query}" },
+  { id: "none", label: "Disabled (URLs only)", template: "" },
+] as const;
+
+export const DEFAULT_BROWSER_SEARCH_ENGINE = "duckduckgo";
+export const browserSearchEngine = ref<string>(DEFAULT_BROWSER_SEARCH_ENGINE);
+
+export function buildBrowserSearchUrl(query: string, engineId: string): string | null {
+  const trimmed = query.trim();
+  if (!trimmed) return null;
+  const normalized = engineId.trim().toLowerCase();
+  if (normalized === "none") return null;
+  const preset = BROWSER_SEARCH_ENGINES.find((e) => e.id === normalized);
+  const template = preset
+    ? preset.template
+    : engineId.startsWith("https://") && engineId.includes("{query}")
+      ? engineId
+      : BROWSER_SEARCH_ENGINES[0].template;
+  if (!template) return null;
+  return template.replace("{query}", encodeURIComponent(trimmed));
+}
+
+export async function setBrowserSearchEngine(next: string): Promise<void> {
+  const trimmed = next.trim() || DEFAULT_BROWSER_SEARCH_ENGINE;
+  browserSearchEngine.value = trimmed;
+  await persist({ browserSearchEngine: trimmed });
+}
+
 /** Updates OS notification preferences and persists them to `settings.json`. */
 export async function setNotificationPreferences(
   patch: Partial<NotificationPreferences>,
@@ -361,6 +400,7 @@ export function usePreferences() {
     webSearchInstance,
     webSearchCredentials,
     notificationPreferences,
+    browserSearchEngine,
     isToolEnabled,
     applyPreferences,
   };

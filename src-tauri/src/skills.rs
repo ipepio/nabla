@@ -23,10 +23,36 @@ pub struct SkillEntry {
 
 const MAX_SKILL_BYTES: u64 = 128 * 1024;
 
-/// List all readable `.md` skills from global config and (optionally) a workspace.
-/// Workspace skills override global skills with the same `name`.
+const BUILTIN_DOCUMENT_PROMPT: &str = "\
+Work with Markdown documents in Nabla's Document pane.
+
+1. **Inspect open document first**: Always call `get_open_document` before asking for a file path. If a document is already open, use its exact `path` and `content`.
+2. **Create**: If the user wants a new document and none is open (or they ask for a new file), write a clean, well-structured Markdown (`.md`) file in the workspace and immediately call `open_document` with its path so it appears in the Document pane.
+3. **Edit & Improve**: When modifying, rewriting, expanding, or polishing an open document, edit the file directly on disk (Nabla's Document pane syncs changes live). Preserve existing structure, links, and embedded images unless asked to change them.
+4. **Export**: If the user asks for Word/DOCX output, call `export_docx` on the `.md` file path.
+
+Reply concisely summarizing what was created or improved.";
+
+/// Built-in skills shipped with Nabla. Any global or workspace skill with the
+/// same `name` overrides the built-in entry.
+fn builtin_skills() -> Vec<SkillEntry> {
+    vec![SkillEntry {
+        id: "builtin:document".to_string(),
+        name: "document".to_string(),
+        description: "Get the open document, create, edit, improve, or export Markdown docs in Nabla".to_string(),
+        prompt: BUILTIN_DOCUMENT_PROMPT.to_string(),
+        source: "builtin".to_string(),
+    }]
+}
+
+/// List all readable `.md` skills from built-ins, global config, and (optionally) a workspace.
+/// Global skills override built-ins; workspace skills override global skills with the same `name`.
 pub fn list_skills(config_dir: &Path, workspace_path: Option<&Path>) -> Vec<SkillEntry> {
-    let mut entries = scan_dir(&config_dir.join("skills"), "global");
+    let mut entries = builtin_skills();
+    for skill in scan_dir(&config_dir.join("skills"), "global") {
+        entries.retain(|existing| existing.name != skill.name);
+        entries.push(skill);
+    }
     if let Some(ws) = workspace_path {
         let local = scan_dir(&ws.join(".nabla").join("skills"), "workspace");
         for skill in local {
@@ -227,12 +253,14 @@ mod tests {
         fs::write(ws_dir.join("summary.md"), "Summarize the current thread.").unwrap();
 
         let skills = list_skills(&base.join("config"), Some(&base.join("ws")));
-        assert_eq!(skills.len(), 2);
-        assert_eq!(skills[0].name, "review");
-        assert_eq!(skills[0].source, "workspace");
-        assert_eq!(skills[0].description, "Workspace override");
-        assert_eq!(skills[1].name, "summary");
-        assert_eq!(skills[1].prompt, "Summarize the current thread.");
+        assert_eq!(skills.len(), 3);
+        assert_eq!(skills[0].name, "document");
+        assert_eq!(skills[0].source, "builtin");
+        assert_eq!(skills[1].name, "review");
+        assert_eq!(skills[1].source, "workspace");
+        assert_eq!(skills[1].description, "Workspace override");
+        assert_eq!(skills[2].name, "summary");
+        assert_eq!(skills[2].prompt, "Summarize the current thread.");
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -254,12 +282,15 @@ mod tests {
         assert_eq!(saved.prompt, "Inspect every change.");
 
         let listed = list_skills(&base, None);
-        assert_eq!(listed.len(), 1);
+        assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].name, "code-review");
+        assert_eq!(listed[1].name, "document");
 
         assert!(delete_skill(&base, "code-review").expect("delete"));
         assert!(!delete_skill(&base, "code-review").expect("delete missing"));
-        assert!(list_skills(&base, None).is_empty());
+        let remaining = list_skills(&base, None);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].name, "document");
 
         let _ = fs::remove_dir_all(&base);
     }

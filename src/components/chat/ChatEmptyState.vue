@@ -10,10 +10,11 @@ import { useAppearance } from "@/lib/appearance";
 import { themedBrand } from "@/lib/brand";
 import { HERO } from "@/lib/hero";
 
-// Theme-aware: the combined mark + wordmark asset follows the palette, so the
-// empty state never shows a white logo on a light background.
+// Theme-aware: separate mark and wordmark assets follow the palette so the
+// triangle mark can be scaled, spaced cleanly above the wordmark, and animated.
 const { isDark } = useAppearance();
-const logo = computed(() => themedBrand("logo", isDark.value));
+const mark = computed(() => themedBrand("markTrimmed", isDark.value));
+const wordmark = computed(() => themedBrand("wordmark", isDark.value));
 
 defineProps<{
   /** Provider id from settings.json, shown in the first chip. */
@@ -29,11 +30,22 @@ defineProps<{
   >
     <div class="flex w-full min-w-0 max-w-[640px] flex-col items-center gap-6">
       <div class="flex flex-col items-center gap-3">
-        <img
-          :src="logo"
-          alt="Nabla"
-          class="h-28 w-auto object-contain opacity-95"
-        />
+        <div
+          class="group flex cursor-default select-none flex-col items-center gap-4"
+          aria-label="Nabla"
+        >
+          <img
+            :src="mark"
+            alt=""
+            aria-hidden="true"
+            class="h-28 w-auto object-contain opacity-95 transition-all duration-300 ease-out group-hover:-translate-y-1.5 group-hover:scale-110 group-hover:rotate-6 group-hover:opacity-100 group-hover:drop-shadow-[0_10px_20px_rgba(0,0,0,0.22)]"
+          />
+          <img
+            :src="wordmark"
+            alt="Nabla"
+            class="h-3.5 w-auto object-contain opacity-90"
+          />
+        </div>
         <!-- Optional copy under the logo; both lines hide when unset. -->
         <p
           v-if="HERO.title"

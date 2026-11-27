@@ -162,6 +162,11 @@ pub struct Settings {
     /// Local embedded CPU voice preferences (STT/TTS model & voice selection).
     #[serde(default)]
     pub voice: VoicePreferences,
+    /// Default search engine for the embedded browser's address bar when the user
+    /// types a plain search query instead of a URL (`"duckduckgo"` | `"google"` |
+    /// `"bing"` | `"brave"` | `"kagi"` | `"none"`).
+    #[serde(default = "default_browser_search_engine")]
+    pub browser_search_engine: String,
 }
 
 /// S2/S3 of `chat-preferences-and-queue.md`: both chat toggles ship enabled, so
@@ -221,6 +226,10 @@ fn default_thinking_level() -> String {
     "off".to_string()
 }
 
+fn default_browser_search_engine() -> String {
+    "duckduckgo".to_string()
+}
+
 /// S2: parses one `--thinking` word, trimmed and case-insensitively. `None` for
 /// anything else, so a caller that must not guess (the command that applies the
 /// human's choice) can reject it, and the spawn can omit the flag instead of
@@ -254,6 +263,7 @@ impl Default for Settings {
             web_search_credentials: String::new(),
             notifications: NotificationPreferences::default(),
             voice: VoicePreferences::default(),
+            browser_search_engine: default_browser_search_engine(),
         }
     }
 }

@@ -169,7 +169,7 @@ pub fn run() {
             });
             // The embedded browser's registry, shared by the commands and by the
             // MCP server: the agent drives exactly the views the human sees.
-            let embeds = embed::EmbedSessions::new();
+            let embeds = embed::EmbedSessions::with_profile_dir(data_dir.join("browser-profile"));
             let shells = shell::ShellSessions::new();
             let memory = Arc::new(
                 memory::MemoryStore::open(&data_dir.join("memory.db"))
@@ -180,6 +180,8 @@ pub fn run() {
             // without agent control of the browser, which is the honest
             // degradation for a local port a firewall may refuse.
             let active_session_path: Arc<std::sync::Mutex<Option<std::path::PathBuf>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let active_document_path: Arc<std::sync::Mutex<Option<String>>> =
                 Arc::new(std::sync::Mutex::new(None));
             let acp_handle = app.handle().clone();
             let acp = acp::AcpManager::new(
@@ -200,6 +202,7 @@ pub fn run() {
                     shells.clone(),
                     data_dir.clone(),
                     Arc::clone(&active_session_path),
+                    Arc::clone(&active_document_path),
                 )),
                 // S1 of `web-search.md`: the `web_search` tool reads its switch and
                 // its instance from `settings.json` on every call, so a change in
@@ -241,6 +244,7 @@ pub fn run() {
                 runtime,
                 acp,
                 active_session_path,
+                active_document_path,
                 cli: cli::CliSessions::new(),
                 cli_sink,
                 // S2 of `tool-drawer-and-mcp.md` (F2): the workspace terminals
@@ -304,6 +308,11 @@ pub fn run() {
                 mcp_registration.complete(mcp_server::RegistrationOutcome::Failed(
                     "the registration thread could not start".to_string(),
                 ));
+            }
+            if let Ok(boot_settings) = settings::load(&commands::settings_file(
+                &app.state::<AppState>().config_dir,
+            )) {
+                commands::apply_native_window_theme(app.handle(), &boot_settings.theme);
             }
             Ok(())
         })
@@ -469,6 +478,7 @@ pub fn run() {
             commands::doc_read,
             commands::doc_write,
             commands::doc_create_temp,
+            commands::doc_set_active,
             commands::export_docx_file,
             commands::memory_list,
             commands::memory_save,

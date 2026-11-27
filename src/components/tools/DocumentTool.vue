@@ -46,6 +46,7 @@ import {
   commandErrorMessage,
   docCreateTemp,
   docRead,
+  docSetActive,
   docWrite,
   exportDocxFile,
   pickImageFiles,
@@ -1088,6 +1089,14 @@ function handleWindowFocus(): void {
   void syncFromDiskIfChanged();
 }
 
+watch(
+  currentPath,
+  (next) => {
+    void docSetActive(next.trim() || null);
+  },
+  { immediate: true },
+);
+
 onMounted(() => {
   window.addEventListener("keydown", onKeydown);
   window.addEventListener("focus", handleWindowFocus);
@@ -1099,6 +1108,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  void docSetActive(null);
   window.removeEventListener("keydown", onKeydown);
   window.removeEventListener("focus", handleWindowFocus);
   window.removeEventListener("mouseup", handleGlobalMouseUp);

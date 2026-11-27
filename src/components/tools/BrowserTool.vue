@@ -94,6 +94,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import {
   ArrowLeftIcon,
   ArrowRightIcon,
+  ExternalLinkIcon,
   RotateCwIcon,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
@@ -109,9 +110,11 @@ import {
   embedSetBounds,
   embedSetVisible,
   embedUrl,
+  openExternalUrl,
   subscribeEmbedNav,
   subscribeEmbedPopup,
 } from "@/contracts/commands";
+import { browserSearchEngine, buildBrowserSearchUrl } from "@/lib/preferences";
 import type {
   EmbedNavEvent,
   EmbedPopupTab,
@@ -208,7 +211,11 @@ function parseHttp(raw: string): string | null {
 
 /**
  * The url to hand Rust for what the human typed, or `null` when it is not a
- * navigation at all: empty, or a scheme this pane may not open.
+ * navigation at all: empty, or a disallowed scheme (`file:`, `javascript:`, etc.).
+ *
+ * When the input does not look like a URL or host (e.g. contains spaces or has no
+ * dot/port and is not `localhost`), falls back to the configured default search
+ * engine (`browserSearchEngine`) unless search fallback is disabled (`"none"`).
  */
 function normalizeAddress(raw: string): string | null {
   const trimmed = raw.trim();
@@ -216,11 +223,30 @@ function normalizeAddress(raw: string): string | null {
   if (trimmed.toLowerCase() === START_URL) return START_URL;
   const direct = parseHttp(trimmed);
   if (direct !== null) return direct;
-  // An explicit scheme that did not parse as http(s) is a refusal, never a host.
-  if (trimmed.includes("://")) return null;
-  const authority = trimmed.split("/")[0] ?? "";
-  if (!IMPLICIT_HOST.test(authority)) return null;
-  return parseHttp(`https://${trimmed}`);
+  // An explicit non-http(s) scheme (`file:`, `javascript:`, `data:`, `mailto:`) is always refused.
+  if (trimmed.includes("://") || /^(javascript|data|file|mailto|vbscript):/i.test(trimmed)) {
+    return null;
+  }
+  const hasSpaces = /\s/.test(trimmed);
+  if (!hasSpaces) {
+    const authority = trimmed.split("/")[0] ?? "";
+    const looksLikeHost =
+      IMPLICIT_HOST.test(authority) &&
+      (authority.includes(".") ||
+        authority.includes(":") ||
+        authority.toLowerCase() === "localhost");
+    if (looksLikeHost) {
+      return parseHttp(`https://${trimmed}`);
+    }
+  }
+  return buildBrowserSearchUrl(trimmed, browserSearchEngine.value);
+}
+
+function openCurrentExternally(): void {
+  const target = currentUrl.value;
+  if (target && target !== START_URL) {
+    void openExternalUrl(target);
+  }
 }
 
 /** The two nodes whose geometry the drawn view follows. */
@@ -1320,6 +1346,16 @@ onBeforeUnmount(() => {
           {{ t("tools.browser.go") }}
         </Button>
       </form>
+      <Button
+        variant="ghost"
+        size="icon-xs"
+        :disabled="currentUrl === START_URL"
+        title="Open in system browser"
+        aria-label="Open in system browser"
+        @click="openCurrentExternally"
+      >
+        <ExternalLinkIcon />
+      </Button>
     </div>
 
     <!-- Status: one line, in the pane's voice. The failure first, because it is
