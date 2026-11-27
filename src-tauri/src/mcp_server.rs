@@ -740,8 +740,10 @@ fn tool_catalog() -> Vec<Value> {
     vec![
         json!({
             "name": "navigate",
-            "description": "Open a url in the embedded browser view the human is looking at. \
-                            Accepts http, https and about:blank only.",
+            "description": "Open a url in the embedded browser view the human is looking at (opens the Browser tab if closed). \
+                            Accepts http, https and about:blank only. Prefer `web_search`, `curl`, `gh`, or `git` for \
+                            repositories, APIs, and public docs; use `navigate` only when the user asks to open a page \
+                            in the browser or when a site requires visual interaction, JS/SPA rendering, or user auth.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -904,7 +906,7 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "export_docx",
-            "description": "Convert a local Markdown (.md) file into a new editable Word (.docx) document with native headings, lists, links, tables and embedded local PNG/JPEG images. Never overwrites an existing output file and opens the document in Nabla's right drawer.",
+            "description": "Convert a local Markdown (.md) file into a new editable Word (.docx) document with native headings, lists, links, tables and embedded local PNG/JPEG images. Call this whenever the user asks for Word/DOCX output. Never overwrites an existing output file and opens the document in Nabla's right drawer.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -922,7 +924,7 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "open_document",
-            "description": "Open a Markdown (.md) file in Nabla's right-hand Document editor and live preview drawer so the human can view, edit, embed images, or export it to .docx/.pdf.",
+            "description": "Open or focus a Markdown (.md) file in Nabla's right-hand Document editor and live preview drawer so the human can view, edit, embed images, or export it to .docx/.pdf. When creating a new Markdown document for the user, write a clean `.md` file in the workspace and immediately call `open_document` with its path.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -936,7 +938,7 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "get_open_document",
-            "description": "Returns the file path and current Markdown content of the document currently open in Nabla's Document pane, so you can read or edit it directly without asking the user for the path.",
+            "description": "Returns the file path and current Markdown content of the document currently open in Nabla's Document pane. Always call this first before asking for a file path whenever the user refers to a document or asks to read, edit, improve, or export one. When editing an open document, write directly to its file on disk (the Document pane syncs live) and preserve existing structure, links, and embedded images unless asked to change them.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -946,9 +948,11 @@ fn tool_catalog() -> Vec<Value> {
         json!({
             "name": "web_search",
             "description": "Search the web through a SearXNG instance and return titles, urls and \
-                            snippets. It does NOT open or render a page: the snippet is what the \
-                            search engine kept, so a page's real content still needs `navigate` \
-                            and `eval` in the browser view. It needs no browser view of its own.",
+                            snippets without opening a browser view. It does NOT open or render a \
+                            page: for repositories, docs, or raw pages prefer HTTP/CLI tools (`curl`, \
+                            `gh`, `git`), and only fall back to `navigate` and `eval` in the browser \
+                            view when a page requires JS rendering, user auth, or the human asked to \
+                            open it. It needs no browser view of its own.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
