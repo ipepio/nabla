@@ -14,6 +14,8 @@ Division of responsibilities:
   - **Terminal**: `terminal_list`, `terminal_read`, and `terminal_write`. You CAN see and drive any open Terminal tab in Nabla's tool drawer — including interactive CLIs, dev servers, or REPLs the human opened. Use `terminal_list` to find open terminals, `terminal_read` to inspect their recent screen output, and `terminal_write` to send text or control keys (`enter`, `ctrl+c`, `esc`, `tab`, arrows).
   - **Document & Drawer**: `open_document`, `export_docx`, and `open_tool` (`terminal`, `browser`, `document`, `files`) to open or focus any tool tab in the right drawer.
   - **Persistent Memory**: `memory_save`, `memory_search`, and `memory_forget` to remember durable preferences, facts, and project decisions across sessions.
+  - **Session Context**: `session_context` to read the full conversation history of the current Nabla session (including turns handled by other models or CLIs in the same session).
+  - **Subagents**: `subagent_list` and `subagent_run` to discover and delegate bounded tasks to Nabla's configured subagent profiles (explorer, researcher, worker, judge, or custom profiles).
 - You still cannot see the human's full OS screen or take arbitrary desktop screenshots outside Nabla's tools.
 - You can use any other MCP server configured for this session. Say which one you use.
 - When a capability is genuinely not available to you, say so plainly instead of

@@ -1,3 +1,4 @@
+mod acp;
 mod agents;
 mod cli;
 mod commands;
@@ -177,12 +178,27 @@ pub fn run() {
             // drive those views. A failure to bind is not fatal — the app runs
             // without agent control of the browser, which is the honest
             // degradation for a local port a firewall may refuse.
+            let active_session_path: Arc<std::sync::Mutex<Option<std::path::PathBuf>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let acp_handle = app.handle().clone();
+            let acp = acp::AcpManager::new(
+                Arc::new(move |session_id: &str, event: &AgentEvent| {
+                    let envelope = AgentEventEnvelope {
+                        session_id: session_id.to_string(),
+                        event: event.clone(),
+                    };
+                    let _ = acp_handle.emit("agent-event", envelope);
+                }),
+                data_dir.clone(),
+            );
             let mcp_endpoint = mcp_server::start(
                 Arc::new(mcp_server::EmbedDriver::new(
                     app.handle().clone(),
                     embeds.clone(),
                     Arc::clone(&memory),
                     shells.clone(),
+                    data_dir.clone(),
+                    Arc::clone(&active_session_path),
                 )),
                 // S1 of `web-search.md`: the `web_search` tool reads its switch and
                 // its instance from `settings.json` on every call, so a change in
@@ -222,6 +238,8 @@ pub fn run() {
                 pi_agent_dir,
                 home_dir: home,
                 runtime,
+                acp,
+                active_session_path,
                 cli: cli::CliSessions::new(),
                 cli_sink,
                 // S2 of `tool-drawer-and-mcp.md` (F2): the workspace terminals
@@ -466,7 +484,12 @@ pub fn run() {
             commands::voice_synthesize_segment,
             commands::voice_record_start,
             commands::voice_record_stop_and_transcribe,
-            commands::voice_record_cancel
+            commands::voice_record_cancel,
+            commands::acp_list_agents,
+            commands::acp_set_agent_enabled,
+            commands::acp_save_custom_agent,
+            commands::acp_delete_custom_agent,
+            commands::acp_start_login
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -484,6 +507,7 @@ pub fn run() {
                 // failure leaves an entry that can never connect again, which is
                 // the only trace it leaves.
                 let _ = commands::unregister_mcp_server(&state);
+                state.acp.stop_all();
                 state.embeds.close_all(app);
             }
         });

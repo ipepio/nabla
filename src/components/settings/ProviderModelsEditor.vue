@@ -436,11 +436,11 @@ async function handleAddDiscovered() {
         provider: props.provider.id,
         id: model.id,
         name: model.name,
-        contextWindow: null,
-        maxTokens: null,
-        inputCost: null,
-        outputCost: null,
-        modalities: [],
+        contextWindow: model.contextWindow ?? null,
+        maxTokens: model.maxTokens ?? null,
+        inputCost: model.inputCost ?? null,
+        outputCost: model.outputCost ?? null,
+        modalities: model.modalities ?? [],
         enabled: true,
       });
       configured.add(model.id);

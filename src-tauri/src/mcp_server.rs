@@ -119,6 +119,16 @@ pub trait WebviewDriver: Send + Sync + 'static {
     fn memory_store(&self) -> Option<Arc<crate::memory::MemoryStore>> {
         None
     }
+
+    /// Access to Nabla's data directory (for `agents.json` subagent profiles).
+    fn data_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// Path to the active Nabla session's JSONL transcript (for `session_context`).
+    fn active_session_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 /// A driver failure, typed so the dispatcher can tell an accident from an answer.
@@ -281,6 +291,15 @@ fn call_tool(
     }
     if name == OPEN_TOOL {
         return open_tool_result(driver, id, &arguments);
+    }
+    if name == SESSION_CONTEXT {
+        return session_context_result(driver, id, &arguments);
+    }
+    if name == SUBAGENT_LIST {
+        return subagent_list_result(driver, id);
+    }
+    if name == SUBAGENT_RUN {
+        return subagent_run_result(driver, id, &arguments);
     }
     let asked_view = arguments.get("viewId").and_then(Value::as_str);
 
@@ -623,7 +642,7 @@ fn targets_text(views: &[LiveView]) -> String {
 /// Every tool this server offers, in catalog order. Kept as data so a name that
 /// is listed but not dispatched (or the reverse) fails a test instead of the
 /// model's next call.
-const TOOL_NAMES: [&str; 21] = [
+const TOOL_NAMES: [&str; 24] = [
     "navigate",
     "eval",
     "get_url",
@@ -644,8 +663,15 @@ const TOOL_NAMES: [&str; 21] = [
     "terminal_read",
     "terminal_write",
     "open_tool",
+    "session_context",
+    "subagent_list",
+    "subagent_run",
     "list_targets",
 ];
+
+const SESSION_CONTEXT: &str = "session_context";
+const SUBAGENT_LIST: &str = "subagent_list";
+const SUBAGENT_RUN: &str = "subagent_run";
 
 /// S3 of `web-search.md`: the tool name. A constant because the catalog, the
 /// dispatch and the tests must all spell it the same way.
@@ -1006,6 +1032,41 @@ fn tool_catalog() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "session_context",
+            "description": "Read the conversation history of the current Nabla chat session (including turns from other models/CLIs in the same session). Use this whenever you need full prior context or earlier messages.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Optional case-insensitive substring filter to search specific messages." },
+                    "limit": { "type": "integer", "description": "Maximum number of turns to return (default 20, max 100)." },
+                    "fromStart": { "type": "boolean", "description": "Set true to read from the beginning of the session instead of the most recent turns (default false)." }
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "subagent_list",
+            "description": "List Nabla's configured and enabled subagent profiles (explorer, researcher, worker, judge, or custom profiles) available for delegation.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }),
+        json!({
+            "name": "subagent_run",
+            "description": "Delegate a bounded task to one of Nabla's enabled subagent profiles and return its final answer.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent": { "type": "string", "description": "Name of an enabled subagent profile from `subagent_list`." },
+                    "task": { "type": "string", "description": "Full self-contained task description for the subagent." },
+                    "cwd": { "type": "string", "description": "Optional working directory path for the subagent." }
+                },
+                "required": ["agent", "task"]
+            }
+        }),
+        json!({
             "name": "list_targets",
             "description": "List the open browser views, one `id (url)` per line. Use it when a call \
                             needs a `viewId`. An empty list is a normal answer: it means no view is \
@@ -1207,6 +1268,176 @@ fn open_tool_result(driver: &dyn WebviewDriver, id: &Value, arguments: &Value) -
         &format!("requested Nabla to open tool `{normalized}` in the right drawer"),
         false,
     )
+}
+
+// ── active session context (`session_context`) ─────────────────────────────
+
+fn session_context_result(driver: &dyn WebviewDriver, id: &Value, arguments: &Value) -> Value {
+    let Some(path) = driver.active_session_path() else {
+        return tool_result(id, "no active Nabla session transcript is available", false);
+    };
+    let mut turns = crate::acp::transcript::read_session_messages(&path);
+    let total = turns.len();
+    if let Some(q) = argument(arguments, "query") {
+        let needle = q.to_ascii_lowercase();
+        turns.retain(|t| t.text.to_ascii_lowercase().contains(&needle));
+    }
+    let limit = arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|n| n.clamp(1, 100) as usize)
+        .unwrap_or(20);
+    let from_start = arguments
+        .get("fromStart")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let slice: Vec<_> = if turns.len() <= limit {
+        turns
+    } else if from_start {
+        turns.into_iter().take(limit).collect()
+    } else {
+        let skip = turns.len() - limit;
+        turns.into_iter().skip(skip).collect()
+    };
+    let payload = json!({
+        "totalTurns": total,
+        "returned": slice.len(),
+        "turns": slice,
+    });
+    let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
+    tool_result(id, &text, false)
+}
+
+// ── subagent delegation over MCP (`subagent_list` / `subagent_run`) ────────
+
+fn subagent_list_result(driver: &dyn WebviewDriver, id: &Value) -> Value {
+    let Some(data_dir) = driver.data_dir() else {
+        return tool_result(id, "subagent configuration is unavailable", true);
+    };
+    let config = match crate::agents::load(&crate::agents::config_path(&data_dir)) {
+        Ok(cfg) => cfg,
+        Err(err) => return tool_result(id, &format!("failed to load agents config: {err}"), true),
+    };
+    if !config.delegation_active() {
+        return tool_result(
+            id,
+            "Subagent delegation is disabled in Nabla Settings -> Subagents.",
+            false,
+        );
+    }
+    let rows: Vec<Value> = config
+        .enabled_profiles()
+        .map(|p| {
+            json!({
+                "name": p.name,
+                "description": p.description,
+                "model": p.model,
+                "effort": p.effort,
+                "tools": p.tools,
+            })
+        })
+        .collect();
+    let text = serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".to_string());
+    tool_result(id, &text, false)
+}
+
+fn subagent_run_result(driver: &dyn WebviewDriver, id: &Value, arguments: &Value) -> Value {
+    let Some(data_dir) = driver.data_dir() else {
+        return tool_result(id, "subagent configuration is unavailable", true);
+    };
+    let Some(agent_name) = argument(arguments, "agent") else {
+        return error(id, -32602, "subagent_run needs an `agent` argument");
+    };
+    let Some(task) = argument(arguments, "task") else {
+        return error(id, -32602, "subagent_run needs a `task` argument");
+    };
+    let config = match crate::agents::load(&crate::agents::config_path(&data_dir)) {
+        Ok(cfg) => cfg,
+        Err(err) => return tool_result(id, &format!("failed to load agents config: {err}"), true),
+    };
+    if !config.delegation_active() {
+        return tool_result(
+            id,
+            "Subagent delegation is disabled in Nabla Settings -> Subagents.",
+            true,
+        );
+    }
+    let Some(profile) = config
+        .enabled_profiles()
+        .find(|p| p.name.eq_ignore_ascii_case(agent_name))
+        .cloned()
+    else {
+        let names: Vec<String> = config.enabled_profiles().map(|p| p.name.clone()).collect();
+        return tool_result(
+            id,
+            &format!(
+                "unknown or disabled subagent `{agent_name}`. Enabled profiles: {}",
+                names.join(", ")
+            ),
+            true,
+        );
+    };
+
+    let resolved = crate::pi_runtime::resolve_pi("pi");
+    let mut cmd = std::process::Command::new(&resolved.program);
+    cmd.args(&resolved.prefix_args);
+    if let Some(ref node_path) = resolved.node_path {
+        cmd.env("NODE_PATH", node_path);
+    }
+    if let Some(agent_dir) = crate::pi_runtime::agent_dir() {
+        cmd.env("PI_CODING_AGENT_DIR", agent_dir);
+    }
+    cmd.arg("--print").arg("--no-session");
+    if !profile.instructions.trim().is_empty() {
+        cmd.arg("--system-prompt").arg(&profile.instructions);
+    }
+    if let Some(model) = profile
+        .model
+        .as_deref()
+        .or(config.model_default.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        cmd.arg("--model").arg(model);
+    }
+    if let Some(cwd) = argument(arguments, "cwd") {
+        let path = std::path::Path::new(cwd);
+        if path.is_dir() {
+            cmd.current_dir(path);
+        }
+    }
+    cmd.arg(task);
+
+    match cmd.output() {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            if out.status.success() {
+                let body = if stdout.is_empty() {
+                    "(subagent completed with empty output)".to_string()
+                } else {
+                    stdout
+                };
+                tool_result(id, &body, false)
+            } else {
+                let msg = if stderr.is_empty() { stdout } else { stderr };
+                tool_result(
+                    id,
+                    &format!(
+                        "subagent `{}` failed (exit {:?}): {msg}",
+                        profile.name,
+                        out.status.code()
+                    ),
+                    true,
+                )
+            }
+        }
+        Err(err) => tool_result(
+            id,
+            &format!("failed to spawn subagent `{}`: {err}", profile.name),
+            true,
+        ),
+    }
 }
 
 // ── persistent agent memory (`memory_save` / `memory_search` / `memory_forget`) ──
@@ -3454,6 +3685,8 @@ pub struct EmbedDriver {
     embeds: crate::embed::EmbedSessions,
     memory: Arc<crate::memory::MemoryStore>,
     shells: crate::shell::ShellSessions,
+    data_dir: std::path::PathBuf,
+    active_session_path: Arc<Mutex<Option<std::path::PathBuf>>>,
 }
 
 impl EmbedDriver {
@@ -3462,12 +3695,16 @@ impl EmbedDriver {
         embeds: crate::embed::EmbedSessions,
         memory: Arc<crate::memory::MemoryStore>,
         shells: crate::shell::ShellSessions,
+        data_dir: std::path::PathBuf,
+        active_session_path: Arc<Mutex<Option<std::path::PathBuf>>>,
     ) -> EmbedDriver {
         EmbedDriver {
             app,
             embeds,
             memory,
             shells,
+            data_dir,
+            active_session_path,
         }
     }
 
@@ -3594,6 +3831,14 @@ impl WebviewDriver for EmbedDriver {
 
     fn memory_store(&self) -> Option<Arc<crate::memory::MemoryStore>> {
         Some(Arc::clone(&self.memory))
+    }
+
+    fn data_dir(&self) -> Option<std::path::PathBuf> {
+        Some(self.data_dir.clone())
+    }
+
+    fn active_session_path(&self) -> Option<std::path::PathBuf> {
+        self.active_session_path.lock().ok().and_then(|g| g.clone())
     }
 }
 

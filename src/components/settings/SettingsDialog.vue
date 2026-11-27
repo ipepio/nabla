@@ -188,6 +188,9 @@ const SkillsSection = defineAsyncComponent(
 const VoiceSection = defineAsyncComponent(
   () => import("./VoiceSection.vue"),
 );
+const AcpSection = defineAsyncComponent(
+  () => import("./AcpSection.vue"),
+);
 import {
   commandErrorMessage,
   configFilePath,
@@ -1716,6 +1719,8 @@ watch(open, (isOpen) => {
               />
               <Separator />
             </template>
+            <AcpSection @signed-in="handleSignedIn" />
+            <Separator />
 
             <section class="space-y-2">
               <div class="min-w-0">

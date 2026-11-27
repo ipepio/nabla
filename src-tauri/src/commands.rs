@@ -41,6 +41,10 @@ pub struct AppState {
     /// User home directory resolved once at startup by Tauri's path resolver.
     pub home_dir: PathBuf,
     pub runtime: ProcessManager,
+    /// Supervisor for ACP (Agent Client Protocol) CLIs (Antigravity, Claude Code, Gemini CLI).
+    pub acp: crate::acp::AcpManager,
+    /// Path to the currently active Nabla session JSONL (read by `session_context` MCP tool).
+    pub active_session_path: Arc<Mutex<Option<PathBuf>>>,
     /// S1/S3 of `pi-cli-bridge.md`: the allowlisted bridge to the `pi` command
     /// line and the registry of interactive sessions it started.
     pub cli: CliSessions,
@@ -431,6 +435,7 @@ pub fn list_provider_models(state: State<'_, AppState>) -> Result<Vec<ProviderMo
     let hidden = settings::load(&settings_path(&state))
         .map(|settings| settings.hidden_models)
         .unwrap_or_default();
+    providers.extend(crate::acp::catalog::provider_models(&state.data_dir));
     crate::providers::apply_hidden_models(&mut providers, &hidden);
     Ok(providers)
 }
@@ -923,11 +928,57 @@ fn prepare_session_start(
 /// `ready`, `crashed` and the exit on the event bridge the panel already draws
 /// (S4). `async` remains only so the task is spawned from inside the runtime,
 /// never so the command waits for it.
+fn set_active_session_path(state: &AppState, path: &str) {
+    if !path.trim().is_empty()
+        && let Ok(mut guard) = state.active_session_path.lock()
+    {
+        *guard = Some(PathBuf::from(path));
+    }
+}
+
+/// Stops any stale core process for `session_id` and spawns a fresh core child
+/// against the session's JSONL file so turns written by an ACP agent are
+/// loaded natively into Nabla's core engine.
+fn reload_core_session_sync(
+    state: &AppState,
+    workspace_id: i64,
+    session_id: i64,
+    provider: &str,
+    model_id: &str,
+) -> Result<(), String> {
+    let key = session_id.to_string();
+    let _ = state.runtime.stop_and_wait(&key);
+    let row = session_row_by_id(&state.store, &key)?;
+    let workspace = workspace_by_id(&state.store, workspace_id)?;
+    let settings = settings::load(&settings_path(state)).map_err(display_err)?;
+    await_mcp_registration(&state.mcp_registration);
+    let report = state
+        .runtime
+        .spawn(
+            &key,
+            &settings.pi_binary,
+            Path::new(&row.pi_session_path),
+            SessionModel {
+                provider,
+                model: model_id,
+                thinking: settings.thinking(),
+            },
+            Path::new(&workspace.path),
+        )
+        .map_err(display_err)?;
+    if report.outcome != StartupOutcome::Ready {
+        let detail = report.stderr_tail.join("\n");
+        return Err(startup_failure_message(report.outcome, &detail));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn start_session(
     state: State<'_, AppState>,
     workspace_id: i64,
 ) -> Result<SessionDto, String> {
+    let loaded_settings = settings::load(&settings_path(&state)).ok();
     let PendingSessionStart { session, spawn } = prepare_session_start(
         &state.store,
         &state.config_dir,
@@ -935,6 +986,33 @@ pub async fn start_session(
         &state.runtime,
         workspace_id,
     )?;
+    set_active_session_path(&state, &session.pi_session_path);
+
+    if let Some(ref s) = loaded_settings
+        && let Some(agent_id) = crate::acp::catalog::acp_agent_id(&s.provider).map(str::to_string)
+    {
+        let acp = state.acp.clone();
+        let mcp = state.mcp_endpoint.clone();
+        let session_key = session.session_id.clone();
+        let model_id =
+            crate::acp::catalog::resolve_wire_model(&agent_id, &s.model, s.thinking());
+        let cwd = spawn.workspace_path.clone();
+        let transcript_path = PathBuf::from(&session.pi_session_path);
+        tauri::async_runtime::spawn(async move {
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                let _ = acp.spawn_session(
+                    &session_key,
+                    &agent_id,
+                    &model_id,
+                    &cwd,
+                    transcript_path,
+                    mcp.as_ref(),
+                );
+            })
+            .await;
+        });
+        return Ok(session);
+    }
     // Detached on purpose: nothing waits for this task and dropping its handle
     // never cancels it, so the start runs to completion either way. A failed
     // start is visible through the runtime's own events, not through this task.
@@ -966,6 +1044,53 @@ pub fn send_prompt(
     text: String,
     images: Option<Vec<PromptImage>>,
 ) -> Result<(), String> {
+    ensure_session_in_workspace(&state.store, workspace_id, session_id)?;
+    let key = session_id.to_string();
+    let row = session_row_by_id(&state.store, &key)?;
+    set_active_session_path(&state, &row.pi_session_path);
+
+    let loaded_settings = settings::load(&settings_path(&state)).ok();
+    if let Some(ref s) = loaded_settings
+        && let Some(agent_id) = crate::acp::catalog::acp_agent_id(&s.provider)
+    {
+        let workspace = workspace_by_id(&state.store, workspace_id)?;
+        let wire_model =
+            crate::acp::catalog::resolve_wire_model(agent_id, &s.model, s.thinking());
+        state.acp.spawn_session(
+            &key,
+            agent_id,
+            &wire_model,
+            Path::new(&workspace.path),
+            PathBuf::from(&row.pi_session_path),
+            state.mcp_endpoint.as_ref(),
+        )?;
+        let img_pairs: Vec<(String, String)> = images
+            .unwrap_or_default()
+            .into_iter()
+            .map(|img| (img.data, img.mime_type))
+            .collect();
+        let _ = state.store.touch_session(session_id);
+        let _ = state.store.touch_workspace(workspace_id);
+        return state.acp.send_prompt(&key, text, img_pairs);
+    }
+
+    // Returning to a core Nabla model after ACP wrote turns (or if session started on ACP):
+    // reload the core process on the updated Pi v3 JSONL so it inherits the full conversation.
+    if state.acp.has_session(&key) {
+        state.acp.stop_session(&key);
+    }
+    if state.acp.take_dirty_for_core(&key) || state.runtime.status(&key).is_none() {
+        let provider = loaded_settings
+            .as_ref()
+            .map(|s| s.provider.as_str())
+            .unwrap_or("");
+        let model = loaded_settings
+            .as_ref()
+            .map(|s| s.model.as_str())
+            .unwrap_or("");
+        reload_core_session_sync(&state, workspace_id, session_id, provider, model)?;
+    }
+
     let paths = ImageCapabilityPaths {
         config_dir: &state.config_dir,
         models: &models_path(&state),
@@ -1432,6 +1557,11 @@ pub fn session_thinking_levels(
     session_id: i64,
 ) -> Result<Vec<String>, String> {
     ensure_session_in_workspace(&state.store, workspace_id, session_id)?;
+    if let Ok(s) = settings::load(&settings_path(&state))
+        && let Some(agent_id) = crate::acp::catalog::acp_agent_id(&s.provider)
+    {
+        return Ok(crate::acp::catalog::thinking_levels_for(agent_id, &s.model));
+    }
     session_thinking_levels_for(&state.runtime, &session_id.to_string())
 }
 
@@ -1446,6 +1576,33 @@ pub fn set_session_thinking_level(
     level: String,
 ) -> Result<String, String> {
     ensure_session_in_workspace(&state.store, workspace_id, session_id)?;
+    if let Ok(mut s) = settings::load(&settings_path(&state))
+        && let Some(agent_id) = crate::acp::catalog::acp_agent_id(&s.provider).map(str::to_string)
+    {
+        let normalized = level.trim().to_ascii_lowercase();
+        let allowed = crate::acp::catalog::thinking_levels_for(&agent_id, &s.model);
+        if !allowed.is_empty() && !allowed.iter().any(|l| l == &normalized) {
+            return Err(format!("unsupported effort level `{normalized}` for {}", s.model));
+        }
+        s.thinking_level = normalized.clone();
+        settings::save(&settings_path(&state), &s).map_err(display_err)?;
+        let key = session_id.to_string();
+        if state.acp.has_session(&key) {
+            let wire_model = crate::acp::catalog::resolve_wire_model(
+                &agent_id,
+                &s.model,
+                Some(normalized.as_str()),
+            );
+            let acp = state.acp.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = tauri::async_runtime::spawn_blocking(move || {
+                    let _ = acp.set_model(&key, &wire_model);
+                })
+                .await;
+            });
+        }
+        return Ok(normalized);
+    }
     set_thinking_level_for(
         &state.config_dir,
         &state.runtime,
@@ -1469,12 +1626,79 @@ pub fn set_session_model(
     model_id: String,
 ) -> Result<SessionModelInfo, String> {
     ensure_session_in_workspace(&state.store, workspace_id, session_id)?;
-    set_session_model_for(
-        &state.runtime,
-        &session_id.to_string(),
-        &provider,
-        &model_id,
-    )
+    let key = session_id.to_string();
+    let row = session_row_by_id(&state.store, &key)?;
+    set_active_session_path(&state, &row.pi_session_path);
+
+    if let Some(agent_id) = crate::acp::catalog::acp_agent_id(&provider) {
+        let spec = crate::acp::catalog::resolve_launch(&state.data_dir, agent_id)?;
+        let current_effort = settings::load(&settings_path(&state))
+            .ok()
+            .and_then(|s| s.thinking().map(str::to_string));
+        let wire_model = crate::acp::catalog::resolve_wire_model(
+            agent_id,
+            &model_id,
+            current_effort.as_deref(),
+        );
+        // Same ACP agent already live on this session: switch model in-place via `session/set_model`.
+        if state.acp.agent_id_for_session(&key).as_deref() == Some(agent_id) {
+            let acp = state.acp.clone();
+            let k = key.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = tauri::async_runtime::spawn_blocking(move || {
+                    let _ = acp.set_model(&k, &wire_model);
+                })
+                .await;
+            });
+            return Ok(SessionModelInfo {
+                provider,
+                id: model_id.clone(),
+                name: if model_id == "default" {
+                    spec.name
+                } else {
+                    model_id
+                },
+            });
+        }
+        // Switching from core (or another ACP CLI) into this ACP agent on the same session.
+        let workspace = workspace_by_id(&state.store, workspace_id)?;
+        let acp = state.acp.clone();
+        let aid = agent_id.to_string();
+        let cwd = PathBuf::from(&workspace.path);
+        let transcript_path = PathBuf::from(&row.pi_session_path);
+        let mcp = state.mcp_endpoint.clone();
+        let spawn_key = key.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                let _ = acp.spawn_session(&spawn_key, &aid, &wire_model, &cwd, transcript_path, mcp.as_ref());
+            })
+            .await;
+        });
+        return Ok(SessionModelInfo {
+            provider,
+            id: model_id.clone(),
+            name: if model_id == "default" {
+                spec.name
+            } else {
+                model_id
+            },
+        });
+    }
+
+    // Switching back from an ACP CLI to a core Nabla model:
+    // stop ACP and reload core on the updated JSONL if ACP wrote turns.
+    if state.acp.has_session(&key) {
+        state.acp.stop_session(&key);
+    }
+    if state.acp.take_dirty_for_core(&key) || state.runtime.status(&key).is_none() {
+        reload_core_session_sync(&state, workspace_id, session_id, &provider, &model_id)?;
+        return Ok(SessionModelInfo {
+            provider,
+            id: model_id.clone(),
+            name: model_id,
+        });
+    }
+    set_session_model_for(&state.runtime, &key, &provider, &model_id)
 }
 
 /// S3: the commands this session offers (extension commands, prompt templates and
@@ -1843,9 +2067,13 @@ pub fn answer_ui_request(
     if request_id.trim().is_empty() {
         return Err("question id is empty".to_string());
     }
+    let key = session_id.to_string();
+    if state.acp.has_session(&key) {
+        return state.acp.answer_ui_request(&key, &request_id, &answer);
+    }
     state
         .runtime
-        .answer_ui_request(&session_id.to_string(), &request_id, &answer)
+        .answer_ui_request(&key, &request_id, &answer)
         .map_err(display_err)
 }
 
@@ -1862,9 +2090,13 @@ pub fn stop_session(
     session_id: i64,
 ) -> Result<(), String> {
     ensure_session_in_workspace(&state.store, workspace_id, session_id)?;
+    let key = session_id.to_string();
+    if state.acp.has_session(&key) {
+        return state.acp.cancel_turn(&key);
+    }
     state
         .runtime
-        .abort_and_wait(&session_id.to_string())
+        .abort_and_wait(&key)
         .map(|_| ())
         .map_err(display_err)
 }
@@ -1879,6 +2111,14 @@ pub fn session_status(
 ) -> Result<SessionStatusDto, String> {
     ensure_session_in_workspace(&state.store, workspace_id, session_id)?;
     let key = session_id.to_string();
+    if let Some(snapshot) = state.acp.status(&key) {
+        return Ok(SessionStatusDto {
+            session_id: key,
+            status: snapshot.status,
+            pid: Some(snapshot.pid),
+            error: snapshot.error,
+        });
+    }
     match state.runtime.status(&key) {
         Some(snapshot) => Ok(SessionStatusDto {
             session_id: key,
@@ -1994,6 +2234,7 @@ fn delete_session_core(
 /// is removed. Returns whether a row was removed.
 #[tauri::command]
 pub fn delete_session(state: State<'_, AppState>, session_id: i64) -> Result<bool, String> {
+    state.acp.stop_session(&session_id.to_string());
     delete_session_core(&state.store, &state.runtime, &state.data_dir, session_id)
 }
 
@@ -2158,6 +2399,7 @@ pub async fn open_session(
     let registration = state.mcp_registration.clone();
     let opened =
         open_session_core(&store, &runtime, &config_dir, &registration, &session_id).await?;
+    set_active_session_path(&state, &opened.pi_session_path);
     // Opening an existing session is activity too: it must show up as recent.
     if let Ok(row_id) = session_id.parse::<i64>() {
         let _ = store.touch_session(row_id);
@@ -2783,12 +3025,90 @@ pub fn load_session_preview(
 /// process that is about to die (see `PROBE_KEY_PREFIX`).
 #[tauri::command]
 pub fn live_session_ids(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    Ok(state
+    let mut ids: Vec<String> = state
         .runtime
         .live_ids()
         .into_iter()
         .filter(|key| !is_probe_key(key))
-        .collect())
+        .collect();
+    for acp_id in state.acp.live_session_ids() {
+        if !ids.contains(&acp_id) {
+            ids.push(acp_id);
+        }
+    }
+    Ok(ids)
+}
+
+// ── ACP (Agent Client Protocol) commands ───────────────────────────────────
+
+#[tauri::command]
+pub fn acp_list_agents(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::acp::catalog::AcpAgentStatus>, String> {
+    Ok(crate::acp::catalog::list_agents(&state.data_dir))
+}
+
+#[tauri::command]
+pub fn acp_set_agent_enabled(
+    state: State<'_, AppState>,
+    agent_id: String,
+    enabled: bool,
+) -> Result<Vec<crate::acp::catalog::AcpAgentStatus>, String> {
+    crate::acp::catalog::set_agent_enabled(&state.data_dir, &agent_id, enabled)
+}
+
+#[tauri::command]
+pub fn acp_save_custom_agent(
+    state: State<'_, AppState>,
+    draft: crate::acp::catalog::CustomAcpAgentDraft,
+) -> Result<Vec<crate::acp::catalog::AcpAgentStatus>, String> {
+    crate::acp::catalog::save_custom_agent(&state.data_dir, draft)
+}
+
+#[tauri::command]
+pub fn acp_delete_custom_agent(
+    state: State<'_, AppState>,
+    agent_id: String,
+) -> Result<Vec<crate::acp::catalog::AcpAgentStatus>, String> {
+    crate::acp::catalog::delete_custom_agent(&state.data_dir, &agent_id)
+}
+
+#[tauri::command]
+pub fn acp_start_login(
+    state: State<'_, AppState>,
+    agent_id: String,
+    workspace: Option<String>,
+) -> Result<ShellSession, String> {
+    let agents = crate::acp::catalog::list_agents(&state.data_dir);
+    let agent = agents
+        .into_iter()
+        .find(|a| a.id == agent_id)
+        .ok_or_else(|| format!("unknown ACP agent: {agent_id}"))?;
+    let cwd = workspace
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| state.home_dir.clone());
+    let shell = shell::resolve_shell();
+    let opened = state
+        .shells
+        .open_with(
+            &shell,
+            &[],
+            &cwd,
+            shell::DEFAULT_COLS,
+            shell::DEFAULT_ROWS,
+            Arc::clone(&state.shell_sink),
+        )
+        .map_err(display_err)?;
+    let mut cmd_line = agent.login_command.clone();
+    for arg in &agent.login_args {
+        cmd_line.push(' ');
+        cmd_line.push_str(arg);
+    }
+    cmd_line.push('\r');
+    let _ = state.shells.write(&opened.session_id, &cmd_line);
+    Ok(opened)
 }
 
 // ── pi CLI bridge (S1-S4 of `pi-cli-bridge.md`) ─────────────────────────────

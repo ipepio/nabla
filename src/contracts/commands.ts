@@ -10,8 +10,10 @@ import {
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { AgentEventEnvelope } from "./agent-events";
 import type {
+  AcpAgentStatus,
   AgentsConfig,
   AppSettings,
+  CustomAcpAgentDraft,
   CustomVoiceModelDraft,
   EmbedNavEvent,
   EmbedPopupTab,
@@ -673,6 +675,40 @@ export async function subscribeShellOutput(
 
 export function startSession(workspaceId: number): Promise<SessionDto> {
   return invoke<SessionDto>("start_session", { workspaceId });
+}
+
+export function acpListAgents(): Promise<AcpAgentStatus[]> {
+  return invoke<AcpAgentStatus[]>("acp_list_agents");
+}
+
+export function acpSetAgentEnabled(
+  agentId: string,
+  enabled: boolean,
+): Promise<AcpAgentStatus[]> {
+  return invoke<AcpAgentStatus[]>("acp_set_agent_enabled", {
+    agentId,
+    enabled,
+  });
+}
+
+export function acpSaveCustomAgent(
+  draft: CustomAcpAgentDraft,
+): Promise<AcpAgentStatus[]> {
+  return invoke<AcpAgentStatus[]>("acp_save_custom_agent", { draft });
+}
+
+export function acpDeleteCustomAgent(agentId: string): Promise<AcpAgentStatus[]> {
+  return invoke<AcpAgentStatus[]>("acp_delete_custom_agent", { agentId });
+}
+
+export function acpStartLogin(
+  agentId: string,
+  workspace?: string | null,
+): Promise<ShellSession> {
+  return invoke<ShellSession>("acp_start_login", {
+    agentId,
+    workspace: workspace ?? null,
+  });
 }
 
 export function sendPrompt(

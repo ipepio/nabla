@@ -55,6 +55,11 @@ export interface ProviderSummary {
 export interface ModelOption {
   id: string;
   name: string;
+  contextWindow?: number | null;
+  maxTokens?: number | null;
+  inputCost?: number | null;
+  outputCost?: number | null;
+  modalities?: string[];
 }
 
 /**
@@ -981,4 +986,28 @@ export interface VoiceSynthesizeResult {
   wavBase64: string;
   sampleRate: number;
   durationMs: number;
+}
+
+export interface AcpAgentStatus {
+  id: string;
+  runtime: string;
+  name: string;
+  description: string;
+  command: string;
+  args: string[];
+  installed: boolean;
+  authenticated: boolean;
+  loginCommand: string;
+  loginArgs: string[];
+  hint: string;
+  custom: boolean;
+  enabled: boolean;
+}
+
+export interface CustomAcpAgentDraft {
+  name: string;
+  command: string;
+  args?: string[];
+  loginCommand?: string | null;
+  loginArgs?: string[];
 }

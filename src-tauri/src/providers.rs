@@ -23,11 +23,21 @@ pub struct ProviderSummary {
     pub has_api_key: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelOption {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modalities: Vec<String>,
 }
 
 /// S2/S3 of `models-by-provider.md`: one provider with the models pi would use,
@@ -284,10 +294,12 @@ pub fn save_provider(path: &Path, draft: &ProviderDraft) -> ProvidersResult<Prov
         "apiKey".to_string(),
         serde_json::Value::String(api_key.to_string()),
     );
-    entry.insert(
-        "models".to_string(),
-        serde_json::to_value(&draft.models).map_err(|e| ProvidersError::Parse(e.to_string()))?,
-    );
+    let model_entries: Vec<serde_json::Value> = draft
+        .models
+        .iter()
+        .map(model_option_to_pi_json)
+        .collect();
+    entry.insert("models".to_string(), serde_json::Value::Array(model_entries));
     providers.insert(id.to_string(), serde_json::Value::Object(entry));
 
     // The backup is taken before the rewrite, and only when there was a file.
@@ -1213,6 +1225,209 @@ pub fn models_endpoint(base_url: &str) -> String {
 ///
 /// Entries without a usable `id` are skipped; a missing `name` falls back to the
 /// id, which is what a plain OpenAI-compatible server usually returns.
+fn model_option_to_pi_json(opt: &ModelOption) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("id".to_string(), serde_json::json!(opt.id));
+    obj.insert("name".to_string(), serde_json::json!(opt.name));
+    if let Some(ctx) = opt.context_window {
+        obj.insert("contextWindow".to_string(), serde_json::json!(ctx));
+    }
+    if let Some(max_tok) = opt.max_tokens {
+        obj.insert("maxTokens".to_string(), serde_json::json!(max_tok));
+    }
+    if !opt.modalities.is_empty() {
+        obj.insert("input".to_string(), serde_json::json!(opt.modalities));
+    }
+    if opt.input_cost.is_some() || opt.output_cost.is_some() {
+        let mut cost = serde_json::Map::new();
+        if let Some(ic) = opt.input_cost {
+            cost.insert("input".to_string(), serde_json::json!(ic));
+        }
+        if let Some(oc) = opt.output_cost {
+            cost.insert("output".to_string(), serde_json::json!(oc));
+        }
+        obj.insert("cost".to_string(), serde_json::Value::Object(cost));
+    }
+    serde_json::Value::Object(obj)
+}
+
+fn json_positive_u64(v: &serde_json::Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        .filter(|&n| n > 0)
+}
+
+fn json_non_neg_f64(v: &serde_json::Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+        .filter(|n| n.is_finite() && *n >= 0.0)
+}
+
+fn parse_discovered_context_window(entry: &serde_json::Value) -> Option<u64> {
+    for key in [
+        "contextWindow",
+        "context_window",
+        "context_length",
+        "max_model_len",
+        "max_context_length",
+        "input_token_limit",
+    ] {
+        if let Some(n) = entry.get(key).and_then(json_positive_u64) {
+            return Some(n);
+        }
+    }
+    if let Some(n) = entry
+        .get("top_provider")
+        .and_then(|tp| tp.get("context_length"))
+        .and_then(json_positive_u64)
+    {
+        return Some(n);
+    }
+    if let Some(n) = entry
+        .get("limits")
+        .and_then(|l| l.get("context").or_else(|| l.get("input")))
+        .and_then(json_positive_u64)
+    {
+        return Some(n);
+    }
+    None
+}
+
+fn parse_discovered_max_tokens(entry: &serde_json::Value) -> Option<u64> {
+    for key in [
+        "maxTokens",
+        "max_tokens",
+        "max_output_tokens",
+        "max_completion_tokens",
+        "output_token_limit",
+    ] {
+        if let Some(n) = entry.get(key).and_then(json_positive_u64) {
+            return Some(n);
+        }
+    }
+    if let Some(n) = entry
+        .get("top_provider")
+        .and_then(|tp| {
+            tp.get("max_completion_tokens")
+                .or_else(|| tp.get("max_output_tokens"))
+        })
+        .and_then(json_positive_u64)
+    {
+        return Some(n);
+    }
+    if let Some(n) = entry
+        .get("limits")
+        .and_then(|l| l.get("output").or_else(|| l.get("max_tokens")))
+        .and_then(json_positive_u64)
+    {
+        return Some(n);
+    }
+    None
+}
+
+fn parse_discovered_modalities(entry: &serde_json::Value) -> Vec<String> {
+    let mut has_text = false;
+    let mut has_image = false;
+
+    let mut absorb_list = |arr: &[serde_json::Value]| {
+        for item in arr {
+            if let Some(raw) = item.as_str() {
+                match raw.trim().to_ascii_lowercase().as_str() {
+                    "text" | "chat" => has_text = true,
+                    "image" | "vision" => has_image = true,
+                    _ => {}
+                }
+            }
+        }
+    };
+
+    for arr in [
+        entry.get("input").and_then(|v| v.as_array()),
+        entry.get("modalities").and_then(|v| v.as_array()),
+        entry.get("input_modalities").and_then(|v| v.as_array()),
+        entry
+            .get("architecture")
+            .and_then(|a| a.get("input_modalities"))
+            .and_then(|v| v.as_array()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        absorb_list(arr);
+    }
+
+    if let Some(modality_str) = entry
+        .get("architecture")
+        .and_then(|a| a.get("modality"))
+        .and_then(|v| v.as_str())
+    {
+        let input_side = modality_str
+            .split("->")
+            .next()
+            .unwrap_or(modality_str)
+            .to_ascii_lowercase();
+        if input_side.contains("text") {
+            has_text = true;
+        }
+        if input_side.contains("image") || input_side.contains("vision") {
+            has_image = true;
+        }
+    }
+
+    if let Some(caps) = entry.get("capabilities").and_then(|v| v.as_object()) {
+        if caps.get("vision").and_then(|v| v.as_bool()) == Some(true)
+            || caps.get("image").and_then(|v| v.as_bool()) == Some(true)
+        {
+            has_image = true;
+            has_text = true;
+        }
+        if caps.get("chat").and_then(|v| v.as_bool()) == Some(true)
+            || caps.get("text").and_then(|v| v.as_bool()) == Some(true)
+        {
+            has_text = true;
+        }
+    }
+    if entry.get("supports_vision").and_then(|v| v.as_bool()) == Some(true)
+        || entry.get("vision").and_then(|v| v.as_bool()) == Some(true)
+    {
+        has_image = true;
+        has_text = true;
+    }
+
+    let mut out = Vec::new();
+    if has_text {
+        out.push("text".to_string());
+    }
+    if has_image {
+        out.push("image".to_string());
+    }
+    out
+}
+
+fn parse_discovered_costs(entry: &serde_json::Value) -> (Option<f64>, Option<f64>) {
+    // 1. Native per-million-token `cost: { input, output }`.
+    if let Some(cost) = entry.get("cost").and_then(|v| v.as_object()) {
+        let input = cost.get("input").and_then(json_non_neg_f64);
+        let output = cost.get("output").and_then(json_non_neg_f64);
+        if input.is_some() || output.is_some() {
+            return (input, output);
+        }
+    }
+    // 2. OpenRouter / OpenAI-compatible `pricing: { prompt, completion }` (USD per single token).
+    if let Some(pricing) = entry.get("pricing").and_then(|v| v.as_object()) {
+        let scale = |v: f64| ((v * 1_000_000.0) * 10_000.0).round() / 10_000.0;
+        let input = pricing.get("prompt").and_then(json_non_neg_f64).map(scale);
+        let output = pricing
+            .get("completion")
+            .and_then(json_non_neg_f64)
+            .map(scale);
+        if input.is_some() || output.is_some() {
+            return (input, output);
+        }
+    }
+    (None, None)
+}
+
 pub fn parse_models_response(body: &str) -> Vec<ModelOption> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
         return Vec::new();
@@ -1232,9 +1447,15 @@ pub fn parse_models_response(body: &str) -> Vec<ModelOption> {
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
                 .unwrap_or(id);
+            let (input_cost, output_cost) = parse_discovered_costs(entry);
             Some(ModelOption {
                 id: id.to_string(),
                 name: name.to_string(),
+                context_window: parse_discovered_context_window(entry),
+                max_tokens: parse_discovered_max_tokens(entry),
+                input_cost,
+                output_cost,
+                modalities: parse_discovered_modalities(entry),
             })
         })
         .collect()
@@ -1331,6 +1552,7 @@ mod tests {
             models: vec![ModelOption {
                 id: "model-a".to_string(),
                 name: "Model A".to_string(),
+                ..Default::default()
             }],
         }
     }
@@ -3099,17 +3321,54 @@ mod tests {
                 ModelOption {
                     id: "gpt-4o".to_string(),
                     name: "gpt-4o".to_string(),
+                    ..Default::default()
                 },
                 ModelOption {
                     id: "qwen3.6-35b".to_string(),
                     name: "Qwen3.6 35B".to_string(),
+                    ..Default::default()
                 },
                 ModelOption {
                     id: "nameless".to_string(),
                     name: "nameless".to_string(),
+                    ..Default::default()
                 },
             ]
         );
+    }
+
+    #[test]
+    fn parse_models_response_extracts_capabilities_and_pricing() {
+        let body = r#"{
+          "data": [
+            {
+              "id": "anthropic/claude-sonnet",
+              "name": "Claude Sonnet",
+              "context_length": 200000,
+              "top_provider": { "max_completion_tokens": 16384 },
+              "architecture": { "input_modalities": ["text", "image"] },
+              "pricing": { "prompt": "0.000003", "completion": "0.000015" }
+            },
+            {
+              "id": "local-vlm",
+              "context_window": 32768,
+              "max_output_tokens": 4096,
+              "capabilities": { "chat": true, "vision": true }
+            }
+          ]
+        }"#;
+        let models = parse_models_response(body);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].context_window, Some(200000));
+        assert_eq!(models[0].max_tokens, Some(16384));
+        assert_eq!(models[0].modalities, vec!["text", "image"]);
+        assert_eq!(models[0].input_cost, Some(3.0));
+        assert_eq!(models[0].output_cost, Some(15.0));
+
+        assert_eq!(models[1].context_window, Some(32768));
+        assert_eq!(models[1].max_tokens, Some(4096));
+        assert_eq!(models[1].modalities, vec!["text", "image"]);
+        assert_eq!(models[1].input_cost, None);
     }
 
     #[test]
@@ -3336,6 +3595,7 @@ mod tests {
         let json = serde_json::to_string(&vec![ModelOption {
             id: "m".to_string(),
             name: "M".to_string(),
+            ..Default::default()
         }])
         .expect("serialize");
         assert!(!json.contains(secret));
@@ -3387,6 +3647,7 @@ mod tests {
         let option = ModelOption {
             id: "m".to_string(),
             name: "M".to_string(),
+            ..Default::default()
         };
         assert_eq!(
             serde_json::to_value(&option).expect("serialize"),
