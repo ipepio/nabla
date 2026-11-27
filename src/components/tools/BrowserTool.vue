@@ -149,8 +149,22 @@ const props = defineProps<{
 /** Whether this pane should have live views right now (see the teardown note). */
 const drawn = computed(() => props.active !== false);
 
-/** Whether the drawer is on screen (the difference between hiding and closing). */
-const shown = computed(() => props.visible !== false);
+/**
+ * True when any modal/dialog overlay is open above the main webview (Settings,
+ * CommandPalette, AlertDialog, etc.). A native child webview floats above all
+ * HTML/CSS z-index layers, so it must be hidden while any modal is open.
+ */
+const overlayActive = ref(false);
+const OVERLAY_SELECTOR =
+  '[role="dialog"], [role="alertdialog"], [data-slot="dialog-overlay"], [data-slot="alert-dialog-overlay"]';
+
+function refreshOverlayState(): void {
+  if (disposed || typeof document === "undefined") return;
+  overlayActive.value = document.querySelector(OVERLAY_SELECTOR) !== null;
+}
+
+/** Whether the drawer is on screen and not covered by a modal dialog. */
+const shown = computed(() => props.visible !== false && !overlayActive.value);
 
 /** What a fresh page view shows. The pane offers no generated start page: only
  *  the http(s) addresses Rust accepts, and a blank document until the human types. */
@@ -224,6 +238,12 @@ const tabs = ref<BrowserTabState>(emptyTabs());
 const urls = ref<Record<string, string>>({});
 /** The view the pane last asked the platform to SHOW. */
 let shownView: string | null = null;
+/**
+ * Monotonic generation counter incremented on every hide/close/show transition.
+ * Prevents an in-flight `placeAndShow()` from re-showing a webview after the
+ * drawer closed, a modal opened, or the tab switched.
+ */
+let visibilitySeq = 0;
 
 const creating = ref(false);
 const navigating = ref(false);
@@ -342,6 +362,9 @@ let sentRect: PaneRect | null = null;
 let sentRectView: string | null = null;
 
 let resizeObserver: ResizeObserver | null = null;
+let overlayObserver: MutationObserver | null = null;
+let reconcileTimer: number | null = null;
+const RECONCILE_MS = 200;
 
 /**
  * How long a layout TRANSITION keeps the rect sampled. A transition animates the
@@ -385,12 +408,16 @@ function bodyRect(): PaneRect | null {
   const width = Math.round(rect.width);
   const height = Math.round(rect.height);
   if (width < 1 || height < 1) return null;
-  return {
-    x: Math.round(rect.left),
-    y: Math.round(rect.top),
-    width,
-    height,
-  };
+  const x = Math.round(rect.left);
+  const y = Math.round(rect.top);
+  // Off-screen or collapsed outside the viewport: never leave a floating view there.
+  if (
+    typeof window !== "undefined" &&
+    (x >= window.innerWidth || y >= window.innerHeight || x + width <= 0 || y + height <= 0)
+  ) {
+    return null;
+  }
+  return { x, y, width, height };
 }
 
 /**
@@ -502,14 +529,29 @@ function sentFor(viewId: string): PaneRect | null {
  */
 async function syncBounds(): Promise<void> {
   const id = activeViewId.value;
-  if (id === null || disposed) return;
+  if (id === null || disposed || !drawn.value || !shown.value) return;
   if (boundsInFlight) {
     boundsAgain = true;
     return;
   }
   const rect = bodyRect();
-  // Collapsed: nothing to cover. The next resize brings a rect back.
-  if (rect === null) return;
+  // Collapsed (e.g. `hidden md:flex` when window narrows) or off-screen:
+  // hide the native child webview immediately so it never stays sticky on screen.
+  if (rect === null) {
+    if (shownView === id) {
+      visibilitySeq += 1;
+      shownView = null;
+      sentRect = null;
+      sentRectView = null;
+      void hideView(id);
+    }
+    return;
+  }
+  // If the view was hidden while collapsed and now has a valid rect again, show it.
+  if (shownView !== id) {
+    void placeAndShow(id);
+    return;
+  }
   // Already asked for: a colour transition or a scroll that moved nothing must
   // not cost a bridge call. The settle pass clears this once, so the LAST rect of
   // a gesture is always placed again even if this shortcut would have skipped it.
@@ -664,7 +706,29 @@ function watchLayout(): void {
     // The pane root too: dragging the drawer or re-splitting the dock changes our
     // position, and the body alone would only report the width it lost.
     if (rootEl.value !== null) resizeObserver.observe(rootEl.value);
+    if (document.documentElement !== null) {
+      resizeObserver.observe(document.documentElement);
+    }
   }
+  if (typeof MutationObserver !== "undefined" && document.body !== null) {
+    overlayObserver = new MutationObserver(refreshOverlayState);
+    overlayObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["role", "data-state", "data-slot"],
+    });
+    refreshOverlayState();
+  }
+  // Lightweight position-drift reconciliation: catches layout shifts that move
+  // `bodyEl` without resizing it (e.g. toggling the left sidebar, dock splits,
+  // or responsive CSS breakpoints). Zero IPC cost when nothing moved.
+  reconcileTimer = window.setInterval(() => {
+    if (disposed || !drawn.value || !shown.value || activeViewId.value === null) {
+      return;
+    }
+    void syncBounds();
+  }, RECONCILE_MS);
   window.addEventListener("resize", onLayoutSignal);
   // Capture: `scroll` does not bubble, and an ancestor scrolling moves the body
   // rect without resizing it.
@@ -680,6 +744,14 @@ function unwatchLayout(): void {
   if (resizeObserver !== null) {
     resizeObserver.disconnect();
     resizeObserver = null;
+  }
+  if (overlayObserver !== null) {
+    overlayObserver.disconnect();
+    overlayObserver = null;
+  }
+  if (reconcileTimer !== null) {
+    window.clearInterval(reconcileTimer);
+    reconcileTimer = null;
   }
   window.removeEventListener("resize", onLayoutSignal);
   window.removeEventListener("scroll", scheduleBounds, true);
@@ -770,26 +842,67 @@ async function hideView(viewId: string): Promise<void> {
  */
 async function placeAndShow(viewId: string): Promise<void> {
   if (disposed || !drawn.value || !shown.value) return;
+  const seq = ++visibilitySeq;
+  const stale = () =>
+    disposed ||
+    seq !== visibilitySeq ||
+    activeViewId.value !== viewId ||
+    !drawn.value ||
+    !shown.value;
   await nextTick();
   await nextFrame();
-  if (disposed || activeViewId.value !== viewId || !shown.value) return;
-  // Unknown until the fresh rect is applied: the drawer's width survived, but the
-  // chat column it shared the row with did not, and another tab was placed since.
-  sentRect = null;
-  sentRectView = null;
-  await syncBounds();
+  if (stale()) return;
+  const rect = bodyRect();
+  if (rect === null) {
+    void hideView(viewId);
+    return;
+  }
+  // Place directly before showing so the view never flashes at a stale rect.
+  try {
+    await embedSetBounds(viewId, rect.x, rect.y, rect.width, rect.height);
+    sentRect = rect;
+    sentRectView = viewId;
+  } catch (cause) {
+    if (!disposed && isDeadView(cause)) {
+      forgetView(viewId);
+      return;
+    }
+  }
   await nextFrame();
-  if (disposed || activeViewId.value !== viewId || !shown.value) return;
-  await syncBounds();
-  if (disposed || activeViewId.value !== viewId || !shown.value) return;
+  if (stale()) return;
+  const settledRect = bodyRect();
+  if (settledRect === null) {
+    void hideView(viewId);
+    return;
+  }
+  if (!sameRect(rect, settledRect)) {
+    try {
+      await embedSetBounds(
+        viewId,
+        settledRect.x,
+        settledRect.y,
+        settledRect.width,
+        settledRect.height,
+      );
+      sentRect = settledRect;
+      sentRectView = viewId;
+    } catch {
+      // keep going; settle pass will retry if needed
+    }
+  }
+  if (stale()) return;
   try {
     await embedSetVisible(viewId, true);
+    // If a hide/close raced while `embedSetVisible(true)` was in flight,
+    // immediately hide it again so the view never stays stuck on screen.
+    if (stale()) {
+      void hideView(viewId);
+      return;
+    }
     shownView = viewId;
   } catch (cause) {
     if (disposed) return;
     if (isDeadView(cause)) {
-      // Showing a view that is gone is the same dead view the bounds sync heals:
-      // one code path, one rebuild — never a second creation path.
       forgetView(viewId);
       return;
     }
@@ -799,10 +912,13 @@ async function placeAndShow(viewId: string): Promise<void> {
   }
 }
 
-/** Hides every tab's view (the drawer is going away). */
+/** Hides every tab's view (the drawer is going away or covered by a modal). */
 async function hideAllViews(): Promise<void> {
+  visibilitySeq += 1;
   const ids = tabs.value.tabs.map((tab) => tab.id);
   shownView = null;
+  sentRect = null;
+  sentRectView = null;
   for (const id of ids) {
     await hideView(id);
   }
@@ -851,11 +967,16 @@ async function createView(): Promise<void> {
       void embedClose(id).catch(() => {});
       return;
     }
+    const initialUrl = await embedUrl(id).catch(() => START_URL);
+    if (disposed || !drawn.value || !shown.value) {
+      void embedClose(id).catch(() => {});
+      return;
+    }
     pageViewId.value = id;
     // The strip starts over: the page tab, and nothing else. A popup cannot have
     // outlived the page view it was opened from (Rust closes them with it).
     tabs.value = openTab(emptyTabs(), { id, openerId: null }).state;
-    urlTo(id, await embedUrl(id).catch(() => START_URL));
+    urlTo(id, initialUrl);
     sentRect = rect;
     sentRectView = id;
     // The tab is the drawn one, so the watcher on the drawn tab places and shows
@@ -887,6 +1008,7 @@ async function createView(): Promise<void> {
  * idempotent, so the double close costs nothing.
  */
 async function closeAllViews(): Promise<void> {
+  visibilitySeq += 1;
   const page = pageViewId.value;
   const popups = closeAllPopups(tabs.value).closed;
   pageViewId.value = null;

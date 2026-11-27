@@ -17,6 +17,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -200,7 +201,60 @@ function preparePiPackages() {
   if (!existsSync(cliPath)) {
     throw new Error(`pi CLI entry point missing at ${cliPath}`);
   }
+  patchOAuthAgentBrand();
   return cliPath;
+}
+
+/**
+ * Brand the bundled OpenAI OAuth authorization flows as "Nabla" instead of
+ * pi's hardcoded fallback ("Pi" / "pi"). `@earendil-works/pi-ai` already
+ * accepts `options.agentName`, but `pi-coding-agent`'s CLI login does not
+ * forward one yet, so it falls back to `AGENT_NAME_HINT` / `originator`.
+ * Idempotent: safe to run on an already-patched runtime directory.
+ */
+function patchOAuthAgentBrand() {
+  const scopeDir = join(RUNTIME_DIR, "node_modules", "@earendil-works");
+  const targets = [
+    {
+      path: join(scopeDir, "pi-ai", "dist", "auth", "oauth", "openai-chatgpt.js"),
+      pattern: /AGENT_NAME_HINT\s*=\s*"Pi"/g,
+      replacement: 'AGENT_NAME_HINT = "Nabla"',
+      alreadyBranded: /AGENT_NAME_HINT\s*=\s*"Nabla"/,
+    },
+    {
+      path: join(scopeDir, "pi-coding-agent", "dist", "bundle", "chunks", "openai-chatgpt.js"),
+      pattern: /AGENT_NAME_HINT="Pi"/g,
+      replacement: 'AGENT_NAME_HINT="Nabla"',
+      alreadyBranded: /AGENT_NAME_HINT="Nabla"/,
+    },
+    {
+      path: join(scopeDir, "pi-ai", "dist", "auth", "oauth", "openai-codex.js"),
+      pattern: /createAuthorizationFlow\(originator\s*=\s*"pi"\)/g,
+      replacement: 'createAuthorizationFlow(originator = "nabla")',
+      alreadyBranded: /createAuthorizationFlow\(originator\s*=\s*"nabla"\)/,
+    },
+    {
+      path: join(scopeDir, "pi-coding-agent", "dist", "bundle", "chunks", "openai-codex.js"),
+      pattern: /createAuthorizationFlow\(originator="pi"\)/g,
+      replacement: 'createAuthorizationFlow(originator="nabla")',
+      alreadyBranded: /createAuthorizationFlow\(originator="nabla"\)/,
+    },
+  ];
+
+  let patched = 0;
+  let already = 0;
+  for (const target of targets) {
+    if (!existsSync(target.path)) continue;
+    const before = readFileSync(target.path, "utf8");
+    const after = before.replace(target.pattern, target.replacement);
+    if (after !== before) {
+      writeFileSync(target.path, after, "utf8");
+      patched += 1;
+    } else if (target.alreadyBranded.test(before)) {
+      already += 1;
+    }
+  }
+  console.log(`[pi-runtime] OpenAI OAuth brand ("Nabla"): ${patched} patched, ${already} already branded`);
 }
 
 async function main() {

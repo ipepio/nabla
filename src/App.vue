@@ -344,7 +344,7 @@ onBeforeUnmount(() => {
             </Tooltip>
           </div>
 
-          <ToolTabs :workspace="activeWorkspace" :visible="toolsOpen" />
+          <ToolTabs :workspace="activeWorkspace" :visible="toolsOpen && !paletteOpen" />
         </ResizableAside>
       </div>
     </SidebarInset>
